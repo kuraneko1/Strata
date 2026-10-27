@@ -178,6 +178,21 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
+// PORT: a file may carry an in-file NextN/MTP block after the trunk (Qwen3.8: blk.48 of 49).  The pack and
+// the canonical table describe the trunk, so tensors past the last block the table knows are skipped.
+static size_t trunk_blocks(const strata::core::WeightTable& t) {
+    static size_t cached = 0;
+    if (!cached) {
+        size_t mx = 0;
+        for (const auto& kv : t.all())
+            if (kv.first.rfind("blk.", 0) == 0) {
+                const long l = std::strtol(kv.first.c_str() + 4, nullptr, 10);
+                if (l >= 0 && (size_t) l + 1 > mx) mx = (size_t) l + 1;
+            }
+        cached = mx ? mx : 1;
+    }
+    return cached;
+}
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 // The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
 // reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not
@@ -200,6 +215,17 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                 if (!seen.insert(tensor.name).second) continue;
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) {
+                    if (tensor.name.rfind("blk.", 0) == 0 &&
+                        (size_t) std::strtol(tensor.name.c_str() + 4, nullptr, 10) >= trunk_blocks(table)) {
+                        static bool said_mtp = false;
+                        if (!said_mtp) {
+                            said_mtp = true;
+                            std::fprintf(stderr, "strata: skipping the in-file MTP block (%s) - it is served from --mtp",
+                                         tensor.name.c_str());
+                            std::fputc((char)10, stderr);
+                        }
+                        continue;
+                    }
                     err = "native dense: tensor absent from canonical table: " + tensor.name;
                     return false;
                 }
@@ -335,6 +361,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) {
+                    if (tensor.name.rfind("blk.", 0) == 0 &&
+                        (size_t) std::strtol(tensor.name.c_str() + 4, nullptr, 10) >= trunk_blocks(table)) {
+                        static bool said_mtp = false;
+                        if (!said_mtp) {
+                            said_mtp = true;
+                            std::fprintf(stderr, "strata: skipping the in-file MTP block (%s) - it is served from --mtp",
+                                         tensor.name.c_str());
+                            std::fputc((char)10, stderr);
+                        }
+                        continue;
+                    }
                     err = "native dense: tensor absent from canonical table: " + tensor.name; return false;
                 }
                 auto& ref = found->second;

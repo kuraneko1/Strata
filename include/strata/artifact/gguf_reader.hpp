@@ -709,6 +709,14 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     };
     for (const Key& k : keys)
         if (!read_int(k.key, g.*k.field, k.required)) return err;
+    // PORT: Qwen3.8 counts an in-file NextN/MTP block in block_count (49 = 48 + 1).  The kernels are
+    // compiled for the trunk and MTP comes from --mtp, so subtract it - family_layout.hpp does the same.
+    {
+        int64_t mtp = 0;
+        if (!read_int("nextn_predict_layers", mtp, false)) return err;
+        // the kernels are compiled for a trunk with no in-file MTP block: subtract only
+        if (mtp > 0 && mtp < g.n_layers) g.n_layers -= mtp;
+    }
 
     int64_t value_length = g.head_dim, ff_shexp = g.n_ff;
     if (!read_int("attention.value_length", value_length, false) ||
@@ -748,8 +756,19 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     // block) exactly on the full-attention layers.
     if (const MetaValue* v = f.get(p + "attention.compress_ratios")) {
         if (v->type != MetaType::ARRAY || v->count != (uint64_t) g.n_layers || v->items.size() != v->count)
-            return p + "attention.compress_ratios must list one entry for each of the " + std::to_string(g.n_layers) +
-                   " layers";
+            {
+                // PORT: the array may carry one entry per block_count (the NextN block included).  The
+                // 0.1.35 engine never read this key, so a file whose list is longer than the trunk loads
+                // with the compiled pooling block rather than being refused.
+                static bool said_len = false;
+                if (!said_len) {
+                    said_len = true;
+                    std::fprintf(stderr, "strata: %sattention.compress_ratios has %lld entries for %lld trunk layers: array ignored, compiled pooling block used",
+                                 p.c_str(), (long long) v->count, (long long) g.n_layers);
+                    std::fputc((char)10, stderr);
+                }
+                return {};
+            }
         // A list of zeros only is a converter's placeholder, not a layer split (#2396: orcarouter's
         // Qwen3.8-Flash-Next-Uncensored GGUFs carry 48 zeros; 0.1.43 never read the key): it is treated as absent
         // and the compiled pooling block is used.  A list with any non-zero entry is checked in full below.
@@ -769,10 +788,20 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
         for (int64_t l = 0; l < g.n_layers; ++l) {
             const int64_t r = (int64_t) v->items[(size_t) l].u;
             if ((r != 0) != core::is_qsa_layer(g, l) || r < 0 || (block && r && r != block))
-                return p + "attention.compress_ratios[" + std::to_string(l) + "] = " + std::to_string(r) +
-                       ", but full_attention_interval = " + std::to_string(g.qsa_interval) + " makes layer " +
-                       std::to_string(l) + (core::is_qsa_layer(g, l) ? " full attention" : " linear attention") +
-                       (block && r ? " (and the other full-attention layers pool " + std::to_string(block) + ")" : "");
+                {
+                    // PORT(0.1.35): the 0.1.35 engine never read this key.  A converter that wrote a
+                    // trailing element the layer split does not allow then still loads, with the
+                    // compiled pooling block - the behaviour this pack was built and run under.
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "strata: %sattention.compress_ratios[%lld] = %lld does not match "
+                                             "full_attention_interval = %lld: array ignored, compiled pooling block used",
+                                     p.c_str(), (long long) l, (long long) r, (long long) g.qsa_interval);
+                        std::fputc((char)10, stderr);
+                    }
+                    return {};
+                }
             if (r) block = r;
         }
         if (block) g.idx_block = block;

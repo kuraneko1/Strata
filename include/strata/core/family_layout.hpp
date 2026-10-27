@@ -60,8 +60,11 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     num("ssm.inner_size", g.ssm_value_dim);
     num("full_attention_interval", g.qsa_interval);
     g.head_dim = key_length;
+    // PORT: Flash-Next counts an in-file NextN/MTP block in block_count too (49 = 48 + 1).  The
+    // kernels and the pack describe the trunk, so the extra block is not part of n_layers.
+    int64_t in_file_mtp = 0;
+    num("nextn_predict_layers", in_file_mtp);   // the trunk is what the kernels describe
     if (family == strata::ModelFamily::Qwen35Moe) {
-        num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
     } else {
@@ -70,7 +73,7 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         num("attention.indexer.head_count", g.idx_q_heads);
         num("attention.indexer.key_length", g.idx_key_dim);
     }
-    g.n_layers = block_count - g.n_mtp_layers;
+    g.n_layers = block_count - in_file_mtp;
     g.ssm_conv_channels = 2 * g.ssm_state_size * g.ssm_k_heads + g.ssm_value_dim;
     if (const strata::MetaValue* v = meta.get("tokenizer.ggml.tokens"))
         if (v->type == strata::MetaType::ARRAY && v->count > 0) g.n_vocab = (int64_t) v->count;

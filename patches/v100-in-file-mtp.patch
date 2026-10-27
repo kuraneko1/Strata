@@ -1,0 +1,154 @@
+diff --git a/include/strata/artifact/gguf_reader.hpp b/include/strata/artifact/gguf_reader.hpp
+index 5b67f54..8b00f2c 100644
+--- a/include/strata/artifact/gguf_reader.hpp
++++ b/include/strata/artifact/gguf_reader.hpp
+@@ -709,6 +709,14 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
+     };
+     for (const Key& k : keys)
+         if (!read_int(k.key, g.*k.field, k.required)) return err;
++    // PORT: Qwen3.8 counts an in-file NextN/MTP block in block_count (49 = 48 + 1).  The kernels are
++    // compiled for the trunk and MTP comes from --mtp, so subtract it - family_layout.hpp does the same.
++    {
++        int64_t mtp = 0;
++        if (!read_int("nextn_predict_layers", mtp, false)) return err;
++        // the kernels are compiled for a trunk with no in-file MTP block: subtract only
++        if (mtp > 0 && mtp < g.n_layers) g.n_layers -= mtp;
++    }
+ 
+     int64_t value_length = g.head_dim, ff_shexp = g.n_ff;
+     if (!read_int("attention.value_length", value_length, false) ||
+@@ -748,8 +756,19 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
+     // block) exactly on the full-attention layers.
+     if (const MetaValue* v = f.get(p + "attention.compress_ratios")) {
+         if (v->type != MetaType::ARRAY || v->count != (uint64_t) g.n_layers || v->items.size() != v->count)
+-            return p + "attention.compress_ratios must list one entry for each of the " + std::to_string(g.n_layers) +
+-                   " layers";
++            {
++                // PORT: the array may carry one entry per block_count (the NextN block included).  The
++                // 0.1.35 engine never read this key, so a file whose list is longer than the trunk loads
++                // with the compiled pooling block rather than being refused.
++                static bool said_len = false;
++                if (!said_len) {
++                    said_len = true;
++                    std::fprintf(stderr, "strata: %sattention.compress_ratios has %lld entries for %lld trunk layers: array ignored, compiled pooling block used",
++                                 p.c_str(), (long long) v->count, (long long) g.n_layers);
++                    std::fputc((char)10, stderr);
++                }
++                return {};
++            }
+         // A list of zeros only is a converter's placeholder, not a layer split (#2396: orcarouter's
+         // Qwen3.8-Flash-Next-Uncensored GGUFs carry 48 zeros; 0.1.43 never read the key): it is treated as absent
+         // and the compiled pooling block is used.  A list with any non-zero entry is checked in full below.
+@@ -769,10 +788,20 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
+         for (int64_t l = 0; l < g.n_layers; ++l) {
+             const int64_t r = (int64_t) v->items[(size_t) l].u;
+             if ((r != 0) != core::is_qsa_layer(g, l) || r < 0 || (block && r && r != block))
+-                return p + "attention.compress_ratios[" + std::to_string(l) + "] = " + std::to_string(r) +
+-                       ", but full_attention_interval = " + std::to_string(g.qsa_interval) + " makes layer " +
+-                       std::to_string(l) + (core::is_qsa_layer(g, l) ? " full attention" : " linear attention") +
+-                       (block && r ? " (and the other full-attention layers pool " + std::to_string(block) + ")" : "");
++                {
++                    // PORT(0.1.35): the 0.1.35 engine never read this key.  A converter that wrote a
++                    // trailing element the layer split does not allow then still loads, with the
++                    // compiled pooling block - the behaviour this pack was built and run under.
++                    static bool said = false;
++                    if (!said) {
++                        said = true;
++                        std::fprintf(stderr, "strata: %sattention.compress_ratios[%lld] = %lld does not match "
++                                             "full_attention_interval = %lld: array ignored, compiled pooling block used",
++                                     p.c_str(), (long long) l, (long long) r, (long long) g.qsa_interval);
++                        std::fputc((char)10, stderr);
++                    }
++                    return {};
++                }
+             if (r) block = r;
+         }
+         if (block) g.idx_block = block;
+diff --git a/include/strata/core/family_layout.hpp b/include/strata/core/family_layout.hpp
+index 554350d..8321dfb 100644
+--- a/include/strata/core/family_layout.hpp
++++ b/include/strata/core/family_layout.hpp
+@@ -60,8 +60,11 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
+     num("ssm.inner_size", g.ssm_value_dim);
+     num("full_attention_interval", g.qsa_interval);
+     g.head_dim = key_length;
++    // PORT: Flash-Next counts an in-file NextN/MTP block in block_count too (49 = 48 + 1).  The
++    // kernels and the pack describe the trunk, so the extra block is not part of n_layers.
++    int64_t in_file_mtp = 0;
++    num("nextn_predict_layers", in_file_mtp);   // the trunk is what the kernels describe
+     if (family == strata::ModelFamily::Qwen35Moe) {
+-        num("nextn_predict_layers", g.n_mtp_layers);
+         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
+         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
+     } else {
+@@ -70,7 +73,7 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
+         num("attention.indexer.head_count", g.idx_q_heads);
+         num("attention.indexer.key_length", g.idx_key_dim);
+     }
+-    g.n_layers = block_count - g.n_mtp_layers;
++    g.n_layers = block_count - in_file_mtp;
+     g.ssm_conv_channels = 2 * g.ssm_state_size * g.ssm_k_heads + g.ssm_value_dim;
+     if (const strata::MetaValue* v = meta.get("tokenizer.ggml.tokens"))
+         if (v->type == strata::MetaType::ARRAY && v->count > 0) g.n_vocab = (int64_t) v->count;
+diff --git a/src/core/native_dense.cpp b/src/core/native_dense.cpp
+index aba2882..ce67262 100644
+--- a/src/core/native_dense.cpp
++++ b/src/core/native_dense.cpp
+@@ -178,6 +178,21 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
+     }
+ }
+ 
++// PORT: a file may carry an in-file NextN/MTP block after the trunk (Qwen3.8: blk.48 of 49).  The pack and
++// the canonical table describe the trunk, so tensors past the last block the table knows are skipped.
++static size_t trunk_blocks(const strata::core::WeightTable& t) {
++    static size_t cached = 0;
++    if (!cached) {
++        size_t mx = 0;
++        for (const auto& kv : t.all())
++            if (kv.first.rfind("blk.", 0) == 0) {
++                const long l = std::strtol(kv.first.c_str() + 4, nullptr, 10);
++                if (l >= 0 && (size_t) l + 1 > mx) mx = (size_t) l + 1;
++            }
++        cached = mx ? mx : 1;
++    }
++    return cached;
++}
+ void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
+ // The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
+ // reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not
+@@ -200,6 +215,17 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
+                 if (!seen.insert(tensor.name).second) continue;
+                 auto found = table.table_.find(tensor.name);
+                 if (found == table.table_.end()) {
++                    if (tensor.name.rfind("blk.", 0) == 0 &&
++                        (size_t) std::strtol(tensor.name.c_str() + 4, nullptr, 10) >= trunk_blocks(table)) {
++                        static bool said_mtp = false;
++                        if (!said_mtp) {
++                            said_mtp = true;
++                            std::fprintf(stderr, "strata: skipping the in-file MTP block (%s) - it is served from --mtp",
++                                         tensor.name.c_str());
++                            std::fputc((char)10, stderr);
++                        }
++                        continue;
++                    }
+                     err = "native dense: tensor absent from canonical table: " + tensor.name;
+                     return false;
+                 }
+@@ -335,6 +361,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
+                 }
+                 auto found = table.table_.find(tensor.name);
+                 if (found == table.table_.end()) {
++                    if (tensor.name.rfind("blk.", 0) == 0 &&
++                        (size_t) std::strtol(tensor.name.c_str() + 4, nullptr, 10) >= trunk_blocks(table)) {
++                        static bool said_mtp = false;
++                        if (!said_mtp) {
++                            said_mtp = true;
++                            std::fprintf(stderr, "strata: skipping the in-file MTP block (%s) - it is served from --mtp",
++                                         tensor.name.c_str());
++                            std::fputc((char)10, stderr);
++                        }
++                        continue;
++                    }
+                     err = "native dense: tensor absent from canonical table: " + tensor.name; return false;
+                 }
+                 auto& ref = found->second;
