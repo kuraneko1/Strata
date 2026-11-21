@@ -700,7 +700,10 @@ struct Engine {
     float *qgr_t1 = nullptr;         // [2 * q_dim + n_rel * n_head] contiguous T=1 fused output
     float *K_conv = nullptr, *V_conv = nullptr, *dyn_k = nullptr, *dyn_v = nullptr;
     float *sink = nullptr, *rel_tab = nullptr, *att = nullptr, *att_gate = nullptr, *wo = nullptr;
-    float *attn_split = nullptr;     // [kAttnSplit * n_head * 130] for split GQA-3 decode
+    float *attn_split = nullptr;     // [verify_max_t * kAttnSplitMax * n_head * 130] for split GQA-3 decode/verify
+    int sm_count = 80;
+    int attn_split_t1_full = 160;
+    int attn_split_t1_swa = 20;
     float *router_logits = nullptr, *ewts = nullptr, *eparts = nullptr, *moe_raw = nullptr;
     float *logits = nullptr;
     float* h_tok_buf = nullptr;      // pinned [tmax * N] FP32 for token embedding upload
@@ -1018,7 +1021,10 @@ struct Engine {
         d_f32(&att, (size_t) tmax * hp.q_dim);
         d_f32(&att_gate, (size_t) tmax * hp.q_dim);
         d_f32(&wo, (size_t) tmax * N);
-        d_f32(&attn_split, (size_t) kAttnSplit * hp.n_head * 130);
+        d_f32(&attn_split, (size_t) verify_max_t * kAttnSplitMax * hp.n_head * 130);
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+        attn_split_t1_full = std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
+        attn_split_t1_swa = std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv), 8, 24);
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
@@ -1880,12 +1886,17 @@ struct Engine {
             const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
-                    if (T == 1) {
-                        k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) kAttnSplit), 128, 0, st>>>(
+                    if (T < 16) {
+                        const int sp = (T == 1)
+                            ? (is_swa ? attn_split_t1_swa : attn_split_t1_full)
+                            : (is_swa ? std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv * T), 4, 24)
+                                      : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax));
+                        k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, kAttnSplit);
-                        k_attn_split_combine<<<(unsigned) hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int) hp.n_head, kAttnSplit);
-                    } else if (T >= 16) {
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
+                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa);
+                    } else {
                         constexpr size_t kAttnWmmaSmem = 29184;
                         static bool wmma_smem_set = false;
                         if (!wmma_smem_set) {
@@ -1896,10 +1907,6 @@ struct Engine {
                         k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, kAttnWmmaSmem, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
-                    } else {
-                        k_attn_q8_gqa3_pp<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 128, 0, st>>>(
-                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
                     }
                 } else {
                     k_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
