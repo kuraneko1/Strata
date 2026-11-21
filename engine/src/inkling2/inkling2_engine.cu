@@ -1896,6 +1896,17 @@ struct Engine {
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa);
+                    } else if (T >= 128) {
+                        constexpr size_t kAttnWmmaSmem32 = 40960;
+                        static bool wmma32_smem_set = false;
+                        if (!wmma32_smem_set) {
+                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnWmmaSmem32);
+                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                            wmma32_smem_set = true;
+                        }
+                        k_attn_q8_gqa3_pp_wmma_t32<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 31) / 32)), 256, kAttnWmmaSmem32, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
                     } else {
                         constexpr size_t kAttnWmmaSmem = 29184;
                         static bool wmma_smem_set = false;
