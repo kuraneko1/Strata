@@ -1544,6 +1544,14 @@ struct Engine {
         if (cst) CK(cudaStreamSynchronize(cst));
         has_pending_rebal = false;
 
+        // Full-attention KV buffers are reallocated below; invalidate all captured decode/verify graphs
+        // unconditionally (even if only tier-2 or zero layers are evicted).
+        if (core_graph) { cudaGraphExecDestroy(core_graph); core_graph = nullptr; }
+        if (verify_core_graph) { cudaGraphExecDestroy(verify_core_graph); verify_core_graph = nullptr; }
+        for (auto& g : layer_pre_graph) {
+            if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+        }
+
         int n_full = 0;
         for (int il = 0; il < hp.n_layer; ++il) {
             if (!hp.is_swa(il)) ++n_full;
@@ -1580,11 +1588,6 @@ struct Engine {
             }
             if (ip >= hp.core_start && ip < hp.core_end) {
                 core_all_gpu = false;
-                if (core_graph) { cudaGraphExecDestroy(core_graph); core_graph = nullptr; }
-                if (verify_core_graph) { cudaGraphExecDestroy(verify_core_graph); verify_core_graph = nullptr; }
-            }
-            for (auto& g : layer_pre_graph) {
-                if (g) { cudaGraphExecDestroy(g); g = nullptr; }
             }
             hybrid = true;
             return true;
