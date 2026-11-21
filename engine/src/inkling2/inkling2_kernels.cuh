@@ -372,6 +372,102 @@ __global__ void k_mix_normed_4(NormMixPtrs ptrs, int D, const float* __restrict_
     }
 }
 
+/// Fused single-pass multi-query mix (prefill, (N&3)==0, D<=8, n_q in {1,3,4}):
+/// 1 CTA per token reads each ptrs.p[d] ONCE across all n_q queries (3x-4x less HBM traffic, 3 barriers total vs 3*D).
+template <int NQ>
+__global__ void k_mix_normed_fused(NormMixPtrs ptrs, int D, const float* __restrict__ q0, const float* __restrict__ q1,
+                                   MixOuts4 out, int N, float inv_sqrt_n, int swa_broadcast) {
+    __shared__ float s_dot[NQ][8][8];  // [q][d][warp]
+    __shared__ float s_w[NQ][8];
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n4 = N >> 2;
+    const float4* qp[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        if constexpr (NQ == 4) {
+            qp[q] = (const float4*) (q < 2 ? (q0 + (size_t) q * N) : (q1 + (size_t) (q - 2) * N));
+        } else {
+            qp[q] = (const float4*) (q0 + (size_t) q * N);
+        }
+    }
+    for (int d = 0; d < D; ++d) {
+        const float4* s4 = (const float4*) (ptrs.p[d] + (size_t) t * N);
+        float acc[NQ] = {};
+        for (int i = tid; i < n4; i += 256) {
+            const float4 v = s4[i];
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                const float4 b = qp[q][i];
+                acc[q] += v.x * b.x + v.y * b.y + v.z * b.z + v.w * b.w;
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            float v = acc[q];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) s_dot[q][d][warp] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < NQ * D) {
+        const int q = tid / D, d = tid % D;
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) s += s_dot[q][d][w];
+        s_w[q][d] = s * inv_sqrt_n;
+    }
+    __syncthreads();
+    if (tid < NQ) {
+        const int q = tid;
+        float m = -1e30f;
+        for (int d = 0; d < D; ++d) m = fmaxf(m, s_w[q][d]);
+        float sum = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            s_w[q][d] = __expf(s_w[q][d] - m);
+            sum += s_w[q][d];
+        }
+        const float inv = __fdividef(1.0f, sum);
+        for (int d = 0; d < D; ++d) s_w[q][d] *= inv;
+    }
+    __syncthreads();
+    if constexpr (NQ == 1) {
+        if (swa_broadcast) {
+            float4* o0 = (float4*) (out.p[0] + (size_t) t * N);
+            float4* o1 = (float4*) (out.p[1] + (size_t) t * N);
+            float4* o2 = (float4*) (out.p[2] + (size_t) t * N);
+            for (int i = tid; i < n4; i += 256) {
+                float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    const float4 v = ((const float4*) (ptrs.p[d] + (size_t) t * N))[i];
+                    const float wd = s_w[0][d];
+                    ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
+                }
+                const float4 r = make_float4(ax, ay, az, aw);
+                o0[i] = r; o1[i] = r; o2[i] = r;
+            }
+            return;
+        }
+    }
+    float4* dst[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) dst[q] = (float4*) (out.p[q] + (size_t) t * N);
+    for (int i = tid; i < n4; i += 256) {
+        float ax[NQ] = {}, ay[NQ] = {}, az[NQ] = {}, aw[NQ] = {};
+        for (int d = 0; d < D; ++d) {
+            const float4 v = ((const float4*) (ptrs.p[d] + (size_t) t * N))[i];
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                const float wd = s_w[q][d];
+                ax[q] += wd * v.x; ay[q] += wd * v.y; az[q] += wd * v.z; aw[q] += wd * v.w;
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) dst[q][i] = make_float4(ax[q], ay[q], az[q], aw[q]);
+    }
+}
+
 /// control prep: out2N[t][0..N-1] = rms_norm(cur[t]), out2N[t][N..2N-1] = rms_norm(msg[t]). grid(2, T), block 256.
 __global__ void k_control_prep(const float* __restrict__ cur, const float* __restrict__ msg,
                                float* __restrict__ out2N, int N, float eps) {
@@ -405,13 +501,51 @@ __global__ void k_control_prep(const float* __restrict__ cur, const float* __res
     for (int i = threadIdx.x; i < N; i += blockDim.x) dst[i] = src[i] * r;
 }
 
+/// Fused control prep directly into FP16 [T][2*N] for Tensor Core loop_down GEMM (prefill, (N&3)==0).
+__global__ void k_control_prep_f16(const float* __restrict__ cur, const float* __restrict__ msg,
+                                   uint16_t* __restrict__ out2N_f16, int N, float eps) {
+    __shared__ float sh[32];
+    const int k = blockIdx.x, t = blockIdx.y;
+    const float* src = (k == 0 ? cur : msg) + (size_t) t * N;
+    __half2* dst2 = reinterpret_cast<__half2*>(out2N_f16 + (size_t) t * (2 * N) + (k * N));
+    const int n4 = N >> 2;
+    const float4* s4 = (const float4*) src;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = s4[i];
+        s += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    s = block_sum(s, sh);
+    const float r = rsqrtf(s / (float) N + eps);
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = s4[i];
+        dst2[i * 2 + 0] = __halves2half2(__float2half_rn(v.x * r), __float2half_rn(v.y * r));
+        dst2[i * 2 + 1] = __halves2half2(__float2half_rn(v.z * r), __float2half_rn(v.w * r));
+    }
+}
+
 __global__ void k_control_combine(const float* __restrict__ cur, const float* __restrict__ msg,
                                   const float* __restrict__ gain, const float* __restrict__ forget,
                                   float* __restrict__ out, int64_t n) {
+    if ((n & 3) == 0) {
+        const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+        const int64_t n4 = n >> 2;
+        if (i >= n4) return;
+        const float4 c = reinterpret_cast<const float4*>(cur)[i];
+        const float4 m = reinterpret_cast<const float4*>(msg)[i];
+        const float4 g = reinterpret_cast<const float4*>(gain)[i];
+        const float4 f = reinterpret_cast<const float4*>(forget)[i];
+        reinterpret_cast<float4*>(out)[i] = make_float4(
+            (1.0f - fast_tanh(f.x)) * c.x + fast_tanh(g.x) * m.x,
+            (1.0f - fast_tanh(f.y)) * c.y + fast_tanh(g.y) * m.y,
+            (1.0f - fast_tanh(f.z)) * c.z + fast_tanh(g.z) * m.z,
+            (1.0f - fast_tanh(f.w)) * c.w + fast_tanh(g.w) * m.w);
+        return;
+    }
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = tanhf(gain[i]);
-    const float f = tanhf(forget[i]);
+    const float g = fast_tanh(gain[i]);
+    const float f = fast_tanh(forget[i]);
     out[i] = (1.0f - f) * cur[i] + g * msg[i];
 }
 
@@ -845,6 +979,54 @@ __global__ void k_rel_table(const float* __restrict__ R, const float* __restrict
                                 + (q2.x * b2.x + q2.y * b2.y + q2.z * b2.z + q2.w * b2.w)
                                 + (q3.x * b3.x + q3.y * b3.y + q3.z * b3.z + q3.w * b3.w);
                 table[(((size_t) (t0 + r) * n_head + h) * n_ext) + d] = dot - s_sk[r];
+            }
+        }
+    }
+}
+
+/// 32-token-tile FP32 k_rel_table for prefill (T >= 32, n_rel == 16): 4x fewer rel_bias reads & CTAs, bit-identical FP32.
+/// grid (n_head, (T + 31) / 32), block 256.
+__global__ void k_rel_table_t32(const float* __restrict__ R, const float* __restrict__ rel_bias,
+                                const float* __restrict__ sink, float* __restrict__ table,
+                                int n_head, int n_rel, int n_ext, int max_rel, const int32_t* __restrict__ pos0, int T) {
+    __shared__ float4 sr[32][4];
+    __shared__ float s_sk[32];
+    const int h = blockIdx.x, t0 = blockIdx.y * 32;
+    const int p0 = pos0[0];
+    const int n_rows = min(32, T - t0);
+    if (n_rows <= 0) return;
+    if (threadIdx.x < n_rows * 4) {
+        const int r = threadIdx.x >> 2, c = threadIdx.x & 3;
+        const float* rr = R + ((size_t) (t0 + r) * n_head + h) * n_rel;
+        sr[r][c] = reinterpret_cast<const float4*>(rr)[c];
+        if (c == 0) s_sk[r] = sink[(size_t) (t0 + r) * n_head + h];
+    }
+    __syncthreads();
+    const int max_d = min(min(n_ext, max_rel), p0 + t0 + n_rows);
+    const int full_d = min(max_d, p0 + t0 + 1);
+    for (int d = threadIdx.x; d < max_d; d += blockDim.x) {
+        const float4* rb4 = reinterpret_cast<const float4*>(rel_bias + (size_t) d * n_rel);
+        const float4 b0 = rb4[0], b1 = rb4[1], b2 = rb4[2], b3 = rb4[3];
+        if (n_rows == 32 && d < full_d) {
+#pragma unroll 8
+            for (int r = 0; r < 32; ++r) {
+                const float4 q0 = sr[r][0], q1 = sr[r][1], q2 = sr[r][2], q3 = sr[r][3];
+                const float dot = (q0.x * b0.x + q0.y * b0.y + q0.z * b0.z + q0.w * b0.w)
+                                + (q1.x * b1.x + q1.y * b1.y + q1.z * b1.z + q1.w * b1.w)
+                                + (q2.x * b2.x + q2.y * b2.y + q2.z * b2.z + q2.w * b2.w)
+                                + (q3.x * b3.x + q3.y * b3.y + q3.z * b3.z + q3.w * b3.w);
+                table[(((size_t) (t0 + r) * n_head + h) * n_ext) + d] = dot - s_sk[r];
+            }
+        } else {
+            for (int r = 0; r < n_rows; ++r) {
+                if (d <= p0 + t0 + r) {
+                    const float4 q0 = sr[r][0], q1 = sr[r][1], q2 = sr[r][2], q3 = sr[r][3];
+                    const float dot = (q0.x * b0.x + q0.y * b0.y + q0.z * b0.z + q0.w * b0.w)
+                                    + (q1.x * b1.x + q1.y * b1.y + q1.z * b1.z + q1.w * b1.w)
+                                    + (q2.x * b2.x + q2.y * b2.y + q2.z * b2.z + q2.w * b2.w)
+                                    + (q3.x * b3.x + q3.y * b3.y + q3.z * b3.z + q3.w * b3.w);
+                    table[(((size_t) (t0 + r) * n_head + h) * n_ext) + d] = dot - s_sk[r];
+                }
             }
         }
     }
@@ -1960,6 +2142,517 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_gqa3(
         }
     }
 #endif
+}
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+__device__ __forceinline__ float fast_exp2f_hw(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ void i8x4_to_h2x2_scaled(uint32_t packed_i8x4, __half2 scale2, __half2& out0, __half2& out1) {
+    const uint32_t u = packed_i8x4 ^ 0x80808080u;
+    const uint32_t lo = __byte_perm(u, 0x6400u, 0x5150u);
+    const uint32_t hi = __byte_perm(u, 0x6400u, 0x5352u);
+    const __half2 bias = __half2half2(__float2half(1152.0f));
+    out0 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&lo), bias), scale2);
+    out1 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&hi), bias), scale2);
+}
+
+__device__ __forceinline__ void wmma_acc_layout_16x16(int lane, int& r0, int& r1, int& c0, int& c1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    r0 = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 1);
+    r1 = r0 + 2;
+    c0 = (lane & 8) + (lane & 2);
+    c1 = c0 + 4;
+#else
+    r0 = lane >> 2;
+    r1 = r0 + 8;
+    c0 = (lane & 3) * 2;
+    c1 = c0 + 8;
+#endif
+}
+
+__device__ __forceinline__ float wmma_row_max_16(float v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 8));
+#else
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
+#endif
+    return v;
+}
+
+__device__ __forceinline__ float wmma_row_sum_16(float v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 8);
+#else
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+#endif
+    return v;
+}
+
+__device__ __forceinline__ bool wmma_row_leader_16(int lane) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    return (lane & 10) == 0;
+#else
+    return (lane & 3) == 0;
+#endif
+}
+
+__device__ __forceinline__ void wmma_rescale_acc(nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>& fc,
+                                                 float a0, float a1) {
+    fc.x[0] *= a0; fc.x[1] *= a0; fc.x[4] *= a0; fc.x[5] *= a0;
+    fc.x[2] *= a1; fc.x[3] *= a1; fc.x[6] *= a1; fc.x[7] *= a1;
+}
+#endif
+
+/// FlashAttention-2 192-row (64 tokens x 3 GQA heads, 384 threads = 12 warps, 1 blk/SM, 97,280 B SMEM) FP16 WMMA prefill:
+/// Zero sS SMEM (in-register 1x4 Q*K^T -> in-register 2-shuffle softmax -> sP), register-resident O accumulators (4x2 P*V),
+/// pre-scaled K/V via i8x4_to_h2x2_scaled, bulk KV register prefetch, and optional Split-KV (reusing caller scratch).
+template <bool SPLIT_KV>
+__global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192(
+        const float* __restrict__ Q,
+        const int8_t* __restrict__ kq, const __half* __restrict__ ks,
+        const int8_t* __restrict__ vq, const __half* __restrict__ vs,
+        const float* __restrict__ rel_tab, const float* __restrict__ sink,
+        const float* __restrict__ gate, float* __restrict__ out,
+        float* __restrict__ split_out,
+        int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
+        const int32_t* __restrict__ pos0, float kq_scale, int T, int split_n) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    extern __shared__ __align__(16) char smem_raw[];
+    // 97,280 B <= 98,304 B (96 KB on sm_70, 100 KB on sm_89):
+    // sQ: 192*136*2 = 52,224 B | sKV: 64*136*2 = 17,408 B | sP: 192*72*2 = 27,648 B
+    // Scalar metadata (s_alpha, s_l, s_m) packed into unused 16 B tail of each sP row (sP[qr*72 + 64..71]).
+    __half* sQ = reinterpret_cast<__half*>(smem_raw);
+    __half* sKV = sQ + 192 * 136;
+    __half* sP = sKV + 64 * 136;
+    auto s_alpha_ptr = [&](int qr) -> float* { return reinterpret_cast<float*>(sP + qr * 72 + 64); };
+    auto s_l_ptr     = [&](int qr) -> float* { return reinterpret_cast<float*>(sP + qr * 72 + 66); };
+    auto s_m_ptr     = [&](int qr) -> float* { return reinterpret_cast<float*>(sP + qr * 72 + 68); };
+
+    const int hkv = blockIdx.x, h0 = 3 * hkv, t0 = blockIdx.y * 64;
+    const int sp = SPLIT_KV ? (int) blockIdx.z : 0;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int kv_dim = n_head_kv * 128;
+    constexpr float kLog2e = 1.4426950408889634f;
+    const float qscale_all = kq_scale * kLog2e;
+
+    const int p0 = pos0[0];
+    const int t_last = min(t0 + 63, T - 1);
+    const int j_start_all = is_swa ? max(0, (p0 + t0) - n_swa + 1) : 0;
+    const int j_end_all = p0 + t_last + 1;
+
+    int j_start = j_start_all;
+    int j_end = j_end_all;
+    if constexpr (SPLIT_KV) {
+        const int n_tiles = (j_end_all - j_start_all + 63) / 64;
+        const int t_per_sp = (n_tiles + split_n - 1) / split_n;
+        j_start = j_start_all + sp * t_per_sp * 64;
+        j_end = min(j_end_all, j_start + t_per_sp * 64);
+        if (j_start >= j_end_all) {
+            if (tid < 192) {
+                const int g = tid >> 6, r = tid & 63, t = t0 + r;
+                if (t < T) {
+                    float* dst = split_out + (((size_t) t * split_n + sp) * n_head + (h0 + g)) * 130;
+                    dst[128] = -1e30f;
+                    dst[129] = 0.0f;
+                }
+            }
+            return;
+        }
+    }
+
+    for (int base_r = 0; base_r < 192; base_r += 48) {
+        const int qr = base_r + (tid >> 3);
+        const int qc0 = (tid & 7) * 16;
+        const int g = qr >> 6, r = qr & 63, t = t0 + r, h = h0 + g;
+        __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * 136 + qc0);
+        if (t < T) {
+            const float* qp = Q + ((size_t) t * n_head + h) * 128 + qc0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 v = *reinterpret_cast<const float4*>(qp + i * 4);
+                dst2[i * 2 + 0] = __halves2half2(__float2half(v.x * qscale_all), __float2half(v.y * qscale_all));
+                dst2[i * 2 + 1] = __halves2half2(__float2half(v.z * qscale_all), __float2half(v.w * qscale_all));
+            }
+        } else {
+            const __half2 z2 = __halves2half2(__float2half(0.0f), __float2half(0.0f));
+#pragma unroll
+            for (int i = 0; i < 8; ++i) dst2[i] = z2;
+        }
+    }
+    __syncthreads();
+
+    const int bulk_end = is_swa ? j_start : max(j_start, min(j_end, p0 + t0 - n_ext + 1));
+    const bool pow2_cap = (cap & (cap - 1)) == 0;
+    const int cap_mask = cap - 1;
+
+    int acc_r0, acc_r1, acc_c0, acc_c1;
+    wmma_acc_layout_16x16(lane, acc_r0, acc_r1, acc_c0, acc_c1);
+    const bool is_leader = wmma_row_leader_16(lane);
+
+    const int qr_base = warp * 16;
+    const int qr0 = qr_base + acc_r0;
+    const int qr1 = qr_base + acc_r1;
+    const int t_row0 = t0 + (qr0 & 63), h_row0 = h0 + (qr0 >> 6);
+    const int t_row1 = t0 + (qr1 & 63), h_row1 = h0 + (qr1 >> 6);
+    const bool ok0 = t_row0 < T;
+    const bool ok1 = t_row1 < T;
+    const float nsink0 = ok0 ? (-sink[(size_t) t_row0 * n_head + h_row0] * kLog2e) : 0.0f;
+    const float nsink1 = ok1 ? (-sink[(size_t) t_row1 * n_head + h_row1] * kLog2e) : 0.0f;
+
+    const bool has_sink = (!SPLIT_KV || sp == 0);
+    float rm0 = has_sink ? 0.0f : -1e30f, rl0 = has_sink ? 1.0f : 0.0f;
+    float rm1 = has_sink ? 0.0f : -1e30f, rl1 = has_sink ? 1.0f : 0.0f;
+
+    const int pv_rg = warp >> 2;
+    const int pv_cg = warp & 3;
+    const int pr0 = pv_rg * 64, pc0 = pv_cg * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        wmma::fill_fragment(acc[m][0], 0.0f);
+        wmma::fill_fragment(acc[m][1], 0.0f);
+    }
+
+    const int kv_r = tid >> 2, kv_c0 = (tid & 3) * 32;
+
+    // Fast specialized bulk loop (!is_swa, dist >= n_ext): zero causal/SWA branches + K/V register prefetch
+    int jb = j_start;
+    const int bulk_tiles_end = bulk_end - 63;
+    uint4 kraw0, kraw1;
+    __half2 dk2;
+    if (jb < bulk_tiles_end && tid < 256) {
+        const int j = jb + kv_r;
+        dk2 = __half2half2(__ldg(&ks[(size_t) j * n_head_kv + hkv]));
+        const int8_t* kp = kq + (size_t) j * kv_dim + hkv * 128 + kv_c0;
+        kraw0 = *reinterpret_cast<const uint4*>(kp);
+        kraw1 = *reinterpret_cast<const uint4*>(kp + 16);
+    }
+    for (; jb < bulk_tiles_end; jb += 64) {
+        if (tid < 256) {
+            __half* dst = sKV + kv_r * 136 + kv_c0;
+            __half2 h2[8];
+            i8x4_to_h2x2_scaled(kraw0.x, dk2, h2[0], h2[1]); i8x4_to_h2x2_scaled(kraw0.y, dk2, h2[2], h2[3]);
+            i8x4_to_h2x2_scaled(kraw0.z, dk2, h2[4], h2[5]); i8x4_to_h2x2_scaled(kraw0.w, dk2, h2[6], h2[7]);
+            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(h2);
+            *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
+            i8x4_to_h2x2_scaled(kraw1.x, dk2, h2[0], h2[1]); i8x4_to_h2x2_scaled(kraw1.y, dk2, h2[2], h2[3]);
+            i8x4_to_h2x2_scaled(kraw1.z, dk2, h2[4], h2[5]); i8x4_to_h2x2_scaled(kraw1.w, dk2, h2[6], h2[7]);
+            *reinterpret_cast<uint4*>(dst + 16) = *reinterpret_cast<const uint4*>(h2);
+            *reinterpret_cast<uint4*>(dst + 24) = *reinterpret_cast<const uint4*>(h2 + 4);
+        }
+        __syncthreads();
+
+        uint4 vraw0, vraw1;
+        __half2 dv2;
+        if (tid < 256) {
+            const int j = jb + kv_r;
+            dv2 = __half2half2(__ldg(&vs[(size_t) j * n_head_kv + hkv]));
+            const int8_t* vp = vq + (size_t) j * kv_dim + hkv * 128 + kv_c0;
+            vraw0 = *reinterpret_cast<const uint4*>(vp);
+            vraw1 = *reinterpret_cast<const uint4*>(vp + 16);
+        }
+
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[4];
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) wmma::fill_fragment(fc[ct], 0.0f);
+#pragma unroll
+        for (int k = 0; k < 128; k += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+            wmma::load_matrix_sync(fa, sQ + qr_base * 136 + k, 136);
+#pragma unroll
+            for (int ct = 0; ct < 4; ++ct) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, sKV + (ct * 16) * 136 + k, 136);
+                wmma::mma_sync(fc[ct], fa, fb, fc[ct]);
+            }
+        }
+
+        float rmax0 = -1e30f, rmax1 = -1e30f;
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+            fc[ct].x[0] += nsink0; fc[ct].x[1] += nsink0; fc[ct].x[4] += nsink0; fc[ct].x[5] += nsink0;
+            rmax0 = fmaxf(rmax0, fmaxf(fmaxf(fc[ct].x[0], fc[ct].x[1]), fmaxf(fc[ct].x[4], fc[ct].x[5])));
+            fc[ct].x[2] += nsink1; fc[ct].x[3] += nsink1; fc[ct].x[6] += nsink1; fc[ct].x[7] += nsink1;
+            rmax1 = fmaxf(rmax1, fmaxf(fmaxf(fc[ct].x[2], fc[ct].x[3]), fmaxf(fc[ct].x[6], fc[ct].x[7])));
+        }
+        rmax0 = wmma_row_max_16(rmax0);
+        rmax1 = wmma_row_max_16(rmax1);
+        const float m_new0 = fmaxf(rm0, rmax0);
+        const float m_new1 = fmaxf(rm1, rmax1);
+        const float alpha0 = rl0 > 0.0f ? fast_exp2f_hw(rm0 - m_new0) : 0.0f;
+        const float alpha1 = rl1 > 0.0f ? fast_exp2f_hw(rm1 - m_new1) : 0.0f;
+        float psum0 = 0.0f, psum1 = 0.0f;
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+            const float p00 = fast_exp2f_hw(fc[ct].x[0] - m_new0), p01 = fast_exp2f_hw(fc[ct].x[1] - m_new0);
+            const float p04 = fast_exp2f_hw(fc[ct].x[4] - m_new0), p05 = fast_exp2f_hw(fc[ct].x[5] - m_new0);
+            psum0 += (p00 + p01) + (p04 + p05);
+            *reinterpret_cast<__half2*>(sP + qr0 * 72 + ct * 16 + acc_c0) = __halves2half2(__float2half(p00), __float2half(p01));
+            *reinterpret_cast<__half2*>(sP + qr0 * 72 + ct * 16 + acc_c1) = __halves2half2(__float2half(p04), __float2half(p05));
+
+            const float p12 = fast_exp2f_hw(fc[ct].x[2] - m_new1), p13 = fast_exp2f_hw(fc[ct].x[3] - m_new1);
+            const float p16 = fast_exp2f_hw(fc[ct].x[6] - m_new1), p17 = fast_exp2f_hw(fc[ct].x[7] - m_new1);
+            psum1 += (p12 + p13) + (p16 + p17);
+            *reinterpret_cast<__half2*>(sP + qr1 * 72 + ct * 16 + acc_c0) = __halves2half2(__float2half(p12), __float2half(p13));
+            *reinterpret_cast<__half2*>(sP + qr1 * 72 + ct * 16 + acc_c1) = __halves2half2(__float2half(p16), __float2half(p17));
+        }
+        psum0 = wmma_row_sum_16(psum0);
+        psum1 = wmma_row_sum_16(psum1);
+        rm0 = m_new0; rl0 = rl0 * alpha0 + psum0;
+        rm1 = m_new1; rl1 = rl1 * alpha1 + psum1;
+        if (is_leader) { *s_alpha_ptr(qr0) = alpha0; *s_alpha_ptr(qr1) = alpha1; }
+        __syncthreads();
+
+        if (tid < 256) {
+            __half* dst = sKV + kv_r * 136 + kv_c0;
+            __half2 h2[8];
+            i8x4_to_h2x2_scaled(vraw0.x, dv2, h2[0], h2[1]); i8x4_to_h2x2_scaled(vraw0.y, dv2, h2[2], h2[3]);
+            i8x4_to_h2x2_scaled(vraw0.z, dv2, h2[4], h2[5]); i8x4_to_h2x2_scaled(vraw0.w, dv2, h2[6], h2[7]);
+            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(h2);
+            *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
+            i8x4_to_h2x2_scaled(vraw1.x, dv2, h2[0], h2[1]); i8x4_to_h2x2_scaled(vraw1.y, dv2, h2[2], h2[3]);
+            i8x4_to_h2x2_scaled(vraw1.z, dv2, h2[4], h2[5]); i8x4_to_h2x2_scaled(vraw1.w, dv2, h2[6], h2[7]);
+            *reinterpret_cast<uint4*>(dst + 16) = *reinterpret_cast<const uint4*>(h2);
+            *reinterpret_cast<uint4*>(dst + 24) = *reinterpret_cast<const uint4*>(h2 + 4);
+        }
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            const float a0 = *s_alpha_ptr(pr0 + m * 16 + acc_r0);
+            const float a1 = *s_alpha_ptr(pr0 + m * 16 + acc_r1);
+            wmma_rescale_acc(acc[m][0], a0, a1);
+            wmma_rescale_acc(acc[m][1], a0, a1);
+        }
+        __syncthreads();
+
+        if (jb + 64 < bulk_tiles_end && tid < 256) {
+            const int j = jb + 64 + kv_r;
+            dk2 = __half2half2(__ldg(&ks[(size_t) j * n_head_kv + hkv]));
+            const int8_t* kp = kq + (size_t) j * kv_dim + hkv * 128 + kv_c0;
+            kraw0 = *reinterpret_cast<const uint4*>(kp);
+            kraw1 = *reinterpret_cast<const uint4*>(kp + 16);
+        }
+#pragma unroll
+        for (int k = 0; k < 64; k += 16) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb0, fb1;
+            wmma::load_matrix_sync(fb0, sKV + k * 136 + pc0, 136);
+            wmma::load_matrix_sync(fb1, sKV + k * 136 + pc0 + 16, 136);
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::load_matrix_sync(fa, sP + (pr0 + m * 16) * 72 + k, 72);
+                wmma::mma_sync(acc[m][0], fa, fb0, acc[m][0]);
+                wmma::mma_sync(acc[m][1], fa, fb1, acc[m][1]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Tail / SWA loop (causal masking + relative distance bias)
+    if (jb < j_end) {
+        const float* rt0 = ok0 ? (rel_tab + ((size_t) t_row0 * n_head + h_row0) * n_ext) : nullptr;
+        const float* rt1 = ok1 ? (rel_tab + ((size_t) t_row1 * n_head + h_row1) * n_ext) : nullptr;
+        const int pos_q0 = p0 + t_row0, pos_q1 = p0 + t_row1;
+        auto mask_bias = [&](float s, int pos_q, int j, bool ok, const float* rt, float ns) -> float {
+            const int d = pos_q - j;
+            const bool v = ok && (j <= pos_q) && (!is_swa || d < n_swa);
+            return v ? (s + (d < n_ext ? (rt[d] * kLog2e) : ns)) : -1e30f;
+        };
+        for (; jb < j_end; jb += 64) {
+            if (tid < 256) {
+                const int j = jb + kv_r;
+                const bool valid = j < j_end;
+                __half* dst = sKV + kv_r * 136 + kv_c0;
+                if (valid) {
+                    const int slot = is_swa ? (pow2_cap ? (j & cap_mask) : (j % cap)) : j;
+                    const __half2 dk2_t = __half2half2(__ldg(&ks[(size_t) slot * n_head_kv + hkv]));
+                    const int8_t* kp = kq + (size_t) slot * kv_dim + hkv * 128 + kv_c0;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const uint4 raw = *reinterpret_cast<const uint4*>(kp + i * 16);
+                        __half2 h2[8];
+                        i8x4_to_h2x2_scaled(raw.x, dk2_t, h2[0], h2[1]); i8x4_to_h2x2_scaled(raw.y, dk2_t, h2[2], h2[3]);
+                        i8x4_to_h2x2_scaled(raw.z, dk2_t, h2[4], h2[5]); i8x4_to_h2x2_scaled(raw.w, dk2_t, h2[6], h2[7]);
+                        *reinterpret_cast<uint4*>(dst + i * 16) = *reinterpret_cast<const uint4*>(h2);
+                        *reinterpret_cast<uint4*>(dst + i * 16 + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
+                    }
+                } else {
+                    const uint4 z = make_uint4(0, 0, 0, 0);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
+                }
+            }
+            __syncthreads();
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[4];
+#pragma unroll
+            for (int ct = 0; ct < 4; ++ct) wmma::fill_fragment(fc[ct], 0.0f);
+#pragma unroll
+            for (int k = 0; k < 128; k += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::load_matrix_sync(fa, sQ + qr_base * 136 + k, 136);
+#pragma unroll
+                for (int ct = 0; ct < 4; ++ct) {
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                    wmma::load_matrix_sync(fb, sKV + (ct * 16) * 136 + k, 136);
+                    wmma::mma_sync(fc[ct], fa, fb, fc[ct]);
+                }
+            }
+            float rmax0 = -1e30f, rmax1 = -1e30f;
+#pragma unroll
+            for (int ct = 0; ct < 4; ++ct) {
+                const int j0 = jb + ct * 16 + acc_c0, j1 = jb + ct * 16 + acc_c1;
+                fc[ct].x[0] = mask_bias(fc[ct].x[0], pos_q0, j0,     ok0, rt0, nsink0);
+                fc[ct].x[1] = mask_bias(fc[ct].x[1], pos_q0, j0 + 1, ok0, rt0, nsink0);
+                fc[ct].x[4] = mask_bias(fc[ct].x[4], pos_q0, j1,     ok0, rt0, nsink0);
+                fc[ct].x[5] = mask_bias(fc[ct].x[5], pos_q0, j1 + 1, ok0, rt0, nsink0);
+                rmax0 = fmaxf(rmax0, fmaxf(fmaxf(fc[ct].x[0], fc[ct].x[1]), fmaxf(fc[ct].x[4], fc[ct].x[5])));
+                fc[ct].x[2] = mask_bias(fc[ct].x[2], pos_q1, j0,     ok1, rt1, nsink1);
+                fc[ct].x[3] = mask_bias(fc[ct].x[3], pos_q1, j0 + 1, ok1, rt1, nsink1);
+                fc[ct].x[6] = mask_bias(fc[ct].x[6], pos_q1, j1,     ok1, rt1, nsink1);
+                fc[ct].x[7] = mask_bias(fc[ct].x[7], pos_q1, j1 + 1, ok1, rt1, nsink1);
+                rmax1 = fmaxf(rmax1, fmaxf(fmaxf(fc[ct].x[2], fc[ct].x[3]), fmaxf(fc[ct].x[6], fc[ct].x[7])));
+            }
+            rmax0 = wmma_row_max_16(rmax0); rmax1 = wmma_row_max_16(rmax1);
+            const float m_new0 = fmaxf(rm0, rmax0), m_new1 = fmaxf(rm1, rmax1);
+            const float alpha0 = rl0 > 0.0f ? fast_exp2f_hw(rm0 - m_new0) : 0.0f;
+            const float alpha1 = rl1 > 0.0f ? fast_exp2f_hw(rm1 - m_new1) : 0.0f;
+            float psum0 = 0.0f, psum1 = 0.0f;
+#pragma unroll
+            for (int ct = 0; ct < 4; ++ct) {
+                const float p00 = (fc[ct].x[0] > -1e20f) ? fast_exp2f_hw(fc[ct].x[0] - m_new0) : 0.0f;
+                const float p01 = (fc[ct].x[1] > -1e20f) ? fast_exp2f_hw(fc[ct].x[1] - m_new0) : 0.0f;
+                const float p04 = (fc[ct].x[4] > -1e20f) ? fast_exp2f_hw(fc[ct].x[4] - m_new0) : 0.0f;
+                const float p05 = (fc[ct].x[5] > -1e20f) ? fast_exp2f_hw(fc[ct].x[5] - m_new0) : 0.0f;
+                psum0 += (p00 + p01) + (p04 + p05);
+                *reinterpret_cast<__half2*>(sP + qr0 * 72 + ct * 16 + acc_c0) = __halves2half2(__float2half(p00), __float2half(p01));
+                *reinterpret_cast<__half2*>(sP + qr0 * 72 + ct * 16 + acc_c1) = __halves2half2(__float2half(p04), __float2half(p05));
+                const float p12 = (fc[ct].x[2] > -1e20f) ? fast_exp2f_hw(fc[ct].x[2] - m_new1) : 0.0f;
+                const float p13 = (fc[ct].x[3] > -1e20f) ? fast_exp2f_hw(fc[ct].x[3] - m_new1) : 0.0f;
+                const float p16 = (fc[ct].x[6] > -1e20f) ? fast_exp2f_hw(fc[ct].x[6] - m_new1) : 0.0f;
+                const float p17 = (fc[ct].x[7] > -1e20f) ? fast_exp2f_hw(fc[ct].x[7] - m_new1) : 0.0f;
+                psum1 += (p12 + p13) + (p16 + p17);
+                *reinterpret_cast<__half2*>(sP + qr1 * 72 + ct * 16 + acc_c0) = __halves2half2(__float2half(p12), __float2half(p13));
+                *reinterpret_cast<__half2*>(sP + qr1 * 72 + ct * 16 + acc_c1) = __halves2half2(__float2half(p16), __float2half(p17));
+            }
+            psum0 = wmma_row_sum_16(psum0); psum1 = wmma_row_sum_16(psum1);
+            rm0 = m_new0; rl0 = rl0 * alpha0 + psum0;
+            rm1 = m_new1; rl1 = rl1 * alpha1 + psum1;
+            if (is_leader) { *s_alpha_ptr(qr0) = alpha0; *s_alpha_ptr(qr1) = alpha1; }
+            __syncthreads();
+            if (tid < 256) {
+                const int j = jb + kv_r;
+                const bool valid = j < j_end;
+                __half* dst = sKV + kv_r * 136 + kv_c0;
+                if (valid) {
+                    const int slot = is_swa ? (pow2_cap ? (j & cap_mask) : (j % cap)) : j;
+                    const __half2 dv2_t = __half2half2(__ldg(&vs[(size_t) slot * n_head_kv + hkv]));
+                    const int8_t* vp = vq + (size_t) slot * kv_dim + hkv * 128 + kv_c0;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const uint4 raw = *reinterpret_cast<const uint4*>(vp + i * 16);
+                        __half2 h2[8];
+                        i8x4_to_h2x2_scaled(raw.x, dv2_t, h2[0], h2[1]); i8x4_to_h2x2_scaled(raw.y, dv2_t, h2[2], h2[3]);
+                        i8x4_to_h2x2_scaled(raw.z, dv2_t, h2[4], h2[5]); i8x4_to_h2x2_scaled(raw.w, dv2_t, h2[6], h2[7]);
+                        *reinterpret_cast<uint4*>(dst + i * 16) = *reinterpret_cast<const uint4*>(h2);
+                        *reinterpret_cast<uint4*>(dst + i * 16 + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
+                    }
+                } else {
+                    const uint4 z = make_uint4(0, 0, 0, 0);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const float a0 = *s_alpha_ptr(pr0 + m * 16 + acc_r0);
+                const float a1 = *s_alpha_ptr(pr0 + m * 16 + acc_r1);
+                wmma_rescale_acc(acc[m][0], a0, a1); wmma_rescale_acc(acc[m][1], a0, a1);
+            }
+            __syncthreads();
+#pragma unroll
+            for (int k = 0; k < 64; k += 16) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb0, fb1;
+                wmma::load_matrix_sync(fb0, sKV + k * 136 + pc0, 136);
+                wmma::load_matrix_sync(fb1, sKV + k * 136 + pc0 + 16, 136);
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::load_matrix_sync(fa, sP + (pr0 + m * 16) * 72 + k, 72);
+                    wmma::mma_sync(acc[m][0], fa, fb0, acc[m][0]);
+                    wmma::mma_sync(acc[m][1], fa, fb1, acc[m][1]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (is_leader) {
+        *s_l_ptr(qr0) = rl0; *s_l_ptr(qr1) = rl1;
+        if constexpr (SPLIT_KV) { *s_m_ptr(qr0) = rm0; *s_m_ptr(qr1) = rm1; }
+    }
+    __syncthreads();
+
+    float* s_out = reinterpret_cast<float*>(sQ);
+    for (int rg = 0; rg < 3; ++rg) {
+        if (pv_rg == rg) {
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                wmma::store_matrix_sync(s_out + (m * 16) * 128 + pc0, acc[m][0], 128, wmma::mem_row_major);
+                wmma::store_matrix_sync(s_out + (m * 16) * 128 + pc0 + 16, acc[m][1], 128, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+        for (int idx = tid; idx < 64 * 128; idx += 384) {
+            const int r = idx >> 7, col = idx & 127, qr = rg * 64 + r, t = t0 + r;
+            if (t < T) {
+                if constexpr (SPLIT_KV) {
+                    float* dst = split_out + (((size_t) t * split_n + sp) * n_head + (h0 + rg)) * 130;
+                    dst[col] = s_out[idx];
+                    if (col == 0) { dst[128] = *s_m_ptr(qr); dst[129] = *s_l_ptr(qr); }
+                } else {
+                    const size_t oi = ((size_t) t * n_head + (h0 + rg)) * 128 + col;
+                    float val = __fdividef(s_out[idx], *s_l_ptr(qr));
+                    if (gate) val *= sigmf(gate[oi]);
+                    out[oi] = val;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#endif
+}
+
+/// Combine Split-KV prefill FA2 outputs (log2-base m/l) and apply optional sigmoid gate. grid (n_head, T), block 128.
+__global__ void k_attn_pp_split_combine(const float* __restrict__ split_out, const float* __restrict__ gate,
+                                        float* __restrict__ out, int n_head, int split_n) {
+    const int h = blockIdx.x, t = blockIdx.y, col = threadIdx.x;
+    float mg = -1e30f;
+    for (int sp = 0; sp < split_n; ++sp) {
+        const float* src = split_out + (((size_t) t * split_n + sp) * n_head + h) * 130;
+        if (src[129] > 0.0f) mg = fmaxf(mg, src[128]);
+    }
+    float lg = 0.0f, og = 0.0f;
+    for (int sp = 0; sp < split_n; ++sp) {
+        const float* src = split_out + (((size_t) t * split_n + sp) * n_head + h) * 130;
+        const float l = src[129];
+        if (l > 0.0f) {
+            const float c = exp2f(src[128] - mg);
+            lg += l * c;
+            og += src[col] * c;
+        }
+    }
+    const size_t oi = ((size_t) t * n_head + h) * 128 + col;
+    float val = __fdividef(og, lg);
+    if (gate) val *= sigmf(gate[oi]);
+    out[oi] = val;
 }
 
 /// GQA-3 Split-KV Q8 decode / verify attention (1 <= T < 16):
