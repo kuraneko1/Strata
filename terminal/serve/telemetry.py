@@ -1732,7 +1732,9 @@ class Telemetry:
         if prev is None or t <= prev[0]:
             return None, None
         dt = t - prev[0]
-        return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
+        dr = max(0, c.read_bytes - prev[1])
+        dw = max(0, c.write_bytes - prev[2])
+        return dr / dt / 2**20, dw / dt / 2**20
 
     def sample(self):
         s = {}
@@ -1772,6 +1774,10 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        if s.get("gpu_pcie_rx_mb") is not None or s.get("gpu_pcie_tx_mb") is not None:
+            s["gpu_pcie_io_mb"] = (s.get("gpu_pcie_rx_mb") or 0.0) + (s.get("gpu_pcie_tx_mb") or 0.0)
+        if s.get("disk_read_mb") is not None or s.get("disk_write_mb") is not None:
+            s["disk_io_mb"] = (s.get("disk_read_mb") or 0.0) + (s.get("disk_write_mb") or 0.0)
         if self.extra:
             try:
                 s.update(self.extra())
@@ -1803,8 +1809,9 @@ class Telemetry:
                 continue
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb",
+                          "gpu_pcie_tx_mb", "gpu_pcie_io_mb", "cpu", "ram_used",
+                          "disk_read_mb", "disk_write_mb", "disk_io_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)

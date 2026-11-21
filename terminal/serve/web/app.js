@@ -666,22 +666,29 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const width = one.width ? `x${one.width}` + (one.width_max > one.width ? ` of x${one.width_max}` : "") : "";
   const rx = hw.gpu_pcie_rx_mb == null ? ""
            : `${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`;
+  const tx = hw.gpu_pcie_tx_mb == null ? ""
+           : `${fmt(hw.gpu_pcie_tx_mb, hw.gpu_pcie_tx_mb < 10 ? 1 : 0)} MB/s`;
+  const pcieTraffic = rx === "" && tx === "" ? ""
+                    : rx !== "" && tx !== "" ? `to GPU ${rx} · from GPU ${tx}`
+                    : rx !== "" ? `to GPU ${rx}` : `from GPU ${tx}`;
   setMetric("pcie", gen ? `Gen${gen}` : null, width,
-            multi ? `${per(link)}${rx ? ` · ${rx} total` : ""}`
-                  : rx === "" ? (unread(gen || null) ? "not available" : "") : `to GPU ${rx}` +
+            multi ? `${per(link)}${pcieTraffic ? ` · ${pcieTraffic}` : ""}`
+                  : pcieTraffic === "" ? (unread(gen || null) ? "not available" : "") : pcieTraffic +
                   (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""),
             unread(gen || null) ? st.gpu_note : "");
-  spark("sp-pcie", h.gpu_pcie_rx_mb);
+  spark("sp-pcie", h.gpu_pcie_io_mb || h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
     setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
   } else {
     const big = hw.disk_read_mb >= 1000;
-    setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
-              hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
+    const dw = hw.disk_write_mb == null ? ""
+             : hw.disk_write_mb >= 1000 ? `write ${fmt(hw.disk_write_mb / 1024, 2)} GB/s`
+             : `write ${fmt(hw.disk_write_mb, hw.disk_write_mb < 10 ? 1 : 0)} MB/s`;
+    setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s", dw);
   }
-  spark("sp-disk", h.disk_read_mb);
+  spark("sp-disk", h.disk_io_mb || h.disk_read_mb);
   // power and temperature averages (#4968); after the cards block above so that block stays self-contained
   sampleHw(hw, !!live.state && live.state !== "idle" && live.state !== "unloaded", `${totals && totals.since}|${eng.model || ""}`);
 

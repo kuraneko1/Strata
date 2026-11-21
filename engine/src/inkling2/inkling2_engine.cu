@@ -556,6 +556,10 @@ struct Engine {
     // Stats
     int64_t hy_gpu = 0, hy_cpu = 0;
     double hy_cpu_ms = 0.0;
+    int placed_slots = 0;
+    size_t placed_bytes = 0;
+    size_t vram_free_after_place = 0;
+    int pool_workers = 0;
 
     // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM
     cudaGraphExec_t core_graph = nullptr;
@@ -1218,7 +1222,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     const int ne = (int) hp.n_expert;
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 512 << 20;
+    const size_t reserve = (size_t) 256 << 20;
     const size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                           : (fr > reserve ? fr - reserve : 0);
 
@@ -1228,7 +1232,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     // Priority 1: Looped core NVFP4 layers (blk.6..17, executed 3x/token!)
     std::vector<int> tier1, tier2;
     for (int ip = 0; ip < hp.n_phys; ++ip) {
-        if (m.layers[(size_t) ip].gu_type == 30) continue;   // BF16 blk.20..23 stays CPU-resident
+        if (m.layers[(size_t) ip].gu_type == 30) continue;   // BF16 stays CPU-resident
         if (ip >= hp.core_start && ip < hp.core_end) tier1.push_back(ip);
         else tier2.push_back(ip);
     }
@@ -1247,7 +1251,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         }
     }
 
-    // Priority 2: Distribute remaining VRAM equally as dynamic hot expert cache across tier2
+    // Priority 2: Distribute remaining VRAM equally across tier2, then greedily fill leftover budget
     if (!tier2.empty() && budget > used) {
         size_t sum_tier2_stride = 0;
         for (int ip : tier2) sum_tier2_stride += m.layers[(size_t) ip].stride;
@@ -1255,6 +1259,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         if (s > 0) {
             for (int ip : tier2) slots[(size_t) ip] = s;
             used += (size_t) s * sum_tier2_stride;
+        }
+        bool added = true;
+        while (added && used < budget) {
+            added = false;
+            for (int ip : tier2) {
+                const size_t st_b = m.layers[(size_t) ip].stride;
+                if (slots[(size_t) ip] < ne && used + st_b <= budget) {
+                    slots[(size_t) ip] += 1;
+                    used += st_b;
+                    added = true;
+                }
+            }
         }
     }
 
@@ -1303,6 +1319,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     if (need_cpu) {
         int nw = threads > 0 ? threads : 0;
         E.pool = std::make_unique<strata::kernels::cpu::ExpertPool>(nw, true, true);
+        E.pool_workers = E.pool->workers();
         std::fprintf(stderr, "strata-inkling2: %s\n", E.pool->placement_line().c_str());
     }
 #else
@@ -1315,11 +1332,23 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     E.core_all_gpu = !tier1.empty() && slots[(size_t) tier1[0]] == ne;
     for (int ip : tier1) if (slots[(size_t) ip] != ne) E.core_all_gpu = false;
 
+    size_t fr_after = 0, tot_after = 0;
+    CK(cudaMemGetInfo(&fr_after, &tot_after));
+    E.placed_slots = total_vram_experts;
+    E.placed_bytes = used;
+    E.vram_free_after_place = fr_after;
+
+    int tier2_min = ne, tier2_max = 0;
+    for (int ip : tier2) {
+        tier2_min = std::min(tier2_min, slots[(size_t) ip]);
+        tier2_max = std::max(tier2_max, slots[(size_t) ip]);
+    }
     std::fprintf(stderr,
-                 "strata-inkling2: placed %d/%lld experts in VRAM (%.2f GiB, tier1=%d/128/layer, tier2=%d/128/layer) in %.2f s\n",
+                 "strata-inkling2: placed %d/%lld experts in VRAM (%.2f GiB, tier1=%d/128/layer, tier2=%d..%d/128/layer, free=%.0f MiB) in %.2f s\n",
                  total_vram_experts, (long long) hp.n_phys * ne, (double) used / (1 << 30),
                  tier1.empty() ? 0 : slots[(size_t) tier1[0]],
-                 tier2.empty() ? 0 : slots[(size_t) tier2[0]],
+                 tier2.empty() ? 0 : tier2_min, tier2.empty() ? 0 : tier2_max,
+                 (double) fr_after / (1 << 20),
                  ms_since(t0) / 1000.0);
     return true;
 }
@@ -1513,6 +1542,11 @@ int run(int argc, char** argv) {
             q_cv.notify_one();
         });
 
+        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d\n",
+                    max_ctx, kv_q8 ? "int8" : "fp16", max_ctx,
+                    E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
+                    (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
+                    E.pool_workers);
         std::printf("READY %d stop\n", max_ctx);
         std::fflush(stdout);
 
@@ -1619,7 +1653,10 @@ int run(int argc, char** argv) {
                     next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg);
                     live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
                     if (E.hybrid) E.rebalance(8);
-                    std::printf("PP %zu %zu\n", off + (size_t) tc, prompt.size());
+                    const double el_ms = ms_since(t_pp0);
+                    const double done_fresh = (double) (off + (size_t) tc - reuse);
+                    const double pp_tps_now = done_fresh / std::max(1e-6, el_ms / 1000.0);
+                    std::printf("PP %zu %zu %.0f %.1f\n", off + (size_t) tc, prompt.size(), el_ms, pp_tps_now);
                     std::fflush(stdout);
                     if (!is_last && !stop_req.load(std::memory_order_acquire)) {
                         const size_t last_cp = snaps.empty() ? 0 : snaps.back().tokens.size();
