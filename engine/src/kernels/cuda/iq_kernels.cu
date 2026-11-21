@@ -7385,14 +7385,39 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
 
 namespace {
 
-template <int BM, int BN>
+template <int TD>
+__device__ __forceinline__ void dq_half_128(const uint8_t* row_ptr, int k0, __half* dst, int lane) {
+    if constexpr (TD == 40) {
+        const block_nvfp4* x = (const block_nvfp4*) row_ptr + (k0 >> 6);
+        const int b = lane >> 4, part = lane & 15;
+        const int i0 = part * 4, s = i0 >> 4, kb = i0 & 15;
+        const float sc = ue4m3_to_f32_half(x[b].d[s]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int k = kb + j;
+            const uint8_t byte = x[b].qs[s * 8 + (k & 7)];
+            const int code = k < 8 ? (byte & 0x0F) : (byte >> 4);
+            dst[b * 64 + i0 + j] = __float2half_rn((float) kvalues_fp4[code] * sc);
+        }
+    } else if constexpr (TD == 8) {
+        const block_q8_0* x = (const block_q8_0*) row_ptr + (k0 >> 5);
+        const int b = lane >> 3, kb = (lane & 7) << 2;
+        const float d = __half2float(x[b].d);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            dst[b * 32 + kb + j] = __float2half_rn((float) x[b].qs[kb + j] * d);
+        }
+    }
+}
+
+template <int TG, int BM, int BN, int WK>
 __global__ void __launch_bounds__(256) wmma_gu_grouped_kernel(
-    int ty, const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
     const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ gate, float* __restrict__ up) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
-    constexpr int WK = 256, XK = 64, LDW = WK + 8, LDX = XK + 8;
+    constexpr int XK = 64, LDW = WK + 8, LDX = XK + 8;
     __shared__ __align__(16) __half sw[BN * LDW];
     __shared__ __align__(16) __half sx[BM * LDX];
 
@@ -7422,7 +7447,13 @@ __global__ void __launch_bounds__(256) wmma_gu_grouped_kernel(
 
             for (int k0 = 0; k0 < K; k0 += WK) {
                 for (int r = warp; r < BN; r += 8) {
-                    dq_dispatch<__half>(ty, we + (size_t) r * L.gu_row, k0 >> 8, sw + r * LDW, lane);
+                    if constexpr (WK == 128) {
+                        dq_half_128<TG>(we + (size_t) r * L.gu_row, k0, sw + r * LDW, lane);
+                    } else if constexpr (TG == 13) {
+                        dq_q5_k<__half>(we + (size_t) r * L.gu_row, k0 >> 8, sw + r * LDW, lane);
+                    } else if constexpr (TG == 12) {
+                        dq_q4_k<__half>(we + (size_t) r * L.gu_row, k0 >> 8, sw + r * LDW, lane);
+                    }
                 }
                 for (int xh = 0; xh < WK / XK; ++xh) {
                     const int xr = tid >> 3, xc = (tid & 7) << 3;
@@ -7454,33 +7485,8 @@ __global__ void __launch_bounds__(256) wmma_gu_grouped_kernel(
         }
     }
 #else
-    (void) ty; (void) grp_ptr; (void) grp_start; (void) n_groups; (void) ent_tok; (void) X; (void) L; (void) gate; (void) up;
+    (void) grp_ptr; (void) grp_start; (void) n_groups; (void) ent_tok; (void) X; (void) L; (void) gate; (void) up;
 #endif
-}
-
-template <int TD>
-__device__ __forceinline__ void dq_half_128(const uint8_t* row_ptr, int k0, __half* dst, int lane) {
-    if constexpr (TD == 40) {
-        const block_nvfp4* x = (const block_nvfp4*) row_ptr + (k0 >> 6);
-        const int b = lane >> 4, part = lane & 15;
-        const int i0 = part * 4, s = i0 >> 4, kb = i0 & 15;
-        const float sc = ue4m3_to_f32_half(x[b].d[s]);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int k = kb + j;
-            const uint8_t byte = x[b].qs[s * 8 + (k & 7)];
-            const int code = k < 8 ? (byte & 0x0F) : (byte >> 4);
-            dst[b * 64 + i0 + j] = __float2half_rn((float) kvalues_fp4[code] * sc);
-        }
-    } else if constexpr (TD == 8) {
-        const block_q8_0* x = (const block_q8_0*) row_ptr + (k0 >> 5);
-        const int b = lane >> 3, kb = (lane & 7) << 2;
-        const float d = __half2float(x[b].d);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            dst[b * 32 + kb + j] = __float2half_rn((float) x[b].qs[kb + j] * d);
-        }
-    }
 }
 
 template <int TD, int BM, int BN>
@@ -7580,7 +7586,7 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
                                 void* stream) {
     if (cap_groups <= 0 || cap_entries <= 0 || L.had_block > 0 || L.gu_nib) return false;
     if (L.n_embd % 256 != 0 || L.n_ff % 128 != 0) return false;
-    if (!is_iq(L.gu_type) && L.gu_type != 40 && L.gu_type != 12 && L.gu_type != 13 && L.gu_type != 8) return false;
+    if (L.gu_type != 40 && L.gu_type != 12 && L.gu_type != 13 && L.gu_type != 8) return false;
     if (L.d_type != 40 && L.d_type != 8) return false;
 
     static int cc_ok[64];
@@ -7603,8 +7609,19 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     __half* h16 = (__half*) ((uint8_t*) scratch + 2 * fa);
 
     const dim3 ggu((unsigned) (2 * L.n_ff / BN), (unsigned) ch_per_e, (unsigned) cap_groups);
-    wmma_gu_grouped_kernel<BM, BN><<<ggu, 256, 0, s>>>(
-        L.gu_type, grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+    if (L.gu_type == 40) {
+        wmma_gu_grouped_kernel<40, BM, BN, 128><<<ggu, 256, 0, s>>>(
+            grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+    } else if (L.gu_type == 8) {
+        wmma_gu_grouped_kernel<8, BM, BN, 128><<<ggu, 256, 0, s>>>(
+            grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+    } else if (L.gu_type == 13) {
+        wmma_gu_grouped_kernel<13, BM, BN, 256><<<ggu, 256, 0, s>>>(
+            grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+    } else {
+        wmma_gu_grouped_kernel<12, BM, BN, 256><<<ggu, 256, 0, s>>>(
+            grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+    }
     check("native_expert_grouped_wmma/gu");
 
     const unsigned act_blocks = (unsigned) std::min<int64_t>(4096, ((cap_entries * L.n_ff) + 255) / 256);
