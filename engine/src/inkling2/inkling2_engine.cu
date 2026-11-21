@@ -707,6 +707,8 @@ struct Engine {
     float *router_logits = nullptr, *ewts = nullptr, *eparts = nullptr, *moe_raw = nullptr;
     float *logits = nullptr;
     float* h_tok_buf = nullptr;      // pinned [tmax * N] FP32 for token embedding upload
+    uint8_t* ckpt_pin = nullptr;     // reusable pinned staging buffer for fast SWA/conv checkpoint D2H
+    size_t ckpt_pin_cap = 0;
     uint16_t* act_bf16 = nullptr;    // [tmax * 2*N] (reused as BF16 or FP16 scratch)
 
     void *xq = nullptr, *xq_k = nullptr, *xq_v = nullptr, *escr = nullptr;
@@ -829,9 +831,17 @@ struct Engine {
         StateCheckpoint cp;
         cp.tokens = tokens;
         cp.data.resize(total);
+        const size_t ds_bytes = dspark ? dspark->checkpoint_bytes() : 0;
+        const size_t stage_bytes = total + ds_bytes;
+        if (stage_bytes > ckpt_pin_cap) {
+            if (ckpt_pin) { cudaFreeHost(ckpt_pin); ckpt_pin = nullptr; ckpt_pin_cap = 0; }
+            if (cudaMallocHost(&ckpt_pin, stage_bytes) == cudaSuccess) ckpt_pin_cap = stage_bytes;
+            else (void) cudaGetLastError();
+        }
+        uint8_t* dst_base = ckpt_pin ? ckpt_pin : cp.data.data();
         size_t off = 0;
         auto pull = [&](const void* src, size_t n) {
-            CK(cudaMemcpyAsync(cp.data.data() + off, src, n, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(dst_base + off, src, n, cudaMemcpyDeviceToHost, st));
             off += n;
         };
         pull(conv_hist_pool, conv_bytes);
@@ -849,10 +859,14 @@ struct Engine {
             }
         }
         if (dspark) {
-            cp.dspark_data.resize(dspark->checkpoint_bytes());
-            dspark->save_checkpoint(cp.dspark_data.data(), st);
+            cp.dspark_data.resize(ds_bytes);
+            dspark->save_checkpoint(ckpt_pin ? (ckpt_pin + total) : cp.dspark_data.data(), st);
         }
         CK(cudaStreamSynchronize(st));
+        if (ckpt_pin) {
+            std::memcpy(cp.data.data(), ckpt_pin, total);
+            if (dspark && ds_bytes > 0) std::memcpy(cp.dspark_data.data(), ckpt_pin + total, ds_bytes);
+        }
         return cp;
     }
 
@@ -916,6 +930,7 @@ struct Engine {
         cudaFree(tok_d); cudaFree(pos0_d); cudaFree(pick_d);
         cudaFree(d_miss); cudaFree(ecpu);
         cudaFreeHost(h_tok_buf);
+        if (ckpt_pin) cudaFreeHost(ckpt_pin);
         cudaFreeHost(h_ids); cudaFreeHost(h_h); cudaFreeHost(cpu_out); cudaFreeHost(h_miss);
         std::free(acts);
         if (ev_route) cudaEventDestroy(ev_route);
@@ -1025,6 +1040,15 @@ struct Engine {
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
         attn_split_t1_full = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
         attn_split_t1_swa = std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv), 8, 24);
+        // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
+        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 32768);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributeMaxDynamicSharedMemorySize, 29184);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
@@ -1887,8 +1911,8 @@ struct Engine {
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
                     if (T == 4 && !is_swa) {
-                        const int sp = std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
-                        k_attn_q8_gqa3_verify4_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 0, st>>>(
+                        const int sp = std::clamp((sm_count * 15) / std::max(1, (int) hp.n_head_kv), 30, kAttnSplitMax);
+                        k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 32768, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
@@ -1904,25 +1928,11 @@ struct Engine {
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa);
                     } else if (T >= 128) {
-                        constexpr size_t kAttnWmmaSmem32 = 49152;
-                        static bool wmma32_smem_set = false;
-                        if (!wmma32_smem_set) {
-                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnWmmaSmem32);
-                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-                            wmma32_smem_set = true;
-                        }
-                        k_attn_q8_gqa3_pp_wmma_t32<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 31) / 32)), 256, kAttnWmmaSmem32, st>>>(
+                        k_attn_q8_gqa3_pp_wmma_gqa3<<<dim3((unsigned) hp.n_head_kv, (unsigned) ((T + 15) / 16)), 256, 49152, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
                     } else {
-                        constexpr size_t kAttnWmmaSmem = 29184;
-                        static bool wmma_smem_set = false;
-                        if (!wmma_smem_set) {
-                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnWmmaSmem);
-                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-                            wmma_smem_set = true;
-                        }
-                        k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, kAttnWmmaSmem, st>>>(
+                        k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, 29184, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
                     }
@@ -2850,7 +2860,7 @@ int run(int argc, char** argv) {
                     std::fflush(stdout);
                     if (!is_last && !stop_req.load(std::memory_order_acquire)) {
                         const size_t last_cp = snaps.empty() ? 0 : snaps.back().tokens.size();
-                        if (live_tokens.size() - last_cp >= 2048) {
+                        if (live_tokens.size() - last_cp >= 8192) {
                             snaps.push_back(E.save_checkpoint(live_tokens));
                             if (snaps.size() > kMaxSnaps) snaps.erase(snaps.begin());
                         }
