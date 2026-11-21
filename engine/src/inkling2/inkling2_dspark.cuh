@@ -495,6 +495,8 @@ inline bool load_dspark_model(const std::string& path, const Hparams& target_hp,
     dm.hidden_out = dm.upload_dense("dspark_hidden_out.weight", (size_t) N, (size_t) rank);
     dm.hidden_out_b = dm.upload_f32("dspark_hidden_out.bias", (size_t) N);
 
+    size_t fr_vram = 0, tot_vram = 0;
+    const bool pack_dspark_q8 = (cudaMemGetInfo(&fr_vram, &tot_vram) == cudaSuccess && tot_vram >= (20ull << 30));
     dm.layers.resize((size_t) hp.n_layer);
     char nm[128];
     for (int il = 0; il < hp.n_layer; ++il) {
@@ -511,15 +513,15 @@ inline bool load_dspark_model(const std::string& path, const Hparams& target_hp,
         L.attn_k_norm = dm.upload_f32(tn("attn_k_norm.weight"), (size_t) hp.head_dim);
         L.attn_k_ctx_norm = dm.upload_f32(tn("attn_k_ctx_norm.weight"), (size_t) hp.head_dim);
 
-        L.attn_k_ctx = dm.upload_dense(tn("attn_k_ctx.weight"), (size_t) hp.kv_dim, (size_t) N);
-        L.attn_v_ctx = dm.upload_dense(tn("attn_v_ctx.weight"), (size_t) hp.kv_dim, (size_t) N);
-        L.attn_q = dm.upload_dense(tn("attn_q.weight"), (size_t) hp.q_dim, (size_t) N);
-        L.attn_k = dm.upload_dense(tn("attn_k.weight"), (size_t) hp.kv_dim, (size_t) N);
-        L.attn_v = dm.upload_dense(tn("attn_v.weight"), (size_t) hp.kv_dim, (size_t) N);
-        L.attn_output = dm.upload_dense(tn("attn_output.weight"), (size_t) N, (size_t) hp.q_dim);
-        L.ffn_gate = dm.upload_dense(tn("ffn_gate.weight"), (size_t) hp.n_ff, (size_t) N);
-        L.ffn_up = dm.upload_dense(tn("ffn_up.weight"), (size_t) hp.n_ff, (size_t) N);
-        L.ffn_down = dm.upload_dense(tn("ffn_down.weight"), (size_t) N, (size_t) hp.n_ff);
+        L.attn_k_ctx = dm.upload_dense(tn("attn_k_ctx.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
+        L.attn_v_ctx = dm.upload_dense(tn("attn_v_ctx.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
+        L.attn_q = dm.upload_dense(tn("attn_q.weight"), (size_t) hp.q_dim, (size_t) N, false, pack_dspark_q8);
+        L.attn_k = dm.upload_dense(tn("attn_k.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
+        L.attn_v = dm.upload_dense(tn("attn_v.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
+        L.attn_output = dm.upload_dense(tn("attn_output.weight"), (size_t) N, (size_t) hp.q_dim, false, pack_dspark_q8);
+        L.ffn_gate = dm.upload_dense(tn("ffn_gate.weight"), (size_t) hp.n_ff, (size_t) N, false, pack_dspark_q8);
+        L.ffn_up = dm.upload_dense(tn("ffn_up.weight"), (size_t) hp.n_ff, (size_t) N, false, pack_dspark_q8);
+        L.ffn_down = dm.upload_dense(tn("ffn_down.weight"), (size_t) N, (size_t) hp.n_ff, false, pack_dspark_q8);
     }
 
     std::fprintf(stderr, "strata-inkling2: loaded dspark draft (%d layers, block=%d, rank=%d) in %.2f s\n",

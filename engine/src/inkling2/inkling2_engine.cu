@@ -797,6 +797,7 @@ struct Engine {
     // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM,
     // plus per-layer pre-route graphs (attn + mix + ffn_norm + route).
     cudaGraphExec_t core_graph = nullptr;
+    cudaGraphExec_t verify_core_graph = nullptr;
     std::vector<cudaGraphExec_t> layer_pre_graph;
     bool core_all_gpu = false;
     bool graph_oom = false;
@@ -878,6 +879,7 @@ struct Engine {
 
     ~Engine() {
         if (core_graph) cudaGraphExecDestroy(core_graph);
+        if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
         for (auto* p : kc) cudaFree(p);
         for (auto* p : vc) cudaFree(p);
@@ -1805,8 +1807,11 @@ struct Engine {
         pp_streaming = (hybrid && T >= pp_stream_t && pp_stage[0] != nullptr);
         if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
         for (int il = 0; il < hp.n_layer; ++il) {
-            if (T == 1 && core_all_gpu && !prof_detail && !capture_dspark && il == hp.core_start && n_core > 0) {
-                if (!core_graph) {
+            const bool use_t1_core = (T == 1 && !capture_dspark);
+            const bool use_vf_core = (verify_max_t > 1 && T == verify_max_t && save_conv_trace && capture_dspark);
+            if ((use_t1_core || use_vf_core) && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
+                cudaGraphExec_t& cg = use_t1_core ? core_graph : verify_core_graph;
+                if (!cg) {
                     cudaGraph_t g = nullptr;
                     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
                     for (int cl = il; cl < core_end_virt; ++cl) {
@@ -1814,14 +1819,14 @@ struct Engine {
                         run_layer_post(cl);
                     }
                     CK(cudaStreamEndCapture(st, &g));
-                    CK(cudaGraphInstantiate(&core_graph, g, nullptr, nullptr, 0));
+                    CK(cudaGraphInstantiate(&cg, g, nullptr, nullptr, 0));
                     CK(cudaGraphDestroy(g));
                 } else {
                     norm_blocks = {norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6]};
                     next_blk_buf = 7;
                 }
                 const auto tp_cg0 = Clock::now();
-                CK(cudaGraphLaunch(core_graph, st));
+                CK(cudaGraphLaunch(cg, st));
                 if (prof) { CK(cudaStreamSynchronize(st)); p_core_ms += ms_since(tp_cg0); }
                 il = core_end_virt - 1;
                 continue;
@@ -2748,7 +2753,14 @@ int run(int argc, char** argv) {
             [&]() -> bool { return false; });
     }
     const double tg_ms = ms_since(t_tg0);
-    if (profile) E.print_prof("tg");
+    if (profile) {
+        E.print_prof("tg");
+        if (dspark) {
+            std::fprintf(stderr, "PROFILE dspark: draft_calls=%lld drafted=%lld acc=%lld draft=%.1f ms inject=%.1f ms out_type=%d\n",
+                         (long long) dspark->n_draft_calls, (long long) dspark->n_drafted, (long long) dspark->n_accepted,
+                         dspark->draft_ms, dspark->inject_ms, m.output_weight.type);
+        }
+    }
 
     std::printf("tokens:");
     for (int32_t id : gen) std::printf(" %d", (int) id);
