@@ -15,19 +15,28 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Strata をダウンロード"></a>
-  <a href="../../LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT ライセンス"></a>
-  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="GitHub Sponsors で Strata を支援する"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Buy Me a Coffee で Strata を支援する"></a>
+  <a href="https://github.com/kuraneko1/Strata"><img src="https://img.shields.io/badge/Fork-kuraneko1%2FStrata_(inkling2)-0ab887" alt="kuraneko1/Strata Fork"></a>
+  <a href="../INKLING2.md"><img src="https://img.shields.io/badge/Engine-strata--inkling2-2563eb" alt="Inkling-2-Mini Engine"></a>
+  <a href="../../LICENSE"><img src="https://img.shields.io/github/license/kuraneko1/Strata" alt="MIT ライセンス"></a>
 </p>
 
 <p align="center"><sub><a href="../../README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <b>日本語</b> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
 
-**無料でオープンソース。自分の環境で動かせます。** デスクトップで、またはお好みのコーディングツールと一緒に Strata を使えます。アカウントは不要です。
+**無料でオープンソース。自分の環境で動かせます。** [Niko1221/Strata](https://github.com/Niko1221/Strata) をベースに、**Inkling-2-Mini (`inkling2`)** 向けの **`strata-inkling2`** CUDA + AVX2 ハイブリッドエンジンと **262,144 ctx** 対応を追加したフォークです。
+
+> **ソース配布:** お使いの NVIDIA GPU（`sm_75` 以降）に合わせてローカルでビルドしてください（例: `-DCMAKE_CUDA_ARCHITECTURES=native`）。詳細は [Inkling-2-Mini ビルド・チューニングガイド](../INKLING2.md) をご覧ください。
 
 ## モデル
 
 まず **ISTA-DASLab** をおすすめします。次に **Unsloth** などの提供元です。メモリに収まる互換モデルがある場合に選べます。
+
+<details open>
+<summary><b>Inkling-2-Mini (`inkling2`・フォーク追加)</b></summary>
+
+- CUDA Graph 化・コンパクト PCIe ミスストリーミング・Q8 KV キャッシュ・プレフィックスチェックポイント再利用を備えた専用エンジン `strata-inkling2`（RTX 4070 12 GB で `65,536` / `262,144` ctx 動作確認済み）。
+- [Inkling-2-Mini ビルド・ベンチマーク・設定ガイド](../INKLING2.md)。
+
+</details>
 
 <details>
 <summary><img src="../media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
@@ -111,7 +120,7 @@ strata launch
 
 <a id="build-from-source"></a>
 
-[ソースからビルド](../SOURCE_INSTALL.md) · [Docker](../DOCKER.md) · [インストールガイド（全文）](../INSTALL.md)
+[ソースからビルド](../SOURCE_INSTALL.md) · [`strata-inkling2` のビルド](../INKLING2.md#build-from-source) · [Docker](../DOCKER.md) · [インストールガイド（全文）](../INSTALL.md)
 
 <a id="what-you-need"></a>
 

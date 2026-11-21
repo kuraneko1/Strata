@@ -15,19 +15,28 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="Sponsor Strata on GitHub Sponsors"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
+  <a href="https://github.com/kuraneko1/Strata"><img src="https://img.shields.io/badge/Fork-kuraneko1%2FStrata_(inkling2)-0ab887" alt="kuraneko1/Strata Fork"></a>
+  <a href="docs/INKLING2.md"><img src="https://img.shields.io/badge/Engine-strata--inkling2-2563eb" alt="Inkling-2-Mini Engine"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/kuraneko1/Strata" alt="MIT license"></a>
 </p>
 
 <p align="center"><sub><b>English</b> · <a href="docs/lang/README.zh-CN.md">简体中文</a> · <a href="docs/lang/README.ja.md">日本語</a> · <a href="docs/lang/README.de.md">Deutsch</a> · <a href="docs/lang/README.fr.md">Français</a> · <a href="docs/lang/README.es.md">Español</a> · <a href="docs/lang/README.pt-BR.md">Português</a> · <a href="docs/lang/README.pl.md">Polski</a></sub></p>
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+**Free, open source, and yours to run.** Fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) adding the **`strata-inkling2`** CUDA + AVX2 hybrid engine and up to **262,144-token** context support for **Inkling-2-Mini**. Use Strata from source with your favorite coding tools or the built-in web UI.
+
+> **Source distribution:** Build `strata-inkling2` locally for your NVIDIA GPU (`sm_75+`, e.g. `-DCMAKE_CUDA_ARCHITECTURES=native` or `86`/`89`/`120`). See the [Inkling-2-Mini build & tuning guide](docs/INKLING2.md).
 
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+
+<details open>
+<summary><b>Inkling-2-Mini (`inkling2`, fork addition)</b></summary>
+
+- Dedicated `strata-inkling2` CUDA + AVX2 hybrid engine with CUDA Graphs, compact-miss PCIe double-buffered prefill streaming, Q8 KV cache, and prefix checkpoint reuse (`65,536` / `262,144` context tested on RTX 4070 12 GB).
+- [Inkling-2-Mini build, benchmarks, and tuning guide](docs/INKLING2.md).
+
+</details>
 
 <details>
 <summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
@@ -112,7 +121,7 @@ Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL
 
 <a id="build-from-source"></a>
 
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+[Build from source](docs/SOURCE_INSTALL.md) · [Build `strata-inkling2`](docs/INKLING2.md#build-from-source) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
 
 <a id="what-you-need"></a>
 
