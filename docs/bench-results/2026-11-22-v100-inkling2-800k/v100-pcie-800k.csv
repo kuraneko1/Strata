@@ -1,0 +1,36 @@
+experiment,gpu,ecc_mode,commit,dspark,max_context,depth_tokens,resume_tokens,fresh_tokens,pp_s,pp_tps,last_full_chunk_ms,tail_chunk_ms,tg_tokens,tg_ms,tg_tps,vram_experts,vram_free_mib,notes
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,512,0,512,0.40,1291.2,333,333,64,490.49,130.5,3072/3072,652,100%-VRAM experts; total_elapsed=0.9s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,65536,575,64961,40.03,1622.9,837,447,64,606.84,105.5,3072/3072,652,100%-VRAM experts; total_elapsed=41.5s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,131072,65599,65473,63.41,1032.5,1196,1129,64,714.11,89.6,3072/3072,652,100%-VRAM experts; total_elapsed=105.7s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,262144,131135,131009,196.60,666.4,1924,1858,64,931.59,68.7,3072/3072,652,100%-VRAM experts; total_elapsed=303.3s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,393216,262207,131009,289.67,452.3,2653,2587,64,1153.73,55.5,3072/3072,652,100%-VRAM experts; total_elapsed=594.3s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,524288,393279,131009,383.18,341.9,3380,3315,64,1371.36,46.7,3072/3072,652,100%-VRAM experts; total_elapsed=979.0s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,655360,524351,131009,476.69,274.8,4114,4043,64,1584.68,40.4,3072/3072,652,100%-VRAM experts; total_elapsed=1457.5s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,786432,655423,131009,570.23,229.7,4840,4771,64,1803.06,35.5,3072/3072,652,100%-VRAM experts; total_elapsed=2029.7s
+gpu0_800k_curve,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,819200,819000,786495,32505,156.22,208.1,5028,3972,64,1857.53,34.5,3072/3072,652,100%-VRAM experts; total_elapsed=2188.1s
+gpu1_256k_baseline,Tesla PG500-216,Enabled,a825d998,on,262144,512,0,512,0.368,1390.1,,368,64,541.77,118.1,3072/3072,,baseline before exp2f/verify4
+gpu1_256k_baseline,Tesla PG500-216,Enabled,a825d998,on,262144,32768,575,32193,19.78,1633.1,,395,64,618.71,103.4,3072/3072,,baseline before exp2f/verify4
+gpu1_256k_baseline,Tesla PG500-216,Enabled,a825d998,on,262144,65536,32831,32705,27.23,1204.1,917,,64,702.30,91.1,3072/3072,,baseline before exp2f/verify4
+gpu1_256k_baseline,Tesla PG500-216,Enabled,a825d998,on,262144,131072,65599,65473,76.32,858.6,1372,,64,882.22,72.5,3072/3072,,baseline before exp2f/verify4
+gpu1_256k_baseline,Tesla PG500-216,Enabled,a825d998,on,262144,196608,131135,65473,105.52,620.9,1833,,64,1055.37,60.6,3072/3072,,baseline before exp2f/verify4
+gpu1_256k_baseline,Tesla PG500-216,Enabled,a825d998,on,262144,258048,196671,61377,125.58,489.0,,2254,64,1211.86,52.8,3072/3072,,baseline; tail 961 tok
+gpu1_256k_optimized,Tesla PG500-216,Enabled,6ff2c009,on,262144,512,0,512,0.40,1268.8,341,341,64,503.94,127.0,3072/3072,10652,exp2f + 4-barrier t32 + verify4
+gpu1_256k_optimized,Tesla PG500-216,Enabled,6ff2c009,on,262144,32768,575,32193,17.74,1814.5,694,339,64,571.64,112.0,3072/3072,10652,exp2f + 4-barrier t32 + verify4
+gpu1_256k_optimized,Tesla PG500-216,Enabled,6ff2c009,on,262144,65536,32831,32705,24.90,1313.7,909,843,64,636.58,100.5,3072/3072,10652,exp2f + 4-barrier t32 + verify4
+gpu1_256k_optimized,Tesla PG500-216,Enabled,6ff2c009,on,262144,131072,65599,65473,70.64,926.9,1343,1279,64,759.08,84.3,3072/3072,10652,exp2f + 4-barrier t32 + verify4
+gpu1_256k_optimized,Tesla PG500-216,Enabled,6ff2c009,on,262144,196608,131135,65473,98.67,663.6,1781,1715,64,882.29,72.5,3072/3072,10652,exp2f + 4-barrier t32 + verify4
+gpu1_256k_optimized,Tesla PG500-216,Enabled,6ff2c009,on,262144,258048,196671,61377,117.83,520.9,2189,2122,64,988.37,64.8,3072/3072,10652,exp2f + 4-barrier t32 + verify4
+gpu0_vs_gpu1_200k,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,262144,200000,0,200000,195.77,1021.6,,627,64,853.2,75.0,3072/3072,10624,one-shot 0->200k
+gpu0_vs_gpu1_200k,Tesla PG500-216,Enabled,6ff2c009,on,262144,200000,0,200000,218.33,916.1,,628,64,912.4,70.1,3072/3072,10652,one-shot 0->200k
+gpu0_vs_gpu1_200k,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,262144,100000,0,100000,70.88,1410.9,,747,64,689.5,92.8,3072/3072,10624,split step 1: 0->100k
+gpu0_vs_gpu1_200k,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,262144,200000,100063,99937,124.76,801.0,,945,64,828.8,77.2,3072/3072,10624,split step 2: 100k->200k exact cont
+gpu0_vs_gpu1_200k,Tesla PG500-216,Enabled,6ff2c009,on,262144,100000,0,100000,76.76,1302.7,,745,64,722.9,88.5,3072/3072,10652,split step 1: 0->100k
+gpu0_vs_gpu1_200k,Tesla PG500-216,Enabled,6ff2c009,on,262144,200000,100000,100000,141.82,705.1,,1194,64,888.4,72.0,3072/3072,10652,split step 2: 100k->200k omit_gen snaps restore
+vram_ctx_capacity,Tesla PG500-216,Enabled,6ff2c009,on,819200,1,0,1,0.1059,9.44,,,3,87.4,34.31,3072/3072,680,max 100%-VRAM ctx w/ DSpark ON (Tier2 128/128)
+vram_ctx_capacity,Tesla PG500-216,Enabled,6ff2c009,on,851968,1,0,1,0.1468,6.81,,,15,477.1,31.44,2992/3072,360,Tier2 121..122/128 misses=189 cpu_ms=37.1
+vram_ctx_capacity,Tesla PG500-216,Enabled,6ff2c009,off,917504,1,0,1,0.1098,9.11,,,15,215.7,69.53,3072/3072,1302,100%-VRAM experts w/ 1.3 GiB free
+vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,off,974848,1,0,1,0.1098,9.11,,,3,43.7,68.58,3072/3072,348,max 100%-VRAM ctx w/ DSpark OFF (Tier2 128/128)
+vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,off,983040,1,0,1,0.1174,8.52,,,3,44.3,67.71,3070/3072,230,Tier2 127..128/128 misses=1 cpu_ms=0.4
+vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,off,1048576,1,0,1,0.1931,5.18,,,1,25.8,38.70,2807/3072,356,1M native; Tier1 128/128 Tier2 105..106/128
+vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,1048576,1,0,1,0.1142,8.76,,,31,1336.1,23.20,2275/3072,356,1M native DSpark ON; Tier2 61..62/128 cpu_ms=675.3
+vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,off,1310720,1,0,1,0.1283,7.80,,,3,88.8,33.77,1959/3072,368,1.25M check; Tier1 128/128 Tier2 35..36/128 cpu_ms=55.3
