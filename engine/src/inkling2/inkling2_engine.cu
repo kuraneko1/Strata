@@ -1756,7 +1756,7 @@ struct Engine {
             }
 
             const int max_rel = is_swa ? std::min<int>((int) hp.n_swa, (int) hp.n_rel_ext) : (int) hp.n_rel_ext;
-            k_rel_table<<<dim3((unsigned) hp.n_head, (unsigned) T), kThreads, 0, st>>>(
+            k_rel_table<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 7) / 8)), kThreads, 0, st>>>(
                 pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T);
             const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
             if (kv_q8) {
@@ -1766,6 +1766,17 @@ struct Engine {
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, kAttnSplit);
                         k_attn_split_combine<<<(unsigned) hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int) hp.n_head, kAttnSplit);
+                    } else if (T >= 16) {
+                        constexpr size_t kAttnWmmaSmem = 29184;
+                        static bool wmma_smem_set = false;
+                        if (!wmma_smem_set) {
+                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnWmmaSmem);
+                            cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                            wmma_smem_set = true;
+                        }
+                        k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, kAttnWmmaSmem, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
                     } else {
                         k_attn_q8_gqa3_pp<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
@@ -2436,7 +2447,7 @@ int run(int argc, char** argv) {
     std::string tokens_str = "1,2";
     std::string dump_logits_path;
     int max_ctx = 65536;
-    int chunk = 256;
+    int chunk = 0;
     int max_new = 32;
     int draft_max = 3;
     int cpu_threads = 0;
@@ -2485,6 +2496,13 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "strata-inkling2: load failed: %s\n", err.c_str());
         return 1;
     }
+    if (chunk <= 0) {
+        size_t vfree = 0, vtot = 0;
+        cudaMemGetInfo(&vfree, &vtot);
+        chunk = (vtot >= (20ULL << 30)) ? 1024 : 512;
+    }
+    // Keep prefill chunk <= n_swa so circular SWA KV stores never overwrite earlier tokens in the same chunk.
+    chunk = std::clamp(chunk, 1, (int) m.hp.n_swa);
 
     std::unique_ptr<DsparkModel> dm;
     std::unique_ptr<DsparkEngine> dspark;
