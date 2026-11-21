@@ -135,6 +135,7 @@ struct PhysLayer {
     DenseMat attn_gate;       // [n_embd, q_dim]
     DenseMat attn_sink_proj;  // [n_embd, n_head]
     DenseMat attn_rel;        // [n_embd, n_rel * n_head]
+    DenseMat attn_qgr;        // concatenated [attn_q; attn_gate; attn_rel] for T==1 single MMVQ
     DenseMat attn_k_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
     DenseMat attn_v_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
 
@@ -203,9 +204,13 @@ struct Model {
     std::vector<PhysLayer> layers;
     std::vector<void*> gpu_allocs;
     std::vector<void*> host_allocs;
+    std::vector<void*> host_pinned_allocs;
+    std::vector<void*> q8_packed_keys;
 
     ~Model() {
+        for (void* p : q8_packed_keys) K::native_q8_0_packed_unregister(p);
         for (void* p : gpu_allocs) cudaFree(p);
+        for (void* p : host_pinned_allocs) cudaFreeHost(p);
         for (void* p : host_allocs) std::free(p);
     }
 
@@ -254,7 +259,8 @@ struct Model {
         return d;
     }
 
-    DenseMat upload_dense(const char* name, size_t rows_override = 0, size_t cols_expected = 0) {
+    DenseMat upload_dense(const char* name, size_t rows_override = 0, size_t cols_expected = 0,
+                          bool pack_q8_in_place = false, bool pack_q8_extra = false) {
         const strata::TensorInfo* t = nullptr;
         const uint8_t* raw = find_tensor(name, &t);
         if (!raw || !t || (t->type != 0 && t->type != 1 && t->type != 30 && !K::native_mmvq_supported((int) t->type))) {
@@ -276,7 +282,23 @@ struct Model {
         }
         const size_t bytes = rb * (size_t) ne1;
         uint8_t* d = gpu_alloc<uint8_t>(bytes);
-        CK(cudaMemcpy(d, raw, bytes, cudaMemcpyHostToDevice));
+        if (t->type == 8 && pack_q8_in_place && K::native_q8_0_packed_eligible((int) ne0, (int) ne1)) {
+            std::vector<uint8_t> packed(bytes);
+            K::native_q8_0_pack_host(raw, packed.data(), (int) ne0, (int) ne1);
+            CK(cudaMemcpy(d, packed.data(), bytes, cudaMemcpyHostToDevice));
+            K::native_q8_0_packed_register(d, d, (int) ne0, (int) ne1);
+            q8_packed_keys.push_back(d);
+        } else {
+            CK(cudaMemcpy(d, raw, bytes, cudaMemcpyHostToDevice));
+            if (t->type == 8 && pack_q8_extra && K::native_q8_0_packed_enabled() && K::native_q8_0_packed_eligible((int) ne0, (int) ne1)) {
+                std::vector<uint8_t> packed(bytes);
+                K::native_q8_0_pack_host(raw, packed.data(), (int) ne0, (int) ne1);
+                uint8_t* pd = gpu_alloc<uint8_t>(bytes);
+                CK(cudaMemcpy(pd, packed.data(), bytes, cudaMemcpyHostToDevice));
+                K::native_q8_0_packed_register(d, pd, (int) ne0, (int) ne1);
+                q8_packed_keys.push_back(d);
+            }
+        }
         if (t->type != 30 && t->type != 0 && t->type != 1) has_quant_dense = true;
         return DenseMat{(int) t->type, ne0, ne1, d, bytes};
     }
@@ -389,7 +411,8 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
     }
     m.output_res_query = m.upload_f32("output_res_query.weight", (size_t) hp.n_embd);
     m.output_norm = m.upload_f32("output_norm.weight", (size_t) hp.n_embd);
-    m.output_weight = m.upload_dense("output.weight", (size_t) hp.vocab_unpadded, (size_t) hp.n_embd);
+    const bool pack_head = std::getenv("STRATA_Q8_HEAD_PACK") != nullptr && std::getenv("STRATA_Q8_HEAD_PACK")[0] == '1';
+    m.output_weight = m.upload_dense("output.weight", (size_t) hp.vocab_unpadded, (size_t) hp.n_embd, pack_head, false);
 
     m.layers.resize((size_t) hp.n_phys);
     char nm[128];
@@ -397,18 +420,51 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
         PhysLayer& L = m.layers[(size_t) ip];
         L.is_swa = hp.is_swa(ip);
         L.has_loop = (hp.num_loops > 1 && ip >= hp.core_start && ip < hp.core_end);
+        const bool pack_core = L.has_loop;
 
         auto tn = [&](const char* suffix) -> const char* {
             std::snprintf(nm, sizeof nm, "blk.%d.%s", ip, suffix);
             return nm;
         };
-        L.attn_q = m.upload_dense(tn("attn_q.weight"));
-        L.attn_k = m.upload_dense(tn("attn_k.weight"));
-        L.attn_v = m.upload_dense(tn("attn_v.weight"));
-        L.attn_output = m.upload_dense(tn("attn_output.weight"));
-        L.attn_gate = m.upload_dense(tn("attn_gate.weight"));
+        const char* nm_q = tn("attn_q.weight");
+        const strata::TensorInfo* tq = nullptr;
+        const uint8_t* raw_q = m.find_tensor(nm_q, &tq);
+        const strata::TensorInfo* tg = nullptr;
+        const strata::TensorInfo* tr = nullptr;
+        std::string sn_g = "blk." + std::to_string(ip) + ".attn_gate.weight";
+        std::string sn_r = "blk." + std::to_string(ip) + ".attn_rel.weight";
+        const uint8_t* raw_g = m.find_tensor(sn_g.c_str(), &tg);
+        const uint8_t* raw_r = m.find_tensor(sn_r.c_str(), &tr);
+        if (raw_q && tq && raw_g && tg && raw_r && tr &&
+            tq->type == tg->type && tq->type == tr->type &&
+            tq->shape[0] == tg->shape[0] && tq->shape[0] == tr->shape[0] &&
+            tq->type != 0 && tq->type != 1 && tq->type != 30 && K::native_mmvq_supported((int) tq->type)) {
+            const int64_t nin = (int64_t) tq->shape[0];
+            const size_t rb = strata::quant::row_bytes((int) tq->type, nin);
+            const int64_t nq_out = tq->shape.size() > 1 ? (int64_t) tq->shape[1] : 1;
+            const int64_t ng_out = tg->shape.size() > 1 ? (int64_t) tg->shape[1] : 1;
+            const int64_t nr_out = tr->shape.size() > 1 ? (int64_t) tr->shape[1] : 1;
+            const size_t bq = rb * (size_t) nq_out;
+            const size_t bg = rb * (size_t) ng_out;
+            const size_t br = rb * (size_t) nr_out;
+            uint8_t* dqgr = m.gpu_alloc<uint8_t>(bq + bg + br);
+            CK(cudaMemcpy(dqgr, raw_q, bq, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dqgr + bq, raw_g, bg, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dqgr + bq + bg, raw_r, br, cudaMemcpyHostToDevice));
+            m.has_quant_dense = true;
+            L.attn_q = DenseMat{(int) tq->type, nin, nq_out, dqgr, bq};
+            L.attn_gate = DenseMat{(int) tg->type, nin, ng_out, dqgr + bq, bg};
+            L.attn_rel = DenseMat{(int) tr->type, nin, nr_out, dqgr + bq + bg, br};
+            L.attn_qgr = DenseMat{(int) tq->type, nin, nq_out + ng_out + nr_out, dqgr, bq + bg + br};
+        } else {
+            L.attn_q = m.upload_dense(tn("attn_q.weight"), 0, 0, false, pack_core);
+            L.attn_gate = m.upload_dense(tn("attn_gate.weight"), 0, 0, false, pack_core);
+            L.attn_rel = m.upload_dense(tn("attn_rel.weight"));
+        }
+        L.attn_k = m.upload_dense(tn("attn_k.weight"), 0, 0, false, pack_core);
+        L.attn_v = m.upload_dense(tn("attn_v.weight"), 0, 0, false, pack_core);
+        L.attn_output = m.upload_dense(tn("attn_output.weight"), 0, 0, false, pack_core);
         L.attn_sink_proj = m.upload_dense(tn("attn_sink_proj.weight"));
-        L.attn_rel = m.upload_dense(tn("attn_rel.weight"));
 
         if (L.is_swa) {
             L.attn_norm = m.upload_f32(tn("attn_norm.weight"), (size_t) hp.n_embd);
@@ -517,22 +573,25 @@ struct Engine {
     std::vector<float*> conv_hist;   // [48][n_sconv_channels * 3]
 
     // Activation scratch (all allocated up to tmax rows)
-    float *cur = nullptr, *inpSA = nullptr, *ffn_inp = nullptr;
+    float *cur = nullptr, *ffn_inp = nullptr;
     float *in_q = nullptr, *in_k = nullptr, *in_v = nullptr, *in_ffn = nullptr;
     float *msg0 = nullptr, *msg1 = nullptr, *msg2 = nullptr, *msg3 = nullptr;
     float *ctrl2N = nullptr, *ctrl64 = nullptr, *ctrl_g = nullptr, *ctrl_f = nullptr;
-    float *stack_norm = nullptr;     // [tmax * 8 * N]
-    float *blk_buf[10] = {};         // intra-forward block residuals (non-aliasing across loop passes)
+    float *norm_cur = nullptr;       // [tmax * N]
+    float *prelude_cur_buf = nullptr;
+    float *norm_blk_buf[9] = {};     // cached RMSNorm of pushed block residuals (0..7 + 8=bank_last)
 
     float *Q = nullptr, *K = nullptr, *V = nullptr, *R = nullptr;
+    float *qgr_t1 = nullptr;         // [2 * q_dim + n_rel * n_head] contiguous T=1 fused output
     float *K_conv = nullptr, *V_conv = nullptr, *dyn_k = nullptr, *dyn_v = nullptr;
     float *sink = nullptr, *rel_tab = nullptr, *att = nullptr, *att_gate = nullptr, *wo = nullptr;
-    float *router_logits = nullptr, *ewts = nullptr, *eparts = nullptr, *moe_raw = nullptr, *moe_conv = nullptr;
+    float *attn_split = nullptr;     // [kAttnSplit * n_head * 130] for split GQA-3 decode
+    float *router_logits = nullptr, *ewts = nullptr, *eparts = nullptr, *moe_raw = nullptr;
     float *logits = nullptr;
     float* h_tok_buf = nullptr;      // pinned [tmax * N] FP32 for token embedding upload
     uint16_t* act_bf16 = nullptr;    // [tmax * 2*N] (reused as BF16 or FP16 scratch)
 
-    void *xq = nullptr, *escr = nullptr;
+    void *xq = nullptr, *xq_k = nullptr, *xq_v = nullptr, *escr = nullptr;
     int32_t *ids = nullptr, *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
     unsigned long long* grp_ptr = nullptr;
     int32_t *tok_d = nullptr, *pos0_d = nullptr, *pick_d = nullptr;
@@ -548,6 +607,25 @@ struct Engine {
     cudaEvent_t ev_route = nullptr;
     bool hybrid = false;
 
+    // Double-buffered PCIe GPU streaming for prefill on hybrid layers
+    struct PpTask {
+        int ip = -1;
+        int e0 = 0;
+        int e1 = 0;
+    };
+    cudaStream_t cst = nullptr;
+    uint8_t* pp_stage[2] = {nullptr, nullptr};
+    size_t pp_stage_bytes = 0;
+    cudaEvent_t ev_pp_copy[2] = {nullptr, nullptr};
+    cudaEvent_t ev_pp_used[2] = {nullptr, nullptr};
+    cudaEvent_t ev_rebal = nullptr;
+    bool has_pending_rebal = false;
+    std::vector<PpTask> pp_tasks;
+    size_t pp_take_idx = 0;
+    size_t pp_kick_idx = 0;
+    int pp_stream_t = 16;
+    bool pp_streaming = false;
+
 #if defined(STRATA_INKLING2_CPU_POOL)
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
@@ -561,8 +639,47 @@ struct Engine {
     size_t vram_free_after_place = 0;
     int pool_workers = 0;
 
-    // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM
+    bool prof = false;
+    bool prof_detail = false;
+    double p_embd_ms = 0, p_attn_ms = 0, p_moe_gpu_ms = 0, p_moe_wait_ms = 0, p_moe_cpu_ms = 0;
+    double p_moe_up_ms = 0, p_moe_post_ms = 0, p_core_ms = 0, p_head_ms = 0, p_rebal_ms = 0;
+    double p_d_mix = 0, p_d_qkv = 0, p_d_attn = 0, p_d_out = 0, p_d_route = 0, p_d_moe_gpu_core = 0, p_d_moe_gpu_nv = 0, p_d_moe_gpu_q5 = 0;
+    double p_d_cpu_nv = 0, p_d_cpu_q5 = 0;
+    int64_t p_miss_nv = 0, p_miss_q5 = 0, p_hit_nv = 0, p_hit_q5 = 0;
+    int p_calls = 0;
+    void reset_prof() {
+        p_embd_ms = p_attn_ms = p_moe_gpu_ms = p_moe_wait_ms = p_moe_cpu_ms = 0;
+        p_moe_up_ms = p_moe_post_ms = p_core_ms = p_head_ms = p_rebal_ms = 0;
+        p_d_mix = p_d_qkv = p_d_attn = p_d_out = p_d_route = 0;
+        p_d_moe_gpu_core = p_d_moe_gpu_nv = p_d_moe_gpu_q5 = 0;
+        p_d_cpu_nv = p_d_cpu_q5 = 0;
+        p_miss_nv = p_miss_q5 = p_hit_nv = p_hit_q5 = 0;
+        p_calls = 0;
+    }
+    void print_prof(const char* tag) const {
+        const double outer_moe = p_moe_gpu_ms + p_moe_wait_ms + p_moe_cpu_ms + p_moe_up_ms + p_moe_post_ms;
+        const double pure_outer_attn = p_attn_ms;
+        const double sum = p_embd_ms + p_core_ms + pure_outer_attn + outer_moe + p_head_ms + p_rebal_ms;
+        std::fprintf(stderr,
+                     "PROFILE %-4s (%d calls, sum=%.1f ms): embd=%.1f core=%.1f attn(outer)=%.1f "
+                     "moe_gpu=%.1f moe_wait=%.1f moe_cpu=%.1f moe_up=%.1f moe_post=%.1f head=%.1f rebal=%.1f\n",
+                     tag, p_calls, sum, p_embd_ms, p_core_ms, pure_outer_attn,
+                     p_moe_gpu_ms, p_moe_wait_ms, p_moe_cpu_ms, p_moe_up_ms, p_moe_post_ms, p_head_ms, p_rebal_ms);
+        if (prof_detail) {
+            std::fprintf(stderr,
+                         "  DETAIL %-4s: mix_ctrl=%.1f qkv_proj=%.1f kv_attn=%.1f out_conv=%.1f route=%.1f "
+                         "moe_gpu(core=%.1f nv=%.1f q5=%.1f) moe_cpu(nv=%.1f/%lldmiss_%lldhit q5=%.1f/%lldmiss_%lldhit)\n",
+                         tag, p_d_mix, p_d_qkv, p_d_attn, p_d_out, p_d_route,
+                         p_d_moe_gpu_core, p_d_moe_gpu_nv, p_d_moe_gpu_q5,
+                         p_d_cpu_nv, (long long) p_miss_nv, (long long) p_hit_nv,
+                         p_d_cpu_q5, (long long) p_miss_q5, (long long) p_hit_q5);
+        }
+    }
+
+    // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM,
+    // plus outer tier2 pre-route graphs (attn + mix + ffn_norm + route).
     cudaGraphExec_t core_graph = nullptr;
+    cudaGraphExec_t outer_pre_graph[12] = {};
     bool core_all_gpu = false;
 
     // Prefix cache checkpoint (stores conv_hist + circular SWA KV state in host RAM; full-attn KV stays append-only on GPU)
@@ -634,6 +751,7 @@ struct Engine {
 
     ~Engine() {
         if (core_graph) cudaGraphExecDestroy(core_graph);
+        for (int i = 0; i < 12; ++i) if (outer_pre_graph[i]) cudaGraphExecDestroy(outer_pre_graph[i]);
         for (auto* p : kc) cudaFree(p);
         for (auto* p : vc) cudaFree(p);
         for (auto* p : kq) cudaFree(p);
@@ -641,18 +759,20 @@ struct Engine {
         for (auto* p : ks) cudaFree(p);
         for (auto* p : vs) cudaFree(p);
         for (auto* p : conv_hist) cudaFree(p);
-        for (auto* p : blk_buf) cudaFree(p);
-        cudaFree(cur); cudaFree(inpSA); cudaFree(ffn_inp);
+        for (auto* p : norm_blk_buf) cudaFree(p);
+        cudaFree(prelude_cur_buf);
+        cudaFree(norm_cur);
+        cudaFree(cur); cudaFree(ffn_inp);
         cudaFree(in_q); cudaFree(in_k); cudaFree(in_v); cudaFree(in_ffn);
         cudaFree(msg0); cudaFree(msg1); cudaFree(msg2); cudaFree(msg3);
         cudaFree(ctrl2N); cudaFree(ctrl64); cudaFree(ctrl_g); cudaFree(ctrl_f);
-        cudaFree(stack_norm);
-        cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(R);
+        cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(R); cudaFree(qgr_t1);
         cudaFree(K_conv); cudaFree(V_conv); cudaFree(dyn_k); cudaFree(dyn_v);
         cudaFree(sink); cudaFree(rel_tab); cudaFree(att); cudaFree(att_gate); cudaFree(wo);
-        cudaFree(router_logits); cudaFree(ewts); cudaFree(eparts); cudaFree(moe_raw); cudaFree(moe_conv);
+        cudaFree(attn_split);
+        cudaFree(router_logits); cudaFree(ewts); cudaFree(eparts); cudaFree(moe_raw);
         cudaFree(logits); cudaFree(act_bf16);
-        cudaFree(xq); cudaFree(escr);
+        cudaFree(xq); cudaFree(xq_k); cudaFree(xq_v); cudaFree(escr);
         cudaFree(ids); cudaFree(grp_start); cudaFree(n_groups); cudaFree(ent_dst); cudaFree(ent_tok); cudaFree(grp_ptr);
         cudaFree(tok_d); cudaFree(pos0_d); cudaFree(pick_d);
         cudaFree(d_miss); cudaFree(ecpu);
@@ -660,6 +780,13 @@ struct Engine {
         cudaFreeHost(h_ids); cudaFreeHost(h_h); cudaFreeHost(cpu_out); cudaFreeHost(h_miss);
         std::free(acts);
         if (ev_route) cudaEventDestroy(ev_route);
+        for (int b = 0; b < 2; ++b) {
+            if (pp_stage[b]) cudaFree(pp_stage[b]);
+            if (ev_pp_copy[b]) cudaEventDestroy(ev_pp_copy[b]);
+            if (ev_pp_used[b]) cudaEventDestroy(ev_pp_used[b]);
+        }
+        if (ev_rebal) cudaEventDestroy(ev_rebal);
+        if (cst) cudaStreamDestroy(cst);
         if (blas) cublasDestroy(blas);
         if (st) cudaStreamDestroy(st);
     }
@@ -702,9 +829,12 @@ struct Engine {
         }
 
         auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
-        for (int b = 0; b < 10; ++b) d_f32(&blk_buf[b], (size_t) tmax * N);
+        for (int b = 0; b < 9; ++b) {
+            d_f32(&norm_blk_buf[b], (size_t) tmax * N);
+        }
+        d_f32(&prelude_cur_buf, (size_t) tmax * N);
+        d_f32(&norm_cur, (size_t) tmax * N);
         d_f32(&cur, (size_t) tmax * N);
-        d_f32(&inpSA, (size_t) tmax * N);
         d_f32(&ffn_inp, (size_t) tmax * N);
         d_f32(&in_q, (size_t) tmax * N);
         d_f32(&in_k, (size_t) tmax * N);
@@ -718,12 +848,12 @@ struct Engine {
         d_f32(&ctrl64, (size_t) tmax * hp.loop_gate_rank);
         d_f32(&ctrl_g, (size_t) tmax * N);
         d_f32(&ctrl_f, (size_t) tmax * N);
-        d_f32(&stack_norm, (size_t) tmax * 8 * N);
 
         d_f32(&Q, (size_t) tmax * hp.q_dim);
         d_f32(&K, (size_t) tmax * hp.kv_dim);
         d_f32(&V, (size_t) tmax * hp.kv_dim);
         d_f32(&R, (size_t) tmax * hp.n_rel * hp.n_head);
+        d_f32(&qgr_t1, (size_t) (2 * hp.q_dim + hp.n_rel * hp.n_head));
         d_f32(&K_conv, (size_t) tmax * hp.kv_dim);
         d_f32(&V_conv, (size_t) tmax * hp.kv_dim);
         d_f32(&dyn_k, (size_t) tmax * hp.n_conv * hp.n_head_kv);
@@ -733,19 +863,21 @@ struct Engine {
         d_f32(&att, (size_t) tmax * hp.q_dim);
         d_f32(&att_gate, (size_t) tmax * hp.q_dim);
         d_f32(&wo, (size_t) tmax * N);
+        d_f32(&attn_split, (size_t) kAttnSplit * hp.n_head * 130);
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
         d_f32(&ewts, (size_t) max_ent);
         d_f32(&eparts, (size_t) max_ent * N);
         d_f32(&moe_raw, (size_t) tmax * N);
-        d_f32(&moe_conv, (size_t) tmax * N);
         d_f32(&logits, (size_t) hp.vocab_unpadded);
 
         CK(cudaMallocHost(&h_tok_buf, (size_t) tmax * N * sizeof(float)));
         CK(cudaMalloc(&act_bf16, (size_t) tmax * 2 * N * sizeof(uint16_t)));
 
         CK(cudaMalloc(&xq, (size_t) tmax * ((2 * N) / 32) * 36));
+        CK(cudaMalloc(&xq_k, (size_t) tmax * ((2 * N) / 32) * 36));
+        CK(cudaMalloc(&xq_v, (size_t) tmax * ((2 * N) / 32) * 36));
         CK(cudaMalloc(&escr, K::native_expert_scratch_bytes(max_ent, hp.n_ff)));
         CK(cudaMalloc(&ids, (size_t) max_ent * sizeof(int32_t)));
         CK(cudaMalloc(&grp_start, (size_t) (hp.n_expert + 1) * sizeof(int32_t)));
@@ -758,17 +890,29 @@ struct Engine {
         CK(cudaMalloc(&pick_d, (size_t) tmax * sizeof(int32_t)));
 
         CK(cudaMallocHost(&h_ids, (size_t) max_ent * sizeof(int32_t)));
-        CK(cudaMallocHost(&h_h, (size_t) tmax * N * sizeof(float)));
-        CK(cudaMallocHost(&cpu_out, (size_t) max_ent * N * sizeof(float)));
-        CK(cudaMallocHost(&h_miss, (size_t) max_ent * sizeof(int32_t)));
-        CK(cudaMalloc(&d_miss, (size_t) max_ent * sizeof(int32_t)));
-        CK(cudaMalloc(&ecpu, (size_t) max_ent * N * sizeof(float)));
-#if defined(STRATA_INKLING2_CPU_POOL)
-        acts = (uint8_t*) std::malloc((size_t) tmax * strata::kernels::cpu::kNativeActBytes);
-#endif
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_rebal, cudaEventDisableTiming));
+        CK(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking));
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaEventCreateWithFlags(&ev_pp_copy[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ev_pp_used[b], cudaEventDisableTiming));
+        }
+        if (const char* v = std::getenv("STRATA_PP_STREAM_T")) pp_stream_t = std::max(1, std::atoi(v));
         reset_state();
         return true;
+    }
+
+    void init_cpu_bufs(int cpu_t) {
+        const int64_t N = m->hp.n_embd;
+        const int64_t cpu_ent = (int64_t) cpu_t * m->hp.n_expert_used;
+        CK(cudaMallocHost(&h_h, (size_t) cpu_t * N * sizeof(float)));
+        CK(cudaMallocHost(&cpu_out, (size_t) cpu_ent * N * sizeof(float)));
+        CK(cudaMallocHost(&h_miss, (size_t) cpu_ent * sizeof(int32_t)));
+        CK(cudaMalloc(&d_miss, (size_t) cpu_ent * sizeof(int32_t)));
+        CK(cudaMalloc(&ecpu, (size_t) cpu_ent * N * sizeof(float)));
+#if defined(STRATA_INKLING2_CPU_POOL)
+        acts = (uint8_t*) std::malloc((size_t) cpu_t * strata::kernels::cpu::kNativeActBytes);
+#endif
     }
 
     void reset_state() {
@@ -778,7 +922,13 @@ struct Engine {
         }
     }
 
-    void project(const float* X, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in) {
+    void prep_q8(const float* X, void* q8_buf, int T, int64_t K_in) {
+        if (T <= 8 && (K_in % 32) == 0) {
+            K::native_quantize_q8_1(X, q8_buf, (int) K_in, T, st);
+        }
+    }
+
+    void project_preq(const float* X, const void* q8_ready, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in) {
         if (W.type == 0) {
             project_f32(X, (const float*) W.d, Y, T, N_out, K_in);
             return;
@@ -803,8 +953,8 @@ struct Engine {
         const auto* ti = strata::quant::type_info(W.type);
         const int blck = ti ? ti->blck : 256;
         if (T <= 8 && (K_in % blck) == 0) {
-            K::native_quantize_q8_1(X, xq, (int) K_in, T, st);
-            K::native_mmvq(W.type, W.d, xq, Y, (int) K_in, (int) N_out, T, st);
+            if (!q8_ready) K::native_quantize_q8_1(X, xq, (int) K_in, T, st);
+            K::native_mmvq(W.type, W.d, q8_ready ? q8_ready : xq, Y, (int) K_in, (int) N_out, T, st);
             return;
         }
         const int64_t tot = (int64_t) T * K_in;
@@ -812,26 +962,38 @@ struct Engine {
         gemm.native(act_bf16, W.type, W.d, Y, T, N_out, K_in);
     }
 
+    void project(const float* X, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in) {
+        project_preq(X, nullptr, W, Y, T, N_out, K_in);
+    }
+
     void project_f32(const float* X, const float* W, float* Y, int T, int64_t N_out, int64_t K_in) {
         if (T == 1 && (K_in % 4) == 0) {
-            k_gemv_f32<<<(unsigned) ((N_out + 7) / 8), 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out);
+            if (N_out <= 128) {
+                k_gemv_f32_cta<<<(unsigned) N_out, 128, 0, st>>>(W, X, Y, (int) K_in, (int) N_out);
+            } else {
+                k_gemv_f32<<<(unsigned) ((N_out + 7) / 8), 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out);
+            }
             return;
         }
         const float alpha = 1.0f, beta = 0.0f;
         CKB(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) N_out, T, (int) K_in, &alpha, W, (int) K_in, X, (int) K_in, &beta, Y, (int) N_out));
     }
 
-    void run_mix(const std::vector<float*>& blocks, float* c, const float* query, float* const* outs, int n_q, int T, int swa_bcast) {
+    void run_mix_normed(const std::vector<float*>& n_blocks, const float* c, bool c_already_normed, const float* query, float* const* outs, int n_q, int T, int swa_bcast) {
         const auto& hp = m->hp;
-        const int B = (int) blocks.size();
+        const int N = (int) hp.n_embd;
+        const int B = (int) n_blocks.size();
         const int D = B + 1;
-        BlkPtrs bp{};
-        for (int i = 0; i < B; ++i) bp.p[i] = blocks[(size_t) (B - 1 - i)];
+        if (!c_already_normed) {
+            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(c, nullptr, norm_cur, N, hp.rms_eps);
+        }
+        NormMixPtrs np{};
+        for (int i = 0; i < B; ++i) np.p[i] = n_blocks[(size_t) (B - 1 - i)];
+        np.p[B] = c_already_normed ? c : norm_cur;
         MixOuts mo{};
         for (int i = 0; i < (swa_bcast ? 3 : n_q); ++i) mo.p[i] = outs[i];
-        k_stack_rms_norm<<<dim3((unsigned) D, (unsigned) T), kThreads, 0, st>>>(bp, c, stack_norm, D, (int) hp.n_embd, T, hp.rms_eps);
-        const float inv_sqrt_n = 1.0f / std::sqrt((float) hp.n_embd);
-        k_mix<<<dim3((unsigned) n_q, (unsigned) T), kThreads, 0, st>>>(stack_norm, query, mo, D, (int) hp.n_embd, n_q, inv_sqrt_n, swa_bcast);
+        const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
+        k_mix_normed<<<dim3((unsigned) n_q, (unsigned) T), kThreads, 0, st>>>(np, D, query, mo, n_q, N, inv_sqrt_n, swa_bcast);
     }
 
     void run_control(const float* c, const float* msg, const PhysLayer& L, int mod, float* out, int T) {
@@ -839,21 +1001,113 @@ struct Engine {
         const int N = (int) hp.n_embd;
         k_control_prep<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, ctrl2N, N, hp.rms_eps);
         project(ctrl2N, L.loop_down[mod], ctrl64, T, hp.loop_gate_rank, 2 * N);
+        if (T == 1 && hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0 && (N % 1) == 0) {
+            k_control_up_combine_t1<<<(unsigned) ((N + 7) / 8), 256, 0, st>>>(
+                c, msg, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d,
+                ctrl64, out, (int) hp.loop_gate_rank, N);
+            return;
+        }
         project(ctrl64, L.loop_gain[mod], ctrl_g, T, N, hp.loop_gate_rank);
         project(ctrl64, L.loop_forget[mod], ctrl_f, T, N, hp.loop_gate_rank);
         const int64_t tot = (int64_t) T * N;
         k_control_combine<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(c, msg, ctrl_g, ctrl_f, out, tot);
     }
 
+    void pp_kick_next() {
+        if (pp_kick_idx >= pp_tasks.size()) return;
+        const PpTask& tk = pp_tasks[pp_kick_idx];
+        const int b = (int) (pp_kick_idx & 1u);
+        const PhysLayer& L = m->layers[(size_t) tk.ip];
+        CK(cudaStreamWaitEvent(cst, ev_pp_used[b], 0));
+        CK(cudaMemcpyAsync(pp_stage[b], L.hblobs + (size_t) tk.e0 * L.stride,
+                           (size_t) (tk.e1 - tk.e0) * L.stride, cudaMemcpyHostToDevice, cst));
+        CK(cudaEventRecord(ev_pp_copy[b], cst));
+        ++pp_kick_idx;
+    }
+
+    void pp_begin(int core_end_virt, int core_all_gpu_flag) {
+        const auto& hp = m->hp;
+        const int ne = (int) hp.n_expert;
+        pp_tasks.clear();
+        pp_take_idx = 0;
+        pp_kick_idx = 0;
+        if (!pp_stage[0] || pp_stage_bytes == 0) return;
+        (void) core_end_virt;
+        (void) core_all_gpu_flag;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            const int ip = hp.loop_layer(il);
+            const PhysLayer& L = m->layers[(size_t) ip];
+            if (L.n_slots >= ne || L.gu_type == 30 || !L.hblobs) continue;
+            const int cap = (int) std::min<size_t>((size_t) ne, pp_stage_bytes / L.stride);
+            if (cap <= 0) continue;
+            for (int e0 = 0; e0 < ne; e0 += cap) {
+                pp_tasks.push_back(PpTask{ip, e0, std::min(ne, e0 + cap)});
+            }
+        }
+        for (int b = 0; b < 2; ++b) CK(cudaEventRecord(ev_pp_used[b], st));
+        for (int k = 0; k < 2 && pp_kick_idx < pp_tasks.size(); ++k) pp_kick_next();
+    }
+
     void run_moe(PhysLayer& L, const float* x_norm, int T) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd, Kp = (int) hp.n_expert_used;
         const int n_ent = T * Kp;
+        const auto tp_moe_r0 = Clock::now();
         project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
-        k_route_inkling2<<<(unsigned) T, (unsigned) hp.n_expert, 0, st>>>(router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale);
+        k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale);
+        if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
 
         const bool has_gpu = L.n_slots > 0;
         const bool need_cpu = L.n_slots < hp.n_expert;
+        const bool is_q5 = (L.L.gu_type == 13);
+
+        if (need_cpu && has_pending_rebal) {
+            CK(cudaStreamWaitEvent(st, ev_rebal, 0));
+            has_pending_rebal = false;
+        }
+
+        if (pp_streaming && need_cpu && L.gu_type != 30 && L.hblobs && pp_stage_bytes >= L.stride) {
+            CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+            CK(cudaEventRecord(ev_route, st));
+            K::quantize_q8_1_rows(x_norm, T, N, xq, st);
+            if (has_gpu) {
+                k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
+                                                   grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
+                K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                         std::min<int64_t>(n_ent, hp.n_expert), n_ent, xq, escr, eparts, st);
+            }
+            const int ne = (int) hp.n_expert;
+            const int cap = (int) std::min<size_t>((size_t) ne, pp_stage_bytes / L.stride);
+            for (int e0 = 0; e0 < ne; e0 += cap) {
+                const int e1 = std::min(ne, e0 + cap);
+                if (pp_take_idx >= pp_tasks.size()) {
+                    std::fprintf(stderr, "strata-inkling2: pp stream underflow\n");
+                    std::exit(1);
+                }
+                const int b = (int) (pp_take_idx & 1u);
+                CK(cudaStreamWaitEvent(st, ev_pp_copy[b], 0));
+                k_group_experts_miss_range<<<1, 128, 0, st>>>(ids, L.d_slot_of, pp_stage[b], L.stride,
+                                                              n_ent, ne, L.n_slots, e0, e1,
+                                                              grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
+                K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                         std::min<int64_t>(n_ent, (int64_t) (e1 - e0)), n_ent, xq, escr, eparts, st);
+                CK(cudaEventRecord(ev_pp_used[b], st));
+                ++pp_take_idx;
+                pp_kick_next();
+            }
+            k_combine_experts<<<dim3((unsigned) ((N + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
+            if (prof) { CK(cudaStreamSynchronize(st)); p_moe_gpu_ms += ms_since(tp_moe_r0); }
+            CK(cudaEventSynchronize(ev_route));
+            int n_miss = 0;
+            for (int e = 0; e < n_ent; ++e) {
+                const int x = h_ids[e];
+                L.score[(size_t) x] += 1.0;
+                if (L.slot_of[(size_t) x] < 0) ++n_miss;
+            }
+            hy_cpu += n_miss;
+            hy_gpu += n_ent - n_miss;
+            return;
+        }
 
         if (need_cpu) {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
@@ -861,6 +1115,7 @@ struct Engine {
             CK(cudaEventRecord(ev_route, st));
         }
 
+        const auto tp_mg0 = Clock::now();
         if (has_gpu) {
             k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
                                                grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
@@ -868,12 +1123,22 @@ struct Engine {
             K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                      std::min<int64_t>(n_ent, hp.n_expert), n_ent, xq, escr, eparts, st);
         }
+        if (prof_detail) {
+            CK(cudaStreamSynchronize(st));
+            const double mg_dt = ms_since(tp_mg0);
+            if (!need_cpu) p_d_moe_gpu_core += mg_dt;
+            else if (is_q5) p_d_moe_gpu_q5 += mg_dt;
+            else p_d_moe_gpu_nv += mg_dt;
+        }
+        if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_gpu_ms += ms_since(tp_moe_r0); }
 
 #if defined(STRATA_INKLING2_CPU_POOL)
         if (need_cpu) {
             namespace C = strata::kernels::cpu;
+            const auto tp_wait0 = Clock::now();
             while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
             }
+            if (prof) p_moe_wait_ms += ms_since(tp_wait0);
             const auto t0 = Clock::now();
             jobs.clear();
             int n_miss = 0;
@@ -889,7 +1154,7 @@ struct Engine {
                     if (!h_miss[e]) continue;
                     ++n_miss;
                     C::ExpertJobMulti j;
-                    j.blob = L.hblobs + (size_t) x * L.L.bytes;
+                    j.blob = L.hblobs + (size_t) x * L.stride;
                     j.nact[0] = act0;
                     j.out[0] = cpu_out + (size_t) e * N;
                     j.nt = 1;
@@ -913,7 +1178,7 @@ struct Engine {
                     int jidx = open_job[x];
                     if (jidx < 0 || jobs[(size_t) jidx].nt == C::MAXT) {
                         C::ExpertJobMulti j;
-                        j.blob = L.hblobs + (size_t) x * L.L.bytes;
+                        j.blob = L.hblobs + (size_t) x * L.stride;
                         jidx = (int) jobs.size();
                         jobs.push_back(j);
                         open_job[x] = jidx;
@@ -928,9 +1193,21 @@ struct Engine {
             }
             hy_cpu += n_miss;
             hy_gpu += n_ent - n_miss;
+            if (prof_detail) {
+                if (is_q5) { p_miss_q5 += n_miss; p_hit_q5 += (n_ent - n_miss); }
+                else { p_miss_nv += n_miss; p_hit_nv += (n_ent - n_miss); }
+            }
             if (n_miss > 0) {
+                const auto tp_c0 = Clock::now();
                 pool->run_split_multi_native(L.cpu_fmt, jobs.data(), (int) jobs.size());
-                hy_cpu_ms += ms_since(t0);
+                const double c_ms = ms_since(tp_c0);
+                hy_cpu_ms += c_ms;
+                if (prof) p_moe_cpu_ms += c_ms;
+                if (prof_detail) {
+                    if (is_q5) p_d_cpu_q5 += c_ms;
+                    else p_d_cpu_nv += c_ms;
+                }
+                const auto tp_u0 = Clock::now();
                 if (has_gpu) {
                     CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * sizeof(float), cudaMemcpyHostToDevice, st));
                     CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, st));
@@ -938,6 +1215,7 @@ struct Engine {
                 } else {
                     CK(cudaMemcpyAsync(eparts, cpu_out, (size_t) n_ent * N * sizeof(float), cudaMemcpyHostToDevice, st));
                 }
+                if (prof) { CK(cudaStreamSynchronize(st)); p_moe_up_ms += ms_since(tp_u0); }
             }
         } else {
             hy_gpu += n_ent;
@@ -949,52 +1227,69 @@ struct Engine {
         }
         hy_gpu += n_ent;
 #endif
+        const auto tp_p0 = Clock::now();
         k_combine_experts<<<dim3((unsigned) ((N + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
+        if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
     }
 
     void rebalance(int max_swaps) {
         if (!hybrid) return;
         const int64_t ne = m->hp.n_expert;
-        int left = max_swaps;
-        for (size_t li = 0; li < m->layers.size() && left > 0; ++li) {
+        struct Cand {
+            double gain;
+            size_t li;
+            int slot;
+            int hot_x;
+            int cold_y;
+        };
+        std::vector<Cand> cands;
+        cands.reserve(m->layers.size() * 2);
+        std::vector<int> order((size_t) ne);
+        std::vector<int> victims;
+        for (size_t li = 0; li < m->layers.size(); ++li) {
             PhysLayer& L = m->layers[li];
             const int S = L.n_slots;
             if (S <= 0 || S >= ne) continue;
-            std::vector<int> order((size_t) ne);
+            const double weight = (L.L.gu_type == 13) ? 1.43 : 1.0;
             for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
-            std::sort(order.begin(), order.end(), [&](int a, int b) { return L.score[(size_t) a] > L.score[(size_t) b]; });
-            std::vector<int> victims;
-            for (int s = 0; s < S; ++s) victims.push_back(s);
-            std::sort(victims.begin(), victims.end(), [&](int a, int b) {
-                return L.score[(size_t) L.exp_in_slot[(size_t) a]] < L.score[(size_t) L.exp_in_slot[(size_t) b]];
-            });
-            size_t vi = 0;
-            bool changed = false;
-            for (int i = 0; i < S && left > 0; ++i) {
+            std::partial_sort(order.begin(), order.begin() + std::min<int>((int) ne, S + 2), order.end(),
+                              [&](int a, int b) { return L.score[(size_t) a] > L.score[(size_t) b]; });
+            victims.resize((size_t) S);
+            for (int s = 0; s < S; ++s) victims[(size_t) s] = s;
+            std::partial_sort(victims.begin(), victims.begin() + std::min<int>(S, 2), victims.end(),
+                              [&](int a, int b) {
+                                  return L.score[(size_t) L.exp_in_slot[(size_t) a]] < L.score[(size_t) L.exp_in_slot[(size_t) b]];
+                              });
+            int hot_cand = -1;
+            for (int i = 0; i < S; ++i) {
                 const int x = order[(size_t) i];
-                if (L.slot_of[(size_t) x] >= 0) continue;
-                while (vi < victims.size()) {
-                    const int s = victims[vi++];
-                    const int y = L.exp_in_slot[(size_t) s];
-                    if (L.score[(size_t) y] >= L.score[(size_t) x]) { vi = victims.size(); break; }
-                    bool y_top = false;
-                    for (int j = 0; j < S; ++j) if (order[(size_t) j] == y) { y_top = true; break; }
-                    if (y_top) continue;
-                    L.slot_of[(size_t) y] = -1;
-                    L.slot_of[(size_t) x] = s;
-                    L.exp_in_slot[(size_t) s] = x;
-                    CK(cudaMemcpyAsync(L.d_blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.L.bytes,
-                                       L.L.bytes, cudaMemcpyHostToDevice, st));
-                    changed = true;
-                    --left;
-                    break;
+                if (L.slot_of[(size_t) x] < 0) { hot_cand = x; break; }
+            }
+            if (hot_cand >= 0) {
+                const int s = victims[0];
+                const int y = L.exp_in_slot[(size_t) s];
+                const double diff = L.score[(size_t) hot_cand] - L.score[(size_t) y];
+                if (diff > 0.0) {
+                    cands.push_back(Cand{diff * weight, li, s, hot_cand, y});
                 }
             }
-            if (changed) {
-                CK(cudaMemcpyAsync(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice, st));
-            }
-            for (int x = 0; x < ne; ++x) L.score[(size_t) x] *= 0.5;
+            for (int x = 0; x < ne; ++x) L.score[(size_t) x] *= 0.8;
         }
+        if (cands.empty()) return;
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.gain > b.gain; });
+        const int take = std::min<int>(max_swaps, (int) cands.size());
+        for (int i = 0; i < take; ++i) {
+            const Cand& c = cands[(size_t) i];
+            PhysLayer& L = m->layers[c.li];
+            L.slot_of[(size_t) c.cold_y] = -1;
+            L.slot_of[(size_t) c.hot_x] = c.slot;
+            L.exp_in_slot[(size_t) c.slot] = c.hot_x;
+            CK(cudaMemcpyAsync(L.d_blobs + (size_t) c.slot * L.stride, L.hblobs + (size_t) c.hot_x * L.stride,
+                               L.L.bytes, cudaMemcpyHostToDevice, cst));
+            CK(cudaMemcpyAsync(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice, cst));
+        }
+        CK(cudaEventRecord(ev_rebal, cst));
+        has_pending_rebal = true;
     }
 
     int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr) {
@@ -1005,6 +1300,8 @@ struct Engine {
         const int64_t n_core = hp.num_loops > 1 ? (hp.core_end - hp.core_start) : 0;
 
         // 1. Token embedding from host mmap + tok_embd_norm
+        if (prof) ++p_calls;
+        const auto tp_e0 = Clock::now();
         for (int t = 0; t < T; ++t) {
             const uint8_t* row = m->host_tok_embd + (size_t) tokens[t] * m->tok_embd_row_bytes;
             float* dst = h_tok_buf + (size_t) t * N;
@@ -1020,41 +1317,44 @@ struct Engine {
                 strata::quant::dequant_row((strata::quant::Type) m->tok_embd_type, row, dst, N);
             }
         }
-        CK(cudaMemcpyAsync(inpSA, h_tok_buf, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(ffn_inp, h_tok_buf, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, st));
         const int32_t pos32 = (int32_t) pos;
         CK(cudaMemcpyAsync(pos0_d, &pos32, sizeof(int32_t), cudaMemcpyHostToDevice, st));
-        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(inpSA, m->tok_embd_norm, cur, N, hp.rms_eps);
+        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(ffn_inp, m->tok_embd_norm, cur, N, hp.rms_eps);
+        if (prof) { CK(cudaStreamSynchronize(st)); p_embd_ms += ms_since(tp_e0); }
 
-        std::vector<float*> blocks;
+        std::vector<float*> norm_blocks;
         int next_blk_buf = 0;
         auto push_block = [&](const float* src) {
-            float* dst = blk_buf[next_blk_buf++];
-            CK(cudaMemcpyAsync(dst, src, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
-            blocks.push_back(dst);
+            const int idx = next_blk_buf++;
+            float* ndst = norm_blk_buf[idx];
+            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(src, nullptr, ndst, N, hp.rms_eps);
+            norm_blocks.push_back(ndst);
         };
 
-        std::vector<float*> prelude_blocks;
-        float* prelude_cur = blk_buf[9];   // dedicated saved buffer for prelude_cur
-        std::vector<float*> bank;
-        float* bank_last = blk_buf[8];     // dedicated saved buffer for bank_last
+        std::vector<float*> prelude_norm_blocks;
+        float* prelude_cur = prelude_cur_buf;
+        std::vector<float*> norm_bank;
+        float* bank_last_norm = norm_blk_buf[8];     // cached normalized bank_last
 
-        auto run_layer = [&](int il) {
+        auto run_layer_pre = [&](int il) {
             const int ip = hp.loop_layer(il);
             PhysLayer& L = m->layers[(size_t) ip];
             const bool is_swa = hp.is_swa(il);
 
+            const auto tp_d0 = Clock::now();
             bool has_msg = false;
             if (n_core > 0 && ip >= hp.core_start && ip < hp.core_end) {
                 const int pass = (il - (int) hp.core_start) / (int) n_core;
                 if (ip == hp.core_start) {
                     if (pass == 0) {
-                        prelude_blocks = blocks;
+                        prelude_norm_blocks = norm_blocks;
                         CK(cudaMemcpyAsync(prelude_cur, cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
                     } else {
-                        bank.clear();
-                        for (size_t bi = prelude_blocks.size() + 1; bi < blocks.size(); ++bi) bank.push_back(blocks[bi]);
-                        CK(cudaMemcpyAsync(bank_last, cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
-                        blocks = prelude_blocks;
+                        norm_bank.clear();
+                        for (size_t bi = prelude_norm_blocks.size() + 1; bi < norm_blocks.size(); ++bi) norm_bank.push_back(norm_blocks[bi]);
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, nullptr, bank_last_norm, N, hp.rms_eps);
+                        norm_blocks = prelude_norm_blocks;
                         CK(cudaMemcpyAsync(cur, prelude_cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
                     }
                 }
@@ -1065,139 +1365,228 @@ struct Engine {
                     const float* q_kv = m->loop_kv_res_query + row * N;
                     float* out_attn[2] = {msg0, msg3};
                     float* out_kv[2] = {msg1, msg2};
-                    run_mix(bank, bank_last, q_attn, out_attn, 2, T, 0);
-                    run_mix(bank, bank_last, q_kv, out_kv, 2, T, 0);
+                    run_mix_normed(norm_bank, bank_last_norm, true, q_attn, out_attn, 2, T, 0);
+                    run_mix_normed(norm_bank, bank_last_norm, true, q_kv, out_kv, 2, T, 0);
                 }
-            }
-
-            CK(cudaMemcpyAsync(inpSA, cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
-
-            if (L.attn_res_query) {
-                float* outs[3] = {in_q, in_k, in_v};
-                run_mix(blocks, cur, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
-            } else {
-                CK(cudaMemcpyAsync(in_q, cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
-                if (!is_swa || has_msg) {
-                    CK(cudaMemcpyAsync(in_k, cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
-                    CK(cudaMemcpyAsync(in_v, cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
-                }
-            }
-
-            if (has_msg) {
-                run_control(in_q, msg0, L, 0, in_q, T);
-                run_control(in_k, msg1, L, 1, in_k, T);
-                run_control(in_v, msg2, L, 2, in_v, T);
             }
 
             const float* ink_src = in_k;
             const float* inv_src = in_v;
-            if (is_swa && has_msg) {
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_norm, in_k, N, hp.rms_eps);
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_norm, in_v, N, hp.rms_eps);
-            } else if (is_swa) {
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
-                ink_src = in_q;
-                inv_src = in_q;
+            if (L.attn_res_query) {
+                float* outs[3] = {in_q, in_k, in_v};
+                run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
+                if (has_msg) {
+                    run_control(in_q, msg0, L, 0, in_q, T);
+                    run_control(in_k, msg1, L, 1, in_k, T);
+                    run_control(in_v, msg2, L, 2, in_v, T);
+                }
+                if (is_swa && has_msg) {
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_norm, in_k, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_norm, in_v, N, hp.rms_eps);
+                } else if (is_swa) {
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
+                    ink_src = in_q;
+                    inv_src = in_q;
+                } else {
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                }
             } else {
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                if (has_msg) {
+                    run_control(cur, msg0, L, 0, in_q, T);
+                    run_control(cur, msg1, L, 1, in_k, T);
+                    run_control(cur, msg2, L, 2, in_v, T);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, is_swa ? L.attn_norm : L.attn_q_inp_norm, in_q, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, is_swa ? L.attn_norm : L.attn_k_inp_norm, in_k, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, is_swa ? L.attn_norm : L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                } else if (is_swa) {
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_norm, in_q, N, hp.rms_eps);
+                    ink_src = in_q;
+                    inv_src = in_q;
+                } else {
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                }
             }
+            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_mix += ms_since(tp_d0); }
 
-            // Attention projections
-            project(in_q, L.attn_q, Q, T, q_dim, N);
-            project(ink_src, L.attn_k, K, T, kv_dim, N);
-            project(inv_src, L.attn_v, V, T, kv_dim, N);
-            project(in_q, L.attn_rel, R, T, hp.n_rel * hp.n_head, N);
-            project(in_q, L.attn_sink_proj, sink, T, hp.n_head, N);
-            project(in_q, L.attn_gate, att_gate, T, q_dim, N);
+            // Attention projections (quantize unique input vectors ONCE per layer)
+            const auto tp_d1 = Clock::now();
+            prep_q8(in_q, xq, T, N);
+            const void* xq_k_src = (ink_src == in_q) ? xq : xq_k;
+            const void* xq_v_src = (inv_src == in_q) ? xq : (inv_src == ink_src ? xq_k_src : xq_v);
+            if (ink_src != in_q) prep_q8(ink_src, xq_k, T, N);
+            if (inv_src != in_q && inv_src != ink_src) prep_q8(inv_src, xq_v, T, N);
+            project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N);
+            float* pQ = Q;
+            float* pGate = att_gate;
+            float* pR = R;
+            if (T == 1 && L.attn_qgr.d != nullptr) {
+                pQ = qgr_t1;
+                pGate = qgr_t1 + q_dim;
+                pR = qgr_t1 + 2 * q_dim;
+                project_preq(in_q, xq, L.attn_qgr, qgr_t1, 1, L.attn_qgr.n_out, N);
+            } else {
+                project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N);
+                project_preq(in_q, xq, L.attn_rel, R, T, hp.n_rel * hp.n_head, N);
+                project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N);
+            }
+            project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N);
+            project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N);
 
             float* hst = conv_hist[(size_t) il];
             if (!is_swa) {
-                project(ink_src, L.attn_k_conv_proj, dyn_k, T, hp.n_conv * hp.n_head_kv, N);
-                project(inv_src, L.attn_v_conv_proj, dyn_v, T, hp.n_conv * hp.n_head_kv, N);
+                project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, hp.n_conv * hp.n_head_kv, N);
+                project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, hp.n_conv * hp.n_head_kv, N);
             }
-            k_shortconv<<<(unsigned) ((kv_dim + 255) / 256), 256, 0, st>>>(K, L.attn_k_conv, is_swa ? nullptr : dyn_k, hst, K_conv, (int) kv_dim, 0, (int) hp.n_head_kv, T);
-            k_shortconv<<<(unsigned) ((kv_dim + 255) / 256), 256, 0, st>>>(V, L.attn_v_conv, is_swa ? nullptr : dyn_v, hst, V_conv, (int) kv_dim, (int) kv_dim, (int) hp.n_head_kv, T);
+            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
+            const auto tp_d2 = Clock::now();
+            k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
+                K, V, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : dyn_k, is_swa ? nullptr : dyn_v,
+                hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
 
             const int apply_tau = is_swa ? 0 : 1;
             k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
-                Q, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
-            k_clip_and_tau<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
-                K_conv, nullptr, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head_kv, 0, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
-            k_v_rms_norm<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(V_conv, (int) hp.head_dim, (int) hp.n_head_kv, hp.rms_eps);
+                pQ, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
             k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
-                R, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                pR, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
 
             if (kv_q8) {
-                k_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
+                k_clip_norm_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
                     K_conv, V_conv, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
-                    (int) hp.n_head_kv, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
+                    (int) hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
             } else {
+                k_clip_and_tau<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
+                    K_conv, nullptr, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head_kv, 0, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                k_v_rms_norm<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(V_conv, (int) hp.head_dim, (int) hp.n_head_kv, hp.rms_eps);
                 k_kv_store<<<dim3((unsigned) ((kv_dim + 255) / 256), (unsigned) T), 256, 0, st>>>(
                     K_conv, V_conv, kc[(size_t) il], vc[(size_t) il], (int) kv_dim, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
             }
 
+            const int max_rel = is_swa ? std::min<int>((int) hp.n_swa, (int) hp.n_rel_ext) : (int) hp.n_rel_ext;
             k_rel_table<<<dim3((unsigned) hp.n_head, (unsigned) T), kThreads, 0, st>>>(
-                R, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, pos0_d, T);
+                pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T);
             const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
             if (kv_q8) {
-                k_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                    Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, att,
-                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
+                if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
+                    if (T == 1) {
+                        k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) kAttnSplit), 128, 0, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, kAttnSplit);
+                        k_attn_split_combine<<<(unsigned) hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int) hp.n_head, kAttnSplit);
+                    } else {
+                        k_attn_q8_gqa3_pp<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 128, 0, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
+                    }
+                } else {
+                    k_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                        pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                        (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
+                }
             } else {
                 k_attn<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                    Q, kc[(size_t) il], vc[(size_t) il], rel_tab, sink, att,
+                    pQ, kc[(size_t) il], vc[(size_t) il], rel_tab, sink, att,
                     (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
             }
+            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
 
-            k_mul_sigmoid<<<(unsigned) (((int64_t) T * q_dim + 255) / 256), 256, 0, st>>>(att, att_gate, (int64_t) T * q_dim);
-            project(att, L.attn_output, wo, T, N, q_dim);
-            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim, 0, T);
-
-            if (ip % hp.attn_res_block_size == 0) {
-                push_block(inpSA);
-            } else {
-                k_add<<<(unsigned) (((int64_t) T * N + 255) / 256), 256, 0, st>>>(cur, inpSA, (int64_t) T * N);
+            const auto tp_d3 = Clock::now();
+            if (!kv_q8) {
+                k_mul_sigmoid<<<(unsigned) (((int64_t) T * q_dim + 255) / 256), 256, 0, st>>>(att, pGate, (int64_t) T * q_dim);
             }
-
-            CK(cudaMemcpyAsync(ffn_inp, cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
+            project(att, L.attn_output, wo, T, N, q_dim);
+            const bool do_push = (ip % hp.attn_res_block_size == 0);
+            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur);
+            if (do_push) push_block(cur);
 
             // MoE
             float* ffn_mix_out[1] = {in_ffn};
-            run_mix(blocks, cur, L.ffn_res_query, ffn_mix_out, 1, T, 0);
+            run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
             if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
             k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_out += ms_since(tp_d3); }
+        };
+
+        auto run_layer_post = [&](int il) {
+            const int ip = hp.loop_layer(il);
+            PhysLayer& L = m->layers[(size_t) ip];
+            float* hst = conv_hist[(size_t) il];
+            const bool track_outer = prof && (L.n_slots < hp.n_expert);
             run_moe(L, in_ffn, T);
-            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T);
-            k_add<<<(unsigned) (((int64_t) T * N + 255) / 256), 256, 0, st>>>(cur, ffn_inp, (int64_t) T * N);
+            const auto tp_mp0 = Clock::now();
+            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T, ffn_inp);
+            if (track_outer) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_mp0); }
         };
 
         const int core_end_virt = (int) (hp.core_start + hp.num_loops * n_core);
+        pp_streaming = (hybrid && T >= pp_stream_t && pp_stage[0] != nullptr);
+        if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
         for (int il = 0; il < hp.n_layer; ++il) {
-            if (T == 1 && core_all_gpu && il == hp.core_start && n_core > 0) {
+            if (T == 1 && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
                 if (!core_graph) {
                     cudaGraph_t g = nullptr;
                     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-                    for (int cl = il; cl < core_end_virt; ++cl) run_layer(cl);
+                    for (int cl = il; cl < core_end_virt; ++cl) {
+                        run_layer_pre(cl);
+                        run_layer_post(cl);
+                    }
                     CK(cudaStreamEndCapture(st, &g));
                     CK(cudaGraphInstantiate(&core_graph, g, nullptr, nullptr, 0));
                     CK(cudaGraphDestroy(g));
                 } else {
-                    blocks = {blk_buf[0], blk_buf[5], blk_buf[6]};
+                    norm_blocks = {norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6]};
                     next_blk_buf = 7;
                 }
+                const auto tp_cg0 = Clock::now();
                 CK(cudaGraphLaunch(core_graph, st));
+                if (prof) { CK(cudaStreamSynchronize(st)); p_core_ms += ms_since(tp_cg0); }
                 il = core_end_virt - 1;
                 continue;
             }
-            run_layer(il);
+            const bool is_outer = (il < hp.core_start || il >= core_end_virt);
+            const int oi = is_outer ? (il < hp.core_start ? il : ((int) hp.core_start + (il - core_end_virt))) : -1;
+            const bool use_outer_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming && oi >= 0 && oi < 12);
+            const auto tp_ly0 = Clock::now();
+            if (use_outer_graph) {
+                if (!outer_pre_graph[oi]) {
+                    cudaGraph_t g = nullptr;
+                    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                    run_layer_pre(il);
+                    CK(cudaStreamEndCapture(st, &g));
+                    CK(cudaGraphInstantiate(&outer_pre_graph[oi], g, nullptr, nullptr, 0));
+                    CK(cudaGraphDestroy(g));
+                } else {
+                    if (il == 0) {
+                        norm_blocks = {norm_blk_buf[0]};
+                        next_blk_buf = 1;
+                    } else if (il == core_end_virt) {
+                        norm_blocks = {norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6], norm_blk_buf[7]};
+                        next_blk_buf = 8;
+                    }
+                }
+                CK(cudaGraphLaunch(outer_pre_graph[oi], st));
+            } else {
+                run_layer_pre(il);
+            }
+            if (prof && is_outer) {
+                CK(cudaStreamSynchronize(st));
+                p_attn_ms += ms_since(tp_ly0);
+            }
+            run_layer_post(il);
+            if (prof && !is_outer) {
+                CK(cudaStreamSynchronize(st));
+                p_core_ms += ms_since(tp_ly0);
+            }
         }
 
         // Output head
+        const auto tp_h0 = Clock::now();
         float* out_head[1] = {in_ffn};
-        run_mix(blocks, cur, m->output_res_query, out_head, 1, T, 0);
+        run_mix_normed(norm_blocks, cur, false, m->output_res_query, out_head, 1, T, 0);
         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
         // Only compute logits for the last row unless needed? Actually compute all if small or last row:
         const float* last_h = cur + (size_t) (T - 1) * N;
@@ -1211,6 +1600,7 @@ struct Engine {
         }
         CK(cudaMemcpyAsync(&next_id, pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (prof) p_head_ms += ms_since(tp_h0);
         pos += T;
         return next_id;
     }
@@ -1223,8 +1613,44 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const size_t reserve = (size_t) 256 << 20;
-    const size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
-                                          : (fr > reserve ? fr - reserve : 0);
+    size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
+                                    : (fr > reserve ? fr - reserve : 0);
+
+    size_t stage_mb = 96;
+    if (const char* v = std::getenv("STRATA_PP_STAGE_MB")) stage_mb = (size_t) std::max(0, std::atoi(v));
+    size_t max_exp_stride = 0;
+    size_t all_exps_bytes = 0;
+    for (int ip = 0; ip < hp.n_phys; ++ip) {
+        if (m.layers[(size_t) ip].gu_type == 30) continue;
+        max_exp_stride = std::max(max_exp_stride, m.layers[(size_t) ip].stride);
+        all_exps_bytes += (size_t) ne * m.layers[(size_t) ip].stride;
+    }
+    if (budget < all_exps_bytes && stage_mb > 0 && max_exp_stride > 0) {
+        size_t req_stage = stage_mb << 20;
+        if (req_stage < max_exp_stride) req_stage = max_exp_stride;
+        if (budget > req_stage * 2 + ((size_t) 256 << 20)) {
+            if (cudaMalloc(&E.pp_stage[0], req_stage) == cudaSuccess &&
+                cudaMalloc(&E.pp_stage[1], req_stage) == cudaSuccess) {
+                E.pp_stage_bytes = req_stage;
+                budget -= req_stage * 2;
+            } else {
+                (void) cudaGetLastError();
+                if (E.pp_stage[0]) { cudaFree(E.pp_stage[0]); E.pp_stage[0] = nullptr; }
+                if (E.pp_stage[1]) { cudaFree(E.pp_stage[1]); E.pp_stage[1] = nullptr; }
+            }
+        }
+    }
+    size_t fr_before_cpu = 0;
+    CK(cudaMemGetInfo(&fr_before_cpu, &tot));
+    const int cpu_t = (E.pp_stage[0] && E.pp_stream_t > 1) ? std::min(E.tmax, E.pp_stream_t - 1) : E.tmax;
+    E.init_cpu_bufs(cpu_t);
+    {
+        size_t fr_cpu = 0;
+        CK(cudaMemGetInfo(&fr_cpu, &tot));
+        const size_t used_cpu = (fr_before_cpu > fr_cpu) ? (fr_before_cpu - fr_cpu) : 0;
+        if (budget > used_cpu) budget -= used_cpu;
+        else budget = 0;
+    }
 
     size_t used = 0;
     std::vector<int> slots(m.layers.size(), 0);
@@ -1287,13 +1713,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
 
         if (s < ne) {
             need_cpu = true;
-            L.hblobs = (uint8_t*) std::malloc((size_t) ne * L.L.bytes);
-            if (!L.hblobs) {
-                err = "host malloc failed for layer " + std::to_string(ip);
-                return false;
+            const size_t hb_bytes = (size_t) ne * L.stride;
+            const bool want_pin = std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr;
+            if (want_pin && cudaHostAlloc(&L.hblobs, hb_bytes, cudaHostAllocDefault) == cudaSuccess) {
+                m.host_pinned_allocs.push_back(L.hblobs);
+            } else {
+                (void) cudaGetLastError();
+                L.hblobs = (uint8_t*) std::malloc(hb_bytes);
+                if (!L.hblobs) {
+                    err = "host malloc failed for layer " + std::to_string(ip);
+                    return false;
+                }
+                m.host_allocs.push_back(L.hblobs);
             }
-            m.host_allocs.push_back(L.hblobs);
-            for (int e = 0; e < ne; ++e) build_expert_blob(L, e, L.hblobs + (size_t) e * L.L.bytes);
+            for (int e = 0; e < ne; ++e) build_expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
         }
 
         if (s > 0) {
@@ -1304,7 +1737,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
 
             tmp.resize(L.L.bytes);
             for (int k = 0; k < s; ++k) {
-                const uint8_t* src = L.hblobs ? (L.hblobs + (size_t) k * L.L.bytes) : (build_expert_blob(L, k, tmp.data()), tmp.data());
+                const uint8_t* src = L.hblobs ? (L.hblobs + (size_t) k * L.stride) : (build_expert_blob(L, k, tmp.data()), tmp.data());
                 CK(cudaMemcpy(L.d_blobs + (size_t) k * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
                 L.slot_of[(size_t) k] = k;
                 L.exp_in_slot[(size_t) k] = k;
@@ -1459,6 +1892,8 @@ int run(int argc, char** argv) {
     bool serve = false;
     bool bench = false;
     bool kv_q8 = true;
+    bool profile = false;
+    bool profile_detail = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1481,6 +1916,8 @@ int run(int argc, char** argv) {
         else if (a == "--kv-q8") kv_q8 = true;
         else if (a == "--serve") serve = true;
         else if (a == "--bench") bench = true;
+        else if (a == "--profile") profile = true;
+        else if (a == "--profile-detail") { profile = true; profile_detail = true; }
     }
 
     if (model_path.empty()) {
@@ -1703,7 +2140,7 @@ int run(int argc, char** argv) {
                             next_tok = E.forward(&fed, 1, sample_on, &lg);
                             live_tokens.push_back(fed);
                             if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
-                            if (E.hybrid && (step % 4 == 3)) E.rebalance(4);
+                            if (E.hybrid && (step % 8 == 7)) E.rebalance(4);
                         }
                     }
                 }
@@ -1736,6 +2173,9 @@ int run(int argc, char** argv) {
         E.hy_cpu_ms = 0.0;
     }
 
+    E.prof = profile;
+    E.prof_detail = profile_detail;
+    E.reset_prof();
     std::vector<float> dumped;
     const auto t_pp0 = Clock::now();
     int32_t next_tok = 0;
@@ -1743,9 +2183,12 @@ int run(int argc, char** argv) {
         const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
         const bool is_last = (off + (size_t) tc == prompt.size());
         next_tok = E.forward(prompt.data() + off, tc, is_last && !dump_logits_path.empty(), &dumped);
+        const auto tr0 = Clock::now();
         if (E.hybrid) E.rebalance(8);
+        if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
     }
     const double pp_ms = ms_since(t_pp0);
+    if (profile) { E.print_prof("pp"); E.reset_prof(); }
 
     if (!dump_logits_path.empty() && !dumped.empty()) {
         std::FILE* f = std::fopen(dump_logits_path.c_str(), "wb");
@@ -1764,9 +2207,12 @@ int run(int argc, char** argv) {
     for (int step = 1; step < max_new; ++step) {
         next_tok = E.forward(&next_tok, 1);
         gen.push_back(next_tok);
-        if (E.hybrid && (step % 4 == 0)) E.rebalance(4);
+        const auto tr0 = Clock::now();
+        if (E.hybrid && (step % 8 == 0)) E.rebalance(4);
+        if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
     }
     const double tg_ms = ms_since(t_tg0);
+    if (profile) E.print_prof("tg");
 
     std::printf("tokens:");
     for (int32_t id : gen) std::printf(" %d", (int) id);
