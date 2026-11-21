@@ -136,6 +136,9 @@ struct PhysLayer {
     DenseMat attn_sink_proj;  // [n_embd, n_head]
     DenseMat attn_rel;        // [n_embd, n_rel * n_head]
     DenseMat attn_qgr;        // concatenated [attn_q; attn_gate; attn_rel] for T==1 single MMVQ
+    DenseMat attn_qgrkv;      // concatenated [attn_q; attn_gate; attn_rel; attn_k; attn_v] for SWA !has_msg T==1
+    DenseMat attn_kkc;        // concatenated [attn_k; attn_k_conv_proj] for !is_swa T==1
+    DenseMat attn_vvc;        // concatenated [attn_v; attn_v_conv_proj] for !is_swa T==1
     DenseMat attn_k_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
     DenseMat attn_v_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
 
@@ -429,16 +432,50 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
         const char* nm_q = tn("attn_q.weight");
         const strata::TensorInfo* tq = nullptr;
         const uint8_t* raw_q = m.find_tensor(nm_q, &tq);
-        const strata::TensorInfo* tg = nullptr;
-        const strata::TensorInfo* tr = nullptr;
+        const strata::TensorInfo *tg = nullptr, *tr = nullptr, *tk = nullptr, *tv = nullptr;
         std::string sn_g = "blk." + std::to_string(ip) + ".attn_gate.weight";
         std::string sn_r = "blk." + std::to_string(ip) + ".attn_rel.weight";
+        std::string sn_k = "blk." + std::to_string(ip) + ".attn_k.weight";
+        std::string sn_v = "blk." + std::to_string(ip) + ".attn_v.weight";
         const uint8_t* raw_g = m.find_tensor(sn_g.c_str(), &tg);
         const uint8_t* raw_r = m.find_tensor(sn_r.c_str(), &tr);
-        if (raw_q && tq && raw_g && tg && raw_r && tr &&
-            tq->type == tg->type && tq->type == tr->type &&
-            tq->shape[0] == tg->shape[0] && tq->shape[0] == tr->shape[0] &&
-            tq->type != 0 && tq->type != 1 && tq->type != 30 && K::native_mmvq_supported((int) tq->type)) {
+        const uint8_t* raw_k = m.find_tensor(sn_k.c_str(), &tk);
+        const uint8_t* raw_v = m.find_tensor(sn_v.c_str(), &tv);
+        const bool qgr_ok = raw_q && tq && raw_g && tg && raw_r && tr &&
+                            tq->type == tg->type && tq->type == tr->type &&
+                            tq->shape[0] == tg->shape[0] && tq->shape[0] == tr->shape[0] &&
+                            tq->type != 0 && tq->type != 1 && tq->type != 30 && K::native_mmvq_supported((int) tq->type);
+        const bool kv_ok_in_qgr = qgr_ok && L.is_swa && raw_k && tk && raw_v && tv &&
+                                  tq->type == tk->type && tq->type == tv->type &&
+                                  tq->shape[0] == tk->shape[0] && tq->shape[0] == tv->shape[0];
+        if (kv_ok_in_qgr) {
+            const int64_t nin = (int64_t) tq->shape[0];
+            const size_t rb = strata::quant::row_bytes((int) tq->type, nin);
+            const int64_t nq_out = tq->shape.size() > 1 ? (int64_t) tq->shape[1] : 1;
+            const int64_t ng_out = tg->shape.size() > 1 ? (int64_t) tg->shape[1] : 1;
+            const int64_t nr_out = tr->shape.size() > 1 ? (int64_t) tr->shape[1] : 1;
+            const int64_t nk_out = tk->shape.size() > 1 ? (int64_t) tk->shape[1] : 1;
+            const int64_t nv_out = tv->shape.size() > 1 ? (int64_t) tv->shape[1] : 1;
+            const size_t bq = rb * (size_t) nq_out;
+            const size_t bg = rb * (size_t) ng_out;
+            const size_t br = rb * (size_t) nr_out;
+            const size_t bk = rb * (size_t) nk_out;
+            const size_t bv = rb * (size_t) nv_out;
+            uint8_t* dall = m.gpu_alloc<uint8_t>(bq + bg + br + bk + bv);
+            CK(cudaMemcpy(dall, raw_q, bq, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dall + bq, raw_g, bg, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dall + bq + bg, raw_r, br, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dall + bq + bg + br, raw_k, bk, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dall + bq + bg + br + bk, raw_v, bv, cudaMemcpyHostToDevice));
+            m.has_quant_dense = true;
+            L.attn_q = DenseMat{(int) tq->type, nin, nq_out, dall, bq};
+            L.attn_gate = DenseMat{(int) tg->type, nin, ng_out, dall + bq, bg};
+            L.attn_rel = DenseMat{(int) tr->type, nin, nr_out, dall + bq + bg, br};
+            L.attn_k = DenseMat{(int) tk->type, nin, nk_out, dall + bq + bg + br, bk};
+            L.attn_v = DenseMat{(int) tv->type, nin, nv_out, dall + bq + bg + br + bk, bv};
+            L.attn_qgr = DenseMat{(int) tq->type, nin, nq_out + ng_out + nr_out, dall, bq + bg + br};
+            L.attn_qgrkv = DenseMat{(int) tq->type, nin, nq_out + ng_out + nr_out + nk_out + nv_out, dall, bq + bg + br + bk + bv};
+        } else if (qgr_ok) {
             const int64_t nin = (int64_t) tq->shape[0];
             const size_t rb = strata::quant::row_bytes((int) tq->type, nin);
             const int64_t nq_out = tq->shape.size() > 1 ? (int64_t) tq->shape[1] : 1;
@@ -461,8 +498,41 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
             L.attn_gate = m.upload_dense(tn("attn_gate.weight"), 0, 0, false, pack_core);
             L.attn_rel = m.upload_dense(tn("attn_rel.weight"));
         }
-        L.attn_k = m.upload_dense(tn("attn_k.weight"), 0, 0, false, pack_core);
-        L.attn_v = m.upload_dense(tn("attn_v.weight"), 0, 0, false, pack_core);
+        if (!kv_ok_in_qgr) {
+            if (!L.is_swa) {
+                const strata::TensorInfo *tkc = nullptr, *tvc = nullptr;
+                std::string sn_kc = "blk." + std::to_string(ip) + ".attn_k_conv_proj.weight";
+                std::string sn_vc = "blk." + std::to_string(ip) + ".attn_v_conv_proj.weight";
+                const uint8_t* raw_kc = m.find_tensor(sn_kc.c_str(), &tkc);
+                const uint8_t* raw_vc = m.find_tensor(sn_vc.c_str(), &tvc);
+                auto upload_pair_k = [&](const uint8_t* ra, const strata::TensorInfo* ta, const uint8_t* rb_raw, const strata::TensorInfo* tb,
+                                         DenseMat& out_a, DenseMat& out_b, DenseMat& out_pair, const char* nm_a, const char* nm_b) {
+                    if (ra && ta && rb_raw && tb && ta->type == tb->type && ta->shape[0] == tb->shape[0] &&
+                        ta->type != 0 && ta->type != 1 && ta->type != 30 && K::native_mmvq_supported((int) ta->type)) {
+                        const int64_t nin = (int64_t) ta->shape[0];
+                        const size_t rbytes = strata::quant::row_bytes((int) ta->type, nin);
+                        const int64_t na = ta->shape.size() > 1 ? (int64_t) ta->shape[1] : 1;
+                        const int64_t nb = tb->shape.size() > 1 ? (int64_t) tb->shape[1] : 1;
+                        const size_t ba = rbytes * (size_t) na, bb = rbytes * (size_t) nb;
+                        uint8_t* dpair = m.gpu_alloc<uint8_t>(ba + bb);
+                        CK(cudaMemcpy(dpair, ra, ba, cudaMemcpyHostToDevice));
+                        CK(cudaMemcpy(dpair + ba, rb_raw, bb, cudaMemcpyHostToDevice));
+                        m.has_quant_dense = true;
+                        out_a = DenseMat{(int) ta->type, nin, na, dpair, ba};
+                        out_b = DenseMat{(int) tb->type, nin, nb, dpair + ba, bb};
+                        out_pair = DenseMat{(int) ta->type, nin, na + nb, dpair, ba + bb};
+                    } else {
+                        out_a = m.upload_dense(nm_a, 0, 0, false, pack_core);
+                        out_b = m.upload_dense(nm_b);
+                    }
+                };
+                upload_pair_k(raw_k, tk, raw_kc, tkc, L.attn_k, L.attn_k_conv_proj, L.attn_kkc, tn("attn_k.weight"), sn_kc.c_str());
+                upload_pair_k(raw_v, tv, raw_vc, tvc, L.attn_v, L.attn_v_conv_proj, L.attn_vvc, tn("attn_v.weight"), sn_vc.c_str());
+            } else {
+                L.attn_k = m.upload_dense(tn("attn_k.weight"), 0, 0, false, pack_core);
+                L.attn_v = m.upload_dense(tn("attn_v.weight"), 0, 0, false, pack_core);
+            }
+        }
         L.attn_output = m.upload_dense(tn("attn_output.weight"), 0, 0, false, pack_core);
         L.attn_sink_proj = m.upload_dense(tn("attn_sink_proj.weight"));
 
@@ -472,8 +542,6 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
             L.attn_q_inp_norm = m.upload_f32(tn("attn_q_inp_norm.weight"), (size_t) hp.n_embd);
             L.attn_k_inp_norm = m.upload_f32(tn("attn_k_inp_norm.weight"), (size_t) hp.n_embd);
             L.attn_v_inp_norm = m.upload_f32(tn("attn_v_inp_norm.weight"), (size_t) hp.n_embd);
-            L.attn_k_conv_proj = m.upload_dense(tn("attn_k_conv_proj.weight"));
-            L.attn_v_conv_proj = m.upload_dense(tn("attn_v_conv_proj.weight"));
         }
 
         if (L.has_loop) {
@@ -853,7 +921,7 @@ struct Engine {
         d_f32(&K, (size_t) tmax * hp.kv_dim);
         d_f32(&V, (size_t) tmax * hp.kv_dim);
         d_f32(&R, (size_t) tmax * hp.n_rel * hp.n_head);
-        d_f32(&qgr_t1, (size_t) (2 * hp.q_dim + hp.n_rel * hp.n_head));
+        d_f32(&qgr_t1, (size_t) (2 * hp.q_dim + hp.n_rel * hp.n_head + 2 * hp.kv_dim + 2 * hp.n_conv * hp.n_head_kv));
         d_f32(&K_conv, (size_t) tmax * hp.kv_dim);
         d_f32(&V_conv, (size_t) tmax * hp.kv_dim);
         d_f32(&dyn_k, (size_t) tmax * hp.n_conv * hp.n_head_kv);
@@ -1001,8 +1069,8 @@ struct Engine {
         const int N = (int) hp.n_embd;
         k_control_prep<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, ctrl2N, N, hp.rms_eps);
         project(ctrl2N, L.loop_down[mod], ctrl64, T, hp.loop_gate_rank, 2 * N);
-        if (T == 1 && hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0 && (N % 1) == 0) {
-            k_control_up_combine_t1<<<(unsigned) ((N + 7) / 8), 256, 0, st>>>(
+        if (T == 1 && hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
+            k_control_up_combine_t1<<<(unsigned) ((N + 31) / 32), 256, 0, st>>>(
                 c, msg, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d,
                 ctrl64, out, (int) hp.loop_gate_rank, N);
             return;
@@ -1363,10 +1431,14 @@ struct Engine {
                     const int64_t row = 2 * (ip - hp.core_start);
                     const float* q_attn = m->loop_res_query + row * N;
                     const float* q_kv = m->loop_kv_res_query + row * N;
-                    float* out_attn[2] = {msg0, msg3};
-                    float* out_kv[2] = {msg1, msg2};
-                    run_mix_normed(norm_bank, bank_last_norm, true, q_attn, out_attn, 2, T, 0);
-                    run_mix_normed(norm_bank, bank_last_norm, true, q_kv, out_kv, 2, T, 0);
+                    NormMixPtrs np{};
+                    const int B = (int) norm_bank.size();
+                    for (int i = 0; i < B; ++i) np.p[i] = norm_bank[(size_t) (B - 1 - i)];
+                    np.p[B] = bank_last_norm;
+                    MixOuts4 mo4{};
+                    mo4.p[0] = msg0; mo4.p[1] = msg3; mo4.p[2] = msg1; mo4.p[3] = msg2;
+                    k_mix_normed_4<<<dim3(4, (unsigned) T), kThreads, 0, st>>>(
+                        np, B + 1, q_attn, q_kv, mo4, N, 1.0f / std::sqrt((float) N));
                 }
             }
 
@@ -1381,9 +1453,7 @@ struct Engine {
                     run_control(in_v, msg2, L, 2, in_v, T);
                 }
                 if (is_swa && has_msg) {
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_norm, in_k, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_norm, in_v, N, hp.rms_eps);
+                    k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
                 } else if (is_swa) {
                     k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
                     ink_src = in_q;
@@ -1398,9 +1468,13 @@ struct Engine {
                     run_control(cur, msg0, L, 0, in_q, T);
                     run_control(cur, msg1, L, 1, in_k, T);
                     run_control(cur, msg2, L, 2, in_v, T);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, is_swa ? L.attn_norm : L.attn_q_inp_norm, in_q, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, is_swa ? L.attn_norm : L.attn_k_inp_norm, in_k, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, is_swa ? L.attn_norm : L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                    if (is_swa) {
+                        k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
+                    } else {
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                    }
                 } else if (is_swa) {
                     k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_norm, in_q, N, hp.rms_eps);
                     ink_src = in_q;
@@ -1424,28 +1498,55 @@ struct Engine {
             float* pQ = Q;
             float* pGate = att_gate;
             float* pR = R;
-            if (T == 1 && L.attn_qgr.d != nullptr) {
+            float* pK = K;
+            float* pV = V;
+            float* pDynK = dyn_k;
+            float* pDynV = dyn_v;
+            const int64_t rel_dim = hp.n_rel * hp.n_head;
+            const int64_t dyn_dim = hp.n_conv * hp.n_head_kv;
+            if (T == 1 && !has_msg && is_swa && L.attn_qgrkv.d != nullptr) {
                 pQ = qgr_t1;
                 pGate = qgr_t1 + q_dim;
                 pR = qgr_t1 + 2 * q_dim;
-                project_preq(in_q, xq, L.attn_qgr, qgr_t1, 1, L.attn_qgr.n_out, N);
+                pK = pR + rel_dim;
+                pV = pK + kv_dim;
+                project_preq(in_q, xq, L.attn_qgrkv, qgr_t1, 1, L.attn_qgrkv.n_out, N);
             } else {
-                project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N);
-                project_preq(in_q, xq, L.attn_rel, R, T, hp.n_rel * hp.n_head, N);
-                project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N);
+                if (T == 1 && L.attn_qgr.d != nullptr) {
+                    pQ = qgr_t1;
+                    pGate = qgr_t1 + q_dim;
+                    pR = qgr_t1 + 2 * q_dim;
+                    project_preq(in_q, xq, L.attn_qgr, qgr_t1, 1, L.attn_qgr.n_out, N);
+                } else {
+                    project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N);
+                    project_preq(in_q, xq, L.attn_rel, R, T, rel_dim, N);
+                    project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N);
+                }
+                if (!is_swa && T == 1 && L.attn_kkc.d != nullptr) {
+                    float* kbuf = qgr_t1 + 2 * q_dim + rel_dim;
+                    pK = kbuf;
+                    pDynK = kbuf + kv_dim;
+                    project_preq(ink_src, xq_k_src, L.attn_kkc, kbuf, 1, L.attn_kkc.n_out, N);
+                } else {
+                    project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N);
+                    if (!is_swa) project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N);
+                }
+                if (!is_swa && T == 1 && L.attn_vvc.d != nullptr) {
+                    float* vbuf = qgr_t1 + 2 * q_dim + rel_dim + kv_dim + dyn_dim;
+                    pV = vbuf;
+                    pDynV = vbuf + kv_dim;
+                    project_preq(inv_src, xq_v_src, L.attn_vvc, vbuf, 1, L.attn_vvc.n_out, N);
+                } else {
+                    project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N);
+                    if (!is_swa) project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N);
+                }
             }
-            project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N);
-            project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N);
 
             float* hst = conv_hist[(size_t) il];
-            if (!is_swa) {
-                project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, hp.n_conv * hp.n_head_kv, N);
-                project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, hp.n_conv * hp.n_head_kv, N);
-            }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
             const auto tp_d2 = Clock::now();
             k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
-                K, V, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : dyn_k, is_swa ? nullptr : dyn_v,
+                pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
                 hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
 
             const int apply_tau = is_swa ? 0 : 1;
@@ -1703,13 +1804,39 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     std::vector<uint8_t> tmp;
     bool need_cpu = false;
     int total_vram_experts = 0;
+    size_t actual_used = 0;
+    std::vector<int> alloc_order;
+    alloc_order.reserve((size_t) hp.n_phys);
+    for (int ip : tier1) alloc_order.push_back(ip);
+    for (int ip : tier2) alloc_order.push_back(ip);
     for (int ip = 0; ip < hp.n_phys; ++ip) {
+        if (m.layers[(size_t) ip].gu_type == 30) alloc_order.push_back(ip);
+    }
+    for (int ip : alloc_order) {
         PhysLayer& L = m.layers[(size_t) ip];
-        const int s = slots[(size_t) ip];
-        L.n_slots = s;
+        int s = slots[(size_t) ip];
         L.slot_of.assign((size_t) ne, -1);
-        L.exp_in_slot.assign((size_t) s, -1);
         L.score.assign((size_t) ne, 0.0);
+
+        if (s > 0) {
+            void* dbl = nullptr;
+            while (s > 0 && cudaMalloc(&dbl, (size_t) s * L.stride) != cudaSuccess) {
+                (void) cudaGetLastError();
+                --s;
+            }
+            if (s > 0 && dbl) {
+                L.d_blobs = (uint8_t*) dbl;
+                m.gpu_allocs.push_back(L.d_blobs);
+                CK(cudaMalloc(&L.d_slot_of, (size_t) ne * sizeof(int32_t)));
+                m.gpu_allocs.push_back(L.d_slot_of);
+                actual_used += (size_t) s * L.stride;
+            } else {
+                s = 0;
+            }
+        }
+        slots[(size_t) ip] = s;
+        L.n_slots = s;
+        L.exp_in_slot.assign((size_t) s, -1);
 
         if (s < ne) {
             need_cpu = true;
@@ -1730,11 +1857,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         }
 
         if (s > 0) {
-            CK(cudaMalloc(&L.d_blobs, (size_t) s * L.stride));
-            m.gpu_allocs.push_back(L.d_blobs);
-            CK(cudaMalloc(&L.d_slot_of, (size_t) ne * sizeof(int32_t)));
-            m.gpu_allocs.push_back(L.d_slot_of);
-
             tmp.resize(L.L.bytes);
             for (int k = 0; k < s; ++k) {
                 const uint8_t* src = L.hblobs ? (L.hblobs + (size_t) k * L.stride) : (build_expert_blob(L, k, tmp.data()), tmp.data());
@@ -1747,6 +1869,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         }
         if (s > 0 && s < ne) E.hybrid = true;
     }
+    used = actual_used;
 
 #if defined(STRATA_INKLING2_CPU_POOL)
     if (need_cpu) {
