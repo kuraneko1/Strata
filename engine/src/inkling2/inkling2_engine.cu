@@ -30,6 +30,9 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <random>
@@ -660,6 +663,7 @@ struct Engine {
     strata::prefill::Gemm gemm;
 
     int ctx = 16384;
+    int full_kv_cap = 16384;
     int tmax = 512;
     int64_t pos = 0;
 
@@ -927,6 +931,9 @@ struct Engine {
               bool enable_gemm_quant = false, int max_verify_t = 1) {
         m = &model;
         ctx = max_ctx;
+        size_t vfree_init = 0, vtot_init = 0;
+        CK(cudaMemGetInfo(&vfree_init, &vtot_init));
+        full_kv_cap = (vtot_init < (20ULL << 30) && max_ctx > 32768) ? 32768 : max_ctx;
         tmax = std::max(max_t, max_verify_t);
         verify_max_t = std::max(1, max_verify_t);
         kv_q8 = use_kv_q8;
@@ -953,7 +960,7 @@ struct Engine {
         CK(cudaMalloc(&conv_hist_pool, (size_t) hp.n_layer * layer_conv_floats * sizeof(float)));
         swa_ptrs.n_swa_layers = 0;
         for (int il = 0; il < hp.n_layer; ++il) {
-            const int cap = hp.is_swa(il) ? (int) hp.n_swa : ctx;
+            const int cap = hp.is_swa(il) ? (int) hp.n_swa : full_kv_cap;
             kv_cap[(size_t) il] = cap;
             if (kv_q8) {
                 CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
@@ -1527,9 +1534,118 @@ struct Engine {
         has_pending_rebal = true;
     }
 
+    void ensure_kv_cap(int needed_pos) {
+        if (needed_pos <= full_kv_cap || full_kv_cap >= ctx) return;
+        const auto& hp = m->hp;
+        const int new_cap = std::min(ctx, std::max(needed_pos, full_kv_cap * 2));
+        if (new_cap <= full_kv_cap) return;
+
+        CK(cudaStreamSynchronize(st));
+        if (cst) CK(cudaStreamSynchronize(cst));
+        has_pending_rebal = false;
+
+        int n_full = 0;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            if (!hp.is_swa(il)) ++n_full;
+        }
+        const size_t per_tok = kv_q8
+            ? ((size_t) hp.kv_dim * 2 + (size_t) hp.n_head_kv * sizeof(__half) * 2)
+            : ((size_t) hp.kv_dim * sizeof(__half) * 2);
+        const size_t extra_total = (size_t) n_full * (size_t) (new_cap - full_kv_cap) * per_tok;
+        const size_t need_free = extra_total + (size_t) new_cap * per_tok + ((size_t) 160 << 20);
+
+        auto evict_layer = [&](int ip) {
+            PhysLayer& L = m->layers[(size_t) ip];
+            if (L.n_slots <= 0 || !L.d_blobs) return false;
+            const int ne = (int) hp.n_expert;
+            if (!L.hblobs && L.gu_type != 30) {
+                const size_t hb_bytes = (size_t) ne * L.stride;
+                L.hblobs = (uint8_t*) std::malloc(hb_bytes);
+                if (!L.hblobs) {
+                    std::fprintf(stderr, "strata-inkling2: host malloc failed during KV growth for layer %d\n", ip);
+                    std::exit(1);
+                }
+                m->host_allocs.push_back(L.hblobs);
+                for (int e = 0; e < ne; ++e) build_expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+            }
+            auto it = std::find(m->gpu_allocs.begin(), m->gpu_allocs.end(), (void*) L.d_blobs);
+            if (it != m->gpu_allocs.end()) m->gpu_allocs.erase(it);
+            CK(cudaFree(L.d_blobs));
+            L.d_blobs = nullptr;
+            L.n_slots = 0;
+            std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
+            L.exp_in_slot.clear();
+            if (L.d_slot_of) {
+                CK(cudaMemcpy(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice));
+            }
+            if (ip >= hp.core_start && ip < hp.core_end) {
+                core_all_gpu = false;
+                if (core_graph) { cudaGraphExecDestroy(core_graph); core_graph = nullptr; }
+                if (verify_core_graph) { cudaGraphExecDestroy(verify_core_graph); verify_core_graph = nullptr; }
+            }
+            for (auto& g : layer_pre_graph) {
+                if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+            }
+            hybrid = true;
+            return true;
+        };
+
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        if (fr < need_free) {
+            for (int ip = (int) m->layers.size() - 1; ip >= 0 && fr < need_free; --ip) {
+                if (ip >= hp.core_start && ip < hp.core_end) continue;
+                if (evict_layer(ip)) CK(cudaMemGetInfo(&fr, &tot));
+            }
+            for (int ip = (int) m->layers.size() - 1; ip >= 0 && fr < need_free; --ip) {
+                if (ip < hp.core_start || ip >= hp.core_end) continue;
+                if (evict_layer(ip)) CK(cudaMemGetInfo(&fr, &tot));
+            }
+        }
+
+        for (int il = 0; il < hp.n_layer; ++il) {
+            if (hp.is_swa(il)) continue;
+            const size_t n_old = (size_t) std::min<int64_t>(pos, full_kv_cap);
+            if (kv_q8) {
+                int8_t *nkq = nullptr, *nvq = nullptr;
+                __half *nks = nullptr, *nvs = nullptr;
+                CK(cudaMalloc(&nkq, (size_t) new_cap * hp.kv_dim * sizeof(int8_t)));
+                CK(cudaMalloc(&nvq, (size_t) new_cap * hp.kv_dim * sizeof(int8_t)));
+                CK(cudaMalloc(&nks, (size_t) new_cap * hp.n_head_kv * sizeof(__half)));
+                CK(cudaMalloc(&nvs, (size_t) new_cap * hp.n_head_kv * sizeof(__half)));
+                if (n_old > 0) {
+                    CK(cudaMemcpyAsync(nkq, kq[(size_t) il], n_old * hp.kv_dim * sizeof(int8_t), cudaMemcpyDeviceToDevice, st));
+                    CK(cudaMemcpyAsync(nvq, vq[(size_t) il], n_old * hp.kv_dim * sizeof(int8_t), cudaMemcpyDeviceToDevice, st));
+                    CK(cudaMemcpyAsync(nks, ks[(size_t) il], n_old * hp.n_head_kv * sizeof(__half), cudaMemcpyDeviceToDevice, st));
+                    CK(cudaMemcpyAsync(nvs, vs[(size_t) il], n_old * hp.n_head_kv * sizeof(__half), cudaMemcpyDeviceToDevice, st));
+                    CK(cudaStreamSynchronize(st));
+                }
+                cudaFree(kq[(size_t) il]); cudaFree(vq[(size_t) il]);
+                cudaFree(ks[(size_t) il]); cudaFree(vs[(size_t) il]);
+                kq[(size_t) il] = nkq; vq[(size_t) il] = nvq;
+                ks[(size_t) il] = nks; vs[(size_t) il] = nvs;
+            } else {
+                __half *nkc = nullptr, *nvc = nullptr;
+                CK(cudaMalloc(&nkc, (size_t) new_cap * hp.kv_dim * sizeof(__half)));
+                CK(cudaMalloc(&nvc, (size_t) new_cap * hp.kv_dim * sizeof(__half)));
+                if (n_old > 0) {
+                    CK(cudaMemcpyAsync(nkc, kc[(size_t) il], n_old * hp.kv_dim * sizeof(__half), cudaMemcpyDeviceToDevice, st));
+                    CK(cudaMemcpyAsync(nvc, vc[(size_t) il], n_old * hp.kv_dim * sizeof(__half), cudaMemcpyDeviceToDevice, st));
+                    CK(cudaStreamSynchronize(st));
+                }
+                cudaFree(kc[(size_t) il]); cudaFree(vc[(size_t) il]);
+                kc[(size_t) il] = nkc; vc[(size_t) il] = nvc;
+            }
+            kv_cap[(size_t) il] = new_cap;
+        }
+        full_kv_cap = new_cap;
+        std::fprintf(stderr, "strata-inkling2: expanded full-attn KV cache to %d slots\n", full_kv_cap);
+    }
+
     int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr,
                     bool all_row_logits = false, bool capture_dspark = false, int verify_k_save = 0,
                     std::vector<int32_t>* out_picks = nullptr) {
+        ensure_kv_cap((int) (pos + T));
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
         const int64_t kv_dim = hp.kv_dim;
@@ -2079,7 +2195,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     int total_vram_experts = 0;
     size_t actual_used = 0;
     size_t pinned_used = 0;
-    size_t max_pin_bytes = (size_t) 7168 << 20;   // 7.0 GiB cap covers 100% of tier1 (or all tier2 at 64K) without swap thrashing
+    size_t max_pin_bytes = (size_t) 7168 << 20;
+#if !defined(_WIN32)
+    {
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long psize = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && psize > 0) {
+            const size_t phys_ram = (size_t) pages * (size_t) psize;
+            max_pin_bytes = std::clamp<size_t>((phys_ram * 2) / 5, (size_t) 7168 << 20, (size_t) 12288 << 20);
+        }
+    }
+#endif
     if (const char* v = std::getenv("STRATA_MAX_PIN_MB")) max_pin_bytes = (size_t) std::max(0, std::atoi(v)) << 20;
     std::vector<int> alloc_order;
     alloc_order.reserve((size_t) hp.n_phys);
@@ -2499,7 +2625,16 @@ int run(int argc, char** argv) {
     if (chunk <= 0) {
         size_t vfree = 0, vtot = 0;
         cudaMemGetInfo(&vfree, &vtot);
-        chunk = (vtot >= (20ULL << 30)) ? 1024 : 512;
+        const int init_kv = (vtot < (20ULL << 30) && max_ctx > 32768) ? 32768 : max_ctx;
+        int n_full = 0;
+        for (int il = 0; il < m.hp.n_layer; ++il) {
+            if (!m.hp.is_swa(il)) ++n_full;
+        }
+        const size_t per_tok = kv_q8
+            ? ((size_t) m.hp.kv_dim * 2 + (size_t) m.hp.n_head_kv * sizeof(__half) * 2)
+            : ((size_t) m.hp.kv_dim * sizeof(__half) * 2);
+        const size_t est_kv = (size_t) n_full * (size_t) init_kv * per_tok;
+        chunk = (vfree > est_kv + (4ULL << 30)) ? 1024 : 512;
     }
     // Keep prefill chunk <= n_swa so circular SWA KV stores never overwrite earlier tokens in the same chunk.
     chunk = std::clamp(chunk, 1, (int) m.hp.n_swa);
