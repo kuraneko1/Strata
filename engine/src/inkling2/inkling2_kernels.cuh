@@ -549,6 +549,101 @@ __global__ void k_shortconv_kv(const float* __restrict__ K, const float* __restr
     hc[2] = h2;
 }
 
+/// Parallel tiled shortconv (prefill, T >= 32, read-only on `hist` from blockIdx.y==0):
+/// Grid: ((n_ch+255)/256, (T+15)/16), Block: 256. Followed by k_shortconv_hist_push.
+__global__ void k_shortconv_pp(const float* __restrict__ cur, const float* __restrict__ w,
+                               const float* __restrict__ hist, float* __restrict__ out,
+                               int n_ch, int hist_offset, int T, const float* __restrict__ res_add) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_ch) return;
+    const int t0 = blockIdx.y * 16;
+    const int t1 = min(T, t0 + 16);
+    float h0, h1, h2;
+    if (t0 == 0) {
+        const float* hc = hist + (size_t) (hist_offset + c) * 3;
+        h0 = hc[0]; h1 = hc[1]; h2 = hc[2];
+    } else {
+        h0 = cur[(size_t) (t0 - 3) * n_ch + c];
+        h1 = cur[(size_t) (t0 - 2) * n_ch + c];
+        h2 = cur[(size_t) (t0 - 1) * n_ch + c];
+    }
+    const float4 w4 = *reinterpret_cast<const float4*>(w + (size_t) c * 4);
+    const float scale = rsqrtf(5.0f);
+    for (int t = t0; t < t1; ++t) {
+        const size_t idx = (size_t) t * n_ch + c;
+        const float x = cur[idx];
+        const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+        float y = (x + s) * scale;
+        if (res_add) y += res_add[idx];
+        out[idx] = y;
+        h0 = h1; h1 = h2; h2 = x;
+    }
+}
+
+__global__ void k_shortconv_kv_pp(const float* __restrict__ K, const float* __restrict__ V,
+                                  const float* __restrict__ wk, const float* __restrict__ wv,
+                                  const float* __restrict__ dyn_k, const float* __restrict__ dyn_v,
+                                  const float* __restrict__ hist, float* __restrict__ K_out, float* __restrict__ V_out,
+                                  int kv_dim, int n_heads, int T) {
+    const int c_all = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c_all >= 2 * kv_dim) return;
+    const bool is_v = (c_all >= kv_dim);
+    const int c = is_v ? (c_all - kv_dim) : c_all;
+    const float* cur = is_v ? V : K;
+    const float* dyn = is_v ? dyn_v : dyn_k;
+    float* out = is_v ? V_out : K_out;
+    const int t0 = blockIdx.y * 16;
+    const int t1 = min(T, t0 + 16);
+    float h0, h1, h2;
+    if (t0 == 0) {
+        const float* hc = hist + (size_t) c_all * 3;
+        h0 = hc[0]; h1 = hc[1]; h2 = hc[2];
+    } else {
+        h0 = cur[(size_t) (t0 - 3) * kv_dim + c];
+        h1 = cur[(size_t) (t0 - 2) * kv_dim + c];
+        h2 = cur[(size_t) (t0 - 1) * kv_dim + c];
+    }
+    const float4 w4 = *reinterpret_cast<const float4*>((is_v ? wv : wk) + (size_t) c * 4);
+    const int head_dim = n_heads > 0 ? (kv_dim / n_heads) : 0;
+    const int h_idx = n_heads > 0 ? (c / head_dim) : 0;
+    const float scale = rsqrtf(dyn ? 9.0f : 5.0f);
+    for (int t = t0; t < t1; ++t) {
+        const size_t idx = (size_t) t * kv_dim + c;
+        const float x = cur[idx];
+        float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+        if (dyn) {
+            const float* dt = dyn + ((size_t) t * n_heads + h_idx) * 4;
+            s += x * dt[0] + h2 * dt[1] + h1 * dt[2] + h0 * dt[3];
+        }
+        out[idx] = (x + s) * scale;
+        h0 = h1; h1 = h2; h2 = x;
+    }
+}
+
+/// Update `hist` after parallel k_shortconv_pp / k_shortconv_kv_pp (for T >= 3).
+__global__ void k_shortconv_hist_push(const float* __restrict__ cur, float* __restrict__ hist,
+                                      int n_ch, int hist_offset, int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_ch) return;
+    float* hc = hist + (size_t) (hist_offset + c) * 3;
+    hc[0] = cur[(size_t) (T - 3) * n_ch + c];
+    hc[1] = cur[(size_t) (T - 2) * n_ch + c];
+    hc[2] = cur[(size_t) (T - 1) * n_ch + c];
+}
+
+__global__ void k_shortconv_kv_hist_push(const float* __restrict__ K, const float* __restrict__ V,
+                                         float* __restrict__ hist, int kv_dim, int T) {
+    const int c_all = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c_all >= 2 * kv_dim) return;
+    const bool is_v = (c_all >= kv_dim);
+    const int c = is_v ? (c_all - kv_dim) : c_all;
+    const float* cur = is_v ? V : K;
+    float* hc = hist + (size_t) c_all * 3;
+    hc[0] = cur[(size_t) (T - 3) * kv_dim + c];
+    hc[1] = cur[(size_t) (T - 2) * kv_dim + c];
+    hc[2] = cur[(size_t) (T - 1) * kv_dim + c];
+}
+
 /// clip(x, scale, thr) per [T][n_heads][D]. Also optionally multiplies by per-token tau if alpha > 0.
 /// grid (n_heads, T), block min(128, D) or 32 (one warp when D <= 128).
 __global__ void k_clip_and_tau(float* __restrict__ x, const float* __restrict__ scale, float thr, int D, int n_heads,
@@ -965,6 +1060,149 @@ __global__ void k_attn_q8_gqa3_pp(const float* __restrict__ Q,
             if (gate) val *= sigmf(gate[oi]);
             out[oi] = val;
         }
+    }
+}
+
+/// Q-tiled GQA-3 prefill Q8 attention (4 queries per CTA -> 4x fewer KV HBM2 loads).
+/// Grid: (n_head_kv, (T + 3) / 4), Block: 128.
+__global__ void k_attn_q8_gqa3_pp_q4(const float* __restrict__ Q,
+                                     const int8_t* __restrict__ kq, const __half* __restrict__ ks,
+                                     const int8_t* __restrict__ vq, const __half* __restrict__ vs,
+                                     const float* __restrict__ rel_tab, const float* __restrict__ sink,
+                                     const float* __restrict__ gate, float* __restrict__ out,
+                                     int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
+                                     const int32_t* __restrict__ pos0, float kq_scale, int T) {
+    __shared__ float sq[4][3][128];
+    __shared__ float s_m[3][4];
+    __shared__ float s_l[3][4];
+    __shared__ float s_acc[3][4][128];
+    const int hkv = blockIdx.x, t0 = blockIdx.y * 4;
+    const int bq_cnt = min(4, T - t0);
+    if (bq_cnt <= 0) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int kv_dim = n_head_kv * 128;
+    const int h0 = 3 * hkv;
+    if (threadIdx.x < 128) {
+        for (int bq = 0; bq < bq_cnt; ++bq) {
+#pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                sq[bq][g][threadIdx.x] = Q[((size_t) (t0 + bq) * n_head + (h0 + g)) * 128 + threadIdx.x];
+            }
+        }
+    }
+    __syncthreads();
+
+    const int base4 = lane * 4;
+    const int p0 = pos0[0];
+    int pos_q[4], j0[4], j1[4];
+    float neg_sink[4][3];
+    const float* rt[4][3];
+    float m[4][3], l[4][3], acc[4][3][4];
+    for (int bq = 0; bq < 4; ++bq) {
+        const int t = t0 + bq;
+        pos_q[bq] = p0 + t;
+        j0[bq] = is_swa ? max(0, pos_q[bq] - n_swa + 1) : 0;
+        j1[bq] = pos_q[bq] + 1;
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            const int h = h0 + g;
+            if (bq < bq_cnt) {
+                rt[bq][g] = rel_tab + ((size_t) t * n_head + h) * n_ext;
+                neg_sink[bq][g] = -sink[(size_t) t * n_head + h];
+            }
+            m[bq][g] = (warp == 0) ? 0.0f : -1e30f;
+            l[bq][g] = (warp == 0) ? 1.0f : 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[bq][g][i] = 0.0f;
+        }
+    }
+
+    const int j_min = j0[0];
+    const int j_max = j1[bq_cnt - 1];
+    const bool pow2_cap = (cap & (cap - 1)) == 0;
+    const int cap_mask = cap - 1;
+
+    for (int j = j_min + warp; j < j_max; j += 4) {
+        const int slot = is_swa ? (pow2_cap ? (j & cap_mask) : (j % cap)) : j;
+        const size_t idx = (size_t) slot * n_head_kv + hkv;
+        const float d_k = __half2float(ks[idx]);
+        const float d_v = __half2float(vs[idx]);
+        const int8_t* kj = kq + (size_t) slot * kv_dim + hkv * 128;
+        const int8_t* vj = vq + (size_t) slot * kv_dim + hkv * 128;
+        const char4 kc4 = *reinterpret_cast<const char4*>(kj + base4);
+        const float k0 = (float) kc4.x, k1 = (float) kc4.y, k2 = (float) kc4.z, k3 = (float) kc4.w;
+        const char4 vc4 = *reinterpret_cast<const char4*>(vj + base4);
+        const float v0 = (float) vc4.x, v1 = (float) vc4.y, v2 = (float) vc4.z, v3 = (float) vc4.w;
+        const float dkkq = d_k * kq_scale;
+
+#pragma unroll
+        for (int bq = 0; bq < 4; ++bq) {
+            if (bq >= bq_cnt || j < j0[bq] || j >= j1[bq]) continue;
+            const int dist = pos_q[bq] - j;
+            const float4 q0 = *reinterpret_cast<const float4*>(&sq[bq][0][base4]);
+            const float4 q1 = *reinterpret_cast<const float4*>(&sq[bq][1][base4]);
+            const float4 q2 = *reinterpret_cast<const float4*>(&sq[bq][2][base4]);
+            float dot0 = q0.x * k0 + q0.y * k1 + q0.z * k2 + q0.w * k3;
+            float dot1 = q1.x * k0 + q1.y * k1 + q1.z * k2 + q1.w * k3;
+            float dot2 = q2.x * k0 + q2.y * k1 + q2.z * k2 + q2.w * k3;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                dot0 += __shfl_xor_sync(0xffffffffu, dot0, o);
+                dot1 += __shfl_xor_sync(0xffffffffu, dot1, o);
+                dot2 += __shfl_xor_sync(0xffffffffu, dot2, o);
+            }
+            const float dots[3] = {dot0, dot1, dot2};
+#pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                const float bias = dist < n_ext ? rt[bq][g][dist] : neg_sink[bq][g];
+                const float sc = dots[g] * dkkq + bias;
+                const float m_new = fmaxf(m[bq][g], sc);
+                const float alpha = l[bq][g] > 0.0f ? __expf(m[bq][g] - m_new) : 0.0f;
+                const float p = __expf(sc - m_new);
+                const float pv = p * d_v;
+                l[bq][g] = l[bq][g] * alpha + p;
+                acc[bq][g][0] = acc[bq][g][0] * alpha + pv * v0;
+                acc[bq][g][1] = acc[bq][g][1] * alpha + pv * v1;
+                acc[bq][g][2] = acc[bq][g][2] * alpha + pv * v2;
+                acc[bq][g][3] = acc[bq][g][3] * alpha + pv * v3;
+                m[bq][g] = m_new;
+            }
+        }
+    }
+
+    for (int bq = 0; bq < bq_cnt; ++bq) {
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            if (lane == 0) {
+                s_m[g][warp] = m[bq][g];
+                s_l[g][warp] = l[bq][g];
+            }
+            s_acc[g][warp][base4] = acc[bq][g][0];
+            s_acc[g][warp][base4 + 1] = acc[bq][g][1];
+            s_acc[g][warp][base4 + 2] = acc[bq][g][2];
+            s_acc[g][warp][base4 + 3] = acc[bq][g][3];
+        }
+        __syncthreads();
+        if (threadIdx.x < 128) {
+#pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                float mg = s_m[g][0];
+                for (int w = 1; w < 4; ++w) if (s_l[g][w] > 0.0f && s_m[g][w] > mg) mg = s_m[g][w];
+                float lg = 0.0f, og = 0.0f;
+                for (int w = 0; w < 4; ++w) {
+                    if (s_l[g][w] > 0.0f) {
+                        const float c = __expf(s_m[g][w] - mg);
+                        lg += s_l[g][w] * c;
+                        og += s_acc[g][w][threadIdx.x] * c;
+                    }
+                }
+                const size_t oi = ((size_t) (t0 + bq) * n_head + (h0 + g)) * 128 + threadIdx.x;
+                float val = __fdividef(og, lg);
+                if (gate) val *= sigmf(gate[oi]);
+                out[oi] = val;
+            }
+        }
+        __syncthreads();
     }
 }
 

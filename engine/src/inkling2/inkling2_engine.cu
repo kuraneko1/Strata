@@ -1278,15 +1278,42 @@ struct Engine {
             has_pending_rebal = false;
         }
 
+        bool q8_ready = false;
+        auto ensure_q8 = [&]() {
+            if (!q8_ready) {
+                K::quantize_q8_1_rows(x_norm, T, N, xq, st);
+                q8_ready = true;
+            }
+        };
+        bool wmma_ready = false;
+        auto ensure_f16 = [&]() {
+            if (!wmma_ready) {
+                const int64_t tot = (int64_t) T * N;
+                k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(x_norm, act_bf16, tot);
+                wmma_ready = true;
+            }
+        };
+        const bool try_wmma = (T >= 16);
+        auto run_grouped = [&](const unsigned long long* gptr, int64_t cap_g) {
+            if (try_wmma) {
+                ensure_f16();
+                if (K::native_expert_grouped_wmma(L.L, gptr, grp_start, n_groups, ent_dst, ent_tok,
+                                                  cap_g, n_ent, act_bf16, escr, eparts, st)) {
+                    return;
+                }
+            }
+            ensure_q8();
+            K::native_expert_grouped(L.L, gptr, grp_start, n_groups, ent_dst, ent_tok,
+                                     cap_g, n_ent, xq, escr, eparts, st);
+        };
+
         if (pp_streaming && need_cpu && L.gu_type != 30 && L.hblobs && pp_stage_bytes >= L.stride) {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
             CK(cudaEventRecord(ev_route, st));
-            K::quantize_q8_1_rows(x_norm, T, N, xq, st);
             if (has_gpu) {
                 k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
                                                    grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
-                K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                         std::min<int64_t>(n_ent, hp.n_expert), n_ent, xq, escr, eparts, st);
+                run_grouped(grp_ptr, std::min<int64_t>(n_ent, hp.n_expert));
             }
             const int ne = (int) hp.n_expert;
             const int n_chunks = pp_layer_cnt[(size_t) il];
@@ -1300,8 +1327,7 @@ struct Engine {
                 CK(cudaStreamWaitEvent(st, ev_pp_copy[b], 0));
                 k_group_experts_miss_map<<<1, 128, 0, st>>>(ids, pp_stage[b], L.stride, n_ent, ne, tk.map,
                                                             grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
-                K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                         std::min<int64_t>(n_ent, (int64_t) tk.n_staged), n_ent, xq, escr, eparts, st);
+                run_grouped(grp_ptr, std::min<int64_t>(n_ent, (int64_t) tk.n_staged));
                 CK(cudaEventRecord(ev_pp_used[b], st));
                 ++pp_take_idx;
                 pp_kick_next();
@@ -1330,9 +1356,7 @@ struct Engine {
         if (has_gpu) {
             k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
                                                grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
-            K::quantize_q8_1_rows(x_norm, T, N, xq, st);
-            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                     std::min<int64_t>(n_ent, hp.n_expert), n_ent, xq, escr, eparts, st);
+            run_grouped(grp_ptr, std::min<int64_t>(n_ent, hp.n_expert));
         }
         if (prof_detail) {
             CK(cudaStreamSynchronize(st));
@@ -1701,9 +1725,17 @@ struct Engine {
             float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
             const auto tp_d2 = Clock::now();
-            k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
-                pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
-                hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T, h_tr, total_conv_floats);
+            if (T >= 32 && !save_conv_trace) {
+                k_shortconv_kv_pp<<<dim3((unsigned) ((2 * kv_dim + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
+                    pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                    hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
+                k_shortconv_kv_hist_push<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
+                    pK, pV, hst, (int) kv_dim, T);
+            } else {
+                k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
+                    pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                    hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T, h_tr, total_conv_floats);
+            }
 
             const int apply_tau = is_swa ? 0 : 1;
             k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
@@ -1734,6 +1766,10 @@ struct Engine {
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, kAttnSplit);
                         k_attn_split_combine<<<(unsigned) hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int) hp.n_head, kAttnSplit);
+                    } else if (T >= 8) {
+                        k_attn_q8_gqa3_pp_q4<<<dim3((unsigned) hp.n_head_kv, (unsigned) ((T + 3) / 4)), 128, 0, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
                     } else {
                         k_attn_q8_gqa3_pp<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
@@ -1757,7 +1793,14 @@ struct Engine {
             }
             project(att, L.attn_output, wo, T, N, q_dim);
             const bool do_push = (ip % hp.attn_res_block_size == 0);
-            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur, h_tr, total_conv_floats);
+            if (T >= 32 && !save_conv_trace) {
+                k_shortconv_pp<<<dim3((unsigned) ((N + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
+                    wo, L.attn_post_conv, hst, ffn_inp, N, 2 * (int) kv_dim, T, do_push ? nullptr : cur);
+                k_shortconv_hist_push<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
+                    wo, hst, N, 2 * (int) kv_dim, T);
+            } else {
+                k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur, h_tr, total_conv_floats);
+            }
             if (do_push) push_block(cur);
 
             // MoE
@@ -1795,7 +1838,14 @@ struct Engine {
             const bool is_hy = (L.n_slots < hp.n_expert);
             run_moe(L, il, in_ffn, T);
             const auto tp_mp0 = Clock::now();
-            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T, ffn_inp, h_tr, total_conv_floats);
+            if (T >= 32 && !save_conv_trace) {
+                k_shortconv_pp<<<dim3((unsigned) ((N + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
+                    moe_raw, L.ffn_post_conv, hst, cur, N, 2 * (int) kv_dim + N, T, ffn_inp);
+                k_shortconv_hist_push<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
+                    moe_raw, hst, N, 2 * (int) kv_dim + N, T);
+            } else {
+                k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T, ffn_inp, h_tr, total_conv_floats);
+            }
             if (prof) {
                 CK(cudaStreamSynchronize(st));
                 if (is_hy) p_moe_post_ms += ms_since(tp_mp0);
