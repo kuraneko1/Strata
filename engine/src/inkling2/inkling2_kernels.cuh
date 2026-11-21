@@ -3377,9 +3377,65 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
     }
 
     // Bulk loop for !is_swa tokens with dist >= n_ext: linear slot == j, bias == -sink[h].
+    // Uses shifted-nsink (0 bulk adds), fast_exp2f_hw, lazy rescale (only when sc > m[g]), and 0xffffffffu warp shuffles.
     const int bulk_end = is_swa ? c_beg : min(c_end, max(c_beg, pos_q - n_ext + 1));
-    for (int jb = c_beg + (hw & ~1); jb < bulk_end; jb += 8) {
-        const int j = jb + (hw & 1);
+    if (c_beg < bulk_end) {
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            if (m[g] > -1e20f) m[g] -= neg_sink2[g];
+        }
+        const int bulk_vec_end = c_beg + ((bulk_end - c_beg) & ~7);
+        const unsigned hw_mask = (hw & 1) ? 0xffff0000u : 0x0000ffffu;
+        int j = c_beg + hw;
+        for (; j < bulk_vec_end; j += 8) {
+            const size_t idx = (size_t) j * n_head_kv + hkv;
+            const float dkkq2 = __half2float(__ldg(&ks[idx])) * kq_l2;
+            const uint2 k8 = *reinterpret_cast<const uint2*>(kq + (size_t) j * kv_dim + hkv * 128 + base8);
+            __half2 kh[4];
+            i8x4_to_h2x2(k8.x, kh[0], kh[1]);
+            i8x4_to_h2x2(k8.y, kh[2], kh[3]);
+            float sc[3];
+#pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                d2 = __hfma2(q2[g][1], kh[1], d2);
+                d2 = __hfma2(q2[g][2], kh[2], d2);
+                d2 = __hfma2(q2[g][3], kh[3], d2);
+                float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(hw_mask, dt, o, 16);
+                sc[g] = dt * dkkq2;
+            }
+            // Exact FP16-zero V-skip: 2^-28 = 3.7e-9 -> __float2half(p * d_v) == 0.0 bit-identically!
+            if (sc[0] - m[0] >= -28.0f || sc[1] - m[1] >= -28.0f || sc[2] - m[2] >= -28.0f) {
+                const float d_v = __half2float(__ldg(&vs[idx]));
+                const uint2 v8 = *reinterpret_cast<const uint2*>(vq + (size_t) j * kv_dim + hkv * 128 + base8);
+                __half2 vh[4];
+                i8x4_to_h2x2(v8.x, vh[0], vh[1]);
+                i8x4_to_h2x2(v8.y, vh[2], vh[3]);
+#pragma unroll
+                for (int g = 0; g < 3; ++g) {
+                    if (sc[g] - m[g] >= -28.0f) {
+                        float p;
+                        if (sc[g] > m[g]) {
+                            const float alpha = l[g] > 0.0f ? fast_exp2f_hw(m[g] - sc[g]) : 0.0f;
+                            const __half2 a2 = __half2half2(__float2half(alpha));
+                            l[g] = l[g] * alpha + 1.0f;
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) acc2[g][i] = __hmul2(acc2[g][i], a2);
+                            m[g] = sc[g];
+                            p = 1.0f;
+                        } else {
+                            p = fast_exp2f_hw(sc[g] - m[g]);
+                            l[g] += p;
+                        }
+                        const __half2 pv2 = __half2half2(__float2half(p * d_v));
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(pv2, vh[i], acc2[g][i]);
+                    }
+                }
+            }
+        }
         if (j < bulk_end) {
             const size_t idx = (size_t) j * n_head_kv + hkv;
             const float dkkq2 = __half2float(__ldg(&ks[idx])) * kq_l2;
@@ -3391,7 +3447,7 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
             i8x4_to_h2x2(k8.y, kh[2], kh[3]);
             i8x4_to_h2x2(v8.x, vh[0], vh[1]);
             i8x4_to_h2x2(v8.y, vh[2], vh[3]);
-            float dots[3];
+            const unsigned am = __activemask();
 #pragma unroll
             for (int g = 0; g < 3; ++g) {
                 __half2 d2 = __hmul2(q2[g][0], kh[0]);
@@ -3400,22 +3456,29 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 d2 = __hfma2(q2[g][3], kh[3], d2);
                 float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
-                for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(__activemask(), dt, o, 16);
-                dots[g] = dt;
-            }
+                for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(am, dt, o, 16);
+                const float sc = dt * dkkq2;
+                float p;
+                if (sc > m[g]) {
+                    const float alpha = l[g] > 0.0f ? fast_exp2f_hw(m[g] - sc) : 0.0f;
+                    const __half2 a2 = __half2half2(__float2half(alpha));
+                    l[g] = l[g] * alpha + 1.0f;
 #pragma unroll
-            for (int g = 0; g < 3; ++g) {
-                const float sc = dots[g] * dkkq2 + neg_sink2[g];
-                const float m_new = fmaxf(m[g], sc);
-                const float alpha = l[g] > 0.0f ? exp2f(m[g] - m_new) : 0.0f;
-                const float p = exp2f(sc - m_new);
-                const __half2 a2 = __half2half2(__float2half(alpha));
+                    for (int i = 0; i < 4; ++i) acc2[g][i] = __hmul2(acc2[g][i], a2);
+                    m[g] = sc;
+                    p = 1.0f;
+                } else {
+                    p = fast_exp2f_hw(sc - m[g]);
+                    l[g] += p;
+                }
                 const __half2 pv2 = __half2half2(__float2half(p * d_v));
-                l[g] = l[g] * alpha + p;
 #pragma unroll
-                for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(acc2[g][i], a2, __hmul2(pv2, vh[i]));
-                m[g] = m_new;
+                for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(pv2, vh[i], acc2[g][i]);
             }
+        }
+#pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            if (m[g] > -1e20f) m[g] += neg_sink2[g];
         }
     }
 
@@ -3436,7 +3499,7 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
             i8x4_to_h2x2(v8.x, vh[0], vh[1]);
             i8x4_to_h2x2(v8.y, vh[2], vh[3]);
             const int dist = pos_q - j;
-            float dots[3];
+            const unsigned am = __activemask();
 #pragma unroll
             for (int g = 0; g < 3; ++g) {
                 __half2 d2 = __hmul2(q2[g][0], kh[0]);
@@ -3445,22 +3508,25 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 d2 = __hfma2(q2[g][3], kh[3], d2);
                 float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
-                for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(__activemask(), dt, o, 16);
-                dots[g] = dt;
-            }
-#pragma unroll
-            for (int g = 0; g < 3; ++g) {
+                for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(am, dt, o, 16);
                 const float bias = dist < n_ext ? (rt[g][dist] * kLog2e) : neg_sink2[g];
-                const float sc = dots[g] * dkkq2 + bias;
-                const float m_new = fmaxf(m[g], sc);
-                const float alpha = l[g] > 0.0f ? exp2f(m[g] - m_new) : 0.0f;
-                const float p = exp2f(sc - m_new);
-                const __half2 a2 = __half2half2(__float2half(alpha));
-                const __half2 pv2 = __half2half2(__float2half(p * d_v));
-                l[g] = l[g] * alpha + p;
+                const float sc = dt * dkkq2 + bias;
+                float p;
+                if (sc > m[g]) {
+                    const float alpha = l[g] > 0.0f ? fast_exp2f_hw(m[g] - sc) : 0.0f;
+                    const __half2 a2 = __half2half2(__float2half(alpha));
+                    l[g] = l[g] * alpha + 1.0f;
 #pragma unroll
-                for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(acc2[g][i], a2, __hmul2(pv2, vh[i]));
-                m[g] = m_new;
+                    for (int i = 0; i < 4; ++i) acc2[g][i] = __hmul2(acc2[g][i], a2);
+                    m[g] = sc;
+                    p = 1.0f;
+                } else {
+                    p = fast_exp2f_hw(sc - m[g]);
+                    l[g] += p;
+                }
+                const __half2 pv2 = __half2half2(__float2half(p * d_v));
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(pv2, vh[i], acc2[g][i]);
             }
         }
     }
@@ -4272,6 +4338,35 @@ __global__ void k_combine_experts(const float* __restrict__ eparts, const float*
     out[(size_t) t * N + i] = s;
 }
 
+__global__ void k_combine_experts_hybrid(const float* __restrict__ eparts, const float* __restrict__ ewts,
+                                         const int32_t* __restrict__ ids, const int32_t* __restrict__ slot_of,
+                                         const float* __restrict__ cpu_sum, float* __restrict__ out,
+                                         int N, int top_k) {
+    if ((N & 3) == 0) {
+        const int n4 = N >> 2;
+        const int i4 = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i4 >= n4) return;
+        const float4 c = reinterpret_cast<const float4*>(cpu_sum)[i4];
+        float sx = c.x, sy = c.y, sz = c.z, sw = c.w;
+        for (int k = 0; k < top_k; ++k) {
+            if (slot_of[ids[k]] >= 0) {
+                const float w = ewts[k];
+                const float4 v = reinterpret_cast<const float4*>(eparts + (size_t) k * N)[i4];
+                sx += w * v.x; sy += w * v.y; sz += w * v.z; sw += w * v.w;
+            }
+        }
+        reinterpret_cast<float4*>(out)[i4] = make_float4(sx, sy, sz, sw);
+        return;
+    }
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float s = cpu_sum[i];
+    for (int k = 0; k < top_k; ++k) {
+        if (slot_of[ids[k]] >= 0) s += ewts[k] * eparts[(size_t) k * N + i];
+    }
+    out[i] = s;
+}
+
 __global__ void k_merge_cpu(float* __restrict__ eparts, const float* __restrict__ ecpu,
                             const int32_t* __restrict__ miss, int N) {
     const int e = blockIdx.x;
@@ -4284,7 +4379,8 @@ __global__ void k_group_experts(const int32_t* __restrict__ ids, const int32_t* 
                                 int n_ent, int n_exp, int n_slots,
                                 unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
                                 int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
-                                int32_t* __restrict__ ent_tok, int top_k) {
+                                int32_t* __restrict__ ent_tok, int top_k,
+                                uint32_t* __restrict__ d_hits = nullptr) {
     // 1 block of 128 threads over all n_ent <= 512*8? For T <= 512, n_ent <= 4096.
     __shared__ int32_t cnt[128];
     __shared__ int32_t slot_id[128];
@@ -4299,6 +4395,9 @@ __global__ void k_group_experts(const int32_t* __restrict__ ids, const int32_t* 
         if (slot_id[x] >= 0) atomicAdd(&cnt[x], 1);
     }
     __syncthreads();
+    if (d_hits && threadIdx.x < n_exp && cnt[threadIdx.x] > 0) {
+        d_hits[threadIdx.x] += (uint32_t) cnt[threadIdx.x];
+    }
     if (threadIdx.x == 0) {
         int ng = 0;
         int off = 0;
