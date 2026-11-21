@@ -1374,6 +1374,57 @@ __global__ void k_group_experts_miss_range(const int32_t* __restrict__ ids, cons
     }
 }
 
+/// Compact slot mapping inside `pp_stage[b]` for missing experts in one staging batch (-1 = not in batch).
+struct PpStageMap {
+    int16_t pos[128];
+};
+
+/// Group entries for compact PCIe-staged misses where `map.pos[x] >= 0` gives the compact slot inside `stage_blobs`.
+__global__ void k_group_experts_miss_map(const int32_t* __restrict__ ids,
+                                         const uint8_t* __restrict__ stage_blobs, size_t stride,
+                                         int n_ent, int n_exp, PpStageMap map,
+                                         unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
+                                         int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
+                                         int32_t* __restrict__ ent_tok, int top_k) {
+    __shared__ int32_t cnt[128];
+    __shared__ int16_t spos[128];
+    __shared__ int32_t cur_off[128];
+    if (threadIdx.x < n_exp) {
+        cnt[threadIdx.x] = 0;
+        spos[threadIdx.x] = map.pos[threadIdx.x];
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) {
+        const int x = ids[e];
+        if (spos[x] >= 0) atomicAdd(&cnt[x], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int ng = 0;
+        int off = 0;
+        for (int x = 0; x < n_exp; ++x) {
+            if (cnt[x] > 0) {
+                grp_ptr[ng] = (unsigned long long) (stage_blobs + (size_t) spos[x] * stride);
+                grp_start[ng] = off;
+                cur_off[x] = off;
+                off += cnt[x];
+                ++ng;
+            }
+        }
+        grp_start[ng] = off;
+        *n_groups = ng;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) {
+        const int x = ids[e];
+        if (spos[x] >= 0) {
+            const int pos = atomicAdd(&cur_off[x], 1);
+            ent_dst[pos] = e;
+            ent_tok[pos] = e / top_k;
+        }
+    }
+}
+
 __global__ void k_softcap(float* __restrict__ logits, int64_t n, float cap) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && cap > 0.0f) logits[i] = cap * tanhf(logits[i] / cap);
