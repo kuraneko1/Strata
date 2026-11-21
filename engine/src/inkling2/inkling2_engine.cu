@@ -1066,7 +1066,7 @@ struct Engine {
         attn_split_t1_full = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
         attn_split_t1_swa = std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv), 8, 24);
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
-        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 32768);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
         cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
@@ -1074,6 +1074,10 @@ struct Engine {
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_bulk, cudaFuncAttributeMaxDynamicSharedMemorySize, 90112);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_bulk, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_tail, cudaFuncAttributeMaxDynamicSharedMemorySize, 90112);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_tail, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
@@ -2024,7 +2028,7 @@ struct Engine {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
                     if (T == 4 && !is_swa) {
                         const int sp = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
-                        k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 28672, st>>>(
+                        k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 21760, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
@@ -2039,6 +2043,39 @@ struct Engine {
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa);
+                    } else if (!is_swa && T >= 256 && pos >= 8192 && escr &&
+                               escr_bytes >= (size_t) T * (size_t) hp.n_head * 130 * sizeof(float) * 2) {
+                        // Zero-sP, Zero-Spill 256-row FA2: pure bulk Split-KV [0, bulk_aligned) + 1 tail split [bulk_aligned, pos+T).
+                        const int q_tiles = (T + 255) / 256;
+                        const int base_ctas = (int) hp.n_head * q_tiles;
+                        const size_t per_sp_bytes = (size_t) T * (size_t) hp.n_head * 130 * sizeof(float);
+                        const int max_total_sp = (int) std::min<size_t>(9, escr_bytes / per_sp_bytes);
+                        const int max_bulk_sp = std::max(1, max_total_sp - 1);
+                        const int bulk_end_min = (int) pos - (int) hp.n_rel_ext + 1;
+                        const int bulk_aligned = (bulk_end_min > 0) ? ((bulk_end_min / 64) * 64) : 0;
+                        int best_sp = 1;
+                        if (bulk_aligned >= 64 * 64 && max_bulk_sp >= 2 && sm_count > 0) {
+                            const int n_kv_tiles = bulk_aligned / 64;
+                            const int max_sp = std::min(max_bulk_sp, std::max(1, n_kv_tiles / 64));
+                            double best_cost = (double) ((base_ctas + sm_count - 1) / sm_count);
+                            for (int sp = 2; sp <= max_sp; ++sp) {
+                                const double cost = (double) ((base_ctas * sp + sm_count - 1) / sm_count) / (double) sp;
+                                if (cost + 1e-4 < best_cost) {
+                                    best_cost = cost;
+                                    best_sp = sp;
+                                }
+                            }
+                        }
+                        const int total_sp = best_sp + 1;
+                        float* pp_sp_buf = (float*) escr;
+                        k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, 87040, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], sink, pp_sp_buf,
+                            (int) hp.n_head, (int) hp.n_head_kv, bulk_aligned, kq_scale, T, best_sp, total_sp);
+                        k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv), 256, 87040, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pp_sp_buf,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp);
+                        k_attn_pp_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            pp_sp_buf, pGate, att, (int) hp.n_head, total_sp);
                     } else if (T >= 128) {
                         const int q_tiles = (T + 63) / 64;
                         const int base_ctas = (int) hp.n_head_kv * q_tiles;
