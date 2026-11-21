@@ -561,6 +561,73 @@ struct Engine {
     cudaGraphExec_t core_graph = nullptr;
     bool core_all_gpu = false;
 
+    // Prefix cache checkpoint (stores conv_hist + circular SWA KV state in host RAM; full-attn KV stays append-only on GPU)
+    struct StateCheckpoint {
+        std::vector<int32_t> tokens;
+        std::vector<uint8_t> data;
+    };
+
+    StateCheckpoint save_checkpoint(const std::vector<int32_t>& tokens) {
+        const auto& hp = m->hp;
+        const size_t conv_bytes = (size_t) hp.n_sconv_channels() * 3 * sizeof(float);
+        size_t total = (size_t) hp.n_layer * conv_bytes;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            if (!hp.is_swa(il)) continue;
+            const size_t cap = (size_t) kv_cap[(size_t) il];
+            if (kv_q8) total += cap * (size_t) hp.kv_dim * 2 + cap * (size_t) hp.n_head_kv * sizeof(__half) * 2;
+            else total += cap * (size_t) hp.kv_dim * sizeof(__half) * 2;
+        }
+        StateCheckpoint cp;
+        cp.tokens = tokens;
+        cp.data.resize(total);
+        size_t off = 0;
+        auto pull = [&](const void* src, size_t n) {
+            CK(cudaMemcpyAsync(cp.data.data() + off, src, n, cudaMemcpyDeviceToHost, st));
+            off += n;
+        };
+        for (int il = 0; il < hp.n_layer; ++il) {
+            pull(conv_hist[(size_t) il], conv_bytes);
+            if (!hp.is_swa(il)) continue;
+            const size_t cap = (size_t) kv_cap[(size_t) il];
+            if (kv_q8) {
+                pull(kq[(size_t) il], cap * (size_t) hp.kv_dim);
+                pull(vq[(size_t) il], cap * (size_t) hp.kv_dim);
+                pull(ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                pull(vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+            } else {
+                pull(kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                pull(vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+            }
+        }
+        CK(cudaStreamSynchronize(st));
+        return cp;
+    }
+
+    void restore_checkpoint(const StateCheckpoint& cp) {
+        const auto& hp = m->hp;
+        const size_t conv_bytes = (size_t) hp.n_sconv_channels() * 3 * sizeof(float);
+        size_t off = 0;
+        auto push = [&](void* dst, size_t n) {
+            CK(cudaMemcpyAsync(dst, cp.data.data() + off, n, cudaMemcpyHostToDevice, st));
+            off += n;
+        };
+        for (int il = 0; il < hp.n_layer; ++il) {
+            push(conv_hist[(size_t) il], conv_bytes);
+            if (!hp.is_swa(il)) continue;
+            const size_t cap = (size_t) kv_cap[(size_t) il];
+            if (kv_q8) {
+                push(kq[(size_t) il], cap * (size_t) hp.kv_dim);
+                push(vq[(size_t) il], cap * (size_t) hp.kv_dim);
+                push(ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                push(vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+            } else {
+                push(kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                push(vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+            }
+        }
+        pos = (int64_t) cp.tokens.size();
+    }
+
     ~Engine() {
         if (core_graph) cudaGraphExecDestroy(core_graph);
         for (auto* p : kc) cudaFree(p);
@@ -1451,6 +1518,9 @@ int run(int argc, char** argv) {
 
         std::vector<float> lg;
         std::vector<int32_t> hist;
+        std::vector<int32_t> live_tokens;
+        std::vector<Engine::StateCheckpoint> snaps;
+        constexpr size_t kMaxSnaps = 8;
         std::mt19937_64 rng(0x9e3779b97f4a7c15ULL);
 
         for (;;) {
@@ -1500,18 +1570,70 @@ int run(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
+
+                // Prefix / KV cache reuse along live_tokens & saved SWA/conv checkpoints
+                const size_t max_possible = prompt.size() - 1;
+                size_t lcp_live = 0;
+                const size_t lim_live = std::min(live_tokens.size(), max_possible);
+                while (lcp_live < lim_live && live_tokens[lcp_live] == prompt[lcp_live]) ++lcp_live;
+
+                size_t reuse = 0;
+                if (lcp_live == live_tokens.size()) {
+                    reuse = lcp_live;
+                } else {
+                    int best_idx = -1;
+                    for (int si = (int) snaps.size() - 1; si >= 0; --si) {
+                        const auto& stoks = snaps[(size_t) si].tokens;
+                        if (stoks.size() <= lcp_live &&
+                            std::equal(stoks.begin(), stoks.end(), prompt.begin())) {
+                            best_idx = si;
+                            break;
+                        }
+                    }
+                    if (best_idx >= 0) {
+                        E.restore_checkpoint(snaps[(size_t) best_idx]);
+                        live_tokens = snaps[(size_t) best_idx].tokens;
+                        snaps.resize((size_t) best_idx + 1);
+                        reuse = live_tokens.size();
+                    } else {
+                        E.reset_state();
+                        live_tokens.clear();
+                        snaps.clear();
+                        reuse = 0;
+                    }
+                }
+                std::printf("RESUME %zu\n", reuse);
+                std::fflush(stdout);
+
                 const auto t_pp0 = Clock::now();
-                E.reset_state();
+                E.hy_gpu = 0;
+                E.hy_cpu = 0;
+                E.hy_cpu_ms = 0.0;
                 hist = prompt;
                 const bool sample_on = smp.needs_logits();
                 int32_t next_tok = 0;
-                for (size_t off = 0; off < prompt.size() && !stop_req.load(std::memory_order_acquire); off += (size_t) chunk) {
+                const size_t fresh = prompt.size() - reuse;
+                for (size_t off = reuse; off < prompt.size() && !stop_req.load(std::memory_order_acquire); off += (size_t) chunk) {
                     const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
                     const bool is_last = (off + (size_t) tc == prompt.size());
                     next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg);
+                    live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
                     if (E.hybrid) E.rebalance(8);
                     std::printf("PP %zu %zu\n", off + (size_t) tc, prompt.size());
                     std::fflush(stdout);
+                    if (!is_last && !stop_req.load(std::memory_order_acquire)) {
+                        const size_t last_cp = snaps.empty() ? 0 : snaps.back().tokens.size();
+                        if (live_tokens.size() - last_cp >= 2048) {
+                            snaps.push_back(E.save_checkpoint(live_tokens));
+                            if (snaps.size() > kMaxSnaps) snaps.erase(snaps.begin());
+                        }
+                    }
+                }
+                if (!stop_req.load(std::memory_order_acquire) && live_tokens.size() == prompt.size()) {
+                    if (snaps.empty() || snaps.back().tokens.size() != live_tokens.size()) {
+                        snaps.push_back(E.save_checkpoint(live_tokens));
+                        if (snaps.size() > kMaxSnaps) snaps.erase(snaps.begin());
+                    }
                 }
                 const double pp_ms = ms_since(t_pp0);
                 if (sample_on && !stop_req.load(std::memory_order_acquire)) {
@@ -1540,14 +1662,19 @@ int run(int argc, char** argv) {
                             break;
                         }
                         if (step + 1 < limit) {
-                            next_tok = E.forward(&next_tok, 1, sample_on, &lg);
+                            const int32_t fed = next_tok;
+                            next_tok = E.forward(&fed, 1, sample_on, &lg);
+                            live_tokens.push_back(fed);
                             if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
                             if (E.hybrid && (step % 4 == 3)) E.rebalance(4);
                         }
                     }
                 }
                 const double tg_ms = ms_since(t_tg0);
-                std::printf("DONE %d %zu %.2f %.2f %s\n", emitted, prompt.size(), pp_ms, tg_ms, finish);
+                const long long lookups = (long long) E.hy_gpu + (long long) E.hy_cpu;
+                std::printf("DONE %d %zu %.2f %.2f %s 0 0 %zu %lld %lld 0 0 0.0 %zu\n",
+                            emitted, prompt.size(), pp_ms, tg_ms, finish,
+                            reuse, (long long) E.hy_gpu, lookups, fresh);
                 std::fflush(stdout);
             }
         }
