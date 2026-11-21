@@ -27,7 +27,7 @@ Cumulative PP (`0 -> 819,000`): **`2,176.43 s` (~36.3 min, overall `~376 t/s`)**
 
 ---
 
-## 2. GPU 1 (`Tesla PG500-216`, ECC On) `512 -> 258,048` Progression (`a825d998` -> `6ff2c009` -> `2a9c9f5f`)
+## 2. GPU 1 (`Tesla PG500-216`, ECC On) `512 -> 258,048` Progression (`a825d998` -> `6ff2c009` -> `2a9c9f5f` -> `8a30df9a`)
 
 Key `6ff2c009` changes:
 - `k_attn_q8_gqa3_pp_wmma_t32`: 4 barriers/tile (`48,768 B` shared mem <= `49,152 B`), `exp2f` + `kLog2e`
@@ -41,14 +41,21 @@ Key `2a9c9f5f` (Round 2 Tensor Core WMMA & Graph) changes:
 - `DsparkEngine::draft`: CUDA Graph capture (`dflare_graph_short` / `dflare_graph_split`) over all 3 DFlare layers using dynamic device `*pos_d` + pinned `h_anchor_pin`.
 - `Engine::save_checkpoint`: Reusable pinned host staging buffer + `8,192`-tok prefill snapshot stride (`65,536`-tok rollback window).
 
-| Depth | `a825d998` PP | `6ff2c009` PP | **`2a9c9f5f` PP** | `a825d998` Decode | `6ff2c009` Decode | **`2a9c9f5f` Decode** | Total Decode Gain |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| `512` | `0.37 s` (`1,390.1 t/s`) | `0.40 s` (`1,268.8 t/s`) | `0.43 s` (`1,186.4 t/s`) | `541.77 ms` (`118.1 t/s`) | `503.94 ms` (`127.0 t/s`) | `502.03 ms` (**`127.5 t/s`**) | **`+8.0%`** |
-| `32,768` | `19.78 s` (`1,633.1 t/s`) | `17.74 s` (`1,814.5 t/s`) | `16.51 s` (**`1,949.6 t/s`**) | `618.71 ms` (`103.4 t/s`) | `571.64 ms` (`112.0 t/s`) | `530.53 ms` (**`120.6 t/s`**) | **`+16.6%`** |
-| `65,536` | `27.23 s` (`1,204.1 t/s`) | `24.90 s` (`1,313.7 t/s`) | `23.00 s` (**`1,422.0 t/s`**) | `702.30 ms` (`91.1 t/s`) | `636.58 ms` (`100.5 t/s`) | `556.45 ms` (**`115.0 t/s`**) | **`+26.2%`** |
-| `131,072` | `76.32 s` (`858.6 t/s`) | `70.64 s` (`926.9 t/s`) | `64.92 s` (**`1,008.5 t/s`**) | `882.22 ms` (`72.5 t/s`) | `759.08 ms` (`84.3 t/s`) | `605.31 ms` (**`105.7 t/s`**) | **`+45.8%`** |
-| `196,608` | `105.52 s` (`620.9 t/s`) | `98.67 s` (`663.6 t/s`) | `90.25 s` (**`725.4 t/s`**) | `1,055.37 ms` (`60.6 t/s`) | `882.29 ms` (`72.5 t/s`) | `651.74 ms` (**`98.2 t/s`**) | **`+62.0%`** |
-| **`258,048`** | `125.58 s` (`489.0 t/s`) | `117.83 s` (`520.9 t/s`) | `107.75 s` (**`569.6 t/s`**) | `1,211.86 ms` (`52.8 t/s`) | `988.37 ms` (`64.8 t/s`) | `696.24 ms` (**`91.9 t/s`**) | **`+74.1%`** |
+Key `8a30df9a` (Round 3 Prefill FlashAttention-2 + MoE/Mix/Ctrl) changes:
+- `k_attn_q8_gqa3_pp_fa2_192<SPLIT_KV>` + `k_attn_pp_split_combine`: True zero-`sS` FlashAttention-2 (`192` rows = `64 tok x 3 GQA`, `384` threads, `97,280 B` SMEM, `1 blk/SM`) with in-register `1x4` QK^T -> `ex2.approx` softmax -> register-resident `4x2` P*V, bulk KV register prefetch, and zero-VRAM Split-KV reusing `escr` (`195.22 -> 71.99 ms/L` at `258K`, **`2.71x` faster**, `45.1 TFLOPS` on 72-SM V100 / `81.8 TFLOPS` on RTX 4070).
+- `iq_kernels.cu`: 1-instruction `__byte_perm` PRMT E2M1 decode + SMEM UE4M3 LUT in `wmma_grouped_64_kernel<40>` (`-12%` NVFP4 MoE), adaptive `BM=128/BN=128` `wmma_grouped_128_kernel` for `Q5_K`/`Q4_K`/`Q8_0` (`1.75x` faster `Q5_K` GU), vectorized `situ_f16_valid_kernel` (`1.42x`).
+- `k_mix_normed_fused<1,3,4>` (`1.40x`), `k_rel_table_t32` (`1.69x`), FP16 Tensor Core `run_control` (`T >= 32`), cached FP16 Q/K/V activations, skip 200K vocab matmul on non-last prefill chunks, and Volta `Gemm::bf16` `x_f16=true` + `reserve_bf16_tc()` CUDA Graph safety fix.
+
+| Depth | `a825d998` PP | `6ff2c009` PP | `2a9c9f5f` PP | **`8a30df9a` PP** | PP Gain vs Base | `2a9c9f5f` Decode | **`8a30df9a` Decode** | Total Decode Gain |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `512` | `0.37 s` (`1,390.1 t/s`) | `0.40 s` (`1,268.8 t/s`) | `0.43 s` (`1,186.4 t/s`) | `0.39 s` (**`1,301.0 t/s`**, chunk `304 ms`) | `-6.4%` (`+9.7%` vs R2) | `502.03 ms` (`127.5 t/s`) | `498.88 ms` (**`128.3 t/s`**) | **`+8.6%`** |
+| `32,768` | `19.78 s` (`1,633.1 t/s`) | `17.74 s` (`1,814.5 t/s`) | `16.51 s` (`1,949.6 t/s`) | `12.46 s` (**`2,584.5 t/s`**, chunk `420 ms`) | **`+58.3%`** | `530.53 ms` (`120.6 t/s`) | `529.32 ms` (**`120.9 t/s`**) | **`+16.9%`** |
+| `65,536` | `27.23 s` (`1,204.1 t/s`) | `24.90 s` (`1,313.7 t/s`) | `23.00 s` (`1,422.0 t/s`) | `14.93 s` (**`2,191.0 t/s`**, chunk `492 ms`) | **`+82.0%`** | `556.45 ms` (`115.0 t/s`) | `555.14 ms` (**`115.3 t/s`**) | **`+26.6%`** |
+| `131,072` | `76.32 s` (`858.6 t/s`) | `70.64 s` (`926.9 t/s`) | `64.92 s` (`1,008.5 t/s`) | `36.68 s` (**`1,784.8 t/s`**, chunk `634 ms`) | **`+107.9%` (`2.08x`)** | `605.31 ms` (`105.7 t/s`) | `603.86 ms` (**`106.0 t/s`**) | **`+46.2%`** |
+| `196,608` | `105.52 s` (`620.9 t/s`) | `98.67 s` (`663.6 t/s`) | `90.25 s` (`725.4 t/s`) | `45.85 s` (**`1,427.8 t/s`**, chunk `777 ms`) | **`+130.0%` (`2.30x`)** | `651.74 ms` (`98.2 t/s`) | `651.16 ms` (**`98.3 t/s`**) | **`+62.2%`** |
+| **`258,048`** | `125.58 s` (`489.0 t/s`) | `117.83 s` (`520.9 t/s`) | `107.75 s` (`569.6 t/s`) | `51.53 s` (**`1,191.2 t/s`**, chunk `911 ms`) | **`+143.6%` (`2.44x`)** | `696.24 ms` (`91.9 t/s`) | `693.49 ms` (**`92.3 t/s`**) | **`+74.8%`** |
+
+Cumulative `0 -> 258,048` PP time on GPU 1 (`PG500-216`, 72 SMs, ECC On): `354.80 s` (`a825d998`) -> `330.18 s` (`6ff2c009`) -> `302.86 s` (`2a9c9f5f`) -> **`161.84 s` (`8a30df9a`, `2.19x` faster end-to-end, `0 MiB` extra VRAM)**.
 
 ---
 
