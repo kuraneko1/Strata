@@ -84,6 +84,8 @@ strata-inkling2 --model <file.gguf> [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--model` / `--native <path>` | (required) | Path to GGUF model |
+| `--draft` / `--draft-model <path>` | off | Optional DSpark draft GGUF (`arch=dflash`) for speculative decoding |
+| `--draft-max` / `--spec <N>` | `3` | Draft block steps per verify cycle (`1..7`) |
 | `--max-context <N>` | `65536` | Context window size (`kv_q8` full-attn KV cache scales with this) |
 | `--chunk` / `--prefill <N>` | `256` | Prefill chunk size (e.g. `512` for higher prefill throughput) |
 | `--max-new` / `-n <N>` | `32` | Tokens to generate in CLI / `--bench` mode |

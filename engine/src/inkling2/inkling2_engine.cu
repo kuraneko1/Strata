@@ -123,98 +123,24 @@ struct DenseMat {
     size_t bytes = 0;
 };
 
-struct PhysLayer {
-    bool is_swa = true;
-    bool has_loop = false;
-
-    // Dense projections on GPU (BF16 or native GGUF quantized)
-    DenseMat attn_q;          // [n_embd, q_dim]
-    DenseMat attn_k;          // [n_embd, kv_dim]
-    DenseMat attn_v;          // [n_embd, kv_dim]
-    DenseMat attn_output;     // [q_dim, n_embd]
-    DenseMat attn_gate;       // [n_embd, q_dim]
-    DenseMat attn_sink_proj;  // [n_embd, n_head]
-    DenseMat attn_rel;        // [n_embd, n_rel * n_head]
-    DenseMat attn_qgr;        // concatenated [attn_q; attn_gate; attn_rel] for T==1 single MMVQ
-    DenseMat attn_qgrkv;      // concatenated [attn_q; attn_gate; attn_rel; attn_k; attn_v] for SWA !has_msg T==1
-    DenseMat attn_kkc;        // concatenated [attn_k; attn_k_conv_proj] for !is_swa T==1
-    DenseMat attn_vvc;        // concatenated [attn_v; attn_v_conv_proj] for !is_swa T==1
-    DenseMat attn_k_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
-    DenseMat attn_v_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
-
-    // Loop controllers [4]: 0=attn, 1=k, 2=v, 3=mlp
-    DenseMat loop_down[4] = {};   // [2*n_embd, 64]
-    DenseMat loop_gain[4] = {};   // [64, n_embd]
-    DenseMat loop_forget[4] = {}; // [64, n_embd]
-
-    // F32 params on GPU
-    float* attn_norm = nullptr;          // SWA
-    float* attn_q_inp_norm = nullptr;    // !is_swa
-    float* attn_k_inp_norm = nullptr;    // !is_swa
-    float* attn_v_inp_norm = nullptr;    // !is_swa
-    float* attn_q_clip = nullptr;        // [head_dim, n_head]
-    float* attn_rel_clip = nullptr;      // [n_rel, n_head]
-    float* attn_rel_bias = nullptr;      // [n_rel_ext, n_rel] transposed -> wait: GGUF is [n_rel, n_ext], i.e. d*n_rel + r!
-    float* attn_k_conv = nullptr;        // [4, kv_dim] -> c*4 + lag
-    float* attn_v_conv = nullptr;
-    float* attn_post_conv = nullptr;     // [4, n_embd]
-    float* ffn_post_conv = nullptr;      // [4, n_embd]
-    float* attn_res_query = nullptr;     // [n_embd, 1 or 3] (null on phys 0)
-    float* ffn_res_query = nullptr;      // [n_embd]
-    float* ffn_norm = nullptr;           // [n_embd]
-    float* ffn_gate_inp = nullptr;       // [n_embd, n_expert]
-    float* exp_probs_b = nullptr;        // [n_expert]
-
-    // MoE experts (host mmap source + packed blobs + VRAM cache)
-    int gu_type = -1;
-    int d_type = -1;
-    size_t gu_row = 0;
-    size_t d_row = 0;
-    const uint8_t* h_gate_up = nullptr;
-    const uint8_t* h_down = nullptr;
-    const float* h_gu_scale = nullptr;   // optional (NVFP4)
-    const float* h_d_scale = nullptr;    // optional (NVFP4)
-
-    K::NativeExpertLayout L{};
-#if defined(STRATA_INKLING2_CPU_POOL)
-    strata::kernels::cpu::NativeFmt cpu_fmt{};
-#endif
-    uint8_t* hblobs = nullptr;           // [n_expert][L.bytes] on host (lazy or pre-built)
-    uint8_t* d_blobs = nullptr;          // [n_slots][stride] in VRAM
-    size_t stride = 0;
-    int n_slots = 0;
-    int32_t* d_slot_of = nullptr;        // [n_expert] in VRAM
-    std::vector<int32_t> slot_of;        // [n_expert] on host (-1 = CPU)
-    std::vector<int32_t> exp_in_slot;    // [n_slots]
-    std::vector<double> score;           // [n_expert]
-};
-
-struct Model {
-    std::unique_ptr<strata::GgufModel> gguf;
-    Hparams hp;
-
-    const uint8_t* host_tok_embd = nullptr;    // [vocab_padded, n_embd] on host (mmap)
-    int tok_embd_type = -1;
-    size_t tok_embd_row_bytes = 0;
-    float* tok_embd_norm = nullptr;
-    float* loop_res_query = nullptr;
-    float* loop_kv_res_query = nullptr;
-    float* output_res_query = nullptr;
-    float* output_norm = nullptr;
-    DenseMat output_weight;                    // [vocab_unpadded, n_embd] in VRAM
-    bool has_quant_dense = false;
-
-    std::vector<PhysLayer> layers;
+struct GpuWeightStore {
     std::vector<void*> gpu_allocs;
     std::vector<void*> host_allocs;
     std::vector<void*> host_pinned_allocs;
     std::vector<void*> q8_packed_keys;
+    bool has_quant_dense = false;
 
-    ~Model() {
+    virtual ~GpuWeightStore() = default;
+
+    void free_store() {
         for (void* p : q8_packed_keys) K::native_q8_0_packed_unregister(p);
         for (void* p : gpu_allocs) cudaFree(p);
         for (void* p : host_pinned_allocs) cudaFreeHost(p);
         for (void* p : host_allocs) std::free(p);
+        q8_packed_keys.clear();
+        gpu_allocs.clear();
+        host_pinned_allocs.clear();
+        host_allocs.clear();
     }
 
     template <typename T>
@@ -225,12 +151,7 @@ struct Model {
         return p;
     }
 
-    const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const {
-        size_t shard = 0;
-        const strata::TensorInfo* t = gguf->find(name, &shard);
-        if (out) *out = t;
-        return t ? gguf->shard(shard).tensor_data(*t) : nullptr;
-    }
+    virtual const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const = 0;
 
     float* upload_f32(const char* name, size_t expected_elems = 0) {
         const strata::TensorInfo* t = nullptr;
@@ -306,6 +227,116 @@ struct Model {
         return DenseMat{(int) t->type, ne0, ne1, d, bytes};
     }
 };
+
+struct PhysLayer {
+    bool is_swa = true;
+    bool has_loop = false;
+
+    // Dense projections on GPU (BF16 or native GGUF quantized)
+    DenseMat attn_q;          // [n_embd, q_dim]
+    DenseMat attn_k;          // [n_embd, kv_dim]
+    DenseMat attn_v;          // [n_embd, kv_dim]
+    DenseMat attn_output;     // [q_dim, n_embd]
+    DenseMat attn_gate;       // [n_embd, q_dim]
+    DenseMat attn_sink_proj;  // [n_embd, n_head]
+    DenseMat attn_rel;        // [n_embd, n_rel * n_head]
+    DenseMat attn_qgr;        // concatenated [attn_q; attn_gate; attn_rel] for T==1 single MMVQ
+    DenseMat attn_qgrkv;      // concatenated [attn_q; attn_gate; attn_rel; attn_k; attn_v] for SWA !has_msg T==1
+    DenseMat attn_kkc;        // concatenated [attn_k; attn_k_conv_proj] for !is_swa T==1
+    DenseMat attn_vvc;        // concatenated [attn_v; attn_v_conv_proj] for !is_swa T==1
+    DenseMat attn_k_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
+    DenseMat attn_v_conv_proj; // [n_embd, n_conv * n_head_kv] (!is_swa)
+
+    // Loop controllers [4]: 0=attn, 1=k, 2=v, 3=mlp
+    DenseMat loop_down[4] = {};   // [2*n_embd, 64]
+    DenseMat loop_gain[4] = {};   // [64, n_embd]
+    DenseMat loop_forget[4] = {}; // [64, n_embd]
+
+    // F32 params on GPU
+    float* attn_norm = nullptr;          // SWA
+    float* attn_q_inp_norm = nullptr;    // !is_swa
+    float* attn_k_inp_norm = nullptr;    // !is_swa
+    float* attn_v_inp_norm = nullptr;    // !is_swa
+    float* attn_q_clip = nullptr;        // [head_dim, n_head]
+    float* attn_rel_clip = nullptr;      // [n_rel, n_head]
+    float* attn_rel_bias = nullptr;      // [n_rel_ext, n_rel] transposed -> wait: GGUF is [n_rel, n_ext], i.e. d*n_rel + r!
+    float* attn_k_conv = nullptr;        // [4, kv_dim] -> c*4 + lag
+    float* attn_v_conv = nullptr;
+    float* attn_post_conv = nullptr;     // [4, n_embd]
+    float* ffn_post_conv = nullptr;      // [4, n_embd]
+    float* attn_res_query = nullptr;     // [n_embd, 1 or 3] (null on phys 0)
+    float* ffn_res_query = nullptr;      // [n_embd]
+    float* ffn_norm = nullptr;           // [n_embd]
+    float* ffn_gate_inp = nullptr;       // [n_embd, n_expert]
+    float* exp_probs_b = nullptr;        // [n_expert]
+
+    // MoE experts (host mmap source + packed blobs + VRAM cache)
+    int gu_type = -1;
+    int d_type = -1;
+    size_t gu_row = 0;
+    size_t d_row = 0;
+    const uint8_t* h_gate_up = nullptr;
+    const uint8_t* h_down = nullptr;
+    const float* h_gu_scale = nullptr;   // optional (NVFP4)
+    const float* h_d_scale = nullptr;    // optional (NVFP4)
+
+    K::NativeExpertLayout L{};
+#if defined(STRATA_INKLING2_CPU_POOL)
+    strata::kernels::cpu::NativeFmt cpu_fmt{};
+#endif
+    uint8_t* hblobs = nullptr;           // [n_expert][L.bytes] on host (lazy or pre-built)
+    uint8_t* d_blobs = nullptr;          // [n_slots][stride] in VRAM
+    size_t stride = 0;
+    int n_slots = 0;
+    int32_t* d_slot_of = nullptr;        // [n_expert] in VRAM
+    std::vector<int32_t> slot_of;        // [n_expert] on host (-1 = CPU)
+    std::vector<int32_t> exp_in_slot;    // [n_slots]
+    std::vector<double> score;           // [n_expert]
+};
+
+struct Model : GpuWeightStore {
+    std::unique_ptr<strata::GgufModel> gguf;
+    Hparams hp;
+
+    const uint8_t* host_tok_embd = nullptr;    // [vocab_padded, n_embd] on host (mmap)
+    int tok_embd_type = -1;
+    size_t tok_embd_row_bytes = 0;
+    float* tok_embd_norm = nullptr;
+    float* loop_res_query = nullptr;
+    float* loop_kv_res_query = nullptr;
+    float* output_res_query = nullptr;
+    float* output_norm = nullptr;
+    DenseMat output_weight;                    // [vocab_unpadded, n_embd] in VRAM
+
+    std::vector<PhysLayer> layers;
+
+    ~Model() override { free_store(); }
+
+    const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const override {
+        size_t shard = 0;
+        const strata::TensorInfo* t = gguf->find(name, &shard);
+        if (out) *out = t;
+        return t ? gguf->shard(shard).tensor_data(*t) : nullptr;
+    }
+
+    void dequant_tok(int32_t tok, float* dst) const {
+        const int N = (int) hp.n_embd;
+        const uint8_t* row = host_tok_embd + (size_t) tok * tok_embd_row_bytes;
+        if (tok_embd_type == 30) {
+            const uint16_t* bf = (const uint16_t*) row;
+            for (int i = 0; i < N; ++i) {
+                uint32_t u = (uint32_t) bf[i] << 16;
+                std::memcpy(&dst[i], &u, 4);
+            }
+        } else if (tok_embd_type == 0) {
+            std::memcpy(dst, row, (size_t) N * sizeof(float));
+        } else {
+            strata::quant::dequant_row((strata::quant::Type) tok_embd_type, row, dst, N);
+        }
+    }
+};
+
+#include "inkling2_dspark.cuh"
 
 void build_expert_blob(const PhysLayer& L, int64_t e, uint8_t* dst) {
     const int64_t n_ff = L.L.n_ff, n_embd = L.L.n_embd;
@@ -638,7 +669,19 @@ struct Engine {
     std::vector<int8_t*> kq, vq;
     std::vector<__half*> ks, vs;
     std::vector<int> kv_cap;
+    float* conv_hist_pool = nullptr;
+    size_t layer_conv_floats = 0;
     std::vector<float*> conv_hist;   // [48][n_sconv_channels * 3]
+
+    // Optional DSpark speculative decoding & verify rollback buffers (allocated only when --draft is active)
+    DsparkEngine* dspark = nullptr;
+    int verify_max_t = 1;
+    int swa_bak_slots = 0;
+    SwaLayerPtrs swa_ptrs{};
+    uint8_t* swa_bak = nullptr;
+    float* d_conv_trace = nullptr;   // [verify_max_t][n_layer][layer_conv_floats]
+    float* d_tgt_feat[4] = {};       // [tmax * N] captured at dspark.target_layers
+    double p_draft_ms = 0.0;
 
     // Activation scratch (all allocated up to tmax rows)
     float *cur = nullptr, *ffn_inp = nullptr;
@@ -762,12 +805,13 @@ struct Engine {
     struct StateCheckpoint {
         std::vector<int32_t> tokens;
         std::vector<uint8_t> data;
+        std::vector<uint8_t> dspark_data;
     };
 
     StateCheckpoint save_checkpoint(const std::vector<int32_t>& tokens) {
         const auto& hp = m->hp;
-        const size_t conv_bytes = (size_t) hp.n_sconv_channels() * 3 * sizeof(float);
-        size_t total = (size_t) hp.n_layer * conv_bytes;
+        const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
+        size_t total = conv_bytes;
         for (int il = 0; il < hp.n_layer; ++il) {
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
@@ -782,8 +826,8 @@ struct Engine {
             CK(cudaMemcpyAsync(cp.data.data() + off, src, n, cudaMemcpyDeviceToHost, st));
             off += n;
         };
+        pull(conv_hist_pool, conv_bytes);
         for (int il = 0; il < hp.n_layer; ++il) {
-            pull(conv_hist[(size_t) il], conv_bytes);
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
             if (kv_q8) {
@@ -796,20 +840,24 @@ struct Engine {
                 pull(vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
             }
         }
+        if (dspark) {
+            cp.dspark_data.resize(dspark->checkpoint_bytes());
+            dspark->save_checkpoint(cp.dspark_data.data(), st);
+        }
         CK(cudaStreamSynchronize(st));
         return cp;
     }
 
     void restore_checkpoint(const StateCheckpoint& cp) {
         const auto& hp = m->hp;
-        const size_t conv_bytes = (size_t) hp.n_sconv_channels() * 3 * sizeof(float);
+        const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
         size_t off = 0;
         auto push = [&](void* dst, size_t n) {
             CK(cudaMemcpyAsync(dst, cp.data.data() + off, n, cudaMemcpyHostToDevice, st));
             off += n;
         };
+        push(conv_hist_pool, conv_bytes);
         for (int il = 0; il < hp.n_layer; ++il) {
-            push(conv_hist[(size_t) il], conv_bytes);
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
             if (kv_q8) {
@@ -823,6 +871,9 @@ struct Engine {
             }
         }
         pos = (int64_t) cp.tokens.size();
+        if (dspark && !cp.dspark_data.empty()) {
+            dspark->restore_checkpoint(cp.dspark_data.data(), (int) cp.tokens.size(), st);
+        }
     }
 
     ~Engine() {
@@ -834,7 +885,10 @@ struct Engine {
         for (auto* p : vq) cudaFree(p);
         for (auto* p : ks) cudaFree(p);
         for (auto* p : vs) cudaFree(p);
-        for (auto* p : conv_hist) cudaFree(p);
+        cudaFree(conv_hist_pool);
+        cudaFree(swa_bak);
+        cudaFree(d_conv_trace);
+        for (auto* p : d_tgt_feat) cudaFree(p);
         for (auto* p : norm_blk_buf) cudaFree(p);
         cudaFree(prelude_cur_buf);
         cudaFree(norm_cur);
@@ -867,10 +921,12 @@ struct Engine {
         if (st) cudaStreamDestroy(st);
     }
 
-    bool init(Model& model, int max_ctx, int max_t, bool use_kv_q8, std::string& err) {
+    bool init(Model& model, int max_ctx, int max_t, bool use_kv_q8, std::string& err,
+              bool enable_gemm_quant = false, int max_verify_t = 1) {
         m = &model;
         ctx = max_ctx;
-        tmax = max_t;
+        tmax = std::max(max_t, max_verify_t);
+        verify_max_t = std::max(1, max_verify_t);
         kv_q8 = use_kv_q8;
         const auto& hp = m->hp;
         const int64_t N = hp.n_embd;
@@ -878,9 +934,9 @@ struct Engine {
         CK(cudaStreamCreate(&st));
         CKB(cublasCreate(&blas));
         CKB(cublasSetStream(blas, st));
-        if (!gemm.init(st, m->has_quant_dense ? (size_t) (8 * 1024 * 1024) : 4096, err)) return false;
+        if (!gemm.init(st, (m->has_quant_dense || enable_gemm_quant) ? (size_t) (8 * 1024 * 1024) : 4096, err)) return false;
 
-        // Allocate KV caches & recurrent history per virtual layer
+        // Allocate KV caches & contiguous recurrent shortconv state per virtual layer
         layer_pre_graph.assign((size_t) hp.n_layer, nullptr);
         pp_layer_cnt.assign((size_t) hp.n_layer, 0);
         kc.resize((size_t) hp.n_layer, nullptr);
@@ -891,6 +947,9 @@ struct Engine {
         vs.resize((size_t) hp.n_layer, nullptr);
         kv_cap.resize((size_t) hp.n_layer);
         conv_hist.resize((size_t) hp.n_layer);
+        layer_conv_floats = (size_t) hp.n_sconv_channels() * 3;
+        CK(cudaMalloc(&conv_hist_pool, (size_t) hp.n_layer * layer_conv_floats * sizeof(float)));
+        swa_ptrs.n_swa_layers = 0;
         for (int il = 0; il < hp.n_layer; ++il) {
             const int cap = hp.is_swa(il) ? (int) hp.n_swa : ctx;
             kv_cap[(size_t) il] = cap;
@@ -903,7 +962,16 @@ struct Engine {
                 CK(cudaMalloc(&kc[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(__half)));
                 CK(cudaMalloc(&vc[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(__half)));
             }
-            CK(cudaMalloc(&conv_hist[(size_t) il], (size_t) hp.n_sconv_channels() * 3 * sizeof(float)));
+            if (hp.is_swa(il) && swa_ptrs.n_swa_layers < 48) {
+                const int s = swa_ptrs.n_swa_layers++;
+                swa_ptrs.kq[s] = kq[(size_t) il];
+                swa_ptrs.vq[s] = vq[(size_t) il];
+                swa_ptrs.ks[s] = ks[(size_t) il];
+                swa_ptrs.vs[s] = vs[(size_t) il];
+                swa_ptrs.kc[s] = kc[(size_t) il];
+                swa_ptrs.vc[s] = vc[(size_t) il];
+            }
+            conv_hist[(size_t) il] = conv_hist_pool + (size_t) il * layer_conv_floats;
         }
 
         auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
@@ -948,7 +1016,7 @@ struct Engine {
         d_f32(&ewts, (size_t) max_ent);
         d_f32(&eparts, (size_t) max_ent * N);
         d_f32(&moe_raw, (size_t) tmax * N);
-        d_f32(&logits, (size_t) hp.vocab_unpadded);
+        d_f32(&logits, (size_t) verify_max_t * hp.vocab_unpadded);
 
         CK(cudaMallocHost(&h_tok_buf, (size_t) tmax * N * sizeof(float)));
         CK(cudaMalloc(&act_bf16, (size_t) tmax * 2 * N * sizeof(uint16_t)));
@@ -995,9 +1063,47 @@ struct Engine {
 
     void reset_state() {
         pos = 0;
-        for (int il = 0; il < m->hp.n_layer; ++il) {
-            CK(cudaMemsetAsync(conv_hist[(size_t) il], 0, (size_t) m->hp.n_sconv_channels() * 3 * sizeof(float), st));
+        CK(cudaMemsetAsync(conv_hist_pool, 0, (size_t) m->hp.n_layer * layer_conv_floats * sizeof(float), st));
+        if (dspark) dspark->reset(st);
+    }
+
+    void enable_dspark(DsparkEngine* ds) {
+        dspark = ds;
+        const auto& hp = m->hp;
+        for (int k = 0; k < 4; ++k) {
+            if (!d_tgt_feat[k]) CK(cudaMalloc(&d_tgt_feat[k], (size_t) tmax * hp.n_embd * sizeof(float)));
         }
+        const size_t total_conv = (size_t) hp.n_layer * layer_conv_floats;
+        if (!d_conv_trace) CK(cudaMalloc(&d_conv_trace, (size_t) verify_max_t * total_conv * sizeof(float)));
+        swa_bak_slots = std::max(1, verify_max_t - 1);
+        const size_t slot_bytes = kv_q8
+            ? ((size_t) hp.kv_dim * 2 + (size_t) hp.n_head_kv * 2 * sizeof(__half))
+            : ((size_t) hp.kv_dim * 2 * sizeof(__half));
+        if (!swa_bak) CK(cudaMalloc(&swa_bak, (size_t) swa_bak_slots * swa_ptrs.n_swa_layers * slot_bytes));
+    }
+
+    /// Commit `1 + m` tokens `[anchor, d_0..d_{m-1}]` out of `1 + K` verified tokens starting at `pos_pre`.
+    void commit_verify(int m_accepted, int K, int pos_pre) {
+        const auto& hp = m->hp;
+        if (m_accepted < K) {
+            const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
+            const size_t total_conv = (size_t) hp.n_layer * layer_conv_floats;
+            CK(cudaMemcpyAsync(conv_hist_pool, d_conv_trace + (size_t) m_accepted * total_conv,
+                               conv_bytes, cudaMemcpyDeviceToDevice, st));
+            if (swa_ptrs.n_swa_layers > 0) {
+                const int n_restore = K - m_accepted;
+                if (kv_q8) {
+                    k_swa_q8_bak<<<dim3((unsigned) n_restore, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                        swa_ptrs, swa_bak, (int) hp.kv_dim, (int) hp.n_head_kv, (int) hp.n_swa,
+                        pos_pre + 1, m_accepted, n_restore, 1);
+                } else {
+                    k_swa_f16_bak<<<dim3((unsigned) n_restore, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                        swa_ptrs, swa_bak, (int) hp.kv_dim, (int) hp.n_swa,
+                        pos_pre + 1, m_accepted, n_restore, 1);
+                }
+            }
+        }
+        pos = pos_pre + 1 + m_accepted;
     }
 
     void prep_q8(const float* X, void* q8_buf, int T, int64_t K_in) {
@@ -1395,30 +1501,34 @@ struct Engine {
         has_pending_rebal = true;
     }
 
-    int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr) {
+    int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr,
+                    bool all_row_logits = false, bool capture_dspark = false, int verify_k_save = 0,
+                    std::vector<int32_t>* out_picks = nullptr) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
         const int64_t kv_dim = hp.kv_dim;
         const int64_t q_dim = hp.q_dim;
         const int64_t n_core = hp.num_loops > 1 ? (hp.core_end - hp.core_start) : 0;
 
+        if (verify_k_save > 0 && swa_bak && swa_ptrs.n_swa_layers > 0) {
+            if (kv_q8) {
+                k_swa_q8_bak<<<dim3((unsigned) verify_k_save, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                    swa_ptrs, swa_bak, (int) kv_dim, (int) hp.n_head_kv, (int) hp.n_swa,
+                    (int) pos + 1, 0, verify_k_save, 0);
+            } else {
+                k_swa_f16_bak<<<dim3((unsigned) verify_k_save, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                    swa_ptrs, swa_bak, (int) kv_dim, (int) hp.n_swa,
+                    (int) pos + 1, 0, verify_k_save, 0);
+            }
+        }
+        const bool save_conv_trace = (verify_k_save > 0 && d_conv_trace != nullptr);
+        const size_t total_conv_floats = (size_t) hp.n_layer * layer_conv_floats;
+
         // 1. Token embedding from host mmap + tok_embd_norm
         if (prof) ++p_calls;
         const auto tp_e0 = Clock::now();
         for (int t = 0; t < T; ++t) {
-            const uint8_t* row = m->host_tok_embd + (size_t) tokens[t] * m->tok_embd_row_bytes;
-            float* dst = h_tok_buf + (size_t) t * N;
-            if (m->tok_embd_type == 30) {
-                const uint16_t* bf = (const uint16_t*) row;
-                for (int i = 0; i < N; ++i) {
-                    uint32_t u = (uint32_t) bf[i] << 16;
-                    std::memcpy(&dst[i], &u, 4);
-                }
-            } else if (m->tok_embd_type == 0) {
-                std::memcpy(dst, row, (size_t) N * sizeof(float));
-            } else {
-                strata::quant::dequant_row((strata::quant::Type) m->tok_embd_type, row, dst, N);
-            }
+            m->dequant_tok(tokens[t], h_tok_buf + (size_t) t * N);
         }
         CK(cudaMemcpyAsync(ffn_inp, h_tok_buf, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, st));
         const int32_t pos32 = (int32_t) pos;
@@ -1479,6 +1589,14 @@ struct Engine {
 
             const float* ink_src = in_k;
             const float* inv_src = in_v;
+            if (capture_dspark && dspark) {
+                const auto& tlayers = dspark->dm->hp.target_layers;
+                for (int ti = 0; ti < 3; ++ti) {
+                    if (il == tlayers[(size_t) ti] && d_tgt_feat[ti]) {
+                        CK(cudaMemcpyAsync(d_tgt_feat[ti], cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
+                    }
+                }
+            }
             if (L.attn_res_query) {
                 float* outs[3] = {in_q, in_k, in_v};
                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
@@ -1578,11 +1696,12 @@ struct Engine {
             }
 
             float* hst = conv_hist[(size_t) il];
+            float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
             const auto tp_d2 = Clock::now();
             k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
                 pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
-                hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
+                hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T, h_tr, total_conv_floats);
 
             const int apply_tau = is_swa ? 0 : 1;
             k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
@@ -1636,7 +1755,7 @@ struct Engine {
             }
             project(att, L.attn_output, wo, T, N, q_dim);
             const bool do_push = (ip % hp.attn_res_block_size == 0);
-            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur);
+            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur, h_tr, total_conv_floats);
             if (do_push) push_block(cur);
 
             // MoE
@@ -1670,10 +1789,11 @@ struct Engine {
             const int ip = hp.loop_layer(il);
             PhysLayer& L = m->layers[(size_t) ip];
             float* hst = conv_hist[(size_t) il];
+            float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             const bool is_hy = (L.n_slots < hp.n_expert);
             run_moe(L, il, in_ffn, T);
             const auto tp_mp0 = Clock::now();
-            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T, ffn_inp);
+            k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T, ffn_inp, h_tr, total_conv_floats);
             if (prof) {
                 CK(cudaStreamSynchronize(st));
                 if (is_hy) p_moe_post_ms += ms_since(tp_mp0);
@@ -1685,7 +1805,7 @@ struct Engine {
         pp_streaming = (hybrid && T >= pp_stream_t && pp_stage[0] != nullptr);
         if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
         for (int il = 0; il < hp.n_layer; ++il) {
-            if (T == 1 && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
+            if (T == 1 && core_all_gpu && !prof_detail && !capture_dspark && il == hp.core_start && n_core > 0) {
                 if (!core_graph) {
                     cudaGraph_t g = nullptr;
                     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
@@ -1707,7 +1827,7 @@ struct Engine {
                 continue;
             }
             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
-            const bool use_pre_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming);
+            const bool use_pre_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming && !capture_dspark);
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (layer_pre_graph[(size_t) il] || !graph_oom)) {
                 if (!layer_pre_graph[(size_t) il]) {
@@ -1756,21 +1876,26 @@ struct Engine {
         float* out_head[1] = {in_ffn};
         run_mix_normed(norm_blocks, cur, false, m->output_res_query, out_head, 1, T, 0);
         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
-        // Only compute logits for the last row unless needed? Actually compute all if small or last row:
-        const float* last_h = cur + (size_t) (T - 1) * N;
-        project(last_h, m->output_weight, logits, 1, hp.vocab_unpadded, N);
-        k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, st>>>(logits, hp.vocab_unpadded, hp.softcap);
-        k_argmax<<<1, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
-        int32_t next_id = 0;
-        if (copy_logits && out_logits) {
-            out_logits->resize((size_t) hp.vocab_unpadded);
-            CK(cudaMemcpyAsync(out_logits->data(), logits, (size_t) hp.vocab_unpadded * sizeof(float), cudaMemcpyDeviceToHost, st));
+        if (capture_dspark && dspark && d_tgt_feat[3]) {
+            CK(cudaMemcpyAsync(d_tgt_feat[3], cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
         }
-        CK(cudaMemcpyAsync(&next_id, pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        const int rows = (all_row_logits || out_picks != nullptr) ? T : 1;
+        const float* head_h = (rows == T) ? cur : (cur + (size_t) (T - 1) * N);
+        project(head_h, m->output_weight, logits, rows, hp.vocab_unpadded, N);
+        const int64_t tot_lg = (int64_t) rows * hp.vocab_unpadded;
+        k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);
+        k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+        std::vector<int32_t> tmp_picks((size_t) rows, 0);
+        if (copy_logits && out_logits) {
+            out_logits->resize((size_t) tot_lg);
+            CK(cudaMemcpyAsync(out_logits->data(), logits, (size_t) tot_lg * sizeof(float), cudaMemcpyDeviceToHost, st));
+        }
+        CK(cudaMemcpyAsync(tmp_picks.data(), pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (out_picks) *out_picks = tmp_picks;
         if (prof) p_head_ms += ms_since(tp_h0);
         pos += T;
-        return next_id;
+        return tmp_picks.back();
     }
 };
 
@@ -2026,8 +2151,17 @@ struct SamplingParams {
     }
 };
 
-int32_t sample_logits(std::vector<float>& logits, const std::vector<int32_t>& history, const SamplingParams& smp, std::mt19937_64& rng) {
-    const int V = (int) logits.size();
+struct SamplingDist {
+    std::vector<int32_t> idx;
+    std::vector<float> probs;
+    float prob_of(int32_t tok) const {
+        for (size_t i = 0; i < idx.size(); ++i) if (idx[i] == tok) return probs[i];
+        return 0.0f;
+    }
+};
+
+SamplingDist build_sampling_dist(const float* raw_logits, int V, const std::vector<int32_t>& history, const SamplingParams& smp) {
+    std::vector<float> adj(raw_logits, raw_logits + V);
     if (smp.pen_last_n > 0 && (smp.rep_pen != 1.0f || smp.freq_pen != 0.0f || smp.pres_pen != 0.0f)) {
         std::vector<int> counts;
         std::vector<int32_t> uniq;
@@ -2042,28 +2176,31 @@ int32_t sample_logits(std::vector<float>& logits, const std::vector<int32_t>& hi
             if (!found) { uniq.push_back(tok); counts.push_back(1); }
         }
         for (size_t j = 0; j < uniq.size(); ++j) {
-            float& l = logits[(size_t) uniq[j]];
+            float& l = adj[(size_t) uniq[j]];
             if (smp.rep_pen != 1.0f) l = (l <= 0.0f) ? (l * smp.rep_pen) : (l / smp.rep_pen);
             l -= (float) counts[j] * smp.freq_pen + smp.pres_pen;
         }
     }
+    SamplingDist d;
     if (smp.temp <= 0.0f) {
         int best = 0;
-        for (int i = 1; i < V; ++i) if (logits[(size_t) i] > logits[(size_t) best]) best = i;
-        return best;
+        for (int i = 1; i < V; ++i) if (adj[(size_t) i] > adj[(size_t) best]) best = i;
+        d.idx = {best};
+        d.probs = {1.0f};
+        return d;
     }
     const int K = (smp.top_k > 0 && smp.top_k < V) ? smp.top_k : std::min(V, 256);
     std::vector<int32_t> idx((size_t) V);
     for (int i = 0; i < V; ++i) idx[(size_t) i] = i;
     std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int32_t a, int32_t b) {
-        return logits[(size_t) a] > logits[(size_t) b];
+        return adj[(size_t) a] > adj[(size_t) b];
     });
-    const float max_l = logits[(size_t) idx[0]];
+    const float max_l = adj[(size_t) idx[0]];
     const float inv_t = 1.0f / smp.temp;
     std::vector<float> probs((size_t) K);
     double sum = 0.0;
     for (int i = 0; i < K; ++i) {
-        const float p = std::exp((logits[(size_t) idx[(size_t) i]] - max_l) * inv_t);
+        const float p = std::exp((adj[(size_t) idx[(size_t) i]] - max_l) * inv_t);
         probs[(size_t) i] = p;
         sum += p;
     }
@@ -2082,24 +2219,175 @@ int32_t sample_logits(std::vector<float>& logits, const std::vector<int32_t>& hi
     }
     double ksum = 0.0;
     for (int i = 0; i < keep; ++i) ksum += probs[(size_t) i];
-    const double r = std::uniform_real_distribution<double>(0.0, ksum)(rng);
+    const float inv_ksum = (ksum > 0.0) ? (float) (1.0 / ksum) : 1.0f;
+    d.idx.assign(idx.begin(), idx.begin() + keep);
+    d.probs.resize((size_t) keep);
+    for (int i = 0; i < keep; ++i) d.probs[(size_t) i] = probs[(size_t) i] * inv_ksum;
+    return d;
+}
+
+int32_t sample_from_dist(const SamplingDist& d, std::mt19937_64& rng) {
+    if (d.idx.size() <= 1) return d.idx[0];
+    const double r = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
     double acc = 0.0;
-    for (int i = 0; i < keep; ++i) {
-        acc += probs[(size_t) i];
-        if (r <= acc) return idx[(size_t) i];
+    for (size_t i = 0; i < d.idx.size(); ++i) {
+        acc += d.probs[i];
+        if (r <= acc) return d.idx[i];
     }
-    return idx[0];
+    return d.idx[0];
+}
+
+int32_t sample_logits(const std::vector<float>& logits, const std::vector<int32_t>& history, const SamplingParams& smp, std::mt19937_64& rng) {
+    return sample_from_dist(build_sampling_dist(logits.data(), (int) logits.size(), history, smp), rng);
+}
+
+int32_t sample_residual_dist(const SamplingDist& p, const SamplingDist& q, std::mt19937_64& rng) {
+    std::vector<int32_t> r_idx;
+    std::vector<float> r_w;
+    r_idx.reserve(p.idx.size());
+    r_w.reserve(p.idx.size());
+    double sum = 0.0;
+    for (size_t i = 0; i < p.idx.size(); ++i) {
+        const float diff = p.probs[i] - q.prob_of(p.idx[i]);
+        if (diff > 0.0f) {
+            r_idx.push_back(p.idx[i]);
+            r_w.push_back(diff);
+            sum += diff;
+        }
+    }
+    if (sum <= 0.0) return sample_from_dist(p, rng);
+    const double u = std::uniform_real_distribution<double>(0.0, sum)(rng);
+    double acc = 0.0;
+    for (size_t i = 0; i < r_idx.size(); ++i) {
+        acc += r_w[i];
+        if (u <= acc) return r_idx[i];
+    }
+    return r_idx[0];
+}
+
+/// Shared autoregressive / DSpark speculative decode loop for both `--serve` and `--bench`/CLI.
+template <typename EmitFn, typename StopCheckFn>
+void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t first_tok, int limit,
+                        const SamplingParams& smp, std::mt19937_64& rng,
+                        std::vector<int32_t>& hist, std::vector<int32_t>& live_tokens,
+                        EmitFn&& on_emit, StopCheckFn&& is_stopped, bool* out_hit_eos = nullptr) {
+    const int V = (int) E.m->hp.vocab_unpadded;
+    const bool sample_on = smp.needs_logits();
+    int32_t next_tok = first_tok;
+    int emitted = 0;
+    std::vector<float> lg;
+    std::vector<int32_t> d_toks, vtoks, t_picks;
+    std::vector<std::vector<float>> d_logits;
+    std::vector<SamplingDist> q_dists;
+    if (out_hit_eos) *out_hit_eos = false;
+
+    auto feed_single = [&](int32_t tok) {
+        const int pos_pre = (int) E.pos;
+        next_tok = E.forward(&tok, 1, sample_on, &lg, false, dspark != nullptr, 0, nullptr);
+        live_tokens.push_back(tok);
+        if (dspark) dspark->inject(E, pos_pre, 1);
+        if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
+    };
+
+    while (emitted < limit && !is_stopped()) {
+        if (!on_emit(next_tok)) {
+            if (out_hit_eos) *out_hit_eos = true;
+            ++emitted;
+            break;
+        }
+        ++emitted;
+        const int rem = limit - emitted;
+        if (rem <= 0 || is_stopped()) break;
+
+        if (!dspark || rem < 2 || draft_max < 1) {
+            feed_single(next_tok);
+            if (E.hybrid && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
+            continue;
+        }
+
+        const int K = std::min(draft_max, rem - 1);
+        const int32_t anchor = next_tok;
+        if (sample_on) {
+            q_dists.resize((size_t) K);
+            dspark->draft(E, anchor, K, d_toks, &d_logits, [&](int step_i, std::vector<float>& row_lg) {
+                std::vector<int32_t> tmp_hist = hist;
+                tmp_hist.insert(tmp_hist.end(), d_toks.begin(), d_toks.begin() + step_i);
+                q_dists[(size_t) step_i] = build_sampling_dist(row_lg.data(), V, tmp_hist, smp);
+                return sample_from_dist(q_dists[(size_t) step_i], rng);
+            });
+        } else {
+            dspark->draft(E, anchor, K, d_toks, nullptr, [&](int, std::vector<float>&) -> int32_t { return 0; });
+        }
+
+        vtoks.resize((size_t) (1 + K));
+        vtoks[0] = anchor;
+        for (int i = 0; i < K; ++i) vtoks[(size_t) (1 + i)] = d_toks[(size_t) i];
+
+        const int pos_pre = (int) E.pos;
+        lg.clear();
+        E.forward(vtoks.data(), 1 + K, sample_on, &lg, sample_on, true, K, &t_picks);
+
+        int m = 0;
+        bool hit_eos = false;
+        if (!sample_on) {
+            while (m < K && t_picks[(size_t) m] == d_toks[(size_t) m]) ++m;
+            for (int j = 0; j < m; ++j) {
+                if (!on_emit(d_toks[(size_t) j])) {
+                    m = j + 1;
+                    hit_eos = true;
+                    break;
+                }
+            }
+            if (!hit_eos) next_tok = t_picks[(size_t) m];
+        } else {
+            bool rejected = false;
+            for (int r = 0; r < K; ++r) {
+                const SamplingDist p_r = build_sampling_dist(lg.data() + (size_t) r * V, V, hist, smp);
+                const float p_x = p_r.prob_of(d_toks[(size_t) r]);
+                const float q_x = q_dists[(size_t) r].prob_of(d_toks[(size_t) r]);
+                const double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+                if (u * (double) q_x <= (double) p_x) {
+                    ++m;
+                    if (!on_emit(d_toks[(size_t) r])) {
+                        hit_eos = true;
+                        break;
+                    }
+                } else {
+                    next_tok = sample_residual_dist(p_r, q_dists[(size_t) r], rng);
+                    rejected = true;
+                    break;
+                }
+            }
+            if (!rejected && !hit_eos) {
+                const SamplingDist p_last = build_sampling_dist(lg.data() + (size_t) K * V, V, hist, smp);
+                next_tok = sample_from_dist(p_last, rng);
+            }
+        }
+
+        emitted += m;
+        E.commit_verify(m, K, pos_pre);
+        for (int i = 0; i < 1 + m; ++i) live_tokens.push_back(vtoks[(size_t) i]);
+        dspark->n_accepted += m;
+        dspark->inject(E, pos_pre, 1 + m);
+        if (hit_eos) {
+            if (out_hit_eos) *out_hit_eos = true;
+            break;
+        }
+        if (E.hybrid && (emitted % 8 < (1 + m))) E.rebalance(E.core_all_gpu ? 4 : 6);
+    }
 }
 
 }  // namespace
 
 int run(int argc, char** argv) {
     std::string model_path;
+    std::string draft_path;
     std::string tokens_str = "1,2";
     std::string dump_logits_path;
     int max_ctx = 65536;
     int chunk = 256;
     int max_new = 32;
+    int draft_max = 3;
     int cpu_threads = 0;
     double expert_vram = -1.0;
     bool serve = false;
@@ -2118,6 +2406,8 @@ int run(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--native" || a == "--model") model_path = next_arg();
+        else if (a == "--draft" || a == "--draft-model") draft_path = next_arg();
+        else if (a == "--draft-max" || a == "--spec") draft_max = std::clamp(std::atoi(next_arg()), 1, 7);
         else if (a == "--max-context") max_ctx = std::atoi(next_arg());
         else if (a == "--chunk" || a == "--prefill") chunk = std::atoi(next_arg());
         else if (a == "--max-new" || a == "-n") max_new = std::atoi(next_arg());
@@ -2134,7 +2424,7 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--draft <dspark.gguf>] [--draft-max N] [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--bench] [--serve]\n");
         return 2;
     }
 
@@ -2145,10 +2435,26 @@ int run(int argc, char** argv) {
         return 1;
     }
 
+    std::unique_ptr<DsparkModel> dm;
+    std::unique_ptr<DsparkEngine> dspark;
+    if (!draft_path.empty()) {
+        dm = std::make_unique<DsparkModel>();
+        if (!load_dspark_model(draft_path, m.hp, *dm, err)) {
+            std::fprintf(stderr, "strata-inkling2: draft load failed: %s\n", err.c_str());
+            return 1;
+        }
+    }
+
     Engine E;
-    if (!E.init(m, max_ctx, chunk, kv_q8, err)) {
+    if (!E.init(m, max_ctx, chunk, kv_q8, err, dm && dm->has_quant_dense, dm ? (draft_max + 1) : 1)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
+    }
+    if (dm) {
+        dspark = std::make_unique<DsparkEngine>();
+        dspark->init(*dm, max_ctx, chunk);
+        E.enable_dspark(dspark.get());
+        E.reset_state();
     }
     if (!place_experts(m, E, expert_vram, cpu_threads, err)) {
         std::fprintf(stderr, "strata-inkling2: expert placement failed: %s\n", err.c_str());
@@ -2192,11 +2498,11 @@ int run(int argc, char** argv) {
             q_cv.notify_one();
         });
 
-        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d\n",
+        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d dspark=%s draft_max=%d\n",
                     max_ctx, kv_q8 ? "int8" : "fp16", max_ctx,
                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
                     (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
-                    E.pool_workers);
+                    E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0);
         std::printf("READY %d stop\n", max_ctx);
         std::fflush(stdout);
 
@@ -2300,7 +2606,9 @@ int run(int argc, char** argv) {
                 for (size_t off = reuse; off < prompt.size() && !stop_req.load(std::memory_order_acquire); off += (size_t) chunk) {
                     const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
                     const bool is_last = (off + (size_t) tc == prompt.size());
-                    next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg);
+                    const int pos_pre = (int) E.pos;
+                    next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg, false, dspark != nullptr, 0, nullptr);
+                    if (dspark) dspark->inject(E, pos_pre, tc);
                     live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
                     if (E.hybrid) E.rebalance(8);
                     const double el_ms = ms_since(t_pp0);
@@ -2335,27 +2643,21 @@ int run(int argc, char** argv) {
                 if (stop_req.load(std::memory_order_acquire)) {
                     finish = "cancel";
                 } else {
-                    for (int step = 0; step < limit; ++step) {
-                        if (stop_req.load(std::memory_order_acquire)) {
-                            finish = "cancel";
-                            break;
-                        }
-                        std::printf("T %d\n", (int) next_tok);
-                        std::fflush(stdout);
-                        ++emitted;
-                        hist.push_back(next_tok);
-                        if (next_tok == eos_id || next_tok == 199999) {
-                            finish = "stop";
-                            break;
-                        }
-                        if (step + 1 < limit) {
-                            const int32_t fed = next_tok;
-                            next_tok = E.forward(&fed, 1, sample_on, &lg);
-                            live_tokens.push_back(fed);
-                            if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
-                            if (E.hybrid && (step % 8 == 7)) E.rebalance(E.core_all_gpu ? 4 : 6);
-                        }
-                    }
+                    bool hit_eos = false;
+                    decode_tokens_loop(
+                        E, dspark.get(), draft_max, next_tok, limit, smp, rng, hist, live_tokens,
+                        [&](int32_t tok) -> bool {
+                            std::printf("T %d\n", (int) tok);
+                            std::fflush(stdout);
+                            ++emitted;
+                            hist.push_back(tok);
+                            if (tok == eos_id || tok == 199999) return false;
+                            return true;
+                        },
+                        [&]() -> bool { return stop_req.load(std::memory_order_acquire); },
+                        &hit_eos);
+                    if (stop_req.load(std::memory_order_acquire)) finish = "cancel";
+                    else if (hit_eos) finish = "stop";
                 }
                 const double tg_ms = ms_since(t_tg0);
                 const long long lookups = (long long) E.hy_gpu + (long long) E.hy_cpu;
@@ -2378,12 +2680,25 @@ int run(int argc, char** argv) {
         int32_t w = 0;
         for (size_t off = 0; off < prompt.size(); off += (size_t) chunk) {
             const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
-            w = E.forward(prompt.data() + off, tc);
+            const int p0 = (int) E.pos;
+            w = E.forward(prompt.data() + off, tc, false, nullptr, false, dspark != nullptr, 0, nullptr);
+            if (dspark) dspark->inject(E, p0, tc);
         }
-        if (max_new > 0) E.forward(&w, 1);
+        if (max_new > 0) {
+            if (dspark && max_new >= 2) {
+                std::vector<int32_t> wd;
+                dspark->draft(E, w, std::min(draft_max, max_new - 1), wd, nullptr, [&](int, std::vector<float>&) -> int32_t { return 0; });
+            } else {
+                E.forward(&w, 1);
+            }
+        }
         E.reset_state();
         E.hy_gpu = E.hy_cpu = 0;
         E.hy_cpu_ms = 0.0;
+        if (dspark) {
+            dspark->n_draft_calls = dspark->n_drafted = dspark->n_accepted = 0;
+            dspark->draft_ms = dspark->inject_ms = 0.0;
+        }
     }
 
     E.prof = profile;
@@ -2395,7 +2710,10 @@ int run(int argc, char** argv) {
     for (size_t off = 0; off < prompt.size(); off += (size_t) chunk) {
         const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
         const bool is_last = (off + (size_t) tc == prompt.size());
-        next_tok = E.forward(prompt.data() + off, tc, is_last && !dump_logits_path.empty(), &dumped);
+        const int p0 = (int) E.pos;
+        next_tok = E.forward(prompt.data() + off, tc, is_last && !dump_logits_path.empty(), &dumped,
+                             false, dspark != nullptr, 0, nullptr);
+        if (dspark) dspark->inject(E, p0, tc);
         const auto tr0 = Clock::now();
         if (E.hybrid) E.rebalance(8);
         if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
@@ -2414,15 +2732,20 @@ int run(int argc, char** argv) {
 
     std::vector<int32_t> gen;
     gen.reserve((size_t) max_new);
-    if (max_new > 0) gen.push_back(next_tok);
+    std::vector<int32_t> cli_hist = prompt;
+    std::vector<int32_t> cli_live = prompt;
+    SamplingParams cli_smp;
+    std::mt19937_64 cli_rng(0x9e3779b97f4a7c15ULL);
 
     const auto t_tg0 = Clock::now();
-    for (int step = 1; step < max_new; ++step) {
-        next_tok = E.forward(&next_tok, 1);
-        gen.push_back(next_tok);
-        const auto tr0 = Clock::now();
-        if (E.hybrid && (step % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
-        if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
+    if (max_new > 0) {
+        decode_tokens_loop(
+            E, dspark.get(), draft_max, next_tok, max_new, cli_smp, cli_rng, cli_hist, cli_live,
+            [&](int32_t tok) -> bool {
+                gen.push_back(tok);
+                return true;
+            },
+            [&]() -> bool { return false; });
     }
     const double tg_ms = ms_since(t_tg0);
     if (profile) E.print_prof("tg");
@@ -2432,10 +2755,20 @@ int run(int argc, char** argv) {
     std::printf("\n");
 
     const double pp_tps = (double) prompt.size() / (pp_ms / 1000.0);
-    const double tg_tps = max_new > 1 ? (double) (max_new - 1) / (tg_ms / 1000.0) : 0.0;
-    std::fprintf(stderr, "strata-inkling2: pp %zu tok in %.1f ms (%.2f t/s) | tg %d tok in %.1f ms (%.2f t/s) | hits=%lld misses=%lld cpu_ms=%.1f\n",
-                 prompt.size(), pp_ms, pp_tps, std::max(0, max_new - 1), tg_ms, tg_tps,
-                 (long long) E.hy_gpu, (long long) E.hy_cpu, E.hy_cpu_ms);
+    const double tg_tps = gen.size() > 1 ? (double) (gen.size() - 1) / (tg_ms / 1000.0) : 0.0;
+    if (dspark) {
+        const double acc_rate = dspark->n_drafted > 0 ? (100.0 * (double) dspark->n_accepted / (double) dspark->n_drafted) : 0.0;
+        const double mean_len = dspark->n_draft_calls > 0 ? (1.0 + (double) dspark->n_accepted / (double) dspark->n_draft_calls) : 1.0;
+        std::fprintf(stderr,
+                     "strata-inkling2: pp %zu tok in %.1f ms (%.2f t/s) | tg %d tok in %.1f ms (%.2f t/s) | dspark acc=%lld/%lld (%.1f%%, %.2f tok/step) | hits=%lld misses=%lld cpu_ms=%.1f\n",
+                     prompt.size(), pp_ms, pp_tps, std::max(0, (int) gen.size() - 1), tg_ms, tg_tps,
+                     (long long) dspark->n_accepted, (long long) dspark->n_drafted, acc_rate, mean_len,
+                     (long long) E.hy_gpu, (long long) E.hy_cpu, E.hy_cpu_ms);
+    } else {
+        std::fprintf(stderr, "strata-inkling2: pp %zu tok in %.1f ms (%.2f t/s) | tg %d tok in %.1f ms (%.2f t/s) | hits=%lld misses=%lld cpu_ms=%.1f\n",
+                     prompt.size(), pp_ms, pp_tps, std::max(0, (int) gen.size() - 1), tg_ms, tg_tps,
+                     (long long) E.hy_gpu, (long long) E.hy_cpu, E.hy_cpu_ms);
+    }
     return 0;
 }
 
