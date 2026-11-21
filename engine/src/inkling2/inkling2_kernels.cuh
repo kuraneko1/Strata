@@ -4260,7 +4260,8 @@ __global__ void k_mul_sigmoid(float* __restrict__ att, const float* __restrict__
 /// n_exp <= 128, top_k <= 16. 1 warp (32 threads) per token (grid T).
 __global__ void k_route_inkling2(const float* __restrict__ logits, const float* __restrict__ bias,
                                  int32_t* __restrict__ ids, float* __restrict__ ewts,
-                                 int n_exp, int top_k, float scale) {
+                                 int n_exp, int top_k, float scale,
+                                 uint32_t* __restrict__ d_hits = nullptr) {
     const int t = blockIdx.x, lane = threadIdx.x;
     float p[4], s[4];
 #pragma unroll
@@ -4302,6 +4303,7 @@ __global__ void k_route_inkling2(const float* __restrict__ logits, const float* 
         }
         if (lane == 0) {
             ids[(size_t) t * top_k + k] = be;
+            if (d_hits) atomicAdd(&d_hits[be], 1u);
             wlocal[k] = bp;
             wsum += bp;
         }

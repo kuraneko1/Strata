@@ -770,11 +770,13 @@ struct Engine {
         PpStageMap map{};
         std::vector<PpRun> runs;
     };
+    static constexpr int kMaxPpStages = 4;
     cudaStream_t cst = nullptr;
-    uint8_t* pp_stage[2] = {nullptr, nullptr};
+    uint8_t* pp_stage[kMaxPpStages] = {nullptr, nullptr, nullptr, nullptr};
+    int pp_stage_cnt = 0;
     size_t pp_stage_bytes = 0;
-    cudaEvent_t ev_pp_copy[2] = {nullptr, nullptr};
-    cudaEvent_t ev_pp_used[2] = {nullptr, nullptr};
+    cudaEvent_t ev_pp_copy[kMaxPpStages] = {nullptr, nullptr, nullptr, nullptr};
+    cudaEvent_t ev_pp_used[kMaxPpStages] = {nullptr, nullptr, nullptr, nullptr};
     cudaEvent_t ev_rebal = nullptr;
     bool has_pending_rebal = false;
     std::vector<PpTask> pp_tasks;
@@ -965,7 +967,7 @@ struct Engine {
         cudaFreeHost(h_ids); cudaFreeHost(h_ewts); cudaFreeHost(h_cpu_sum); cudaFreeHost(h_h); cudaFreeHost(cpu_out); cudaFreeHost(h_miss);
         std::free(acts);
         if (ev_route) cudaEventDestroy(ev_route);
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < kMaxPpStages; ++b) {
             if (pp_stage[b]) cudaFree(pp_stage[b]);
             if (ev_pp_copy[b]) cudaEventDestroy(ev_pp_copy[b]);
             if (ev_pp_used[b]) cudaEventDestroy(ev_pp_used[b]);
@@ -1146,7 +1148,7 @@ struct Engine {
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_rebal, cudaEventDisableTiming));
         CK(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking));
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < kMaxPpStages; ++b) {
             CK(cudaEventCreateWithFlags(&ev_pp_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&ev_pp_used[b], cudaEventDisableTiming));
         }
@@ -1356,10 +1358,31 @@ struct Engine {
         k_control_combine<<<(unsigned) ((n4 + 255) / 256), 256, 0, st>>>(c, msg, ctrl_g, ctrl_f, out, tot);
     }
 
+    void sync_d_hits(bool accumulate_hy = false) {
+        const auto& hp = m->hp;
+        const int ne = (int) hp.n_expert;
+        std::vector<uint32_t> tmp((size_t) ne);
+        for (int ip = 0; ip < (int) m->layers.size(); ++ip) {
+            PhysLayer& L = m->layers[(size_t) ip];
+            if (!L.d_hits) continue;
+            CK(cudaMemcpy(tmp.data(), L.d_hits, (size_t) ne * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            CK(cudaMemset(L.d_hits, 0, (size_t) ne * sizeof(uint32_t)));
+            for (int e = 0; e < ne; ++e) {
+                const uint32_t c = tmp[(size_t) e];
+                if (c == 0) continue;
+                L.score[(size_t) e] += (double) c;
+                if (accumulate_hy) {
+                    if (L.slot_of[(size_t) e] >= 0) hy_gpu += c;
+                    else hy_cpu += c;
+                }
+            }
+        }
+    }
+
     void pp_kick_next() {
-        if (pp_kick_idx >= pp_tasks.size()) return;
+        if (pp_kick_idx >= pp_tasks.size() || pp_stage_cnt <= 0) return;
         const PpTask& tk = pp_tasks[pp_kick_idx];
-        const int b = (int) (pp_kick_idx & 1u);
+        const int b = (int) (pp_kick_idx % (size_t) pp_stage_cnt);
         const PhysLayer& L = m->layers[(size_t) tk.ip];
         CK(cudaStreamWaitEvent(cst, ev_pp_used[b], 0));
         for (const PpRun& r : tk.runs) {
@@ -1379,7 +1402,7 @@ struct Engine {
         std::fill(pp_layer_cnt.begin(), pp_layer_cnt.end(), 0);
         pp_take_idx = 0;
         pp_kick_idx = 0;
-        if (!pp_stage[0] || pp_stage_bytes == 0) return;
+        if (pp_stage_cnt <= 0 || !pp_stage[0] || pp_stage_bytes == 0) return;
         (void) core_end_virt;
         (void) core_all_gpu_flag;
         int missing[128];
@@ -1413,22 +1436,28 @@ struct Engine {
                 ++pp_layer_cnt[(size_t) il];
             }
         }
-        for (int b = 0; b < 2; ++b) CK(cudaEventRecord(ev_pp_used[b], st));
-        for (int k = 0; k < 2 && pp_kick_idx < pp_tasks.size(); ++k) pp_kick_next();
+        for (int b = 0; b < pp_stage_cnt; ++b) CK(cudaEventRecord(ev_pp_used[b], st));
+        for (int k = 0; k < pp_stage_cnt && pp_kick_idx < pp_tasks.size(); ++k) pp_kick_next();
     }
 
-    void run_moe(PhysLayer& L, int il, const float* x_norm, int T) {
+    void run_moe(PhysLayer& L, int il, const float* x_norm, int T, bool pre_routed_t1 = false) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd, Kp = (int) hp.n_expert_used;
         const int n_ent = T * Kp;
-        const auto tp_moe_r0 = Clock::now();
-        project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
-        k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale);
-        if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
-
         const bool has_gpu = L.n_slots > 0;
         const bool need_cpu = L.n_slots < hp.n_expert;
         const bool is_q5 = (L.L.gu_type == 13);
+
+        const auto tp_moe_r0 = Clock::now();
+        if (!pre_routed_t1) {
+            if (need_cpu && T == 1 && !pp_streaming) {
+                CK(cudaMemcpyAsync(h_h, x_norm, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
+            }
+            project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
+            k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
+                router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale, L.d_hits);
+            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
+        }
 
         if (need_cpu && has_pending_rebal) {
             CK(cudaStreamWaitEvent(st, ev_rebal, 0));
@@ -1465,11 +1494,10 @@ struct Engine {
         };
 
         if (pp_streaming && need_cpu && L.gu_type != 30 && L.hblobs && pp_stage_bytes >= L.stride) {
-            CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
-            CK(cudaEventRecord(ev_route, st));
+            // Zero host-GPU stalls across all 48 layers: k_route_inkling2 tracks exact routing counts in L.d_hits on GPU!
             if (has_gpu) {
                 k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
-                                                   grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp, L.d_hits);
+                                                   grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
                 run_grouped(grp_ptr, std::min<int64_t>(n_ent, hp.n_expert));
             }
             const int ne = (int) hp.n_expert;
@@ -1480,7 +1508,7 @@ struct Engine {
                     std::exit(1);
                 }
                 const PpTask& tk = pp_tasks[pp_take_idx];
-                const int b = (int) (pp_take_idx & 1u);
+                const int b = (int) (pp_take_idx % (size_t) pp_stage_cnt);
                 CK(cudaStreamWaitEvent(st, ev_pp_copy[b], 0));
                 k_group_experts_miss_map<<<1, 128, 0, st>>>(ids, pp_stage[b], L.stride, n_ent, ne, tk.map,
                                                             grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
@@ -1491,29 +1519,22 @@ struct Engine {
             }
             k_combine_experts<<<dim3((unsigned) ((N + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
             if (prof) { CK(cudaStreamSynchronize(st)); p_moe_gpu_ms += ms_since(tp_moe_r0); }
-            CK(cudaEventSynchronize(ev_route));
-            int n_miss = 0;
-            for (int e = 0; e < n_ent; ++e) {
-                const int x = h_ids[e];
-                L.score[(size_t) x] += 1.0;
-                if (L.slot_of[(size_t) x] < 0) ++n_miss;
-            }
-            hy_cpu += n_miss;
-            hy_gpu += n_ent - n_miss;
             return;
         }
 
         if (need_cpu) {
-            CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
-            if (T == 1) CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) Kp * sizeof(float), cudaMemcpyDeviceToHost, st));
-            CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost, st));
+            if (!pre_routed_t1) {
+                CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+                if (T == 1) CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) Kp * sizeof(float), cudaMemcpyDeviceToHost, st));
+                else CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost, st));
+            }
             CK(cudaEventRecord(ev_route, st));
         }
 
         const auto tp_mg0 = Clock::now();
         if (has_gpu) {
             k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
-                                               grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp, L.d_hits);
+                                               grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
             run_grouped(grp_ptr, std::min<int64_t>(n_ent, hp.n_expert));
         }
         if (prof_detail) {
@@ -1536,13 +1557,9 @@ struct Engine {
             jobs.clear();
             int n_miss = 0;
             if (T == 1) {
-                if (L.cpu_fmt.gu_act != 0) {
-                    C::native_quant_act(L.cpu_fmt, h_h, acts);
-                }
                 const void* act0 = (L.cpu_fmt.gu_act == 0) ? (const void*) h_h : (const void*) acts;
                 for (int e = 0; e < Kp; ++e) {
                     const int x = h_ids[e];
-                    L.score[(size_t) x] += 1.0;
                     h_miss[e] = L.slot_of[(size_t) x] < 0 ? 1 : 0;
                     if (!h_miss[e]) continue;
                     ++n_miss;
@@ -1552,6 +1569,9 @@ struct Engine {
                     j.out[0] = cpu_out + (size_t) e * N;
                     j.nt = 1;
                     jobs.push_back(j);
+                }
+                if (n_miss > 0 && L.cpu_fmt.gu_act != 0) {
+                    C::native_quant_act(L.cpu_fmt, h_h, acts);
                 }
             } else {
                 std::vector<char> quantized((size_t) T, 0);
@@ -1655,6 +1675,8 @@ struct Engine {
 
     void rebalance(int max_swaps, int max_per_layer = 1) {
         if (!hybrid) return;
+        CK(cudaStreamSynchronize(st));
+        sync_d_hits(false);
         const auto& hp = m->hp;
         const int64_t ne = hp.n_expert;
         struct Cand {
@@ -1740,18 +1762,8 @@ struct Engine {
         graph_oom = false;
 
         const int ne = (int) hp.n_expert;
-        // Pull GPU routing hit counts into L.score for 100%-GPU layers so shrinking keeps the true hottest experts!
-        {
-            std::vector<uint32_t> hits_tmp((size_t) ne);
-            for (int ip = 0; ip < (int) m->layers.size(); ++ip) {
-                PhysLayer& L = m->layers[(size_t) ip];
-                if (L.d_hits && L.n_slots == ne) {
-                    CK(cudaMemcpy(hits_tmp.data(), L.d_hits, (size_t) ne * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-                    for (int e = 0; e < ne; ++e) L.score[(size_t) e] += (double) hits_tmp[(size_t) e];
-                    CK(cudaMemset(L.d_hits, 0, (size_t) ne * sizeof(uint32_t)));
-                }
-            }
-        }
+        // Pull GPU routing hit counts into L.score for ALL layers so shrinking keeps the true hottest experts!
+        sync_d_hits(false);
 
         int n_full = 0;
         for (int il = 0; il < hp.n_layer; ++il) {
@@ -1912,17 +1924,31 @@ struct Engine {
                         CK(cudaMemGetInfo(&fr, &tot));
                     }
                 } else {
+                    // Level all tier1 layers to the same uniform target slot count (avoids uneven 48..94/128 after prior tail trim).
                     size_t sum_stride = 0;
-                    for (int ip : t1_layers) sum_stride += m->layers[(size_t) ip].stride;
+                    int sum_slots = 0;
+                    for (int ip : t1_layers) {
+                        sum_stride += m->layers[(size_t) ip].stride;
+                        sum_slots += m->layers[(size_t) ip].n_slots;
+                    }
                     while (fr < need_free && sum_stride > 0) {
                         const size_t deficit = need_free - fr;
-                        const int drop = std::max(1, (int) ((deficit + sum_stride - 1) / sum_stride));
+                        const int total_drop = std::max(1, (int) ((deficit + t1_stride - 1) / t1_stride));
+                        const int target_s = std::max(0, (sum_slots - total_drop) / (int) t1_layers.size());
                         bool any = false;
+                        sum_slots = 0;
                         for (int ip : t1_layers) {
                             const int cur_s = m->layers[(size_t) ip].n_slots;
-                            if (cur_s > 0 && shrink_layer(ip, std::max(0, cur_s - drop))) any = true;
+                            if (cur_s > target_s && shrink_layer(ip, target_s)) any = true;
+                            sum_slots += m->layers[(size_t) ip].n_slots;
                         }
-                        if (!any) break;
+                        if (!any) {
+                            for (int ip : t1_layers) {
+                                const int cur_s = m->layers[(size_t) ip].n_slots;
+                                if (cur_s > 0 && shrink_layer(ip, cur_s - 1)) any = true;
+                            }
+                            if (!any) break;
+                        }
                         CK(cudaMemGetInfo(&fr, &tot));
                     }
                 }
@@ -2101,7 +2127,7 @@ struct Engine {
         std::vector<float*> norm_bank;
         float* bank_last_norm = norm_blk_buf[8];     // cached normalized bank_last
 
-        auto run_layer_pre = [&](int il) {
+        auto run_layer_pre = [&](int il, bool include_route_t1 = false) {
             const int ip = hp.loop_layer(il);
             PhysLayer& L = m->layers[(size_t) ip];
             const bool is_swa = hp.is_swa(il);
@@ -2440,6 +2466,16 @@ struct Engine {
             run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
             if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
             k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+            if (include_route_t1) {
+                // Capture h_h D2H + router + k_route + h_ids/h_ewts D2H inside layer_pre_graph[il] (-240 API calls/tok!)
+                const int Kp = (int) hp.n_expert_used;
+                CK(cudaMemcpyAsync(h_h, in_ffn, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
+                project_f32(in_ffn, L.ffn_gate_inp, router_logits, 1, hp.n_expert, N);
+                k_route_inkling2<<<1, 32, 0, st>>>(
+                    router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale, L.d_hits);
+                CK(cudaMemcpyAsync(h_ids, ids, (size_t) Kp * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) Kp * sizeof(float), cudaMemcpyDeviceToHost, st));
+            }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_out += ms_since(tp_d3); }
         };
 
@@ -2462,13 +2498,13 @@ struct Engine {
             }
         };
 
-        auto run_layer_post = [&](int il) {
+        auto run_layer_post = [&](int il, bool pre_routed_t1 = false) {
             const int ip = hp.loop_layer(il);
             PhysLayer& L = m->layers[(size_t) ip];
             float* hst = conv_hist[(size_t) il];
             float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             const bool is_hy = (L.n_slots < hp.n_expert);
-            run_moe(L, il, in_ffn, T);
+            run_moe(L, il, in_ffn, T, pre_routed_t1);
             const auto tp_mp0 = Clock::now();
             if (T >= 32 && !save_conv_trace) {
                 k_shortconv_pp<<<dim3((unsigned) ((N + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
@@ -2486,7 +2522,7 @@ struct Engine {
         };
 
         const int core_end_virt = (int) (hp.core_start + hp.num_loops * n_core);
-        pp_streaming = (hybrid && T >= pp_stream_t && pp_stage[0] != nullptr);
+        pp_streaming = (hybrid && T >= pp_stream_t && pp_stage_cnt > 0 && pp_stage[0] != nullptr);
         if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
         for (int il = 0; il < hp.n_layer; ++il) {
             const bool use_t1_core = (T == 1 && !capture_dspark);
@@ -2497,8 +2533,8 @@ struct Engine {
                     cudaGraph_t g = nullptr;
                     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
                     for (int cl = il; cl < core_end_virt; ++cl) {
-                        run_layer_pre(cl);
-                        run_layer_post(cl);
+                        run_layer_pre(cl, false);
+                        run_layer_post(cl, false);
                     }
                     CK(cudaStreamEndCapture(st, &g));
                     CK(cudaGraphInstantiate(&cg, g, nullptr, nullptr, 0));
@@ -2515,6 +2551,8 @@ struct Engine {
             }
             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
             const bool use_pre_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming && !capture_dspark);
+            const int ip_cur = hp.loop_layer(il);
+            const bool include_route_t1 = use_pre_graph && (m->layers[(size_t) ip_cur].n_slots < hp.n_expert);
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (layer_pre_graph[(size_t) il] || !graph_oom)) {
                 if (!layer_pre_graph[(size_t) il]) {
@@ -2525,7 +2563,7 @@ struct Engine {
                     cudaGraph_t g = nullptr;
                     cudaError_t ce = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
                     if (ce == cudaSuccess) {
-                        run_layer_pre(il);
+                        run_layer_pre(il, include_route_t1);
                         ce = cudaStreamEndCapture(st, &g);
                     }
                     cudaGraphExec_t ge = nullptr;
@@ -2541,21 +2579,21 @@ struct Engine {
                         next_blk_buf = saved_next;
                         prelude_norm_blocks = saved_pnb;
                         norm_bank = saved_bank;
-                        run_layer_pre(il);
+                        run_layer_pre(il, include_route_t1);
                     }
                 } else {
                     advance_pre_meta(il);
                     CK(cudaGraphLaunch(layer_pre_graph[(size_t) il], st));
                 }
             } else {
-                run_layer_pre(il);
+                run_layer_pre(il, include_route_t1);
             }
             if (prof) {
                 CK(cudaStreamSynchronize(st));
                 if (is_outer) p_attn_ms += ms_since(tp_ly0);
                 else p_core_ms += ms_since(tp_ly0);
             }
-            run_layer_post(il);
+            run_layer_post(il, include_route_t1);
         }
 
         // Output head (skip 200K vocab matmul + sync on intermediate prefill chunks where only KV/DSpark states are needed)
@@ -2571,6 +2609,7 @@ struct Engine {
         }
         if (!compute_logits) {
             CK(cudaStreamSynchronize(st));
+            if (pp_streaming) sync_d_hits(true);
             if (prof) p_head_ms += ms_since(tp_h0);
             pos += T;
             return 0;
@@ -2588,6 +2627,7 @@ struct Engine {
         }
         CK(cudaMemcpyAsync(tmp_picks.data(), pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (pp_streaming) sync_d_hits(true);
         if (out_picks) *out_picks = tmp_picks;
         if (prof) p_head_ms += ms_since(tp_h0);
         pos += T;
@@ -2622,15 +2662,24 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     if (budget < all_exps_bytes && stage_mb > 0 && max_exp_stride > 0) {
         size_t req_stage = stage_mb << 20;
         if (req_stage < max_exp_stride) req_stage = max_exp_stride;
-        if (budget > req_stage * 2 + ((size_t) 256 << 20)) {
-            if (cudaMalloc(&E.pp_stage[0], req_stage) == cudaSuccess &&
-                cudaMalloc(&E.pp_stage[1], req_stage) == cudaSuccess) {
+        // Prefer 3-slot ring buffer (3 x 64 MiB = 192 MiB) for deep PCIe lookahead across 36ms FA2 layers; fall back to 2-slot.
+        const int want_cnt = (budget > req_stage * 3 + ((size_t) 512 << 20)) ? 3 : 2;
+        if (budget > req_stage * (size_t) want_cnt + ((size_t) 256 << 20)) {
+            int ok_cnt = 0;
+            for (int b = 0; b < want_cnt; ++b) {
+                if (cudaMalloc(&E.pp_stage[b], req_stage) == cudaSuccess) {
+                    ++ok_cnt;
+                } else {
+                    (void) cudaGetLastError();
+                    break;
+                }
+            }
+            if (ok_cnt >= 2) {
+                E.pp_stage_cnt = ok_cnt;
                 E.pp_stage_bytes = req_stage;
-                budget -= req_stage * 2;
+                budget -= req_stage * (size_t) ok_cnt;
             } else {
-                (void) cudaGetLastError();
-                if (E.pp_stage[0]) { cudaFree(E.pp_stage[0]); E.pp_stage[0] = nullptr; }
-                if (E.pp_stage[1]) { cudaFree(E.pp_stage[1]); E.pp_stage[1] = nullptr; }
+                for (int b = 0; b < ok_cnt; ++b) { cudaFree(E.pp_stage[b]); E.pp_stage[b] = nullptr; }
             }
         }
     }
@@ -2731,7 +2780,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                     const size_t head_b = (size_t) 5120 << 20;
                     if (avail_b > head_b) {
                         const size_t safe_pin = avail_b - head_b;
-                        max_pin_bytes = std::clamp<size_t>(safe_pin, (size_t) 4096 << 20, (size_t) 12288 << 20);
+                        max_pin_bytes = std::clamp<size_t>(safe_pin, (size_t) 4096 << 20, (size_t) 14336 << 20);
                     }
                     break;
                 }
@@ -2755,6 +2804,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         int s = slots[(size_t) ip];
         L.slot_of.assign((size_t) ne, -1);
         L.score.assign((size_t) ne, 0.0);
+        if (!L.d_hits) {
+            CK(cudaMalloc(&L.d_hits, (size_t) ne * sizeof(uint32_t)));
+            CK(cudaMemset(L.d_hits, 0, (size_t) ne * sizeof(uint32_t)));
+            m.gpu_allocs.push_back(L.d_hits);
+        }
 
         if (s > 0) {
             void* dbl = nullptr;
@@ -2767,9 +2821,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                 m.gpu_allocs.push_back(L.d_blobs);
                 CK(cudaMalloc(&L.d_slot_of, (size_t) ne * sizeof(int32_t)));
                 m.gpu_allocs.push_back(L.d_slot_of);
-                CK(cudaMalloc(&L.d_hits, (size_t) ne * sizeof(uint32_t)));
-                CK(cudaMemset(L.d_hits, 0, (size_t) ne * sizeof(uint32_t)));
-                m.gpu_allocs.push_back(L.d_hits);
                 actual_used += (size_t) s * L.stride;
             } else {
                 s = 0;
