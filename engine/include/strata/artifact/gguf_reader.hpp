@@ -846,11 +846,26 @@ inline std::string geometry_unsupported(const core::ModelGeometry& g) {
 /// The architecture guard: "" when the engine can read the model whose metadata shard is `f`.  Qwen3.8-Flash-Next
 /// (qwen4exp) is read and checked against the shape the kernels are compiled for; Qwen3.6-35B-A3B (qwen35moe) must
 /// carry every key its geometry is read from (core::geometry_from_gguf).
+inline std::string check_architecture_inkling2(const GgufFile& g) {
+    static const char* const keys[] = {
+        "inkling2.block_count", "inkling2.embedding_length", "inkling2.attention.head_count",
+        "inkling2.attention.head_count_kv", "inkling2.attention.key_length", "inkling2.attention.value_length",
+        "inkling2.expert_count", "inkling2.expert_used_count", "inkling2.expert_feed_forward_length",
+        "inkling2.vocab_size", "inkling2.vocab_size_unpadded",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+    }
+    return {};
+}
+
 inline std::string check_architecture(const GgufFile& f) {
     const MetaValue* arch = f.get("general.architecture");
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Inkling2) return check_architecture_inkling2(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

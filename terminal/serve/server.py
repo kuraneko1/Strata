@@ -312,7 +312,7 @@ from serve.server_parts.openai_api import (  # noqa: F401  (moved unchanged, fil
     logprob_span,
     openai_collect,
 )
-from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
+from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, InklingOutputParser, OutputParser,  # noqa: E402
                             parser_for_template, anthropic_to_messages, anthropic_tools,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
@@ -694,7 +694,7 @@ class ConvCacheLog:
         return dict(self.state)
 
 
-EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+EOS_IDS = {248044, 248046, 200006, 199999}   # <|endoftext|>, <|im_end|>, inkling2 <|content_model_end_sampling|>
 
 
 def configure_batch_telemetry_env(env: dict, cfg: dict, override: bool | None) -> None:
@@ -4929,6 +4929,8 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
+        if off and "reasoning_effort" not in kwargs and isinstance(getattr(self, "parser_cls", None), type) and issubclass(self.parser_cls, InklingOutputParser):
+            kwargs = {**kwargs, "reasoning_effort": "none"}
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -5650,6 +5652,7 @@ class Service:
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+                                and not isinstance(parser, InklingOutputParser)
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):

@@ -216,6 +216,10 @@ bool iq128_supported(int ggml_type) noexcept { return false; }
 void iq256_gu_rows_exact_one(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0, int r1) { cpu_kernel_unreachable("iq256_gu_rows_exact_one"); }
 bool nvfp4_256_fits(int n) { return false; }
 void nvfp4_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, float s_gate, float s_up) { cpu_kernel_unreachable("nvfp4_256_gu_rows"); }
+void nvfp4_256_gu_rows_situ(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, float s_gate, float s_up, float beta, float lb) { cpu_kernel_unreachable("nvfp4_256_gu_rows_situ"); }
+bool bf16_256_fits(int n) { return false; }
+void bf16_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, bool situ, float beta, float lb) { cpu_kernel_unreachable("bf16_256_gu_rows"); }
+void bf16_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) { cpu_kernel_unreachable("bf16_256_rows"); }
 void nvfp4_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1, float scale) { cpu_kernel_unreachable("nvfp4_256_rows"); }
 bool nvfp4_512_fits(int n) { return false; }
 void nvfp4_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, float s_gate, float s_up) { cpu_kernel_unreachable("nvfp4_512_gu_rows"); }

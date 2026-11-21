@@ -23,6 +23,9 @@ def tool_format(source: str) -> str:
         return "none"
     if _DSML in source:
         return "dsml"
+    if "<|message_model|>" in source and ("<|content_text|>" in source or "<|content_thinking|>" in source
+                                         or "<|content_invoke_tool_json|>" in source):
+        return "inkling2"
     has_call = "<tool_call>" in source
     if has_call and _XML_OPEN.search(source) and "<parameter=" in source:
         return "xml"

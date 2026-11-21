@@ -2207,6 +2207,17 @@ __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const floa
     h[i] = (g / (1.0f + __expf(-g))) * up[i];
 }
 
+__global__ void situ_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
+                                    long long n, float beta, float lb) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gate[i];
+    const float u = up[i];
+    const float tg = beta * tanhf(g / beta) * (1.0f / (1.0f + __expf(-g)));
+    const float tu = lb > 0.0f ? lb * tanhf(u / lb) : u;
+    h[i] = tg * tu;
+}
+
 template<int TD>
 __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                           const int32_t* __restrict__ grp_start,
@@ -2871,6 +2882,24 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
 #else
         const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
 #endif
+        q8_1_store(h, hq, i);
+    }
+}
+
+__global__ void __launch_bounds__(256) situ_q8_1_entries_kernel(const float* __restrict__ gate,
+                                                                 const float* __restrict__ up,
+                                                                 const int32_t* __restrict__ grp_start,
+                                                                 const int32_t* __restrict__ n_groups, int n_ff,
+                                                                 float beta, float lb,
+                                                                 block_q8_1* __restrict__ hq) {
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = gate[i];
+        const float u = up[i];
+        const float tg = beta * tanhf(g / beta) * (1.0f / (1.0f + __expf(-g)));
+        const float tu = lb > 0.0f ? lb * tanhf(u / lb) : u;
+        const float h = tg * tu;
         q8_1_store(h, hq, i);
     }
 }
@@ -6638,7 +6667,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool gs_layout = true;
 #endif
-    if (gs_layout && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
+    if (gs_layout && !L.situ && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
         switch (L.gu_type) {
 #define STRATA_GS(T) case T: gs_done = launch_gu_swiglu<T>(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
             STRATA_GU_FMTS(STRATA_GS)
@@ -6718,7 +6747,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
-    if (sw_v1 || L.had_block > 0) {
+    if (L.situ) {
+        if (sw_v1 || L.had_block > 0) {
+            situ_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.situ_beta, L.situ_linear_beta);
+            if (L.had_block > 0)
+                hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
+            quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+        } else {
+            situ_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
+                                                                                   (int) L.n_ff, L.situ_beta, L.situ_linear_beta, hq);
+        }
+    } else if (sw_v1 || L.had_block > 0) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
             hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);

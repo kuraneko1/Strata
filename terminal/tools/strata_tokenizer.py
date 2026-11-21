@@ -130,6 +130,8 @@ def pre_tokenizer_kind(pre) -> str | None:
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
         return "qwen35"
+    if p == "inkling2":
+        return "deepseek3"
     if p == "qwen2":
         return "qwen2"
     if p.startswith("deepseek"):

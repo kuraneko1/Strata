@@ -2951,9 +2951,220 @@ class JsonOutputParser(OutputParser):
                          declared_only=declared_only, deferred=deferred)
 
 
+_INK_MSG = "<|message_model|>"
+_INK_THINK = "<|content_thinking|>"
+_INK_TEXT = "<|content_text|>"
+_INK_TOOL_JSON = "<|content_invoke_tool_json|>"
+_INK_TOOL_TEXT = "<|content_invoke_tool_text|>"
+_INK_END = "<|end_message|>"
+_INK_EOS = "<|content_model_end_sampling|>"
+_INK_EOT = "<|endoftext|>"
+_INK_TAGS = (_INK_MSG, _INK_THINK, _INK_TEXT, _INK_TOOL_JSON, _INK_TOOL_TEXT, _INK_END, _INK_EOS, _INK_EOT)
+_INK_HEADERS = (_INK_THINK, _INK_TEXT, _INK_TOOL_JSON, _INK_TOOL_TEXT, _INK_END, _INK_EOS, _INK_EOT)
+
+
+class InklingOutputParser(OutputParser):
+    """Incremental parser for Inkling-2 wire format:
+    `<|message_model|><|content_thinking|>...</|end_message|>`
+    `<|message_model|><|content_text|>...</|end_message|>`
+    `<|message_model|>NAME<|content_invoke_tool_json|>{"name":...,"args":{...}}<|end_message|>`
+    terminated by `<|content_model_end_sampling|>` or `<|endoftext|>`.
+    Never leaks control tags or partial tag prefixes across deltas."""
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
+        super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools, recover=recover,
+                         declared_only=declared_only, deferred=deferred)
+        self._want_thinking = thinking
+        self._mode = "idle"     # "idle" | "header" | "thinking" | "text" | "tool_json"
+        self._tool_name = ""
+        self._tool_buf = ""
+
+    @property
+    def clean(self) -> bool:
+        return not self.buf and not self._held and self._mode in ("idle", "thinking", "text")
+
+    def feed(self, delta: str) -> list[Event]:
+        self.buf += delta
+        out: list[Event] = []
+        while self.buf:
+            if self._mode == "idle":
+                stripped = self.buf.lstrip("\r\n\t ")
+                if not stripped:
+                    if len(self.buf) > 16:
+                        self.buf = self.buf[-16:]
+                    break
+                if len(stripped) < len(self.buf):
+                    self.buf = stripped
+                best_i, best_tag = -1, ""
+                for tag in _INK_TAGS:
+                    if self.buf.startswith(tag):
+                        best_i, best_tag = 0, tag
+                        break
+                if best_i == 0:
+                    self.buf = self.buf[len(best_tag):]
+                    if best_tag == _INK_MSG:
+                        self._mode = "header"
+                        self._tool_name = ""
+                    elif best_tag == _INK_THINK:
+                        self._mode = "thinking"
+                        self.state = "reasoning"
+                    elif best_tag == _INK_TEXT:
+                        self._mode = "text"
+                        self.state = "content"
+                    elif best_tag in (_INK_TOOL_JSON, _INK_TOOL_TEXT):
+                        self._mode = "tool_json"
+                        self.state = "content"
+                        self._tool_buf = ""
+                    elif best_tag in (_INK_END, _INK_EOS, _INK_EOT):
+                        self._mode = "idle"
+                        self.state = "content"
+                    continue
+                if any(tag.startswith(self.buf) for tag in _INK_TAGS):
+                    break
+                # Untyped raw output fallback (only if non-tag content starts)
+                self._mode = "thinking" if self._want_thinking else "text"
+                self.state = "reasoning" if self._mode == "thinking" else "content"
+                continue
+
+            if self._mode == "header":
+                best_i, best_tag = -1, ""
+                for tag in _INK_HEADERS:
+                    p = self.buf.find(tag)
+                    if p >= 0 and (best_i < 0 or p < best_i):
+                        best_i, best_tag = p, tag
+                if best_i >= 0:
+                    self._tool_name = self.buf[:best_i].strip()
+                    self.buf = self.buf[best_i + len(best_tag):]
+                    if best_tag == _INK_THINK:
+                        self._mode = "thinking"
+                        self.state = "reasoning"
+                    elif best_tag == _INK_TEXT:
+                        self._mode = "text"
+                        self.state = "content"
+                    elif best_tag in (_INK_TOOL_JSON, _INK_TOOL_TEXT):
+                        self._mode = "tool_json"
+                        self.state = "content"
+                        self._tool_buf = ""
+                    else:
+                        self._mode = "idle"
+                        self.state = "content"
+                    continue
+                if len(self.buf) > 256 and "<|" not in self.buf:
+                    self._mode = "text"
+                    self.state = "content"
+                    continue
+                break
+
+            if self._mode in ("thinking", "text"):
+                kind = "reasoning" if self._mode == "thinking" else "content"
+                best_i, best_tag = -1, ""
+                for tag in _INK_TAGS:
+                    p = self.buf.find(tag)
+                    if p >= 0 and (best_i < 0 or p < best_i):
+                        best_i, best_tag = p, tag
+                if best_i >= 0:
+                    if best_i > 0:
+                        out.append(Event(kind, self.buf[:best_i]))
+                    self.buf = self.buf[best_i + len(best_tag):]
+                    if best_tag == _INK_MSG:
+                        self._mode = "header"
+                        self._tool_name = ""
+                        self.state = "content"
+                    elif best_tag == _INK_THINK:
+                        self._mode = "thinking"
+                        self.state = "reasoning"
+                    elif best_tag == _INK_TEXT:
+                        self._mode = "text"
+                        self.state = "content"
+                    elif best_tag in (_INK_TOOL_JSON, _INK_TOOL_TEXT):
+                        self._mode = "tool_json"
+                        self.state = "content"
+                        self._tool_buf = ""
+                        self._tool_name = ""
+                    else:
+                        self._mode = "idle"
+                        self.state = "content"
+                    continue
+                keep = self._hold(self.buf, _INK_TAGS)
+                if len(self.buf) > keep:
+                    out.append(Event(kind, self.buf[:len(self.buf) - keep]))
+                    self.buf = self.buf[len(self.buf) - keep:]
+                break
+
+            if self._mode == "tool_json":
+                best_i, best_tag = -1, ""
+                for tag in (_INK_END, _INK_MSG, _INK_EOS, _INK_EOT):
+                    p = self.buf.find(tag)
+                    if p >= 0 and (best_i < 0 or p < best_i):
+                        best_i, best_tag = p, tag
+                if best_i >= 0:
+                    payload = self._tool_buf + self.buf[:best_i]
+                    self._tool_buf = ""
+                    self.buf = self.buf[best_i + len(best_tag):]
+                    out.extend(self._emit_inkling_tool(payload))
+                    self._tool_name = ""
+                    if best_tag == _INK_MSG:
+                        self._mode = "header"
+                    else:
+                        self._mode = "idle"
+                    self.state = "content"
+                    continue
+                keep = self._hold(self.buf, (_INK_END, _INK_MSG, _INK_EOS, _INK_EOT))
+                if len(self.buf) > keep:
+                    self._tool_buf += self.buf[:len(self.buf) - keep]
+                    self.buf = self.buf[len(self.buf) - keep:]
+                break
+        return out
+
+    def _emit_inkling_tool(self, payload: str) -> list[Event]:
+        s = payload.strip()
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            raw_name = obj.get("name") or self._tool_name
+            args = obj.get("args") if "args" in obj else obj.get("arguments")
+            if args is None:
+                args = {}
+            if isinstance(raw_name, str) and isinstance(args, dict):
+                name = self.aliases.get(raw_name.strip(), raw_name.strip())
+                if self._callable(name):
+                    return [Event("tool_call", call=ToolCall(name=name, arguments=args))]
+                self.unread += 1
+                if len(self.unread_names) < 5:
+                    self.unread_names.append(name)
+        self.unread += 1
+        return [Event("content", payload)]
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        out: list[Event] = []
+        if self._mode == "tool_json":
+            payload = self._tool_buf + self.buf
+            self._tool_buf = ""
+            self.buf = ""
+            if payload.strip():
+                if reason in (None, "stop"):
+                    out.extend(self._emit_inkling_tool(payload))
+                else:
+                    out.append(Event("content", payload))
+        elif self._mode in ("thinking", "text") and self.buf:
+            kind = "reasoning" if self._mode == "thinking" else "content"
+            out.append(Event(kind, self.buf))
+            self.buf = ""
+        else:
+            self.buf = ""
+        self._mode = "idle"
+        self.state = "content"
+        return out
+
+
 def parser_for_template(source: str | None):
     """The OutputParser class for a chat template's text, by the tool-call form the template documents (serve/toolformat.py):
-    the JSON form gets JsonOutputParser; the XML form every Strata model ships with, templates without tools, and forms nothing
-    here reads keep OutputParser (the same class as before this existed)."""
+    the JSON form gets JsonOutputParser, Inkling2 gets InklingOutputParser, and the XML form / others keep OutputParser."""
     from serve import toolformat
-    return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser
+    fmt = toolformat.tool_format(source or "")
+    if fmt == "inkling2":
+        return InklingOutputParser
+    return JsonOutputParser if fmt == "json" else OutputParser
