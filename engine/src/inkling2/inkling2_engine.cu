@@ -1068,10 +1068,12 @@ struct Engine {
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
         cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 32768);
         cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
@@ -2021,8 +2023,8 @@ struct Engine {
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
                     if (T == 4 && !is_swa) {
-                        const int sp = std::clamp((sm_count * 15) / std::max(1, (int) hp.n_head_kv), 30, kAttnSplitMax);
-                        k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 32768, st>>>(
+                        const int sp = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
+                        k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 28672, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
@@ -2058,15 +2060,19 @@ struct Engine {
                         }
                         if (best_sp > 1) {
                             float* pp_sp_buf = (float*) escr;
-                            k_attn_q8_gqa3_pp_fa2_192<true><<<dim3((unsigned) hp.n_head_kv, (unsigned) q_tiles, (unsigned) best_sp), 384, 97280, st>>>(
+                            k_attn_q8_gqa3_pp_fa2_192<true, false><<<dim3((unsigned) hp.n_head_kv, (unsigned) q_tiles, (unsigned) best_sp), 256, 97280, st>>>(
                                 pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att, pp_sp_buf,
-                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], 0, (int) hp.n_swa, pos0_d, kq_scale, T, best_sp);
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale, T, best_sp);
                             k_attn_pp_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                                 pp_sp_buf, pGate, att, (int) hp.n_head, best_sp);
-                        } else {
-                            k_attn_q8_gqa3_pp_fa2_192<false><<<dim3((unsigned) hp.n_head_kv, (unsigned) q_tiles), 384, 97280, st>>>(
+                        } else if (is_swa) {
+                            k_attn_q8_gqa3_pp_fa2_192<false, true><<<dim3((unsigned) hp.n_head_kv, (unsigned) q_tiles), 256, 97280, st>>>(
                                 pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att, nullptr,
-                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T, 1);
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale, T, 1);
+                        } else {
+                            k_attn_q8_gqa3_pp_fa2_192<false, false><<<dim3((unsigned) hp.n_head_kv, (unsigned) q_tiles), 256, 97280, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att, nullptr,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale, T, 1);
                         }
                     } else {
                         k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, 29184, st>>>(

@@ -7726,10 +7726,12 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
                     const int r_start = mh * 32;
                     const int r_end = min(rows, r_start + 32);
                     const int n_valid = max(0, r_end - r_start);
-                    for (int i = tid; i < n_valid * BN; i += 256) {
-                        const int r = r_start + i / BN, c = i % BN;
+                    for (int i = tid; i < n_valid * (BN / 4); i += 256) {
+                        const int r = r_start + (i >> 5), c4 = i & 31;
                         const int out_row = IS_DOWN ? ent_idx[c0 + r] : (c0 + r);
-                        dst_mat[(size_t) out_row * N_out + col0 + c] = s_out[i] * sc;
+                        const float4 v = reinterpret_cast<const float4*>(s_out)[i];
+                        reinterpret_cast<float4*>(dst_mat + (size_t) out_row * N_out + col0)[c4] =
+                            make_float4(v.x * sc, v.y * sc, v.z * sc, v.w * sc);
                     }
                     __syncthreads();
                 }
@@ -7906,10 +7908,12 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 wmma::store_matrix_sync(s_out + (wm * 32 + 16) * BN + wn * 32,      acc[1][0], BN, wmma::mem_row_major);
                 wmma::store_matrix_sync(s_out + (wm * 32 + 16) * BN + wn * 32 + 16, acc[1][1], BN, wmma::mem_row_major);
                 __syncthreads();
-                for (int i = tid; i < rows * BN; i += 256) {
-                    const int r = i >> 7, c = i & 127;
+                for (int i4 = tid; i4 < (rows * BN) / 4; i4 += 256) {
+                    const int r = i4 >> 5, c = (i4 & 31) << 2;
                     const int out_row = IS_DOWN ? ent_idx[c0 + r] : (c0 + r);
-                    dst_mat[(size_t) out_row * N_out + col0 + c] = s_out[i] * sc;
+                    const float4 v = reinterpret_cast<const float4*>(s_out)[i4];
+                    *reinterpret_cast<float4*>(dst_mat + (size_t) out_row * N_out + col0 + c) =
+                        make_float4(v.x * sc, v.y * sc, v.z * sc, v.w * sc);
                 }
                 __syncthreads();
             }
