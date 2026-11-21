@@ -6,29 +6,29 @@ Machine-readable CSV data: [v100-pcie-800k.csv](v100-pcie-800k.csv).
 
 ---
 
-## 1. GPU 0 (`Tesla V100-PCIE-32GB`, ECC Off) `512 -> 819,000` (`800K`) Full Sweep (`6ff2c009` -> `8a30df9a` -> `2f09e21e`)
+## 1. GPU 0 (`Tesla V100-PCIE-32GB`, ECC Off) `512 -> 819,000` (`800K`) Full Sweep (`6ff2c009` -> `8a30df9a` -> `2f09e21e` -> `9056d598`)
 
-Config: `--max-context 819200 --draft ... --draft-max 3` (`3072/3072` experts resident in VRAM, `13.76 GiB` experts, `652 MiB` free VRAM).  
+Config: `--max-context 819200 --draft ... --draft-max 3` (`3072/3072` experts resident in VRAM, `13.76 GiB` experts, `652 MiB` free VRAM, exact INT8 KV — zero quantization changes).  
 Each depth checkpoint appended tokens up to target depth (`temperature=0`) and generated 64 tokens.
 
-Key `2f09e21e` (Round 4 Roofline-guided 0-spill kernels) changes:
-- `k_attn_q8_gqa3_pp_fa2_192<SPLIT_KV, IS_SWA>`: 8-warp (`256` thr, exact `2.0` warps/SMSP, **0 B stack spills** on both `sm_70` & `sm_89`) `3x2` QK^T + `bar.sync` 64-thr half-row max merge + `3x4` P*V (`0.583` SMEM loads/WMMA), `HFMA2` fused KV dequant, shifted-`nsink` bulk loop (`0` bulk adds), lazy `acc` rescale, and separate `IS_SWA` template specialization (`204.2 -> 181.4 ms/L` sustained at `819K`, **`56.9 TFLOPS`** = `67.7%` of real cuBLAS TC peak).
-- `k_attn_q8_gqa3_verify4_wmma_split` & `k_dspark_attn_q8_wmma_split`: Register-resident WMMA O accumulators (`acc0/acc1`, zero per-tile `s_tile` bounce), `HFMA2` pre-scaled KV dequant, `ex2.approx` softmax, lazy rescale, eliminated `s_dk`/`s_dv`/`s_pvmax`/`s_qscale`, raised split cap `sp -> 240`, `0` spills (`3.683 -> 2.972 ms/L` = **`+23.9%`** faster standalone, `573.3 GB/s` = `66.2%` of real HBM2 STREAM peak).
-- Vectorized `float4` paths in `k_f32_to_f16`, `k_combine_experts`, and `wmma_grouped_{64,128}_kernel` epilogues.
+Key `2f09e21e` (Round 4) & `9056d598` (Round 5 — zero quantization change) changes:
+- `wmma_acc_to_matA_16x16`: Bit-exact in-register `16x16` accumulator -> `matrix_a` converter (6 warp shuffles on Volta `sm_70`, 0 shuffles on `sm_75+`, verified `max_err = 0.00000000`), completely eliminating `sP` SMEM and 2-way `sP` bank conflicts.
+- `k_attn_q8_gqa3_pp_fa2_256_bulk` + `_tail` (`9056d598`): Zero-`sP`, zero-`bar.sync`, L2-swizzled `dim3(3*q_tiles, n_head_kv, best_sp)` `256`-row global prefill (`2x4` QK^T + `2x8` P*V, `0.500` SMEM loads/WMMA, `87,040 B` SMEM), reaching **`169.1 ms/L` sustained (`61.0 TFLOPS` = `72.5%` of real cuBLAS `4096^3` peak)**.
+- `k_attn_q8_gqa3_verify4_wmma_split` & `k_dspark_attn_q8_wmma_split` (`9056d598`): Zero-Sync warp-independent V3 (`128` thr, `4 blk/SM`, `21,760 B` / `18,432 B` SMEM, `128` regs, ZERO `__syncthreads()` inside the entire 800K KV loop, ZERO `sS`/`sP`), hitting **`2.363 ms/L` (`721.1 GB/s` = `83.3%` of real HBM2 STREAM peak)** standalone and breaking **`70.1 t/s` (`913.11 ms`)** at `819K` (`100.2 t/s` at `262K`)!
 
-| Depth | Added (`RESUME`) | `6ff2c009` PP | `8a30df9a` (R3) PP | **`2f09e21e` (R4) PP** | Total PP Gain | Last 1024-tok Chunk | `6ff2c009` Decode | `8a30df9a` (R3) Decode | **`2f09e21e` (R4) Decode** | Total Decode Gain |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `512` | `+512` (`0`) | `0.40 s` (`1,291.2 t/s`) | `0.38 s` (`1,333.2 t/s`) | `0.38 s` (**`1,339.7 t/s`**) | `+3.8%` | `333 -> 292 -> 290 ms` | `130.5 t/s` | `131.3 t/s` | `130.1 t/s` (`491.75 ms`) | `-0.3%` |
-| `65,536` (`64K`) | `+64,961` (`575`) | `40.03 s` (`1,622.9 t/s`) | `26.92 s` (`2,413.0 t/s`) | `26.64 s` (**`2,438.8 t/s`**) | **`+50.3%`** | `837 -> 480 -> 465 ms` | `105.5 t/s` | `119.9 t/s` | `118.0 t/s` (`542.48 ms`) | **`+11.8%`** |
-| `131,072` (`128K`) | `+65,473` (`65,599`) | `63.41 s` (`1,032.5 t/s`) | `35.26 s` (`1,856.7 t/s`) | `34.17 s` (**`1,916.1 t/s`**) | **`+85.6%`** | `1,196 -> 604 -> 583 ms` | `89.6 t/s` | `110.8 t/s` | `110.2 t/s` (`580.75 ms`) | **`+23.0%`** |
-| `262,144` (`256K`) | `+131,009` (`131,135`) | `196.60 s` (`666.4 t/s`) | `95.52 s` (`1,371.5 t/s`) | `90.55 s` (**`1,446.8 t/s`**) | **`2.17x`** | `1,924 -> 864 -> 813 ms` | `68.7 t/s` | `96.3 t/s` | **`97.2 t/s`** (`658.76 ms`) | **`+41.5%`** |
-| `393,216` (`384K`) | `+131,009` (`262,207`) | `289.67 s` (`452.3 t/s`) | `128.81 s` (`1,017.1 t/s`) | `120.39 s` (**`1,088.2 t/s`**) | **`2.41x`** | `2,653 -> 1,127 -> 1,047 ms` | `55.5 t/s` | `85.7 t/s` | **`87.4 t/s`** (`731.85 ms`) | **`+57.5%`** |
-| `524,288` (`512K`) | `+131,009` (`393,279`) | `383.18 s` (`341.9 t/s`) | `161.96 s` (`808.9 t/s`) | `150.13 s` (**`872.6 t/s`**) | **`2.55x`** | `3,380 -> 1,383 -> 1,278 ms` | `46.7 t/s` | `77.0 t/s` | **`78.9 t/s`** (`811.22 ms`) | **`+69.0%`** |
-| `655,360` (`640K`) | `+131,009` (`524,351`) | `476.69 s` (`274.8 t/s`) | `195.24 s` (`671.0 t/s`) | `179.82 s` (**`728.5 t/s`**) | **`2.65x`** | `4,114 -> 1,644 -> 1,513 ms` | `40.4 t/s` | `69.7 t/s` | **`72.3 t/s`** (`884.61 ms`) | **`+79.0%`** |
-| `786,432` (`768K`) | `+131,009` (`655,423`) | `570.23 s` (`229.7 t/s`) | `228.52 s` (`573.3 t/s`) | `209.46 s` (**`625.5 t/s`**) | **`2.72x`** | `4,840 -> 1,902 -> 1,741 ms` | `35.5 t/s` | `64.1 t/s` | **`66.5 t/s`** (`961.78 ms`) | **`+87.3%`** |
-| **`819,000` (`~800K`)** | `+32,505` (`786,495`) | `156.22 s` (`208.1 t/s`) | `61.82 s` (`525.8 t/s`) | `56.59 s` (**`574.3 t/s`**) | **`2.76x`** | **`5,028 -> 1,970 -> 1,800 ms`** | `34.5 t/s` | `62.8 t/s` | **`65.3 t/s`** (`979.49 ms`) | **`+89.3%`** |
+| Depth | Added (`RESUME`) | `6ff2c009` PP | `8a30df9a` (R3) PP | `2f09e21e` (R4) PP | **`9056d598` (R5) PP** | Total PP Gain | Last Chunk (`1024`) | `6ff2c009` Decode | `2f09e21e` (R4) Decode | **`9056d598` (R5) Decode** | Total Decode Gain |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `512` | `+512` (`0`) | `1,291.2 t/s` | `1,333.2 t/s` | `1,339.7 t/s` | **`1,349.2 t/s`** | `+4.5%` | `333 -> 289 ms` | `130.5 t/s` | `130.1 t/s` | `130.2 t/s` (`491.7 ms`) | `-0.2%` |
+| `65,536` | `+64,961` (`575`) | `1,622.9 t/s` | `2,413.0 t/s` | `2,438.8 t/s` | **`2,427.2 t/s`** | **`+49.6%`** | `837 -> 464 ms` | `105.5 t/s` | `118.0 t/s` | **`118.6 t/s`** (`539.5 ms`) | **`+12.4%`** |
+| `131,072` | `+65,473` (`65,599`) | `1,032.5 t/s` | `1,856.7 t/s` | `1,916.1 t/s` | **`1,935.3 t/s`** | **`+87.4%`** | `1,196 -> 571 ms` | `89.6 t/s` | `110.2 t/s` | **`111.6 t/s`** (`573.3 ms`) | **`+24.6%`** |
+| `262,144` | `+131,009` (`131,135`) | `666.4 t/s` | `1,371.5 t/s` | `1,446.8 t/s` | **`1,483.0 t/s`** | **`2.23x`** | `1,924 -> 787 ms` | `68.7 t/s` | `97.2 t/s` | **`100.2 t/s`** (`638.6 ms`) | **`+45.9%`** |
+| `393,216` | `+131,009` (`262,207`) | `452.3 t/s` | `1,017.1 t/s` | `1,088.2 t/s` | **`1,127.8 t/s`** | **`2.49x`** | `2,653 -> 1,005 ms` | `55.5 t/s` | `87.4 t/s` | **`91.2 t/s`** (`701.5 ms`) | **`+64.3%`** |
+| `524,288` | `+131,009` (`393,279`) | `341.9 t/s` | `808.9 t/s` | `872.6 t/s` | **`910.4 t/s`** | **`2.66x`** | `3,380 -> 1,221 ms` | `46.7 t/s` | `78.9 t/s` | **`83.5 t/s`** (`766.9 ms`) | **`+78.8%`** |
+| `655,360` | `+131,009` (`524,351`) | `274.8 t/s` | `671.0 t/s` | `728.5 t/s` | **`763.4 t/s`** | **`2.78x`** | `4,114 -> 1,442 ms` | `40.4 t/s` | `72.3 t/s` | **`77.0 t/s`** (`831.0 ms`) | **`+90.6%`** |
+| `786,432` | `+131,009` (`655,423`) | `229.7 t/s` | `573.3 t/s` | `625.5 t/s` | **`657.2 t/s`** | **`2.86x`** | `4,840 -> 1,654 ms` | `35.5 t/s` | `66.5 t/s` | **`71.8 t/s`** (`891.4 ms`) | **`+102.3%`** |
+| **`819,000`** | `+32,505` (`786,495`) | `208.1 t/s` | `525.8 t/s` | `574.3 t/s` | **`603.7 t/s`** | **`2.90x`** | **`5,028 -> 1,709 ms`** | `34.5 t/s` | `65.3 t/s` | **`70.1 t/s`** (`913.1 ms`) | **`+103.2% (2.03x)`** |
 
-Cumulative `0 -> 819,000` wall time: `2,188.1 s` (`36.5 min`) in `6ff2c009` -> `942.4 s` (`15.7 min`) in `8a30df9a` -> **`875.9 s` (`14.6 min`, `2.50x` faster overall, `945 t/s` avg PP)** in `2f09e21e`. Zero OOMs, zero thermal/power throttling.
+Cumulative `0 -> 819,000` wall time: `2,188.1 s` (`36.5 min`) in `6ff2c009` -> `942.4 s` (`15.7 min`) in `8a30df9a` -> `875.9 s` (`14.6 min`) in `2f09e21e` -> **`841.7 s` (`14.0 min`, `2.60x` faster overall, `984 t/s` avg PP)** in `9056d598`. Zero OOMs, zero thermal/power throttling, zero quantization changes.
 
 ---
 
@@ -110,14 +110,14 @@ Cumulative `0 -> 258,048` PP time on GPU 1 (`PG500-216`, 72 SMs, ECC On): `354.8
 
 | Regime / Kernel Section | Time (`1024`-tok chunk) | Share | Achieved Rate | % of Real Silicon Ceiling |
 |---|---:|---:|---:|---:|
-| **800K Prefill (`1,800 ms/chunk`) — Global Attention (`8L`, `FA2_192` 8w R4)** | **`1,451 ms`** (`181.4 ms/L`) | **`80.6%`** | **`56.9 TFLOPS`** (incl. INT8 dequant + softmax + Split-KV) | **`67.7%`** of `84.1` TC ceiling (`67.1%` of pure WMMA loop) |
-| **800K Prefill — All Non-Global (`40L` SWA + `48L` MoE/Dense/Mix/Ctrl)** | **`349 ms`** | `19.4%` | — | — |
+| **800K Prefill (`1,709 ms/chunk`) — Global Attention (`8L`, R5 `FA2_256_bulk` Zero-`sP`)** | **`1,353 ms`** (`169.1 ms/L`) | **`79.2%`** | **`61.0 TFLOPS`** (incl. INT8 dequant + softmax + Split-KV) | **`72.5%`** of `84.1` TC ceiling (`163.3 ms/L` = `63.1 TFLOPS` standalone) |
+| **800K Prefill — All Non-Global (`40L` SWA + `48L` MoE/Dense/Mix/Ctrl)** | **`356 ms`** | `20.8%` | — | — |
 | **Short Diverse Prefill (`416.5 ms/chunk` GPU, `2048`-tok `nvprof`)**: | | | | |
 | ├ NVFP4 MoE Gate+Up + Down (`44L`, `wmma_grouped_64`) | `133.8 + 72.1 = 205.9 ms` | `49.4%` | `~21–30 TFLOPS` (Zipf routed `128` exp) | Memory/dequant + routing-imbalance bound |
 | ├ Dense `Q8_0` GEMMs (`Q/K/V/O` + `dequant_q8_0`) | `47.7 ms` | `11.5%` | `66–82 TFLOPS` (`cuBLAS` / `cutlass`) | `80–97%` of `cuBLAS` ceiling |
 | ├ `FA2_192` SWA (`40L`) + Global (`8L`) | `41.8 ms` | `10.0%` | — | `0` spills (`222` / `255` regs) |
 | ├ `Q5_K` GU (`4L`) + `Q8_0` Down (`4L`) (`wmma_grouped_128`) | `16.7 + 8.8 = 25.5 ms` | `6.1%` | — | Vectorized `float4` epilogue |
 | └ Elementwise / Norm / Mix / Rel / Ctrl / ShortConv / Combine | `95.6 ms` | `23.0%` | Memory-bound | Fused `mix`/`rel`/`ctrl` + `float4` `f32->f16`/`combine` |
-| **800K Decode (`verify4_wmma_v2`, `8L` Global KV scan, `1.70 GB/L`)** | **`23.8 ms/step`** (`2.972 ms/L`) | `~49%` of step | **`573.3 GB/s`** (incl. `HFMA2` + WMMA + softmax) | **`66.2%`** of `865.9` STREAM (`77.5%` of `MODE1` `2.305 ms/L` floor) |
-| **800K Decode (`dspark` full-attn `v2`, `1L` + combine)** | **`~6.7 ms/step`** | `~14%` of step | — | Register-resident `acc0/acc1`, `sp=240`, `0` spills |
+| **800K Decode (`verify4_wmma_v3` Zero-Sync, `8L` Global KV scan, `1.70 GB/L`)** | **`18.9 ms/step`** (`2.363 ms/L`) | `~44%` of step | **`721.1 GB/s`** (incl. `HFMA2` + WMMA + softmax) | **`83.3%`** of `865.9` STREAM (**`97.5%`** of `MODE1` `2.305 ms/L` floor!) |
+| **800K Decode (`dspark` full-attn `v3` Zero-Sync, `1L` + combine)** | **`~7.4 ms/step`** | `~17%` of step | — | `4 blk/SM`, `128` regs, `0` `__syncthreads()` in KV loop |
 
