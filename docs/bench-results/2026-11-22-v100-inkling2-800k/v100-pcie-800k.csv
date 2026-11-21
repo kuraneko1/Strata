@@ -34,3 +34,9 @@ vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,off,983040,1,0,1,0.1174
 vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,off,1048576,1,0,1,0.1931,5.18,,,1,25.8,38.70,2807/3072,356,1M native; Tier1 128/128 Tier2 105..106/128
 vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,on,1048576,1,0,1,0.1142,8.76,,,31,1336.1,23.20,2275/3072,356,1M native DSpark ON; Tier2 61..62/128 cpu_ms=675.3
 vram_ctx_capacity,Tesla V100-PCIE-32GB,Disabled,6ff2c009,off,1310720,1,0,1,0.1283,7.80,,,3,88.8,33.77,1959/3072,368,1.25M check; Tier1 128/128 Tier2 35..36/128 cpu_ms=55.3
+gpu1_256k_wmma_r2,Tesla PG500-216,Enabled,2a9c9f5f,on,262144,512,0,512,0.43,1186.4,341,341,64,502.03,127.5,3072/3072,10660,WMMA verify4+dspark8 + GQA-3 PP + DFlare graph
+gpu1_256k_wmma_r2,Tesla PG500-216,Enabled,2a9c9f5f,on,262144,32768,575,32193,16.51,1949.6,605,326,64,530.53,120.6,3072/3072,10660,WMMA verify4+dspark8 + GQA-3 PP + DFlare graph
+gpu1_256k_wmma_r2,Tesla PG500-216,Enabled,2a9c9f5f,on,262144,65536,32831,32705,23.00,1422.0,801,803,64,556.45,115.0,3072/3072,10660,WMMA verify4+dspark8 + GQA-3 PP + DFlare graph
+gpu1_256k_wmma_r2,Tesla PG500-216,Enabled,2a9c9f5f,on,262144,131072,65599,65473,64.92,1008.5,1192,1197,64,605.31,105.7,3072/3072,10660,WMMA verify4+dspark8 + GQA-3 PP + DFlare graph
+gpu1_256k_wmma_r2,Tesla PG500-216,Enabled,2a9c9f5f,on,262144,196608,131135,65473,90.25,725.4,1590,1593,64,651.74,98.2,3072/3072,10660,WMMA verify4+dspark8 + GQA-3 PP + DFlare graph
+gpu1_256k_wmma_r2,Tesla PG500-216,Enabled,2a9c9f5f,on,262144,258048,196671,61377,107.75,569.6,1964,1968,64,696.24,91.9,3072/3072,10660,WMMA verify4+dspark8 + GQA-3 PP + DFlare graph
