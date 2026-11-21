@@ -939,7 +939,7 @@ __global__ void k_attn_q8(const float* __restrict__ Q,
     }
 }
 
-inline constexpr int kAttnSplitMax = 160;
+inline constexpr int kAttnSplitMax = 240;
 
 /// GQA-3 prefill Q8 KV attention: 1 CTA of 128 threads processes all 3 Q-heads per KV head, 3x less KV HBM traffic.
 /// grid (n_head_kv, T), block 128. Requires n_head == 3 * n_head_kv and head_dim == 128.
@@ -1074,7 +1074,7 @@ __global__ void k_attn_q8_gqa3_pp(const float* __restrict__ Q,
     }
 }
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 530
 /// Vectorized 4x int8 -> 2x half2 in-register decode via byte_perm + __hsub2 (bit-exact for [-128, 127]).
 __device__ __forceinline__ void i8x4_to_h2x2(uint32_t packed_i8x4, __half2& out0, __half2& out1) {
     const uint32_t u = packed_i8x4 ^ 0x80808080u;
@@ -1381,13 +1381,14 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     extern __shared__ __align__(16) char smem_raw[];
-    // 40,064 B total: sQ (8704) | sKV (17408, aliases s_tile 17408) | sS (8192) | sP (4608) | scalars (1152)
+    // 48,768 B total (fits 2 blk/SM in 96/100 KB): sQ (8704) | sKV (17408, separate!) | sP (4608) |
+    // sS (8192) overlaid by s_tile (32*132 = 16896) | scalars (1152). Cuts barriers from 6 -> 4 per tile.
     __half* sQ = reinterpret_cast<__half*>(smem_raw);
     __half* sKV = sQ + 32 * 136;
-    float* s_tile = reinterpret_cast<float*>(sKV);
-    float* sS = reinterpret_cast<float*>(sKV + 64 * 136);
-    __half* sP = reinterpret_cast<__half*>(sS + 32 * 64);
-    float* s_qscale = reinterpret_cast<float*>(sP + 32 * 72);
+    __half* sP = sKV + 64 * 136;
+    float* sS = reinterpret_cast<float*>(sP + 32 * 72);
+    float* s_tile = sS;
+    float* s_qscale = s_tile + 32 * 132;
     float* s_dk = s_qscale + 32;
     float* s_dv = s_dk + 64;
     float* s_m = s_dv + 64;
@@ -1402,6 +1403,7 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
     const int warp = tid >> 5;
     const int lane = tid & 31;
     const int kv_dim = n_head_kv * 128;
+    constexpr float kLog2e = 1.4426950408889634f;
 
     {
         const int qr = tid >> 3;
@@ -1422,7 +1424,7 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
         const float qscale = (amax > 0.0f) ? amax : 1.0f;
         const float inv_qs = __fdividef(1.0f, qscale);
         if ((tid & 7) == 0) {
-            s_qscale[qr] = qscale;
+            s_qscale[qr] = qscale * kq_scale * kLog2e;
             s_m[qr] = 0.0f;
             s_l[qr] = 1.0f;
         }
@@ -1541,16 +1543,16 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
                 const int r = warp * 4 + rr;
                 const int t = t0 + r;
                 const bool t_ok = t < T;
-                const float nsink = t_ok ? -sink[(size_t) t * n_head + h] : 0.0f;
-                const float qks = s_qscale[r] * kq_scale;
+                const float nsink = t_ok ? (-sink[(size_t) t * n_head + h] * kLog2e) : 0.0f;
+                const float qks2 = s_qscale[r];
 
                 float sc0, sc1;
                 bool v0, v1;
                 if (is_bulk) {
                     v0 = t_ok;
                     v1 = t_ok;
-                    sc0 = t_ok ? (sS[r * 64 + col0] * qks * dk0 + nsink) : -1e30f;
-                    sc1 = t_ok ? (sS[r * 64 + col1] * qks * dk1 + nsink) : -1e30f;
+                    sc0 = t_ok ? (sS[r * 64 + col0] * qks2 * dk0 + nsink) : -1e30f;
+                    sc1 = t_ok ? (sS[r * 64 + col1] * qks2 * dk1 + nsink) : -1e30f;
                 } else {
                     const int pos_q = p0 + t;
                     const float* rt = t_ok ? (rel_tab + ((size_t) t * n_head + h) * n_ext) : nullptr;
@@ -1558,8 +1560,8 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
                     const int d1 = pos_q - j_1;
                     v0 = t_ok && (j_0 <= pos_q) && (!is_swa || d0 < n_swa);
                     v1 = t_ok && (j_1 <= pos_q) && (!is_swa || d1 < n_swa);
-                    sc0 = v0 ? (sS[r * 64 + col0] * qks * dk0 + (d0 < n_ext ? rt[d0] : nsink)) : -1e30f;
-                    sc1 = v1 ? (sS[r * 64 + col1] * qks * dk1 + (d1 < n_ext ? rt[d1] : nsink)) : -1e30f;
+                    sc0 = v0 ? (sS[r * 64 + col0] * qks2 * dk0 + (d0 < n_ext ? (rt[d0] * kLog2e) : nsink)) : -1e30f;
+                    sc1 = v1 ? (sS[r * 64 + col1] * qks2 * dk1 + (d1 < n_ext ? (rt[d1] * kLog2e) : nsink)) : -1e30f;
                 }
 
                 float rmax = fmaxf(sc0, sc1);
@@ -1567,9 +1569,9 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
                 for (int o = 16; o > 0; o >>= 1) rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, o));
                 const float m_old = s_m[r], l_old = s_l[r];
                 const float m_new = fmaxf(m_old, rmax);
-                const float alpha = l_old > 0.0f ? __expf(m_old - m_new) : 0.0f;
-                const float p_0 = v0 ? __expf(sc0 - m_new) : 0.0f;
-                const float p_1 = v1 ? __expf(sc1 - m_new) : 0.0f;
+                const float alpha = l_old > 0.0f ? exp2f(m_old - m_new) : 0.0f;
+                const float p_0 = v0 ? exp2f(sc0 - m_new) : 0.0f;
+                const float p_1 = v1 ? exp2f(sc1 - m_new) : 0.0f;
                 float psum = p_0 + p_1;
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) psum += __shfl_xor_sync(0xffffffffu, psum, o);
@@ -1607,18 +1609,16 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
                 wmma::mma_sync(fc0, fa0, fb, fc0);
                 wmma::mma_sync(fc1, fa1, fb, fc1);
             }
-            __syncthreads();
-            wmma::store_matrix_sync(s_tile + cbase, fc0, 136, wmma::mem_row_major);
-            wmma::store_matrix_sync(s_tile + 16 * 136 + cbase, fc1, 136, wmma::mem_row_major);
+            wmma::store_matrix_sync(s_tile + cbase, fc0, 132, wmma::mem_row_major);
+            wmma::store_matrix_sync(s_tile + 16 * 132 + cbase, fc1, 132, wmma::mem_row_major);
         }
         __syncthreads();
 
         const int row0 = my_half * 16;
 #pragma unroll
         for (int r = 0; r < 16; ++r) {
-            acc[r] = acc[r] * s_alpha[row0 + r] + s_pvmax[row0 + r] * s_tile[(row0 + r) * 136 + my_col];
+            acc[r] = acc[r] * s_alpha[row0 + r] + s_pvmax[row0 + r] * s_tile[(row0 + r) * 132 + my_col];
         }
-        __syncthreads();
     };
 
     int jb = j_start;
@@ -1641,14 +1641,15 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
 
 /// GQA-3 Split-KV Q8 decode / verify attention (1 <= T < 16):
 /// grid (n_head_kv, split_n, T), block 128 (8 half-warps of 16 threads).
-/// Each half-warp handles 1 key token via coalesced int2 KV loads + FP16x2 (__half2) Q*K dot product.
-__global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
-                                     const int8_t* __restrict__ kq, const __half* __restrict__ ks,
-                                     const int8_t* __restrict__ vq, const __half* __restrict__ vs,
-                                     const float* __restrict__ rel_tab, const float* __restrict__ sink,
-                                     float* __restrict__ split_out,
-                                     int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
-                                     const int32_t* __restrict__ pos0, float kq_scale, int split_n) {
+/// Each half-warp handles 1 key token via uint2 KV loads, SIMD i8x4_to_h2x2 decode, __half2 V acc, and log2 exp2f.
+__global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
+        const float* __restrict__ Q,
+        const int8_t* __restrict__ kq, const __half* __restrict__ ks,
+        const int8_t* __restrict__ vq, const __half* __restrict__ vs,
+        const float* __restrict__ rel_tab, const float* __restrict__ sink,
+        float* __restrict__ split_out,
+        int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
+        const int32_t* __restrict__ pos0, float kq_scale, int split_n) {
     __shared__ __half2 sq2[3][64];
     __shared__ float s_m[3][8];
     __shared__ float s_l[3][8];
@@ -1659,6 +1660,8 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
     const int hlane = tid & 15;
     const int kv_dim = n_head_kv * 128;
     const int h0 = 3 * hkv;
+    constexpr float kLog2e = 1.4426950408889634f;
+    const float kq_l2 = kq_scale * kLog2e;
 
     const int pos_q = pos0[0] + t;
     const int j0 = is_swa ? max(0, pos_q - n_swa + 1) : 0;
@@ -1695,23 +1698,25 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
         q2[g][3] = sq2[g][hlane * 4 + 3];
     }
 
-    float neg_sink[3];
+    float neg_sink2[3];
     const float* rt[3];
 #pragma unroll
     for (int g = 0; g < 3; ++g) {
         const int h = h0 + g;
         rt[g] = rel_tab + ((size_t) t * n_head + h) * n_ext;
-        neg_sink[g] = -sink[(size_t) t * n_head + h];
+        neg_sink2[g] = -sink[(size_t) t * n_head + h] * kLog2e;
     }
 
     const bool has_sink = (sp == 0 && hw == 0);
-    float m[3], l[3], acc[3][8];
+    const __half2 z2 = __half2half2(__float2half(0.0f));
+    float m[3], l[3];
+    __half2 acc2[3][4];
 #pragma unroll
     for (int g = 0; g < 3; ++g) {
         m[g] = has_sink ? 0.0f : -1e30f;
         l[g] = has_sink ? 1.0f : 0.0f;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) acc[g][i] = 0.0f;
+        for (int i = 0; i < 4; ++i) acc2[g][i] = z2;
     }
 
     // Bulk loop for !is_swa tokens with dist >= n_ext: linear slot == j, bias == -sink[h].
@@ -1720,17 +1725,15 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
         const int j = jb + (hw & 1);
         if (j < bulk_end) {
             const size_t idx = (size_t) j * n_head_kv + hkv;
-            const float dkkq = __half2float(__ldg(&ks[idx])) * kq_scale;
-            const float d_v  = __half2float(__ldg(&vs[idx]));
-            const int2 k8 = *reinterpret_cast<const int2*>(kq + (size_t) j * kv_dim + hkv * 128 + base8);
-            const int2 v8 = *reinterpret_cast<const int2*>(vq + (size_t) j * kv_dim + hkv * 128 + base8);
-            const int8_t* kp = (const int8_t*) &k8;
-            const int8_t* vp = (const int8_t*) &v8;
-            __half2 kh[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                kh[i] = __halves2half2(__int2half_rn(kp[2 * i]), __int2half_rn(kp[2 * i + 1]));
-            }
+            const float dkkq2 = __half2float(__ldg(&ks[idx])) * kq_l2;
+            const float d_v = __half2float(__ldg(&vs[idx]));
+            const uint2 k8 = *reinterpret_cast<const uint2*>(kq + (size_t) j * kv_dim + hkv * 128 + base8);
+            const uint2 v8 = *reinterpret_cast<const uint2*>(vq + (size_t) j * kv_dim + hkv * 128 + base8);
+            __half2 kh[4], vh[4];
+            i8x4_to_h2x2(k8.x, kh[0], kh[1]);
+            i8x4_to_h2x2(k8.y, kh[2], kh[3]);
+            i8x4_to_h2x2(v8.x, vh[0], vh[1]);
+            i8x4_to_h2x2(v8.y, vh[2], vh[3]);
             float dots[3];
 #pragma unroll
             for (int g = 0; g < 3; ++g) {
@@ -1745,14 +1748,15 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
             }
 #pragma unroll
             for (int g = 0; g < 3; ++g) {
-                const float sc = dots[g] * dkkq + neg_sink[g];
+                const float sc = dots[g] * dkkq2 + neg_sink2[g];
                 const float m_new = fmaxf(m[g], sc);
-                const float alpha = l[g] > 0.0f ? __expf(m[g] - m_new) : 0.0f;
-                const float p = __expf(sc - m_new);
-                const float pv = p * d_v;
+                const float alpha = l[g] > 0.0f ? exp2f(m[g] - m_new) : 0.0f;
+                const float p = exp2f(sc - m_new);
+                const __half2 a2 = __half2half2(__float2half(alpha));
+                const __half2 pv2 = __half2half2(__float2half(p * d_v));
                 l[g] = l[g] * alpha + p;
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[g][i] = acc[g][i] * alpha + pv * (float) vp[i];
+                for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(acc2[g][i], a2, __hmul2(pv2, vh[i]));
                 m[g] = m_new;
             }
         }
@@ -1765,17 +1769,15 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
         if (j < c_end) {
             const int slot = is_swa ? (pow2_cap ? (j & cap_mask) : (j % cap)) : j;
             const size_t idx = (size_t) slot * n_head_kv + hkv;
-            const float dkkq = __half2float(__ldg(&ks[idx])) * kq_scale;
-            const float d_v  = __half2float(__ldg(&vs[idx]));
-            const int2 k8 = *reinterpret_cast<const int2*>(kq + (size_t) slot * kv_dim + hkv * 128 + base8);
-            const int2 v8 = *reinterpret_cast<const int2*>(vq + (size_t) slot * kv_dim + hkv * 128 + base8);
-            const int8_t* kp = (const int8_t*) &k8;
-            const int8_t* vp = (const int8_t*) &v8;
-            __half2 kh[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                kh[i] = __halves2half2(__int2half_rn(kp[2 * i]), __int2half_rn(kp[2 * i + 1]));
-            }
+            const float dkkq2 = __half2float(__ldg(&ks[idx])) * kq_l2;
+            const float d_v = __half2float(__ldg(&vs[idx]));
+            const uint2 k8 = *reinterpret_cast<const uint2*>(kq + (size_t) slot * kv_dim + hkv * 128 + base8);
+            const uint2 v8 = *reinterpret_cast<const uint2*>(vq + (size_t) slot * kv_dim + hkv * 128 + base8);
+            __half2 kh[4], vh[4];
+            i8x4_to_h2x2(k8.x, kh[0], kh[1]);
+            i8x4_to_h2x2(k8.y, kh[2], kh[3]);
+            i8x4_to_h2x2(v8.x, vh[0], vh[1]);
+            i8x4_to_h2x2(v8.y, vh[2], vh[3]);
             const int dist = pos_q - j;
             float dots[3];
 #pragma unroll
@@ -1791,15 +1793,16 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
             }
 #pragma unroll
             for (int g = 0; g < 3; ++g) {
-                const float bias = dist < n_ext ? rt[g][dist] : neg_sink[g];
-                const float sc = dots[g] * dkkq + bias;
+                const float bias = dist < n_ext ? (rt[g][dist] * kLog2e) : neg_sink2[g];
+                const float sc = dots[g] * dkkq2 + bias;
                 const float m_new = fmaxf(m[g], sc);
-                const float alpha = l[g] > 0.0f ? __expf(m[g] - m_new) : 0.0f;
-                const float p = __expf(sc - m_new);
-                const float pv = p * d_v;
+                const float alpha = l[g] > 0.0f ? exp2f(m[g] - m_new) : 0.0f;
+                const float p = exp2f(sc - m_new);
+                const __half2 a2 = __half2half2(__float2half(alpha));
+                const __half2 pv2 = __half2half2(__float2half(p * d_v));
                 l[g] = l[g] * alpha + p;
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[g][i] = acc[g][i] * alpha + pv * (float) vp[i];
+                for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(acc2[g][i], a2, __hmul2(pv2, vh[i]));
                 m[g] = m_new;
             }
         }
@@ -1815,7 +1818,11 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
 #pragma unroll
     for (int g = 0; g < 3; ++g) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) s_acc[hw][base8 + i] = acc[g][i];
+        for (int i = 0; i < 4; ++i) {
+            const float2 f2 = __half22float2(acc2[g][i]);
+            s_acc[hw][base8 + 2 * i + 0] = f2.x;
+            s_acc[hw][base8 + 2 * i + 1] = f2.y;
+        }
         __syncthreads();
         const int h = h0 + g;
         float mg = -1e30f;
@@ -1823,7 +1830,7 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
         float lg = 0.0f, og = 0.0f;
         for (int w = 0; w < 8; ++w) {
             if (s_l[g][w] > 0.0f) {
-                const float c = __expf(s_m[g][w] - mg);
+                const float c = exp2f(s_m[g][w] - mg);
                 lg += s_l[g][w] * c;
                 og += s_acc[w][tid] * c;
             }
@@ -1833,6 +1840,238 @@ __global__ void k_attn_q8_gqa3_split(const float* __restrict__ Q,
         if (tid == 0) {
             dst[128] = mg;
             dst[129] = lg;
+        }
+        __syncthreads();
+    }
+}
+
+/// Shared-KV Split-KV Q8 verify attention for T == 4 (non-SWA, GQA-3, head_dim=128):
+/// Loads K/V once per BK=16 tile into shared memory instead of 4x from HBM;
+/// pairs 2 half-warps per query token (parity 0/1) for full 8-half-warp occupancy and CUDA-graph dynamic *pos0.
+__global__ void __launch_bounds__(128, 6) k_attn_q8_gqa3_verify4_split(
+        const float* __restrict__ Q,
+        const int8_t* __restrict__ kq, const __half* __restrict__ ks,
+        const int8_t* __restrict__ vq, const __half* __restrict__ vs,
+        const float* __restrict__ rel_tab, const float* __restrict__ sink,
+        float* __restrict__ split_out,
+        int n_head, int n_head_kv, int n_ext,
+        const int32_t* __restrict__ pos0, float kq_scale, int split_n) {
+    constexpr int BK = 16;
+    __shared__ uint2 sK[BK][16];
+    __shared__ uint2 sV[BK][16];
+    __shared__ float sDK[BK];
+    __shared__ float sDV[BK];
+    __shared__ float s_m[3][8];
+    __shared__ float s_l[3][8];
+    __shared__ float s_acc[4][128];
+
+    const int hkv = blockIdx.x, sp = blockIdx.y;
+    const int tid = threadIdx.x, hw = tid >> 4, hlane = tid & 15;
+    const int t = hw & 3;
+    const int parity = hw >> 2;
+    const int h0 = 3 * hkv, kv_dim = n_head_kv * 128;
+    const int base8 = hlane * 8;
+    constexpr float kLog2e = 1.4426950408889634f;
+    const float kq_l2 = kq_scale * kLog2e;
+
+    const int p0 = pos0[0];
+    const int total = p0 + 4;
+    const int chunk_sz = max(64, (total + split_n - 1) / split_n);
+    const int c_beg = sp * chunk_sz;
+    if (c_beg >= total) {
+        if (parity == 0 && hlane == 0) {
+            for (int g = 0; g < 3; ++g) {
+                float* dst = split_out + (((size_t) t * split_n + sp) * n_head + (h0 + g)) * 130;
+                dst[128] = -1e30f;
+                dst[129] = 0.0f;
+            }
+        }
+        return;
+    }
+    const int c_end = min(total, c_beg + chunk_sz);
+
+    __half2 q2[3][4];
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        const float* qp = Q + ((size_t) t * n_head + (h0 + g)) * 128 + base8;
+        q2[g][0] = __float22half2_rn(*reinterpret_cast<const float2*>(qp + 0));
+        q2[g][1] = __float22half2_rn(*reinterpret_cast<const float2*>(qp + 2));
+        q2[g][2] = __float22half2_rn(*reinterpret_cast<const float2*>(qp + 4));
+        q2[g][3] = __float22half2_rn(*reinterpret_cast<const float2*>(qp + 6));
+    }
+
+    const int pos_q = p0 + t;
+    float neg_sink2[3];
+    const float* rt[3];
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        const int h = h0 + g;
+        rt[g] = rel_tab + ((size_t) t * n_head + h) * n_ext;
+        neg_sink2[g] = -sink[(size_t) t * n_head + h] * kLog2e;
+    }
+
+    const bool has_sink = (sp == 0 && parity == 0);
+    const __half2 z2 = __half2half2(__float2half(0.0f));
+    float m[3], l[3];
+    __half2 acc2[3][4];
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        m[g] = has_sink ? 0.0f : -1e30f;
+        l[g] = has_sink ? 1.0f : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc2[g][i] = z2;
+    }
+
+    const int bulk_limit = p0 - n_ext + 1;
+    const int bulk_end = min(c_end, max(c_beg, bulk_limit));
+    int jb = c_beg;
+    for (; jb + BK <= bulk_end; jb += BK) {
+        for (int r = hw; r < BK; r += 8) {
+            const int j = jb + r;
+            sK[r][hlane] = *reinterpret_cast<const uint2*>(kq + (size_t) j * kv_dim + hkv * 128 + base8);
+            sV[r][hlane] = *reinterpret_cast<const uint2*>(vq + (size_t) j * kv_dim + hkv * 128 + base8);
+            if (hlane == 0) {
+                const size_t idx = (size_t) j * n_head_kv + hkv;
+                sDK[r] = __half2float(__ldg(&ks[idx])) * kq_l2;
+                sDV[r] = __half2float(__ldg(&vs[idx]));
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int k = parity; k < BK; k += 2) {
+            const uint2 k8 = sK[k][hlane];
+            const uint2 v8 = sV[k][hlane];
+            const float dkkq2 = sDK[k], d_v = sDV[k];
+            __half2 kh[4], vh[4];
+            i8x4_to_h2x2(k8.x, kh[0], kh[1]);
+            i8x4_to_h2x2(k8.y, kh[2], kh[3]);
+            i8x4_to_h2x2(v8.x, vh[0], vh[1]);
+            i8x4_to_h2x2(v8.y, vh[2], vh[3]);
+            float dots[3];
+#pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                d2 = __hfma2(q2[g][1], kh[1], d2);
+                d2 = __hfma2(q2[g][2], kh[2], d2);
+                d2 = __hfma2(q2[g][3], kh[3], d2);
+                float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(__activemask(), dt, o, 16);
+                dots[g] = dt;
+            }
+#pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                const float sc = dots[g] * dkkq2 + neg_sink2[g];
+                const float m_new = fmaxf(m[g], sc);
+                const float alpha = l[g] > 0.0f ? exp2f(m[g] - m_new) : 0.0f;
+                const float p = exp2f(sc - m_new);
+                const __half2 a2 = __half2half2(__float2half(alpha));
+                const __half2 pv2 = __half2half2(__float2half(p * d_v));
+                l[g] = l[g] * alpha + p;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(acc2[g][i], a2, __hmul2(pv2, vh[i]));
+                m[g] = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (; jb < c_end; jb += BK) {
+        const int nk = min(BK, c_end - jb);
+        for (int r = hw; r < nk; r += 8) {
+            const int j = jb + r;
+            sK[r][hlane] = *reinterpret_cast<const uint2*>(kq + (size_t) j * kv_dim + hkv * 128 + base8);
+            sV[r][hlane] = *reinterpret_cast<const uint2*>(vq + (size_t) j * kv_dim + hkv * 128 + base8);
+            if (hlane == 0) {
+                const size_t idx = (size_t) j * n_head_kv + hkv;
+                sDK[r] = __half2float(__ldg(&ks[idx])) * kq_l2;
+                sDV[r] = __half2float(__ldg(&vs[idx]));
+            }
+        }
+        __syncthreads();
+
+        for (int k = parity; k < nk; k += 2) {
+            const int j = jb + k;
+            if (j <= pos_q) {
+                const uint2 k8 = sK[k][hlane];
+                const uint2 v8 = sV[k][hlane];
+                const float dkkq2 = sDK[k], d_v = sDV[k];
+                __half2 kh[4], vh[4];
+                i8x4_to_h2x2(k8.x, kh[0], kh[1]);
+                i8x4_to_h2x2(k8.y, kh[2], kh[3]);
+                i8x4_to_h2x2(v8.x, vh[0], vh[1]);
+                i8x4_to_h2x2(v8.y, vh[2], vh[3]);
+                const int dist = pos_q - j;
+                float dots[3];
+#pragma unroll
+                for (int g = 0; g < 3; ++g) {
+                    __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                    d2 = __hfma2(q2[g][1], kh[1], d2);
+                    d2 = __hfma2(q2[g][2], kh[2], d2);
+                    d2 = __hfma2(q2[g][3], kh[3], d2);
+                    float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
+#pragma unroll
+                    for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(__activemask(), dt, o, 16);
+                    dots[g] = dt;
+                }
+#pragma unroll
+                for (int g = 0; g < 3; ++g) {
+                    const float bias = dist < n_ext ? (rt[g][dist] * kLog2e) : neg_sink2[g];
+                    const float sc = dots[g] * dkkq2 + bias;
+                    const float m_new = fmaxf(m[g], sc);
+                    const float alpha = l[g] > 0.0f ? exp2f(m[g] - m_new) : 0.0f;
+                    const float p = exp2f(sc - m_new);
+                    const __half2 a2 = __half2half2(__float2half(alpha));
+                    const __half2 pv2 = __half2half2(__float2half(p * d_v));
+                    l[g] = l[g] * alpha + p;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) acc2[g][i] = __hfma2(acc2[g][i], a2, __hmul2(pv2, vh[i]));
+                    m[g] = m_new;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        if (hlane == 0) {
+            s_m[g][hw] = m[g];
+            s_l[g][hw] = l[g];
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        if (parity == 1) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f2 = __half22float2(acc2[g][i]);
+                s_acc[t][base8 + 2 * i + 0] = f2.x;
+                s_acc[t][base8 + 2 * i + 1] = f2.y;
+            }
+        }
+        __syncthreads();
+        if (parity == 0) {
+            const float m0 = m[g], l0 = l[g];
+            const float m1 = s_m[g][t + 4], l1 = s_l[g][t + 4];
+            float mg = -1e30f;
+            if (l0 > 0.0f && m0 > mg) mg = m0;
+            if (l1 > 0.0f && m1 > mg) mg = m1;
+            const float c0 = (l0 > 0.0f) ? exp2f(m0 - mg) : 0.0f;
+            const float c1 = (l1 > 0.0f) ? exp2f(m1 - mg) : 0.0f;
+            const float lg = l0 * c0 + l1 * c1;
+            float* dst = split_out + (((size_t) t * split_n + sp) * n_head + (h0 + g)) * 130;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f0 = __half22float2(acc2[g][i]);
+                dst[base8 + 2 * i + 0] = f0.x * c0 + s_acc[t][base8 + 2 * i + 0] * c1;
+                dst[base8 + 2 * i + 1] = f0.y * c0 + s_acc[t][base8 + 2 * i + 1] * c1;
+            }
+            if (hlane == 0) {
+                dst[128] = mg;
+                dst[129] = lg;
+            }
         }
         __syncthreads();
     }
@@ -1860,7 +2099,7 @@ __global__ void k_attn_split_combine(const float* __restrict__ split_out, const 
         const float* src = split_out + (((size_t) t * split_n + s) * n_head + h) * 130;
         const float ls = src[129];
         if (ls > 0.0f) {
-            const float c = __expf(src[128] - mg);
+            const float c = exp2f(src[128] - mg);
             lg += ls * c;
             og += src[d] * c;
         }

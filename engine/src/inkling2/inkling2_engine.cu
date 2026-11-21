@@ -1023,7 +1023,7 @@ struct Engine {
         d_f32(&wo, (size_t) tmax * N);
         d_f32(&attn_split, (size_t) verify_max_t * kAttnSplitMax * hp.n_head * 130);
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
-        attn_split_t1_full = std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
+        attn_split_t1_full = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
         attn_split_t1_swa = std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv), 8, 24);
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
@@ -1886,7 +1886,14 @@ struct Engine {
             const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
-                    if (T < 16) {
+                    if (T == 4 && !is_swa) {
+                        const int sp = std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
+                        k_attn_q8_gqa3_verify4_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 0, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
+                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa);
+                    } else if (T < 16) {
                         const int sp = (T == 1)
                             ? (is_swa ? attn_split_t1_swa : attn_split_t1_full)
                             : (is_swa ? std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv * T), 4, 24)
@@ -1897,7 +1904,7 @@ struct Engine {
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa);
                     } else if (T >= 128) {
-                        constexpr size_t kAttnWmmaSmem32 = 40960;
+                        constexpr size_t kAttnWmmaSmem32 = 49152;
                         static bool wmma32_smem_set = false;
                         if (!wmma32_smem_set) {
                             cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kAttnWmmaSmem32);
