@@ -1,0 +1,13 @@
+run,commit,gpu,context_max,depth,fresh_tokens,pp_s,pp_tps,dec_tokens,tg_ms,dec_tps,gpu_hit_pct,cum_pp_s,experts_vram,tier1_slots,tier2_slots,notes
+rtx4070_262k_base,9056d598,NVIDIA GeForce RTX 4070 (12GB),262144,512,512,0.91,564.0,64,1396.8,45.10,78.2,0.91,1827,128,24..25,Initial 32K KV; DSpark OFF; Q8KV
+rtx4070_262k_base,9056d598,NVIDIA GeForce RTX 4070 (12GB),262144,32768,32256,17.01,1895.8,64,1225.6,51.40,91.3,17.92,,,,KV expanded to 64K
+rtx4070_262k_base,9056d598,NVIDIA GeForce RTX 4070 (12GB),262144,65536,32768,18.62,1759.4,64,2487.5,25.33,90.2,36.55,,,,KV expanded to 131K
+rtx4070_262k_base,9056d598,NVIDIA GeForce RTX 4070 (12GB),262144,131072,65473,72.49,903.2,64,6498.1,9.70,68.7,109.03,,,,KV expanded to 262K (whole-layer eviction + unpinned malloc)
+rtx4070_262k_base,9056d598,NVIDIA GeForce RTX 4070 (12GB),262144,196608,65536,133.05,492.6,64,5259.3,11.98,43.8,242.08,896,7x128+5x0,0,5 core layers evicted to 0/128 unpinned malloc
+rtx4070_262k_base,9056d598,NVIDIA GeForce RTX 4070 (12GB),262144,262000,65392,143.34,456.2,64,5234.8,12.03,43.8,385.42,896,7x128+5x0,0,5 core layers evicted to 0/128 unpinned malloc
+rtx4070_262k_opt,23125db1,NVIDIA GeForce RTX 4070 (12GB),262144,512,512,0.88,584.0,64,1163.1,54.17,79.4,0.88,1858,128,26..28,Zero-waste KV growth + uniform hot shrink + pinned tier1 + FA2 sp4 + T1 CPU pre-combine
+rtx4070_262k_opt,23125db1,NVIDIA GeForce RTX 4070 (12GB),262144,32768,32256,19.11,1687.8,64,1219.1,51.68,93.8,19.99,1762,128,18..20,KV expanded to 64K (free 292 MiB)
+rtx4070_262k_opt,23125db1,NVIDIA GeForce RTX 4070 (12GB),262144,65536,32768,19.64,1668.7,64,1912.3,32.94,91.7,39.62,1546,128,0..2,KV expanded to 131K (free 302 MiB; tier1 still 128/128)
+rtx4070_262k_opt,23125db1,NVIDIA GeForce RTX 4070 (12GB),262144,131072,65473,44.46,1472.6,64,18636.4,3.38,77.0,84.09,1068,89,0,tg_ms includes one-time 131K->262K KV expansion & 12-layer hblobs build (~16.4s; steady decode ~28.5 t/s)
+rtx4070_262k_opt,23125db1,NVIDIA GeForce RTX 4070 (12GB),262144,196608,65536,56.35,1163.0,64,2204.1,28.58,74.9,140.44,1068,89,0,All 12 core layers 89/128 hot experts + pinned PCIe Gen4
+rtx4070_262k_opt,23125db1,NVIDIA GeForce RTX 4070 (12GB),262144,262000,65392,60.74,1076.6,64,2368.0,26.60,74.9,201.18,1068,89,0,All 12 core layers 89/128 hot experts + pinned PCIe Gen4 (free 260 MiB)
