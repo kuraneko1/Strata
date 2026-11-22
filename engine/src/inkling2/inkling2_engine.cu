@@ -1,9 +1,11 @@
 // src/inkling2/inkling2_engine.cu - Standalone / integrated CUDA + AVX2 hybrid engine for Inkling-2-Mini (arch inkling2).
 #include "strata/inkling2/engine.hpp"
+#include "strata/inkling2/profile_rules.hpp"
 #include "inkling2_kernels.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/gguf_split.hpp"
+#include "strata/core/emulate.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -688,6 +690,7 @@ struct Engine {
     int swa_kv_cap = 1024;
     int tmax = 512;
     int64_t pos = 0;
+    strata::inkling2::ResolvedProfile profile{};
 
     // KV caches & shortconv state (per virtual layer il = 0..47)
     bool kv_q8 = true;
@@ -983,12 +986,18 @@ struct Engine {
     }
 
     bool init(Model& model, int max_ctx, int max_t, bool use_kv_q8, std::string& err,
-              bool enable_gemm_quant = false, int max_verify_t = 1) {
+              bool enable_gemm_quant = false, int max_verify_t = 1,
+              const strata::inkling2::ResolvedProfile* prof_cfg = nullptr) {
         m = &model;
         ctx = max_ctx;
         size_t vfree_init = 0, vtot_init = 0;
         CK(cudaMemGetInfo(&vfree_init, &vtot_init));
-        full_kv_cap = (vtot_init < (20ULL << 30) && max_ctx > 32768) ? 32768 : max_ctx;
+        if (prof_cfg) {
+            profile = *prof_cfg;
+            full_kv_cap = std::clamp(profile.full_kv_init, 1, max_ctx);
+        } else {
+            full_kv_cap = (vtot_init < (20ULL << 30) && max_ctx > 32768) ? 32768 : max_ctx;
+        }
         tmax = std::max(max_t, max_verify_t);
         verify_max_t = std::max(1, max_verify_t);
         kv_q8 = use_kv_q8;
@@ -1056,7 +1065,7 @@ struct Engine {
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, cur_dev);
         cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, cur_dev);
         cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, cur_dev);
-        bf16_x_f16 = gemm.bf16_converts_x() || (cc_maj == 7 && cc_min < 5);
+        bf16_x_f16 = gemm.bf16_converts_x() || profile.force_bf16_x_f16;
         {
             int64_t max_bf16_w = 0;
             auto note_bf16 = [&](const DenseMat& W) {
@@ -1075,8 +1084,8 @@ struct Engine {
                 gemm.reserve_bf16_tc(max_bf16_w, bf16_x_f16 ? 0 : (int64_t) tmax * 2 * N);
             }
         }
-        attn_split_t1_full = std::clamp((sm_count * 8) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
-        attn_split_t1_swa = std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv), 8, 24);
+        attn_split_t1_full = std::clamp((sm_count * profile.t1_full_split_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
+        attn_split_t1_swa = std::clamp((sm_count * profile.t1_swa_split_mult) / std::max(1, (int) hp.n_head_kv), 8, 24);
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
         cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
         cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
@@ -1129,8 +1138,7 @@ struct Engine {
 
         const size_t reg0_qkv = 3 * sz_N + 4 * sz_kv + sz_rel + 2 * sz_dyn;
         const size_t per_sp_bytes = (size_t) tmax * (size_t) hp.n_head * 130 * sizeof(float);
-        // Reserve 7 splits on >=20 GiB cards (e.g. V100 80-SM needs total_sp=6 for 6 exact waves at T=1024), 5/4 on 12 GB cards.
-        const size_t want_sp = (tmax >= 2048) ? 4 : ((vtot_init >= (20ULL << 30)) ? 7 : 5);
+        const size_t want_sp = (size_t) std::max(2, profile.want_sp);
         const size_t reg0_bytes = a256(std::max(reg0_qkv, want_sp * per_sp_bytes));
         const size_t reg1_bytes = a256(std::max(3 * sz_N, 3 * sz_q));
         const size_t reg2_ctrl = sz_2N + 3 * sz_N + sz_c64 + ctrl_w16_bytes;
@@ -1510,7 +1518,7 @@ struct Engine {
             project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
             k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
                 router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
-                (hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+                (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
         }
 
@@ -1831,7 +1839,7 @@ struct Engine {
             : ((size_t) hp.kv_dim * sizeof(__half) * 2);
         const size_t extra_total = (size_t) n_full * (size_t) (new_cap - full_kv_cap) * per_tok;
         // Host-staged per-layer KV growth needs ZERO extra full-layer temp headroom (saves ~520 MiB at 262K = +122 core experts!).
-        const size_t need_free = extra_total + ((size_t) 112 << 20);
+        const size_t need_free = extra_total + ((size_t) std::max(64, profile.kv_grow_reserve_mib) << 20);
 
         auto demote_tier2_pin = [&](size_t need_bytes) -> bool {
             for (int j = (int) m->layers.size() - 1; j >= 0 && pinned_used + need_bytes > max_pin_bytes; --j) {
@@ -2713,11 +2721,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     const int ne = (int) hp.n_expert;
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 256 << 20;
+    const bool core_res_hy = (E.profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
+    const size_t reserve = core_res_hy ? ((size_t) 160 << 20) : ((size_t) 256 << 20);
     size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                     : (fr > reserve ? fr - reserve : 0);
 
-    size_t stage_mb = 64;
+    size_t stage_mb = (size_t) (E.profile.pp_stage_mb > 0 ? E.profile.pp_stage_mb : 64);
     if (const char* v = std::getenv("STRATA_PP_STAGE_MB")) stage_mb = (size_t) std::max(0, std::atoi(v));
     size_t max_exp_stride = 0;
     size_t all_exps_bytes = 0;
@@ -2726,16 +2735,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         max_exp_stride = std::max(max_exp_stride, m.layers[(size_t) ip].stride);
         all_exps_bytes += (size_t) ne * m.layers[(size_t) ip].stride;
     }
-    // Keep extra ~144 MiB (400 MiB total) headroom when hybrid-offloading so 48 CUDA pre-graphs + desktop fit OOM-free
+    // Keep extra headroom when hybrid-offloading so CUDA pre-graphs + desktop fit OOM-free (CoreResidentHybrid uses 1 core_graph).
     if (vram_gib < 0.0 && budget < all_exps_bytes) {
-        const size_t extra_resv = (size_t) 144 << 20;
+        const size_t extra_resv = core_res_hy ? ((size_t) 64 << 20) : ((size_t) 144 << 20);
         budget = budget > extra_resv ? (budget - extra_resv) : 0;
     }
     if (budget < all_exps_bytes && stage_mb > 0 && max_exp_stride > 0) {
         size_t req_stage = stage_mb << 20;
         if (req_stage < max_exp_stride) req_stage = max_exp_stride;
-        // Prefer 3-slot ring buffer (3 x 64 MiB = 192 MiB) for deep PCIe lookahead across 36ms FA2 layers; fall back to 2-slot.
-        const int want_cnt = (budget > req_stage * 3 + ((size_t) 512 << 20)) ? 3 : 2;
+        const int pref_cnt = std::clamp(E.profile.pp_stage_cnt_pref > 0 ? E.profile.pp_stage_cnt_pref : 3, 2, Engine::kMaxPpStages);
+        const int want_cnt = (budget > req_stage * (size_t) pref_cnt + ((size_t) 512 << 20)) ? pref_cnt : 2;
         if (budget > req_stage * (size_t) want_cnt + ((size_t) 256 << 20)) {
             int ok_cnt = 0;
             for (int b = 0; b < want_cnt; ++b) {
@@ -3287,28 +3296,6 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "strata-inkling2: load failed: %s\n", err.c_str());
         return 1;
     }
-    if (chunk <= 0) {
-        size_t vfree = 0, vtot = 0;
-        cudaMemGetInfo(&vfree, &vtot);
-        const int init_kv = (vtot < (20ULL << 30) && max_ctx > 32768) ? 32768 : max_ctx;
-        int n_full = 0;
-        for (int il = 0; il < m.hp.n_layer; ++il) {
-            if (!m.hp.is_swa(il)) ++n_full;
-        }
-        const size_t per_tok = kv_q8
-            ? ((size_t) m.hp.kv_dim * 2 + (size_t) m.hp.n_head_kv * sizeof(__half) * 2)
-            : ((size_t) m.hp.kv_dim * sizeof(__half) * 2);
-        const size_t est_kv = (size_t) n_full * (size_t) init_kv * per_tok;
-        if (vtot < (20ULL << 30) && kv_q8 && draft_path.empty() && vfree > est_kv + (4ULL << 30)) {
-            // Hybrid <20 GiB cards cut PCIe expert streaming bytes/token in half with T=2048 via SWA ring expansion + arena aliasing.
-            chunk = 2048;
-        } else {
-            chunk = (vfree > est_kv + (4ULL << 30)) ? 1024 : 512;
-        }
-    }
-    // SWA circular ring auto-expands to (n_swa + tmax) when chunk > n_swa, unlocking T=2048+ prefill.
-    chunk = std::clamp(chunk, 1, 4096);
-
     std::unique_ptr<DsparkModel> dm;
     std::unique_ptr<DsparkEngine> dspark;
     if (!draft_path.empty()) {
@@ -3319,8 +3306,53 @@ int run(int argc, char** argv) {
         }
     }
 
+    // Resolve two-axis (SM arch x VRAM residency regime) profile after dense (+ optional draft) weights load.
+    strata::inkling2::ProfileInput pin;
+    {
+        int cur_dev = 0, raw_maj = 0, raw_min = 0, sm_cnt = 0;
+        cudaGetDevice(&cur_dev);
+        cudaDeviceGetAttribute(&raw_maj, cudaDevAttrComputeCapabilityMajor, cur_dev);
+        cudaDeviceGetAttribute(&raw_min, cudaDevAttrComputeCapabilityMinor, cur_dev);
+        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, cur_dev);
+        size_t vfree = 0, vtot = 0;
+        cudaMemGetInfo(&vfree, &vtot);
+
+        pin.cc_major = strata::cc_major_of(raw_maj);
+        pin.cc_minor = strata::cc_minor_of(raw_min);
+        pin.sm_count = sm_cnt;
+        pin.vram_total_bytes = vtot;
+        pin.vram_free_bytes = vfree;
+        pin.max_ctx = max_ctx;
+        pin.requested_chunk = chunk;
+        pin.kv_q8 = kv_q8;
+        pin.has_draft = (dm != nullptr);
+        pin.n_swa = (int) m.hp.n_swa;
+        pin.n_full_layers = 0;
+        pin.n_swa_layers = 0;
+        for (int il = 0; il < m.hp.n_layer; ++il) {
+            if (m.hp.is_swa(il)) ++pin.n_swa_layers;
+            else ++pin.n_full_layers;
+        }
+        pin.kv_bytes_per_tok = kv_q8
+            ? ((size_t) m.hp.kv_dim * 2 + (size_t) m.hp.n_head_kv * sizeof(__half) * 2)
+            : ((size_t) m.hp.kv_dim * sizeof(__half) * 2);
+        for (int ip = 0; ip < m.hp.n_phys; ++ip) {
+            if (m.layers[(size_t) ip].gu_type == 30) continue;
+            const size_t lb = (size_t) m.hp.n_expert * m.layers[(size_t) ip].stride;
+            pin.all_experts_bytes += lb;
+            if (ip >= m.hp.core_start && ip < m.hp.core_end) pin.tier1_experts_bytes += lb;
+        }
+        if (expert_vram >= 0.0) {
+            pin.expert_vram_forced = true;
+            pin.expert_vram_cap_bytes = (size_t) (expert_vram * (double) (1ull << 30));
+        }
+    }
+    const auto prof_cfg = strata::inkling2::resolve_inkling2_profile(pin);
+    chunk = prof_cfg.chunk;
+    std::fprintf(stderr, "strata-inkling2: %s\n", strata::inkling2::format_profile_line(pin, prof_cfg).c_str());
+
     Engine E;
-    if (!E.init(m, max_ctx, chunk, kv_q8, err, dm && dm->has_quant_dense, dm ? (draft_max + 1) : 1)) {
+    if (!E.init(m, max_ctx, chunk, kv_q8, err, dm && dm->has_quant_dense, dm ? (draft_max + 1) : 1, &prof_cfg)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
     }

@@ -412,6 +412,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(q36_expert_info_test tests/program/q36_expert_info_test.cpp)
   target_include_directories(q36_expert_info_test PRIVATE include)
   add_test(NAME q36_expert_info_test COMMAND q36_expert_info_test)
+  # strata-inkling2 two-axis (SM arch x VRAM regime) profile selection rules (header-only, no GPU)
+  add_executable(inkling2_profile_rules_test tests/program/inkling2_profile_rules_test.cpp)
+  target_include_directories(inkling2_profile_rules_test PRIVATE include)
+  add_test(NAME inkling2_profile_rules_test COMMAND inkling2_profile_rules_test)
 
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
