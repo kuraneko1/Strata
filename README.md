@@ -23,7 +23,7 @@ It runs **65K–262K** context on a single **12 GB consumer GPU (RTX 4070)** and
 
 - **Zero-knob automatic tuning (`SM arch × VRAM regime`)** — Choose `--max-context` (and optionally `--draft` for DSpark). The engine inspects the GPU architecture and live free VRAM to select the verified chunk size, KV allocation policy, staging budget, FA2 split-K width, and CUDA Graph mode via [profile_rules.hpp](engine/include/strata/inkling2/profile_rules.hpp).
 - **Zero quantization / precision compromises** — Native `UD-Q4_K_M` weights and `Q8` KV cache (`--kv-q8`), verified for 64/64 greedy token parity across optimization rounds.
-- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, 65K/131K runs with 100% of looped `tier1` core experts resident in VRAM (`50.4 t/s` at 65K, `38.2 t/s` at 131K), while 262K switches to `chunk=2048` compact-miss PCIe streaming (`1,506 t/s` prefill, `27.3 t/s` decode at 262K). On V100 32 GB, all 3,072 experts fit in VRAM up to 819K with DSpark (`116–142 t/s` decode at 64K–256K, `77.0 t/s` at 800K).
+- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, 65K/131K runs with 100% of looped `tier1` core experts resident in VRAM (`50.4 t/s` at 65K, `38.2 t/s` at 131K), while 262K switches to `chunk=2048` compact-miss PCIe streaming (`1,506 t/s` prefill, `27.3 t/s` decode at 262K). On V100 32 GB (GPU 0, ECC Off), all 3,072 experts fit in VRAM up to 819K with DSpark (`120–146 t/s` decode at 64K–256K, `80.9 t/s` at 800K, `182.8 t/s` at 512).
 - **Drop-in OpenAI & Anthropic API** — Works directly with Claude Code, Codex CLI, OpenCode, and other local coding agents, plus upstream Strata's Qwen3.8-Flash-Next and Qwen3.6-35B-A3B engines.
 
 ## Supported Hardware & Auto-Profiles
@@ -72,10 +72,10 @@ Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/ben
 
 | Mode (`--max-context`) | Context Depth | Prefill | Decode | Notes |
 | --- | ---: | ---: | ---: | --- |
-| **`819200`** (DSpark ON, `full_vram`) | `64K` | **`2,643.2 t/s`** | **`142.0 t/s`** | `3,072/3,072` experts, `916 MiB` free |
-| **`819200`** (DSpark ON, `full_vram`) | `256K` | **`1,693.2 t/s`** | **`116.3 t/s`** | Native Volta `HMMA.884` (`74.8 TFLOPS`) + zero-spill MoE |
-| **`819200`** (DSpark ON, `full_vram`) | `512K` | **`1,065.7 t/s`** | **`93.9 t/s`** | `>1,065 t/s` PP & `2.01×` decode past half-million ctx |
-| **`819200`** (DSpark ON, `full_vram`) | `800K` | **`719.8 t/s`** | **`77.0 t/s`** | `3.46×` PP / `2.23×` decode vs baseline; `0→819K` in `12.0 min` |
+| **`819200`** (DSpark ON, `full_vram`) | `64K` | **`2,713.7 t/s`** | **`146.3 t/s`** | `3,072/3,072` experts, `916 MiB` free (`182.8 t/s` @ 512) |
+| **`819200`** (DSpark ON, `full_vram`) | `256K` | **`1,718.5 t/s`** | **`120.1 t/s`** | Native Volta `HMMA.884` + fused NVFP4/Q8_0/SWA + Head-Major KV |
+| **`819200`** (DSpark ON, `full_vram`) | `512K` | **`1,078.9 t/s`** | **`97.6 t/s`** | `>1,078 t/s` PP & `2.09×` decode past half-million ctx |
+| **`819200`** (DSpark ON, `full_vram`) | `800K` | **`724.0 t/s`** | **`80.9 t/s`** | `3.48×` PP / `2.34×` decode vs baseline; `0→819K` in `11.9 min` |
 | **`1048576`** (DSpark OFF, `core_resident_hybrid`) | `1M` | — | **`54.4 t/s`** | `2,897/3,072` experts (`+90` vs pre-arena) |
 
 Full V100 800K progression, Roofline analysis & chart: [2026-11-22 V100 800K Report](docs/bench-results/2026-11-22-v100-inkling2-800k/README.md).
@@ -206,7 +206,7 @@ Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the eng
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --max-context 262144 --bench --max-new 128
 
-# Tesla V100 32 GB — 819K + DSpark (auto: sm70 + full_vram, chunk=1024, 99–118 t/s)
+# Tesla V100 32 GB — 819K + DSpark (auto: sm70 + full_vram, chunk=1024, 120–146 t/s @ 64K–256K, 80.9 t/s @ 800K)
 ./engine/build-sm70/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/Inkling-2-Mini-DSpark.gguf --draft-max 3 \

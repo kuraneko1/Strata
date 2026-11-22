@@ -1295,13 +1295,43 @@ struct Engine {
             return;
         }
         if (W.type == 1) {
+            const uint16_t* wp = (const uint16_t*) W.d;
+            if (T >= 1 && T <= 8 && (K_in % 4) == 0 && ((((uintptr_t) wp) & 7u) == 0u) && ((((uintptr_t) X) & 15u) == 0u)) {
+                if (N_out <= 128) {
+                    if (T == 1) {
+                        k_gemm_f16_smallT_cta<1, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 1);
+                    } else if (T == 4) {
+                        k_gemm_f16_smallT_cta<4, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 4);
+                    } else if (T == 2) {
+                        k_gemm_f16_smallT_cta<2, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 2);
+                    } else if (T == 3) {
+                        k_gemm_f16_smallT_cta<3, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 3);
+                    } else {
+                        k_gemm_f16_smallT_cta<8, false><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    }
+                } else {
+                    const unsigned nb = (unsigned) ((N_out + 7) / 8);
+                    if (T == 1) {
+                        k_gemm_f16_smallT_warp<1, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 1);
+                    } else if (T == 4) {
+                        k_gemm_f16_smallT_warp<4, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 4);
+                    } else if (T == 2) {
+                        k_gemm_f16_smallT_warp<2, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 2);
+                    } else if (T == 3) {
+                        k_gemm_f16_smallT_warp<3, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 3);
+                    } else {
+                        k_gemm_f16_smallT_warp<8, false><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    }
+                }
+                return;
+            }
             const uint16_t* xf16 = f16_ready;
             if (!xf16) {
                 const int64_t tot = (int64_t) T * K_in;
                 k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(X, act_bf16, tot);
                 xf16 = act_bf16;
             }
-            gemm.f16(xf16, (const uint16_t*) W.d, Y, T, N_out, K_in);
+            gemm.f16(xf16, wp, Y, T, N_out, K_in);
             return;
         }
         if (W.type == 30) {
@@ -1350,7 +1380,25 @@ struct Engine {
         const int blck = ti ? ti->blck : 256;
         if (T <= 8 && (K_in % blck) == 0) {
             if (!q8_ready) K::native_quantize_q8_1(X, xq, (int) K_in, T, st);
-            K::native_mmvq(W.type, W.d, q8_ready ? q8_ready : xq, Y, (int) K_in, (int) N_out, T, st);
+            const void* xq_ptr = q8_ready ? q8_ready : xq;
+            if (W.type == 8 && T >= 2 && (K_in % 256) == 0 && ((((uintptr_t) W.d) & 3u) == 0u)) {
+                const unsigned nb = (unsigned) ((N_out + 3) / 4);
+                const uint8_t* w8 = (const uint8_t*) W.d;
+                const uint32_t* xu = (const uint32_t*) xq_ptr;
+                if (T == 4) {
+                    k_mmvq_q8_0_smallT<4, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 4);
+                } else if (T == 8) {
+                    k_mmvq_q8_0_smallT<8, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 8);
+                } else if (T == 2) {
+                    k_mmvq_q8_0_smallT<2, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 2);
+                } else if (T == 3) {
+                    k_mmvq_q8_0_smallT<3, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 3);
+                } else {
+                    k_mmvq_q8_0_smallT<8, false, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, T);
+                }
+                return;
+            }
+            K::native_mmvq(W.type, W.d, xq_ptr, Y, (int) K_in, (int) N_out, T, st);
             return;
         }
         const uint16_t* xf16 = f16_ready;
@@ -1364,6 +1412,29 @@ struct Engine {
 
     void project(const float* X, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in) {
         project_preq(X, nullptr, W, Y, T, N_out, K_in);
+    }
+
+    bool try_project_pair_q8_0(const void* q8_ready, const DenseMat& W1, float* Y1, int64_t N1,
+                               const DenseMat& W2, float* Y2, int64_t N2, int T, int64_t K_in) {
+        if (!q8_ready || W1.type != 8 || W2.type != 8 || T < 2 || T > 8) return false;
+        if ((K_in % 256) != 0 || (N1 & 3) != 0) return false;
+        if (((((uintptr_t) W1.d) | ((uintptr_t) W2.d)) & 3u) != 0u) return false;
+        const unsigned nb = (unsigned) ((N1 + N2 + 3) / 4);
+        const uint8_t* w1 = (const uint8_t*) W1.d;
+        const uint8_t* w2 = (const uint8_t*) W2.d;
+        const uint32_t* xu = (const uint32_t*) q8_ready;
+        if (T == 4) {
+            k_mmvq_q8_0_smallT<4, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 4, w2, Y2, (int) N2);
+        } else if (T == 8) {
+            k_mmvq_q8_0_smallT<8, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 8, w2, Y2, (int) N2);
+        } else if (T == 2) {
+            k_mmvq_q8_0_smallT<2, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 2, w2, Y2, (int) N2);
+        } else if (T == 3) {
+            k_mmvq_q8_0_smallT<3, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 3, w2, Y2, (int) N2);
+        } else {
+            k_mmvq_q8_0_smallT<8, false, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, T, w2, Y2, (int) N2);
+        }
+        return true;
     }
 
     void project_f32(const float* X, const float* W, float* Y, int T, int64_t N_out, int64_t K_in) {
@@ -1419,7 +1490,13 @@ struct Engine {
         if (T >= 1 && (N & 3) == 0 && D <= 8 && (n_q == 1 || n_q == 3)) {
             MixOuts4 mo4{};
             for (int i = 0; i < (swa_bcast ? 3 : n_q); ++i) mo4.p[i] = outs[i];
-            if (n_q == 1) {
+            if (N == 2304) {
+                if (n_q == 1) {
+                    k_mix_normed_fused_1pass<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, swa_bcast);
+                } else {
+                    k_mix_normed_fused_1pass<3><<<(unsigned) T, 576, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, 0);
+                }
+            } else if (n_q == 1) {
                 k_mix_normed_fused<1><<<(unsigned) T, kThreads, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, swa_bcast);
             } else {
                 k_mix_normed_fused<3><<<(unsigned) T, kThreads, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, 0);
@@ -1445,11 +1522,12 @@ struct Engine {
                 uint16_t* w_gain16 = w_down16 + n_wd;
                 uint16_t* w_fgt16  = w_gain16 + n_wu;
                 k_control_prep_f16<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, act_bf16, N, hp.rms_eps);
-                k_f32_to_f16<<<(unsigned) ((n_wd + 255) / 256), 256, 0, st>>>((const float*) L.loop_down[mod].d, w_down16, n_wd);
+                const int64_t tot_w4 = (n_wd + 2 * n_wu) >> 2;
+                k_f32_to_f16_ctrl_w<<<(unsigned) ((tot_w4 + 255) / 256), 256, 0, st>>>(
+                    (const float*) L.loop_down[mod].d, (const float*) L.loop_gain[mod].d,
+                    (const float*) L.loop_forget[mod].d, w_down16, n_wd, n_wu);
                 gemm.f16(act_bf16, w_down16, ctrl64, T, R, 2 * N);
                 k_f32_to_f16<<<(unsigned) ((n_x64 + 255) / 256), 256, 0, st>>>(ctrl64, act_bf16, n_x64);
-                k_f32_to_f16<<<(unsigned) ((n_wu + 255) / 256), 256, 0, st>>>((const float*) L.loop_gain[mod].d, w_gain16, n_wu);
-                k_f32_to_f16<<<(unsigned) ((n_wu + 255) / 256), 256, 0, st>>>((const float*) L.loop_forget[mod].d, w_fgt16, n_wu);
                 gemm.f16(act_bf16, w_gain16, ctrl_g, T, N, R);
                 gemm.f16(act_bf16, w_fgt16, ctrl_f, T, N, R);
                 const int64_t tot = (int64_t) T * N;
@@ -1458,8 +1536,24 @@ struct Engine {
                 return;
             }
         }
-        k_control_prep<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, ctrl2N, N, hp.rms_eps);
-        project(ctrl2N, L.loop_down[mod], ctrl64, T, hp.loop_gate_rank, 2 * N);
+        if (T >= 1 && T <= 8 && L.loop_down[mod].type == 0 && (N & 3) == 0) {
+            const float* wd = (const float*) L.loop_down[mod].d;
+            const int R = (int) hp.loop_gate_rank;
+            if (T == 4) {
+                k_loop_down_fused_smallT<4, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 4, hp.rms_eps);
+            } else if (T == 1) {
+                k_loop_down_fused_smallT<1, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 1, hp.rms_eps);
+            } else if (T == 2) {
+                k_loop_down_fused_smallT<2, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 2, hp.rms_eps);
+            } else if (T == 3) {
+                k_loop_down_fused_smallT<3, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 3, hp.rms_eps);
+            } else {
+                k_loop_down_fused_smallT<8, false><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, T, hp.rms_eps);
+            }
+        } else {
+            k_control_prep<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, ctrl2N, N, hp.rms_eps);
+            project(ctrl2N, L.loop_down[mod], ctrl64, T, hp.loop_gate_rank, 2 * N);
+        }
         if (hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
             if (T == 1) {
                 k_control_up_combine_t1<<<(unsigned) ((N + 31) / 32), 256, 0, st>>>(
@@ -1572,13 +1666,16 @@ struct Engine {
         for (int k = 0; k < pp_stage_cnt && pp_kick_idx < pp_tasks.size(); ++k) pp_kick_next();
     }
 
-    void run_moe(PhysLayer& L, int il, const float* x_norm, int T, bool pre_routed_t1 = false) {
+    void run_moe(PhysLayer& L, int il, const float* x_norm, int T, bool pre_routed_t1 = false,
+                 bool xq_ready_in = false, bool skip_combine = false, bool f16_ready_in = false) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd, Kp = (int) hp.n_expert_used;
         const int n_ent = T * Kp;
         const bool has_gpu = L.n_slots > 0;
         const bool need_cpu = L.n_slots < hp.n_expert;
         const bool is_q5 = (L.L.gu_type == 13);
+        const bool fused_rg = (!need_cpu && has_gpu && !pre_routed_t1 && T >= 1 && T <= 8 &&
+                               hp.n_expert <= 128 && Kp <= 16);
 
         const auto tp_moe_r0 = Clock::now();
         if (!pre_routed_t1) {
@@ -1586,9 +1683,18 @@ struct Engine {
                 CK(cudaMemcpyAsync(h_h, x_norm, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
             project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
-            k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
-                router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
-                (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+            if (fused_rg) {
+                const int blk = (T <= 4) ? 128 : 256;
+                k_route_and_group_smallT<<<1, blk, 0, st>>>(
+                    router_logits, L.exp_probs_b, ids, ewts, L.d_slot_of, L.d_blobs, L.stride,
+                    T, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                    grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                    (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+            } else {
+                k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
+                    router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                    (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+            }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
         }
 
@@ -1597,14 +1703,14 @@ struct Engine {
             has_pending_rebal = false;
         }
 
-        bool q8_ready = false;
+        bool q8_ready = xq_ready_in;
         auto ensure_q8 = [&]() {
             if (!q8_ready) {
                 K::quantize_q8_1_rows(x_norm, T, N, xq, st);
                 q8_ready = true;
             }
         };
-        bool wmma_ready = false;
+        bool wmma_ready = f16_ready_in;
         auto ensure_f16 = [&]() {
             if (!wmma_ready) {
                 const int64_t tot = (int64_t) T * N;
@@ -1652,7 +1758,8 @@ struct Engine {
                 ++pp_take_idx;
                 pp_kick_next();
             }
-            k_combine_experts<<<dim3((unsigned) ((N + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
+            const int n4 = ((N & 3) == 0) ? (N >> 2) : N;
+            k_combine_experts<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
             if (prof) { CK(cudaStreamSynchronize(st)); p_moe_gpu_ms += ms_since(tp_moe_r0); }
             return;
         }
@@ -1668,8 +1775,10 @@ struct Engine {
 
         const auto tp_mg0 = Clock::now();
         if (has_gpu) {
-            k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
-                                               grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
+            if (!fused_rg) {
+                k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
+                                                   grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
+            }
             run_grouped(grp_ptr, std::min<int64_t>(n_ent, hp.n_expert));
         }
         if (prof_detail) {
@@ -1803,8 +1912,10 @@ struct Engine {
         }
         hy_gpu += n_ent;
 #endif
+        if (skip_combine) return;
         const auto tp_p0 = Clock::now();
-        k_combine_experts<<<dim3((unsigned) ((N + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
+        const int n4 = ((N & 3) == 0) ? (N >> 2) : N;
+        k_combine_experts<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
         if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
     }
 
@@ -2107,8 +2218,12 @@ struct Engine {
             CK(cudaMemGetInfo(&fr, &tot));
             const bool direct_d2d = (fr >= (size_t) new_cap * per_tok + ((size_t) 128 << 20));
             if (kv_q8) {
-                const size_t b_kv_old = n_old * (size_t) hp.kv_dim * sizeof(int8_t);
-                const size_t b_s_old = n_old * (size_t) hp.n_head_kv * sizeof(__half);
+                // Full-Attn Q8 KV is Head-Major: [n_head_kv][cap][128] for kq/vq and [n_head_kv][cap] for ks/vs.
+                const int nhkv = (int) hp.n_head_kv;
+                const size_t b_kv_head = n_old * 128 * sizeof(int8_t);
+                const size_t b_s_head = n_old * sizeof(__half);
+                const size_t old_kv_stride = (size_t) full_kv_cap * 128;
+                const size_t new_kv_stride = (size_t) new_cap * 128;
                 if (direct_d2d) {
                     int8_t *nkq = nullptr, *nvq = nullptr;
                     __half *nks = nullptr, *nvs = nullptr;
@@ -2117,10 +2232,12 @@ struct Engine {
                     CK(cudaMalloc(&nks, (size_t) new_cap * hp.n_head_kv * sizeof(__half)));
                     CK(cudaMalloc(&nvs, (size_t) new_cap * hp.n_head_kv * sizeof(__half)));
                     if (n_old > 0) {
-                        CK(cudaMemcpyAsync(nkq, kq[(size_t) il], b_kv_old, cudaMemcpyDeviceToDevice, st));
-                        CK(cudaMemcpyAsync(nvq, vq[(size_t) il], b_kv_old, cudaMemcpyDeviceToDevice, st));
-                        CK(cudaMemcpyAsync(nks, ks[(size_t) il], b_s_old, cudaMemcpyDeviceToDevice, st));
-                        CK(cudaMemcpyAsync(nvs, vs[(size_t) il], b_s_old, cudaMemcpyDeviceToDevice, st));
+                        for (int h = 0; h < nhkv; ++h) {
+                            CK(cudaMemcpyAsync(nkq + (size_t) h * new_kv_stride, kq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToDevice, st));
+                            CK(cudaMemcpyAsync(nvq + (size_t) h * new_kv_stride, vq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToDevice, st));
+                            CK(cudaMemcpyAsync(nks + (size_t) h * new_cap,       ks[(size_t) il] + (size_t) h * full_kv_cap,   b_s_head,  cudaMemcpyDeviceToDevice, st));
+                            CK(cudaMemcpyAsync(nvs + (size_t) h * new_cap,       vs[(size_t) il] + (size_t) h * full_kv_cap,   b_s_head,  cudaMemcpyDeviceToDevice, st));
+                        }
                         CK(cudaStreamSynchronize(st));
                     }
                     cudaFree(kq[(size_t) il]); cudaFree(vq[(size_t) il]);
@@ -2129,12 +2246,14 @@ struct Engine {
                     ks[(size_t) il] = nks; vs[(size_t) il] = nvs;
                 } else {
                     if (n_old > 0) {
-                        kv_stage.resize(2 * b_kv_old + 2 * b_s_old);
+                        kv_stage.resize((size_t) nhkv * (2 * b_kv_head + 2 * b_s_head));
                         uint8_t* p = kv_stage.data();
-                        CK(cudaMemcpyAsync(p, kq[(size_t) il], b_kv_old, cudaMemcpyDeviceToHost, st)); p += b_kv_old;
-                        CK(cudaMemcpyAsync(p, vq[(size_t) il], b_kv_old, cudaMemcpyDeviceToHost, st)); p += b_kv_old;
-                        CK(cudaMemcpyAsync(p, ks[(size_t) il], b_s_old, cudaMemcpyDeviceToHost, st)); p += b_s_old;
-                        CK(cudaMemcpyAsync(p, vs[(size_t) il], b_s_old, cudaMemcpyDeviceToHost, st));
+                        for (int h = 0; h < nhkv; ++h) {
+                            CK(cudaMemcpyAsync(p, kq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToHost, st)); p += b_kv_head;
+                            CK(cudaMemcpyAsync(p, vq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToHost, st)); p += b_kv_head;
+                            CK(cudaMemcpyAsync(p, ks[(size_t) il] + (size_t) h * full_kv_cap,   b_s_head,  cudaMemcpyDeviceToHost, st)); p += b_s_head;
+                            CK(cudaMemcpyAsync(p, vs[(size_t) il] + (size_t) h * full_kv_cap,   b_s_head,  cudaMemcpyDeviceToHost, st)); p += b_s_head;
+                        }
                         CK(cudaStreamSynchronize(st));
                     }
                     cudaFree(kq[(size_t) il]); cudaFree(vq[(size_t) il]);
@@ -2147,10 +2266,12 @@ struct Engine {
                     CK(cudaMalloc(&vs[(size_t) il], (size_t) new_cap * hp.n_head_kv * sizeof(__half)));
                     if (n_old > 0) {
                         const uint8_t* p = kv_stage.data();
-                        CK(cudaMemcpyAsync(kq[(size_t) il], p, b_kv_old, cudaMemcpyHostToDevice, st)); p += b_kv_old;
-                        CK(cudaMemcpyAsync(vq[(size_t) il], p, b_kv_old, cudaMemcpyHostToDevice, st)); p += b_kv_old;
-                        CK(cudaMemcpyAsync(ks[(size_t) il], p, b_s_old, cudaMemcpyHostToDevice, st)); p += b_s_old;
-                        CK(cudaMemcpyAsync(vs[(size_t) il], p, b_s_old, cudaMemcpyHostToDevice, st));
+                        for (int h = 0; h < nhkv; ++h) {
+                            CK(cudaMemcpyAsync(kq[(size_t) il] + (size_t) h * new_kv_stride, p, b_kv_head, cudaMemcpyHostToDevice, st)); p += b_kv_head;
+                            CK(cudaMemcpyAsync(vq[(size_t) il] + (size_t) h * new_kv_stride, p, b_kv_head, cudaMemcpyHostToDevice, st)); p += b_kv_head;
+                            CK(cudaMemcpyAsync(ks[(size_t) il] + (size_t) h * new_cap,       p, b_s_head,  cudaMemcpyHostToDevice, st)); p += b_s_head;
+                            CK(cudaMemcpyAsync(vs[(size_t) il] + (size_t) h * new_cap,       p, b_s_head,  cudaMemcpyHostToDevice, st)); p += b_s_head;
+                        }
                         CK(cudaStreamSynchronize(st));
                     }
                 }
@@ -2313,7 +2434,10 @@ struct Engine {
                     np.p[B] = bank_last_norm;
                     MixOuts4 mo4{};
                     mo4.p[0] = msg0; mo4.p[1] = msg3; mo4.p[2] = msg1; mo4.p[3] = msg2;
-                    if (T >= 1 && (N & 3) == 0 && B + 1 <= 8) {
+                    if (T >= 1 && N == 2304 && B + 1 <= 8) {
+                        k_mix_normed_fused_1pass<4><<<(unsigned) T, 576, 0, st>>>(
+                            np, B + 1, q_attn, q_kv, mo4, N, 1.0f / std::sqrt((float) N), 0);
+                    } else if (T >= 1 && (N & 3) == 0 && B + 1 <= 8) {
                         k_mix_normed_fused<4><<<(unsigned) T, kThreads, 0, st>>>(
                             np, B + 1, q_attn, q_kv, mo4, N, 1.0f / std::sqrt((float) N), 0);
                     } else {
@@ -2333,6 +2457,9 @@ struct Engine {
                     }
                 }
             }
+            const bool fuse_q8_norm = (T <= 8 && (N & 31) == 0);
+            const int rms_q8_blk = (N == 2304) ? 768 : kThreads;
+            bool q8_pre_done = false;
             if (L.attn_res_query) {
                 float* outs[3] = {in_q, in_k, in_v};
                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
@@ -2342,15 +2469,34 @@ struct Engine {
                     run_control(in_v, msg2, L, 2, in_v, T);
                 }
                 if (is_swa && has_msg) {
-                    k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
+                    if (fuse_q8_norm) {
+                        k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
+                            in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
+                            xq, xq_k, xq_v, N, hp.rms_eps);
+                        q8_pre_done = true;
+                    } else {
+                        k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
+                    }
                 } else if (is_swa) {
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
+                    if (fuse_q8_norm) {
+                        k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_q, L.attn_norm, in_q, xq, N, hp.rms_eps);
+                        q8_pre_done = true;
+                    } else {
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
+                    }
                     ink_src = in_q;
                     inv_src = in_q;
                 } else {
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                    if (fuse_q8_norm) {
+                        k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
+                            in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
+                            xq, xq_k, xq_v, N, hp.rms_eps);
+                        q8_pre_done = true;
+                    } else {
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                    }
                 }
             } else {
                 if (has_msg) {
@@ -2358,31 +2504,59 @@ struct Engine {
                     run_control(cur, msg1, L, 1, in_k, T);
                     run_control(cur, msg2, L, 2, in_v, T);
                     if (is_swa) {
-                        k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
+                        if (fuse_q8_norm) {
+                            k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
+                                in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
+                                xq, xq_k, xq_v, N, hp.rms_eps);
+                            q8_pre_done = true;
+                        } else {
+                            k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
+                        }
                     } else {
-                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
-                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
-                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                        if (fuse_q8_norm) {
+                            k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
+                                in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
+                                xq, xq_k, xq_v, N, hp.rms_eps);
+                            q8_pre_done = true;
+                        } else {
+                            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
+                            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
+                            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                        }
                     }
                 } else if (is_swa) {
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_norm, in_q, N, hp.rms_eps);
+                    if (fuse_q8_norm) {
+                        k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(cur, L.attn_norm, in_q, xq, N, hp.rms_eps);
+                        q8_pre_done = true;
+                    } else {
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_norm, in_q, N, hp.rms_eps);
+                    }
                     ink_src = in_q;
                     inv_src = in_q;
                 } else {
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
-                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                    if (fuse_q8_norm) {
+                        k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
+                            cur, cur, cur, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
+                            xq, xq_k, xq_v, N, hp.rms_eps);
+                        q8_pre_done = true;
+                    } else {
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
+                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
+                    }
                 }
             }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_mix += ms_since(tp_d0); }
 
             // Attention projections (quantize/convert unique input vectors ONCE per layer)
             const auto tp_d1 = Clock::now();
-            prep_q8(in_q, xq, T, N);
             const void* xq_k_src = (ink_src == in_q) ? xq : xq_k;
             const void* xq_v_src = (inv_src == in_q) ? xq : (inv_src == ink_src ? xq_k_src : xq_v);
-            if (ink_src != in_q) prep_q8(ink_src, xq_k, T, N);
-            if (inv_src != in_q && inv_src != ink_src) prep_q8(inv_src, xq_v, T, N);
+            if (!q8_pre_done) {
+                prep_q8(in_q, xq, T, N);
+                if (ink_src != in_q) prep_q8(ink_src, xq_k, T, N);
+                if (inv_src != in_q && inv_src != ink_src) prep_q8(inv_src, xq_v, T, N);
+            }
             const uint16_t* f16_q = nullptr;
             if (T > 8) {
                 const int64_t tot = (int64_t) T * N;
@@ -2413,32 +2587,38 @@ struct Engine {
                     pR = qgr_t1 + 2 * q_dim;
                     project_preq(in_q, xq, L.attn_qgr, qgr_t1, 1, L.attn_qgr.n_out, N);
                 } else {
-                    project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N, f16_q);
-                    project_preq(in_q, xq, L.attn_rel, R, T, rel_dim, N, f16_q);
-                    project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N, f16_q);
-                }
-                if (!is_swa && T == 1 && L.attn_kkc.d != nullptr) {
-                    float* kbuf = qgr_t1 + 2 * q_dim + rel_dim;
-                    pK = kbuf;
-                    pDynK = kbuf + kv_dim;
-                    project_preq(ink_src, xq_k_src, L.attn_kkc, kbuf, 1, L.attn_kkc.n_out, N);
-                } else {
-                    const uint16_t* f16_k = (T > 8 && ink_src == in_q) ? f16_q : nullptr;
-                    if (T > 8 && !f16_k) {
-                        const int64_t tot = (int64_t) T * N;
-                        k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(ink_src, act_bf16, tot);
-                        f16_k = act_bf16;
+                    if (!try_project_pair_q8_0(xq, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N)) {
+                        project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N, f16_q);
+                        project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N, f16_q);
                     }
-                    project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N, f16_k);
+                    project_preq(in_q, xq, L.attn_rel, R, T, rel_dim, N, f16_q);
                 }
-                if (!is_swa && T == 1 && L.attn_vvc.d != nullptr) {
-                    float* vbuf = qgr_t1 + 2 * q_dim + rel_dim + kv_dim + dyn_dim;
-                    pV = vbuf;
-                    pDynV = vbuf + kv_dim;
-                    project_preq(inv_src, xq_v_src, L.attn_vvc, vbuf, 1, L.attn_vvc.n_out, N);
-                } else {
-                    const uint16_t* f16_v = (T > 8 && (inv_src == ink_src || (inv_src == in_q && ink_src == in_q))) ? act_bf16 : nullptr;
-                    project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N, f16_v);
+                const bool paired_kv = (T >= 2 && T <= 8 && xq_v_src == xq_k_src &&
+                                        try_project_pair_q8_0(xq_k_src, L.attn_k, K, kv_dim, L.attn_v, V, kv_dim, T, N));
+                if (!paired_kv) {
+                    if (!is_swa && T == 1 && L.attn_kkc.d != nullptr) {
+                        float* kbuf = qgr_t1 + 2 * q_dim + rel_dim;
+                        pK = kbuf;
+                        pDynK = kbuf + kv_dim;
+                        project_preq(ink_src, xq_k_src, L.attn_kkc, kbuf, 1, L.attn_kkc.n_out, N);
+                    } else {
+                        const uint16_t* f16_k = (T > 8 && ink_src == in_q) ? f16_q : nullptr;
+                        if (T > 8 && !f16_k) {
+                            const int64_t tot = (int64_t) T * N;
+                            k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(ink_src, act_bf16, tot);
+                            f16_k = act_bf16;
+                        }
+                        project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N, f16_k);
+                    }
+                    if (!is_swa && T == 1 && L.attn_vvc.d != nullptr) {
+                        float* vbuf = qgr_t1 + 2 * q_dim + rel_dim + kv_dim + dyn_dim;
+                        pV = vbuf;
+                        pDynV = vbuf + kv_dim;
+                        project_preq(inv_src, xq_v_src, L.attn_vvc, vbuf, 1, L.attn_vvc.n_out, N);
+                    } else {
+                        const uint16_t* f16_v = (T > 8 && (inv_src == ink_src || (inv_src == in_q && ink_src == in_q))) ? act_bf16 : nullptr;
+                        project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N, f16_v);
+                    }
                 }
                 // Dynamic conv projections (BF16 on !is_swa) run after FP16 projections so they may reuse act_bf16 freely.
                 if (!is_swa && !(T == 1 && L.attn_kkc.d != nullptr)) {
@@ -2453,7 +2633,15 @@ struct Engine {
             float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
             const auto tp_d2 = Clock::now();
-            if (T >= 32 && !save_conv_trace) {
+            const int apply_tau = is_swa ? 0 : 1;
+            const bool fused_kv_q8 = (T < 32 && kv_q8 && hp.head_dim == 128);
+            if (fused_kv_q8) {
+                k_shortconv_kv_clip_norm_store_q8<<<dim3((unsigned) hp.n_head_kv, 2), 128, 0, st>>>(
+                    pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                    hst, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                    (int) hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0,
+                    T, h_tr, total_conv_floats);
+            } else if (T >= 32 && !save_conv_trace) {
                 k_shortconv_kv_pp<<<dim3((unsigned) ((2 * kv_dim + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
                     pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
                     hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
@@ -2465,40 +2653,58 @@ struct Engine {
                     hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T, h_tr, total_conv_floats);
             }
 
-            const int apply_tau = is_swa ? 0 : 1;
-            k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
-                pQ, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
-            k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
-                pR, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
-
-            if (kv_q8) {
-                k_clip_norm_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
-                    K_conv, V_conv, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
-                    (int) hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
+            if (hp.head_dim == 128 && hp.n_rel <= 32) {
+                k_clip_and_tau_qr<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
+                    pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
+                    (int) hp.n_head, (int) hp.n_rel, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
             } else {
-                k_clip_and_tau<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
-                    K_conv, nullptr, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head_kv, 0, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
-                k_v_rms_norm<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(V_conv, (int) hp.head_dim, (int) hp.n_head_kv, hp.rms_eps);
-                k_kv_store<<<dim3((unsigned) ((kv_dim + 255) / 256), (unsigned) T), 256, 0, st>>>(
-                    K_conv, V_conv, kc[(size_t) il], vc[(size_t) il], (int) kv_dim, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
+                k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
+                    pQ, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
+                    pR, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+            }
+
+            if (!fused_kv_q8) {
+                if (kv_q8) {
+                    k_clip_norm_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
+                        K_conv, V_conv, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                        (int) hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
+                } else {
+                    k_clip_and_tau<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
+                        K_conv, nullptr, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head_kv, 0, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                    k_v_rms_norm<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(V_conv, (int) hp.head_dim, (int) hp.n_head_kv, hp.rms_eps);
+                    k_kv_store<<<dim3((unsigned) ((kv_dim + 255) / 256), (unsigned) T), 256, 0, st>>>(
+                        K_conv, V_conv, kc[(size_t) il], vc[(size_t) il], (int) kv_dim, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
+                }
             }
 
             const int max_rel = is_swa ? std::min<int>((int) hp.n_swa, (int) hp.n_rel_ext) : (int) hp.n_rel_ext;
             if (T >= 32 && hp.n_rel == 16) {
                 k_rel_table_t32<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 31) / 32)), kThreads, 0, st>>>(
                     pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T);
+            } else if (T >= 1 && T <= 8 && hp.n_rel == 16) {
+                const int d_splits = (max_rel > 512) ? 4 : 2;
+                k_rel_table_split<<<dim3((unsigned) hp.n_head, (unsigned) d_splits), 128, 0, st>>>(
+                    pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T, d_splits);
             } else {
                 k_rel_table<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 7) / 8)), kThreads, 0, st>>>(
                     pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T);
             }
             const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
+            const void* att_xq_ready = nullptr;
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
-                    if (T == 4 && !is_swa) {
+                    if (is_swa && T >= 1 && T <= 8) {
+                        k_attn_q8_gqa3_swa_1pass<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink,
+                            pGate, att, xq, (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext,
+                            kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale);
+                        att_xq_ready = xq;
+                    } else if (T == 4 && !is_swa) {
                         const int sp = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
                         k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 21760, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                            (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa);
                     } else if (T < 16) {
@@ -2539,10 +2745,10 @@ struct Engine {
                         const int bulk_smem = (profile.arch.id == strata::inkling2::ArchId::Sm70Volta) ? 92160 : 87040;
                         k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, (size_t) bulk_smem, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], sink, pp_sp_buf,
-                            (int) hp.n_head, (int) hp.n_head_kv, bulk_aligned, kq_scale, T, best_sp, total_sp);
+                            (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], bulk_aligned, kq_scale, T, best_sp, total_sp);
                         k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv), 256, 87040, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pp_sp_buf,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp);
+                            (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp);
                         k_attn_pp_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             pp_sp_buf, pGate, att, (int) hp.n_head, total_sp);
                     } else if (T >= 128) {
@@ -2600,7 +2806,7 @@ struct Engine {
             if (!kv_q8) {
                 k_mul_sigmoid<<<(unsigned) (((int64_t) T * q_dim + 255) / 256), 256, 0, st>>>(att, pGate, (int64_t) T * q_dim);
             }
-            project(att, L.attn_output, wo, T, N, q_dim);
+            project_preq(att, att_xq_ready, L.attn_output, wo, T, N, q_dim);
             const bool do_push = (ip % hp.attn_res_block_size == 0);
             if (T >= 32 && !save_conv_trace) {
                 k_shortconv_pp<<<dim3((unsigned) ((N + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
@@ -2608,7 +2814,7 @@ struct Engine {
                 k_shortconv_hist_push<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
                     wo, hst, N, 2 * (int) kv_dim, T);
             } else {
-                k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur, h_tr, total_conv_floats);
+                k_shortconv<<<(unsigned) ((N + 63) / 64), 64, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur, h_tr, total_conv_floats);
             }
             if (do_push) push_block(cur);
 
@@ -2616,7 +2822,13 @@ struct Engine {
             float* ffn_mix_out[1] = {in_ffn};
             run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
             if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
-            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+            if (T <= 8 && !include_route_t1 && (N & 31) == 0) {
+                k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
+            } else if (T >= 16 && (N & 3) == 0) {
+                k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
+            } else {
+                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+            }
             if (include_route_t1) {
                 // Capture h_h D2H + router + k_route + h_ids/h_ewts D2H inside layer_pre_graph[il] (-240 API calls/tok!)
                 const int Kp = (int) hp.n_expert_used;
@@ -2655,9 +2867,16 @@ struct Engine {
             float* hst = conv_hist[(size_t) il];
             float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             const bool is_hy = (L.n_slots < hp.n_expert);
-            run_moe(L, il, in_ffn, T, pre_routed_t1);
+            const bool xq_ffn_ready = (T <= 8 && !pre_routed_t1 && (N & 31) == 0);
+            const bool f16_ffn_ready = (T >= 16 && (N & 3) == 0);
+            const bool fuse_comb_conv = (!is_hy && T <= 8);
+            run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv, f16_ffn_ready);
             const auto tp_mp0 = Clock::now();
-            if (T >= 32 && !save_conv_trace) {
+            if (fuse_comb_conv) {
+                k_combine_experts_shortconv<<<(unsigned) ((N + 63) / 64), 64, 0, st>>>(
+                    eparts, ewts, L.ffn_post_conv, hst, ffn_inp, cur, N, (int) hp.n_expert_used,
+                    2 * (int) kv_dim + N, T, h_tr, total_conv_floats);
+            } else if (T >= 32 && !save_conv_trace) {
                 k_shortconv_pp<<<dim3((unsigned) ((N + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
                     moe_raw, L.ffn_post_conv, hst, cur, N, 2 * (int) kv_dim + N, T, ffn_inp);
                 k_shortconv_hist_push<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
@@ -2750,10 +2969,16 @@ struct Engine {
         // Output head (skip 200K vocab matmul + sync on intermediate prefill chunks where only KV/DSpark states are needed)
         const auto tp_h0 = Clock::now();
         const bool compute_logits = need_logits || copy_logits || all_row_logits || out_picks != nullptr;
+        const int rows = (all_row_logits || out_picks != nullptr) ? T : 1;
+        const bool fuse_head_q8 = (compute_logits && rows == T && T <= 8 && (N & 31) == 0);
         if (compute_logits || (capture_dspark && dspark && d_tgt_feat[3])) {
             float* out_head[1] = {in_ffn};
             run_mix_normed(norm_blocks, cur, false, m->output_res_query, out_head, 1, T, 0);
-            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
+            if (fuse_head_q8) {
+                k_rms_norm_q8_1<<<(unsigned) T, (N == 2304) ? 768 : kThreads, 0, st>>>(in_ffn, m->output_norm, cur, xq, N, hp.rms_eps);
+            } else {
+                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
+            }
             if (capture_dspark && dspark && d_tgt_feat[3]) {
                 CK(cudaMemcpyAsync(d_tgt_feat[3], cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
             }
@@ -2765,9 +2990,8 @@ struct Engine {
             pos += T;
             return 0;
         }
-        const int rows = (all_row_logits || out_picks != nullptr) ? T : 1;
         const float* head_h = (rows == T) ? cur : (cur + (size_t) (T - 1) * N);
-        project(head_h, m->output_weight, logits, rows, hp.vocab_unpadded, N);
+        project_preq(head_h, fuse_head_q8 ? xq : nullptr, m->output_weight, logits, rows, hp.vocab_unpadded, N);
         const int64_t tot_lg = (int64_t) rows * hp.vocab_unpadded;
         if (copy_logits && hp.softcap > 0.0f) {
             k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);

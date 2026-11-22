@@ -4414,8 +4414,71 @@ __global__ void __launch_bounds__(256, 3) native_gu_nvfp4_72_kernel(
                     const int off4[4] = { 0, 72, 144, 216 };
                     float s4[4];
                     row_dot_72_sub8<4, false>(wr, s_xq, off4, n, t, s4);
-                    if (t < n) dst[(size_t) (e + t) * L.n_ff + r] = s4[t] * sc;
+                    if (t < n) {
+                        const float v = (t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3];
+                        dst[(size_t) (e + t) * L.n_ff + r] = v * sc;
+                    }
                 }
+            }
+        }
+    }
+}
+
+// Standalone zero-spill fused NVFP4 (type 40) Gate+Up + SiTU + Q8_1 quantization kernel for n_embd == 2304, n_ff % 32 == 0.
+// Each 256-thread CTA owns 32 consecutive hidden columns (32 subwarps x 8 lanes), stages xq ONCE in SMEM for both gate & up,
+// evaluates exact SiTU in registers, and writes 32-element block_q8_1 directly to hq (eliminates gate/up HBM roundtrip & situ launch).
+__global__ void __launch_bounds__(256, 3) native_gu_nvfp4_72_situ_q8_1_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq, NativeExpertLayout L, float beta, float lb,
+    block_q8_1* __restrict__ hq) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    __shared__ uint32_t s_xq_buf[GRP_NC * 72 * 9];
+    __shared__ float sh[GRP_NC][32];
+    const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = (int) blockIdx.x * 32 + subwarp;
+    const size_t g_off = (size_t) r * L.gu_row;
+    const size_t u_off = L.up_off + g_off;
+    const block_q8_1* s_xq = reinterpret_cast<const block_q8_1*>(s_xq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const float sg = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+        const float su = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int i = 0; i < n; ++i) {
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + i] * 72);
+                for (int j = threadIdx.x; j < 72 * 9; j += 256) s_xq_buf[i * (72 * 9) + j] = src[j];
+            }
+            iq_sync_lds();
+            float gg = 0.0f, uu = 0.0f;
+            if (n == 1) {
+                const int off1[1] = { 0 };
+                float s1[1];
+                row_dot_72_sub8<1, true>(blob + g_off, s_xq, off1, 1, t, s1);
+                if (t == 0) gg = s1[0] * sg;
+                row_dot_72_sub8<1, true>(blob + u_off, s_xq, off1, 1, t, s1);
+                if (t == 0) uu = s1[0] * su;
+            } else {
+                const int off4[4] = { 0, 72, 144, 216 };
+                float s4[4];
+                row_dot_72_sub8<4, false>(blob + g_off, s_xq, off4, n, t, s4);
+                if (t < n) gg = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * sg;
+                row_dot_72_sub8<4, false>(blob + u_off, s_xq, off4, n, t, s4);
+                if (t < n) uu = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * su;
+            }
+            if (t < n) {
+                const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
+                const float tu = lb > 0.0f ? lb * tanhf(uu / lb) : uu;
+                sh[t][subwarp] = tg * tu;
+            }
+            iq_sync_lds();
+            if (warp < n) {
+                q8_1_store(sh[warp][lane], hq, (long long) (e + warp) * L.n_ff + (long long) blockIdx.x * 32 + lane);
             }
         }
     }
@@ -4455,7 +4518,10 @@ __global__ void __launch_bounds__(256, 4) native_down_nvfp4_36_kernel(
                     const int off4[4] = { 0, 36, 72, 108 };
                     float s4[4];
                     row_dot_36_sub8<4, false>(wr, s_hq, off4, n, t, s4);
-                    if (t < n) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                    if (t < n) {
+                        const float v = (t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3];
+                        out[(size_t) ent_dst[e + t] * L.n_embd + r] = v * sd;
+                    }
                 }
             }
         }
@@ -6879,7 +6945,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool gs_layout = true;
 #endif
-    if (gs_layout && !L.situ && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
+    if (gs_layout && L.situ && L.gu_type == 40 && L.n_embd == 2304 && L.n_ff > 0 && (L.n_ff % 32) == 0 &&
+        L.had_block == 0 && g_exp_phase == 0 && !v1 && !g_old_kernels && !g_no_sub16_gu && !nib_layout(L)) {
+        const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) gy);
+        native_gu_nvfp4_72_situ_q8_1_kernel<<<gl, 256, 0, s>>>(
+            grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
+        gs_done = true;
+        check("native_expert_grouped/gu+situ+q8_1");
+    } else if (gs_layout && !L.situ && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
         switch (L.gu_type) {
 #define STRATA_GS(T) case T: gs_done = launch_gu_swiglu<T>(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
             STRATA_GU_FMTS(STRATA_GS)
@@ -8148,10 +8221,10 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                     *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc)     = x1_ok ? *reinterpret_cast<const uint4*>(cxp1)     : make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc + 8) = x1_ok ? *reinterpret_cast<const uint4*>(cxp1 + 8) : make_uint4(0, 0, 0, 0);
                     if constexpr (WT == 40) {
-                        const uint8_t* bp = we_t + (size_t) (k0 >> 6) * 36;
+                        const uint8_t* wp = we_t + (size_t) (k0 >> 6) * 36;
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
-                            const uint8_t* wpb = bp + (size_t) (b * 64) * row_stride;
+                            const uint8_t* wpb = wp + (size_t) (b * 64) * row_stride;
                             dq_nvfp4_sub16_store_sc(*reinterpret_cast<const uint32_t*>(wpb + 4 + sb * 8),
                                                     *reinterpret_cast<const uint32_t*>(wpb + 8 + sb * 8),
                                                     s_ue4m3[wpb[sb]], sw + (b * 64 + wr) * LD + sb * 16);
@@ -8203,10 +8276,10 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                     *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
                     if constexpr (WT == 40) {
-                        const uint8_t* bp = we_t + (size_t) (k0 >> 6) * 36;
+                        const uint8_t* wp = we_t + (size_t) (k0 >> 6) * 36;
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
-                            const uint8_t* wpb = bp + (size_t) (b * 64) * row_stride;
+                            const uint8_t* wpb = wp + (size_t) (b * 64) * row_stride;
                             dq_nvfp4_sub16_store_sc(*reinterpret_cast<const uint32_t*>(wpb + 4 + sb * 8),
                                                     *reinterpret_cast<const uint32_t*>(wpb + 8 + sb * 8),
                                                     s_ue4m3[wpb[sb]], sw + (b * 64 + wr) * LD + sb * 16);

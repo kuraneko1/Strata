@@ -28,28 +28,31 @@ Key `2f09e21e` (Round 4) & `9056d598` (Round 5 — zero quantization change) cha
 | `786,432` | `+131,009` (`655,423`) | `229.7 t/s` | `573.3 t/s` | `625.5 t/s` | **`657.2 t/s`** | **`2.86x`** | `4,840 -> 1,654 ms` | `35.5 t/s` | `66.5 t/s` | **`71.8 t/s`** (`891.4 ms`) | **`+102.3%`** |
 | **`819,000`** | `+32,505` (`786,495`) | `208.1 t/s` | `525.8 t/s` | `574.3 t/s` | **`603.7 t/s`** | **`2.90x`** | **`5,028 -> 1,709 ms`** | `34.5 t/s` | `65.3 t/s` | **`70.1 t/s`** (`913.1 ms`) | **`+103.2% (2.03x)`** |
 
-Cumulative `0 -> 819,000` wall time: `2,188.1 s` (`36.5 min`) in `6ff2c009` -> `942.4 s` (`15.7 min`) in `8a30df9a` -> `875.9 s` (`14.6 min`) in `2f09e21e` -> `841.7 s` (`14.0 min`, `984 t/s` avg PP) in `9056d598` -> `741.2 s` (`12.35 min`) in **Round 6** -> **`720.3 s` (`12.00 min`, `3.04x` faster overall, `1,148 t/s` avg PP)** in **Round 7**. Zero OOMs, zero thermal/power throttling, zero quantization changes.
+Cumulative `0 -> 819,000` wall time: `2,188.1 s` (`36.5 min`) in `6ff2c009` -> `942.4 s` (`15.7 min`) in `8a30df9a` -> `875.9 s` (`14.6 min`) in `2f09e21e` -> `841.7 s` (`14.0 min`, `984 t/s` avg PP) in `9056d598` -> `741.2 s` (`12.35 min`) in **Round 6** -> `720.3 s` (`12.00 min`) in **Round 7** -> **`713.1 s` (`11.88 min`, `3.07x` faster overall, `1,160 t/s` avg PP)** in **Round 8**. Zero OOMs, zero thermal/power throttling, zero quantization changes.
 
-### Round 6 & Round 7 Update: Volta Native `HMMA.884` + Decode/Prefill Floor Boost
+### Round 6, Round 7 & Round 8 Update (GPU 0: `Tesla V100-PCIE-32GB`, 80 SM, ECC Off)
+
+> Note: All Round 6–8 sweeps were measured strictly on **GPU 0 (`Tesla V100-PCIE-32GB`, 80 SM, ECC Off)** and are kept separate from Section 2's **GPU 1 (`Tesla PG500-216`, 72 SM, ECC On, higher-bandwidth SKU)**.
 
 - **Round 6 (`940132c6`)**: Replacing C++ WMMA inside `k_attn_q8_gqa3_pp_fa2_256_bulk` on `sm_70` with direct PTX `HMMA.884` (`LDS.128`, 8-way batched `LDS.64`, conflict-free `STRIDE=144` SMEM `92,160 B`, compact `packed4` softmax) boosted Global Attention from `61.0` to **`74.8 TFLOPS` (`89.0%` of real `cuBLAS 4096^3` ceiling, `137.8 ms/L`)**.
-- **Round 7 (Decode & MoE Floor Boost — zero quantization change, 64/64 exact greedy parity at 512 / 2K / 64K)**:
-  - **2-stage multi-block `k_argmax_stage1/stage2`** (`dim3(64, rows)`, 256 thr) in both target engine and DSpark draft loop + skip monotonic `k_softcap` when `!copy_logits` (`~32 ms -> <1 ms`).
-  - **Fused small-`T` (`2..8`) F32 & BF16 kernels** (`k_gemm_f32_smallT_cta/warp`, `k_gemm_bf16_smallT_cta/warp`, `k_control_up_combine_smallT`), eliminating cuBLAS SGEMM / `cutlass` / `splitKreduce` / `bf16_to_f16` launch chains across `loop_down`, `loop_gain`, `loop_forget`, `router`, and BF16 projections.
-  - **Standalone zero-spill NVFP4 (`type 40`) decode kernels** for Inkling-2-Mini dimensions (`native_gu_nvfp4_72_kernel` for `n_embd=2304`, `native_down_nvfp4_36_kernel` for `n_ff=1152`, 8-lane sub-warp / 32 rows/block, SMEM-staged `q8_1`, bitwise identical reduction tree: down `84.1 -> 53.6 µs`, `1.57x`).
-  - **`k_mix_normed_fused` enabled for `T >= 1`**, plus **Volta native `HMMA.884` + `LDS.128` + direct `float2` epilogue** inside `wmma_grouped_64_kernel` and `wmma_grouped_128_kernel` (enabling `BM=128` for `WT=40` on `sm_70` with `STACK: 0`).
+- **Round 7 (`a2e79622`, Decode & MoE Floor Boost)**: 2-stage `k_argmax_stage1/stage2`, fused small-`T` F32/BF16 GEMMs, standalone zero-spill NVFP4 decode kernels, `k_mix_normed_fused` for `T >= 1`, and Volta native `HMMA.884` `BM=128` MoE prefill.
+- **Round 8 (Full Roofline Sweep — Phases 1–5, zero quantization change, 256/256 = 64/64 × 4 exact greedy parity at `div_512` / `div_2048` / `rep_2048` / `div_64k`, `0 MiB` extra VRAM)**:
+  - **C1 (Zero-SMEM `Q8_0` small-`T` MMVQ + Pair Fusion)**: `k_mmvq_q8_0_smallT<MT, EXACT_T, PAIR>` (`REG: 40–64, STACK: 0, SHARED: 0`, branchless 32-bit `LDG` + `__funnelshift_r`) fusing `Q+Gate`, `K+V`, and DSpark `K_ctx+V_ctx`/`K+V`/`Gate+Up` (200K LM head `838 -> 663 µs = 739 GB/s` at `T=4`, `588 µs = 832 GB/s = 96.1%` STREAM at `T=2`), plus `A9` small-`T` FP16 GEMM.
+  - **C2 (Zero-Spill NVFP4 + Fused Gate+Up+SiTU+Q8_1)**: Eliminated `STACK: 16 -> 0` in NVFP4 decode kernels and added `native_gu_nvfp4_72_situ_q8_1_kernel` (`REG: 59, STACK: 0`), eliminating `gate`/`up` HBM roundtrips and all 440 `situ_q8_1_entries_kernel` launches.
+  - **A2–A8 (Floor & Prefill Kernel Fusions)**: 1-pass SWA Q8 attention with direct `xq` store (`k_attn_q8_gqa3_swa_1pass`, `2.78x` faster), bit-exact SMEM-cached 768-thread `k_rms_norm_q8_1` / `k_rms_norm_3_q8_1`, 1-pass register-cached `k_mix_normed_fused_1pass<1,3,4>` (`1.90x` faster in prefill), `k_loop_down_fused_smallT` (eliminating `k_control_prep`), `k_route_and_group_smallT`, `k_combine_experts_shortconv`, `k_shortconv_kv_clip_norm_store_q8`, `k_clip_and_tau_qr`, `k_rel_table_split`, plus `B2/B4` (`k_rms_norm_f16`, `k_f32_to_f16_ctrl_w`, SWA V-prefetch in `fa2_192`).
+  - **C3 (Head-Major Full-Attn KV `[n_head_kv][cap][128]`)**: Contiguous 128-byte per-token bursts and 1-cache-line scale reads across all target & DSpark Full-Attn kernels (keeping SWA ring buffer unchanged and updating `ensure_kv_cap` to copy head-by-head), cutting 819K Decode from `830.76 -> 791.31 ms` (**`80.9 t/s`**, breaking `80 t/s` past 800K context!).
 
-| Depth | R5 (`9056d598`) PP | R6 (`940132c6`) PP | **R7 PP** | R7 vs Base | Last Chunk (`1024`) | R6 Decode | **R7 Decode** | R7 vs R6 Decode | R7 vs Base Decode |
+| Depth | R6 (`940132c6`) PP | R7 (`a2e79622`) PP | **R8 PP** | R8 vs Base PP | Last Chunk (`1024`) | R7 Decode | **R8 Decode** | R8 vs R7 Decode | R8 vs Base Decode |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `512` | `1,349.2 t/s` | `1,339.9 t/s` | **`1,403.3 t/s`** | `+8.7%` | `272 ms` | `130.3 t/s` | **`166.4 t/s`** | **`+27.7%`** | `+27.5%` |
-| `65,536` | `2,427.2 t/s` | `2,485.3 t/s` | **`2,643.2 t/s`** | `+62.9%` | `420 ms` | `117.8 t/s` | **`142.0 t/s`** | **`+20.5%`** | `+34.6%` |
-| `131,072` | `1,935.3 t/s` | `2,050.8 t/s` | **`2,153.9 t/s`** | `2.09x` | `512 ms` | `110.9 t/s` | **`131.8 t/s`** | **`+18.8%`** | `+47.1%` |
-| `262,144` | `1,483.0 t/s` | `1,624.3 t/s` | **`1,693.2 t/s`** | `2.54x` | `682 ms` | `99.4 t/s` | **`116.3 t/s`** | **`+17.0%`** | `+69.3%` |
-| `393,216` | `1,127.8 t/s` | `1,267.3 t/s` | **`1,304.0 t/s`** | `2.88x` | `862 ms` | `90.5 t/s` | **`104.3 t/s`** | **`+15.2%`** | `+87.9%` |
-| `524,288` | `910.4 t/s` | `1,040.0 t/s` | **`1,065.7 t/s`** | `3.12x` | `1,038 ms` | `82.7 t/s` | **`93.9 t/s`** | **`+13.5%`** | **`2.01x`** |
-| `655,360` | `763.4 t/s` | `882.6 t/s` | **`901.8 t/s`** | `3.28x` | `1,217 ms` | `76.5 t/s` | **`86.0 t/s`** | **`+12.4%`** | **`2.13x`** |
-| `786,432` | `657.2 t/s` | `767.0 t/s` | **`782.2 t/s`** | `3.41x` | `1,386 ms` | `71.1 t/s` | **`79.3 t/s`** | **`+11.5%`** | **`2.23x`** |
-| **`819,000`** | `603.7 t/s` | `707.1 t/s` | **`719.8 t/s`** | **`3.46x`** | **`1,434 ms`** | `69.4 t/s` | **`77.0 t/s`** | **`+11.0%`** | **`2.23x`** |
+| `512` | `1,339.9 t/s` | `1,403.3 t/s` | **`1,428.7 t/s`** | `+10.6%` | `268 ms` | `166.4 t/s` | **`182.8 t/s`** | **`+9.9%`** | `+40.1%` |
+| `65,536` | `2,485.3 t/s` | `2,643.2 t/s` | **`2,713.7 t/s`** | `+67.2%` | `406 ms` | `142.0 t/s` | **`146.3 t/s`** | `+3.0%` | `+38.7%` |
+| `131,072` | `2,050.8 t/s` | `2,153.9 t/s` | **`2,195.4 t/s`** | `2.13x` | `495 ms` | `131.8 t/s` | **`136.2 t/s`** | `+3.3%` | `+52.0%` |
+| `262,144` | `1,624.3 t/s` | `1,693.2 t/s` | **`1,718.5 t/s`** | `2.58x` | `668 ms` | `116.3 t/s` | **`120.1 t/s`** | `+3.3%` | `+74.8%` |
+| `393,216` | `1,267.3 t/s` | `1,304.0 t/s` | **`1,323.4 t/s`** | `2.93x` | `849 ms` | `104.3 t/s` | **`107.5 t/s`** | `+3.1%` | `+93.7%` |
+| `524,288` | `1,040.0 t/s` | `1,065.7 t/s` | **`1,078.9 t/s`** | `3.16x` | `1,019 ms` | `93.9 t/s` | **`97.6 t/s`** | **`+3.9%`** | **`2.09x`** |
+| `655,360` | `882.6 t/s` | `901.8 t/s` | **`911.1 t/s`** | `3.32x` | `1,206 ms` | `86.0 t/s` | **`89.1 t/s`** | **`+3.6%`** | **`2.21x`** |
+| `786,432` | `767.0 t/s` | `782.2 t/s` | **`785.4 t/s`** | `3.42x` | `1,379 ms` | `79.3 t/s` | **`82.3 t/s`** | **`+3.8%`** | **`2.32x`** |
+| **`819,000`** | `707.1 t/s` | `719.8 t/s` | **`724.0 t/s`** | **`3.48x`** | **`1,423 ms`** | `77.0 t/s` | **`80.9 t/s`** | **`+5.1%`** | **`2.34x`** |
 
 ---
 

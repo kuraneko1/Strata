@@ -117,14 +117,15 @@ __global__ void k_dspark_norm_rope_kv_store_q8(const float* __restrict__ K, cons
     const float idk = dk > 0.0f ? (127.0f / amax_k) : 0.0f;
     const float idv = dv > 0.0f ? (127.0f / amax_v) : 0.0f;
 
-    const size_t dst_off = (size_t) slot * kv_dim + hkv * 128;
+    const size_t dst_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
     kq[dst_off + d]      = (int8_t) __float2int_rn(k0 * idk);
     kq[dst_off + d + 64] = (int8_t) __float2int_rn(k1 * idk);
     vq[dst_off + d]      = (int8_t) __float2int_rn(v0 * idv);
     vq[dst_off + d + 64] = (int8_t) __float2int_rn(v1 * idv);
     if (d == 0) {
-        ks[(size_t) slot * n_head_kv + hkv] = __float2half(dk);
-        vs[(size_t) slot * n_head_kv + hkv] = __float2half(dv);
+        const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
+        ks[s_off] = __float2half(dk);
+        vs[s_off] = __float2half(dv);
     }
 }
 
@@ -199,11 +200,12 @@ __global__ void k_dspark_attn_q8(const float* __restrict__ Q,
     // 1. Context KV entries j in [j0 .. P-1]
     for (int j = j0 + warp; j < P; j += 4) {
         const int slot = is_swa ? (j % cap) : j;
-        const size_t k_off = (size_t) slot * kv_dim + hkv * 128;
+        const size_t k_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
+        const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
         const int8_t* kj = kq_ctx + k_off;
         const int8_t* vj = vq_ctx + k_off;
-        const float ksc = __half2float(ks_ctx[(size_t) slot * n_head_kv + hkv]);
-        const float vsc = __half2float(vs_ctx[(size_t) slot * n_head_kv + hkv]);
+        const float ksc = __half2float(ks_ctx[s_off]);
+        const float vsc = __half2float(vs_ctx[s_off]);
         float dot = sq[lane] * (float) kj[lane]
                   + sq[32 + lane] * (float) kj[32 + lane]
                   + sq[64 + lane] * (float) kj[64 + lane]
@@ -472,7 +474,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         const int8_t* __restrict__ vq_ctx, const __half* __restrict__ vs_ctx,
         const float* __restrict__ K_self, const float* __restrict__ V_self,
         float* __restrict__ split_out,
-        int n_head, int n_head_kv, const int32_t* __restrict__ pos_d, int block_n, float kq_scale, int split_n) {
+        int n_head, int n_head_kv, int cap, const int32_t* __restrict__ pos_d, int block_n, float kq_scale, int split_n) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     extern __shared__ __align__(16) char smem_raw[];
@@ -484,7 +486,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int rt = warp >> 1;      // 0: rows 0..15, 1: rows 16..31
     const int kw = warp & 1;       // 0..1: 2 independent 64-thr KV streams stepping by 32
-    const int h0 = 3 * hkv, kv_dim = n_head_kv * 128;
+    const int h0 = 3 * hkv;
     const int n_rows = block_n * 3;
     const int P = pos_d[0];
     constexpr float kLog2e = 1.4426950408889634f;
@@ -544,9 +546,10 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
     for (; jb <= c_end - 16; jb += 32) {
         const int j = jb + kr;
         {
-            const __half2 dk2 = __half2half2(__ldg(&ks_ctx[(size_t) j * n_head_kv + hkv]));
+            const int hj = hkv * cap + j;
+            const __half2 dk2 = __half2half2(__ldg(&ks_ctx[hj]));
             const __half2 kb = __hmul2(neg1152, dk2);
-            const int8_t* kp = kq_ctx + (size_t) j * kv_dim + hkv * 128 + kc0;
+            const int8_t* kp = kq_ctx + (size_t) hj * 128 + kc0;
             __half* dst = sKV + kr * 136 + kc0;
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
@@ -560,8 +563,9 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         }
         asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
 
-        const __half2 dv2 = __half2half2(__ldg(&vs_ctx[(size_t) j * n_head_kv + hkv]));
-        const int8_t* vp = vq_ctx + (size_t) j * kv_dim + hkv * 128 + kc0;
+        const int hjv = hkv * cap + j;
+        const __half2 dv2 = __half2half2(__ldg(&vs_ctx[hjv]));
+        const int8_t* vp = vq_ctx + (size_t) hjv * 128 + kc0;
         const uint4 vr0 = *reinterpret_cast<const uint4*>(vp);
         const uint4 vr1 = *reinterpret_cast<const uint4*>(vp + 16);
 
@@ -620,9 +624,10 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         {
             __half* dst = sKV + kr * 136 + kc0;
             if (j < c_end) {
-                const __half2 dk2 = __half2half2(__ldg(&ks_ctx[(size_t) j * n_head_kv + hkv]));
+                const int hj = hkv * cap + j;
+                const __half2 dk2 = __half2half2(__ldg(&ks_ctx[hj]));
                 const __half2 kb = __hmul2(neg1152, dk2);
-                const int8_t* kp = kq_ctx + (size_t) j * kv_dim + hkv * 128 + kc0;
+                const int8_t* kp = kq_ctx + (size_t) hj * 128 + kc0;
 #pragma unroll 1
                 for (int i = 0; i < 2; ++i) {
                     const uint4 raw = *reinterpret_cast<const uint4*>(kp + i * 16);
@@ -655,9 +660,10 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         {
             __half* dst = sKV + kr * 136 + kc0;
             if (j < c_end) {
-                const __half2 dv2 = __half2half2(__ldg(&vs_ctx[(size_t) j * n_head_kv + hkv]));
+                const int hj = hkv * cap + j;
+                const __half2 dv2 = __half2half2(__ldg(&vs_ctx[hj]));
                 const __half2 vb = __hmul2(neg1152, dv2);
-                const int8_t* vp = vq_ctx + (size_t) j * kv_dim + hkv * 128 + kc0;
+                const int8_t* vp = vq_ctx + (size_t) hj * 128 + kc0;
 #pragma unroll 1
                 for (int i = 0; i < 2; ++i) {
                     const uint4 raw = *reinterpret_cast<const uint4*>(vp + i * 16);
@@ -1336,8 +1342,11 @@ struct DsparkEngine {
             dspark_detail::k_dspark_mix_features<<<(unsigned) T, 256, 0, E.st>>>(
                 f0, f1, f2, f3, dm->dspark_fuse + il * 4, L.dflare_norm, ctx_norm, hp.n_embd, hp.rms_eps);
             E.prep_q8(ctx_norm, E.xq, T, hp.n_embd);
-            E.project_preq(ctx_norm, T <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, T, hp.kv_dim, hp.n_embd);
-            E.project_preq(ctx_norm, T <= 8 ? E.xq : nullptr, L.attn_v_ctx, ctx_v, T, hp.kv_dim, hp.n_embd);
+            if (!E.try_project_pair_q8_0(T <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, hp.kv_dim,
+                                         L.attn_v_ctx, ctx_v, hp.kv_dim, T, hp.n_embd)) {
+                E.project_preq(ctx_norm, T <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, T, hp.kv_dim, hp.n_embd);
+                E.project_preq(ctx_norm, T <= 8 ? E.xq : nullptr, L.attn_v_ctx, ctx_v, T, hp.kv_dim, hp.n_embd);
+            }
             dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 64, 0, E.st>>>(
                 ctx_k, ctx_v, L.attn_k_ctx_norm,
                 kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
@@ -1384,17 +1393,19 @@ struct DsparkEngine {
                 block_cur, dm->mask_embd, block_n, N);
             for (int il = 0; il < hp.n_layer; ++il) {
                 const auto& L = dm->layers[(size_t) il];
-                k_rms_norm<<<(unsigned) block_n, kThreads, 0, E.st>>>(block_cur, L.attn_norm, x_norm, N, hp.rms_eps);
-                E.prep_q8(x_norm, E.xq, block_n, N);
+                const int rms_blk = (N == 2304) ? 768 : kThreads;
+                k_rms_norm_q8_1<<<(unsigned) block_n, rms_blk, 0, E.st>>>(block_cur, L.attn_norm, x_norm, E.xq, N, hp.rms_eps);
                 E.project_preq(x_norm, E.xq, L.attn_q, Q, block_n, hp.q_dim, N);
-                E.project_preq(x_norm, E.xq, L.attn_k, K, block_n, hp.kv_dim, N);
-                E.project_preq(x_norm, E.xq, L.attn_v, V, block_n, hp.kv_dim, N);
+                if (!E.try_project_pair_q8_0(E.xq, L.attn_k, K, hp.kv_dim, L.attn_v, V, hp.kv_dim, block_n, N)) {
+                    E.project_preq(x_norm, E.xq, L.attn_k, K, block_n, hp.kv_dim, N);
+                    E.project_preq(x_norm, E.xq, L.attn_v, V, block_n, hp.kv_dim, N);
+                }
                 dspark_detail::k_dspark_qk_norm_rope<<<dim3((unsigned) (hp.n_head + hp.n_head_kv), (unsigned) block_n), 64, 0, E.st>>>(
                     Q, K, L.attn_q_norm, L.attn_k_norm, hp.n_head, hp.n_head_kv, pos_d, hp.rms_eps, hp.freq_base, hp.n_rot);
                 if (!L.is_swa && use_split) {
                     dspark_detail::k_dspark_attn_q8_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) split_full), 128, 18432, E.st>>>(
                         Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, split_out,
-                        hp.n_head, hp.n_head_kv, pos_d, block_n, kq_scale, split_full);
+                        hp.n_head, hp.n_head_kv, kv_cap[(size_t) il], pos_d, block_n, kq_scale, split_full);
                     dspark_detail::k_dspark_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) block_n), 128, 0, E.st>>>(
                         split_out, att, hp.n_head, pos_d, split_full);
                 } else {
@@ -1406,10 +1417,11 @@ struct DsparkEngine {
                 dspark_detail::k_dspark_add<<<(unsigned) (((int64_t) block_n * N + 255) / 256), 256, 0, E.st>>>(
                     block_cur, block_cur, wo, (int64_t) block_n * N);
 
-                k_rms_norm<<<(unsigned) block_n, kThreads, 0, E.st>>>(block_cur, L.ffn_norm, x_norm, N, hp.rms_eps);
-                E.prep_q8(x_norm, E.xq, block_n, N);
-                E.project_preq(x_norm, E.xq, L.ffn_gate, gate, block_n, hp.n_ff, N);
-                E.project_preq(x_norm, E.xq, L.ffn_up, up, block_n, hp.n_ff, N);
+                k_rms_norm_q8_1<<<(unsigned) block_n, (N == 2304) ? 768 : kThreads, 0, E.st>>>(block_cur, L.ffn_norm, x_norm, E.xq, N, hp.rms_eps);
+                if (!E.try_project_pair_q8_0(E.xq, L.ffn_gate, gate, hp.n_ff, L.ffn_up, up, hp.n_ff, block_n, N)) {
+                    E.project_preq(x_norm, E.xq, L.ffn_gate, gate, block_n, hp.n_ff, N);
+                    E.project_preq(x_norm, E.xq, L.ffn_up, up, block_n, hp.n_ff, N);
+                }
                 dspark_detail::k_dspark_swiglu<<<(unsigned) (((int64_t) block_n * hp.n_ff + 255) / 256), 256, 0, E.st>>>(
                     gate, up, gate, (int64_t) block_n * hp.n_ff);
                 E.project(gate, L.ffn_down, wo, block_n, N, hp.n_ff);
