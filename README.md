@@ -72,9 +72,10 @@ Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/ben
 
 | Mode (`--max-context`) | Context Depth | Prefill | Decode | Notes |
 | --- | ---: | ---: | ---: | --- |
-| **`819200`** (DSpark ON, `full_vram`) | `65K` | `2,428.7 t/s` | **`117.6 t/s`** | `3,072/3,072` experts, `916 MiB` free |
-| **`819200`** (DSpark ON, `full_vram`) | `131K` | `1,935.4 t/s` | **`110.8 t/s`** | Zero regression vs pre-R4 baseline |
-| **`819200`** (DSpark ON, `full_vram`) | `262K` | `1,483.7 t/s` | **`99.3 t/s`** | Verified up to `819,200` tokens |
+| **`819200`** (DSpark ON, `full_vram`) | `64K` | **`2,485.3 t/s`** | **`117.8 t/s`** | `3,072/3,072` experts, `916 MiB` free |
+| **`819200`** (DSpark ON, `full_vram`) | `256K` | **`1,624.3 t/s`** | **`99.4 t/s`** | Native Volta `HMMA.884` (`74.8 TFLOPS`) |
+| **`819200`** (DSpark ON, `full_vram`) | `512K` | **`1,040.0 t/s`** | **`82.7 t/s`** | `>1,000 t/s` sustained past half-million ctx |
+| **`819200`** (DSpark ON, `full_vram`) | `800K` | **`707.1 t/s`** | **`69.4 t/s`** | `3.40×` PP vs baseline; `0→819K` in `12.4 min` |
 | **`1048576`** (DSpark OFF, `core_resident_hybrid`) | `1M` | — | **`54.4 t/s`** | `2,897/3,072` experts (`+90` vs pre-arena) |
 
 Full V100 800K progression, Roofline analysis & chart: [2026-11-22 V100 800K Report](docs/bench-results/2026-11-22-v100-inkling2-800k/README.md).

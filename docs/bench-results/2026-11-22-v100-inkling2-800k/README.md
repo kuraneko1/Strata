@@ -28,7 +28,22 @@ Key `2f09e21e` (Round 4) & `9056d598` (Round 5 — zero quantization change) cha
 | `786,432` | `+131,009` (`655,423`) | `229.7 t/s` | `573.3 t/s` | `625.5 t/s` | **`657.2 t/s`** | **`2.86x`** | `4,840 -> 1,654 ms` | `35.5 t/s` | `66.5 t/s` | **`71.8 t/s`** (`891.4 ms`) | **`+102.3%`** |
 | **`819,000`** | `+32,505` (`786,495`) | `208.1 t/s` | `525.8 t/s` | `574.3 t/s` | **`603.7 t/s`** | **`2.90x`** | **`5,028 -> 1,709 ms`** | `34.5 t/s` | `65.3 t/s` | **`70.1 t/s`** (`913.1 ms`) | **`+103.2% (2.03x)`** |
 
-Cumulative `0 -> 819,000` wall time: `2,188.1 s` (`36.5 min`) in `6ff2c009` -> `942.4 s` (`15.7 min`) in `8a30df9a` -> `875.9 s` (`14.6 min`) in `2f09e21e` -> **`841.7 s` (`14.0 min`, `2.60x` faster overall, `984 t/s` avg PP)** in `9056d598`. Zero OOMs, zero thermal/power throttling, zero quantization changes.
+Cumulative `0 -> 819,000` wall time: `2,188.1 s` (`36.5 min`) in `6ff2c009` -> `942.4 s` (`15.7 min`) in `8a30df9a` -> `875.9 s` (`14.6 min`) in `2f09e21e` -> `841.7 s` (`14.0 min`, `984 t/s` avg PP) in `9056d598` -> **`741.2 s` (`12.35 min`, `2.95x` faster overall, `1,116 t/s` avg PP)** in **Round 6 (Volta native `HMMA.884`)**. Zero OOMs, zero thermal/power throttling, zero quantization changes.
+
+### Round 6 Update: Volta Native `HMMA.884` (`mma.sync.aligned.m8n8k4`, `STRIDE=144`)
+
+Replacing C++ WMMA inside `k_attn_q8_gqa3_pp_fa2_256_bulk` on `sm_70` with direct PTX `HMMA.884` (`LDS.128` 128-bit Q/K loads, 8-way batched `LDS.64` V loads, conflict-free `STRIDE=144` SMEM `92,160 B`, compact `packed4` softmax) boosts Global Attention from `61.0` to **`74.8 TFLOPS` (`89.0%` of real `cuBLAS 4096^3` ceiling, `137.8 ms/L`)** with **64/64 exact greedy token parity** (zero quantization change):
+
+| Depth | R5 (`9056d598`) PP | **R6 (`HMMA.884`) PP** | R6 vs R5 | R6 vs Base (`6ff2c009`) | Last Chunk (`1024`) | R6 Decode |
+|---:|---:|---:|---:|---:|---:|---:|
+| `65,536` | `2,427.2 t/s` | **`2,485.3 t/s`** | `+2.4%` | `+53.1%` | `450 ms` | `117.8 t/s` |
+| `131,072` | `1,935.3 t/s` | **`2,050.8 t/s`** | **`+6.0%`** | `1.99x` | `529 ms` | `110.9 t/s` |
+| `262,144` | `1,483.0 t/s` | **`1,624.3 t/s`** | **`+9.5%`** | `2.44x` | `704 ms` | `99.4 t/s` |
+| `393,216` | `1,127.8 t/s` | **`1,267.3 t/s`** | **`+12.4%`** | `2.80x` | `883 ms` | `90.5 t/s` |
+| `524,288` | `910.4 t/s` | **`1,040.0 t/s`** | **`+14.2%`** | `3.04x` | `1,058 ms` | `82.7 t/s` |
+| `655,360` | `763.4 t/s` | **`882.6 t/s`** | **`+15.6%`** | `3.21x` | `1,235 ms` | `76.5 t/s` |
+| `786,432` | `657.2 t/s` | **`767.0 t/s`** | **`+16.7%`** | `3.34x` | `1,410 ms` | `71.1 t/s` |
+| **`819,000`** | `603.7 t/s` | **`707.1 t/s`** | **`+17.1%`** | **`3.40x`** | **`1,458 ms`** (`-251 ms`) | `69.4 t/s` |
 
 ---
 

@@ -1095,7 +1095,7 @@ struct Engine {
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_bulk, cudaFuncAttributeMaxDynamicSharedMemorySize, 90112);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_bulk, cudaFuncAttributeMaxDynamicSharedMemorySize, 94208);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_bulk, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_tail, cudaFuncAttributeMaxDynamicSharedMemorySize, 90112);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_tail, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
@@ -2466,7 +2466,8 @@ struct Engine {
                             }
                         }
                         const int total_sp = best_sp + 1;
-                        k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, 87040, st>>>(
+                        const int bulk_smem = (profile.arch.id == strata::inkling2::ArchId::Sm70Volta) ? 92160 : 87040;
+                        k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, (size_t) bulk_smem, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], sink, pp_sp_buf,
                             (int) hp.n_head, (int) hp.n_head_kv, bulk_aligned, kq_scale, T, best_sp, total_sp);
                         k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv), 256, 87040, st>>>(
