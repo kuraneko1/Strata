@@ -1129,7 +1129,8 @@ struct Engine {
 
         const size_t reg0_qkv = 3 * sz_N + 4 * sz_kv + sz_rel + 2 * sz_dyn;
         const size_t per_sp_bytes = (size_t) tmax * (size_t) hp.n_head * 130 * sizeof(float);
-        const size_t want_sp = (tmax >= 2048) ? 4 : 5;
+        // Reserve 7 splits on >=20 GiB cards (e.g. V100 80-SM needs total_sp=6 for 6 exact waves at T=1024), 5/4 on 12 GB cards.
+        const size_t want_sp = (tmax >= 2048) ? 4 : ((vtot_init >= (20ULL << 30)) ? 7 : 5);
         const size_t reg0_bytes = a256(std::max(reg0_qkv, want_sp * per_sp_bytes));
         const size_t reg1_bytes = a256(std::max(3 * sz_N, 3 * sz_q));
         const size_t reg2_ctrl = sz_2N + 3 * sz_N + sz_c64 + ctrl_w16_bytes;
@@ -1508,7 +1509,8 @@ struct Engine {
             }
             project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
             k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
-                router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale, L.d_hits);
+                router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                (hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
         }
 
