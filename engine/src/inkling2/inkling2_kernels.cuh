@@ -761,12 +761,14 @@ __global__ void k_mix_normed_fused(NormMixPtrs ptrs, int D, const float* __restr
 
 /// Single-pass register-cached multi-query mix for N == 2304 (n4 = 576, blockDim = 576 = 18 warps, D <= 8):
 /// Reads each ptrs.p[d] ONCE into registers (ZERO second HBM/L2 pass!) and runs 18 warps/token.
-template <int NQ>
+template <int NQ, bool NORM_LAST = false>
 __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass(
     NormMixPtrs ptrs, int D, const float* __restrict__ q0, const float* __restrict__ q1,
-    MixOuts4 out, int N, float inv_sqrt_n, int swa_broadcast) {
+    MixOuts4 out, int N, float inv_sqrt_n, int swa_broadcast, float rms_eps = 0.0f) {
     __shared__ float s_dot[NQ][8][18];  // [q][d][warp]
     __shared__ float s_w[NQ][8];
+    __shared__ float s_ss[18];
+    __shared__ float s_inv_rms;
     const int t = blockIdx.x;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const float4* qp[NQ];
@@ -788,6 +790,14 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass(
         if (d < D) {
             const float4 v = reinterpret_cast<const float4*>(ptrs.p[d] + (size_t) t * N)[tid];
             cv[d] = v;
+            if constexpr (NORM_LAST) {
+                if (d == D - 1) {
+                    float ss = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+                    if (lane == 0) s_ss[warp] = ss;
+                }
+            }
 #pragma unroll
             for (int q = 0; q < NQ; ++q) {
                 float dot = v.x * qv[q].x + v.y * qv[q].y + v.z * qv[q].z + v.w * qv[q].w;
@@ -803,6 +813,16 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass(
         float s = 0.0f;
 #pragma unroll
         for (int w = 0; w < 18; ++w) s += s_dot[q][d][w];
+        if constexpr (NORM_LAST) {
+            if (d == D - 1) {
+                float ss = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) ss += s_ss[w];
+                const float ir = rsqrtf(ss / (float) N + rms_eps);
+                if (q == 0) s_inv_rms = ir;
+                s *= ir;
+            }
+        }
         s_w[q][d] = s * inv_sqrt_n;
     }
     __syncthreads();
@@ -817,6 +837,9 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass(
         }
         const float inv = __fdividef(1.0f, sum);
         for (int d = 0; d < D; ++d) s_w[q][d] *= inv;
+        if constexpr (NORM_LAST) {
+            s_w[q][D - 1] *= s_inv_rms;
+        }
     }
     __syncthreads();
     if constexpr (NQ == 1) {
@@ -866,6 +889,80 @@ __global__ void k_loop_down_fused_smallT(const float* __restrict__ W, const floa
     __shared__ float s_sm[MT][8];
     const int o = blockIdx.x;
     if (o >= R) return;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n4 = N >> 2;
+    const float4* wc4 = reinterpret_cast<const float4*>(W + (size_t) o * (2 * N));
+    const float4* wm4 = reinterpret_cast<const float4*>(W + (size_t) o * (2 * N) + N);
+    float dc[MT], sc[MT], dm[MT], sm[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) { dc[t] = 0.0f; sc[t] = 0.0f; dm[t] = 0.0f; sm[t] = 0.0f; }
+    for (int i = tid; i < n4; i += 256) {
+        const float4 awc = wc4[i];
+        const float4 awm = wm4[i];
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 vc = reinterpret_cast<const float4*>(cur + (size_t) t * N)[i];
+                const float4 vm = reinterpret_cast<const float4*>(msg + (size_t) t * N)[i];
+                dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
+                sc[t] += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
+                dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
+                sm[t] += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (EXACT_T || t < T) {
+            float vdc = dc[t], vsc = sc[t], vdm = dm[t], vsm = sm[t];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                vdc += __shfl_xor_sync(0xffffffffu, vdc, m);
+                vsc += __shfl_xor_sync(0xffffffffu, vsc, m);
+                vdm += __shfl_xor_sync(0xffffffffu, vdm, m);
+                vsm += __shfl_xor_sync(0xffffffffu, vsm, m);
+            }
+            if (lane == 0) {
+                s_dc[t][warp] = vdc; s_sc[t][warp] = vsc;
+                s_dm[t][warp] = vdm; s_sm[t][warp] = vsm;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < (EXACT_T ? MT : T)) {
+        float tdc = 0.0f, tsc = 0.0f, tdm = 0.0f, tsm = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            tdc += s_dc[tid][w]; tsc += s_sc[tid][w];
+            tdm += s_dm[tid][w]; tsm += s_sm[tid][w];
+        }
+        const float rc = rsqrtf(tsc / (float) N + eps);
+        const float rm = rsqrtf(tsm / (float) N + eps);
+        Y[(size_t) tid * R + o] = tdc * rc + tdm * rm;
+    }
+}
+
+/// 3-module batched k_loop_down_fused_smallT for Q/K/V loop controllers (grid = (R=64, 3) = 192 blocks -> 100% V100 SM fill!).
+struct CtrlPtrs3 {
+    const float *w0, *w1, *w2;
+    const float *c0, *c1, *c2;
+    const float *m0, *m1, *m2;
+};
+
+template <int MT, bool EXACT_T>
+__global__ void k_loop_down_fused_smallT_3(CtrlPtrs3 cp, float* __restrict__ Y_base,
+                                           int N, int R, int T, float eps) {
+    __shared__ float s_dc[MT][8];
+    __shared__ float s_sc[MT][8];
+    __shared__ float s_dm[MT][8];
+    __shared__ float s_sm[MT][8];
+    const int o = blockIdx.x;
+    const int mod = blockIdx.y;
+    if (o >= R || mod >= 3) return;
+    const float* W = (mod == 0) ? cp.w0 : ((mod == 1) ? cp.w1 : cp.w2);
+    const float* cur = (mod == 0) ? cp.c0 : ((mod == 1) ? cp.c1 : cp.c2);
+    const float* msg = (mod == 0) ? cp.m0 : ((mod == 1) ? cp.m1 : cp.m2);
+    float* Y = Y_base + (size_t) mod * (size_t) (EXACT_T ? MT : T) * (size_t) R;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int n4 = N >> 2;
     const float4* wc4 = reinterpret_cast<const float4*>(W + (size_t) o * (2 * N));
@@ -1048,6 +1145,67 @@ __global__ void k_control_up_combine_smallT(const float* __restrict__ cur, const
     const int half = lane >> 4;
     const int i = lane & 15;
     const float* wg = half ? w_forget : w_gain;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int o = base_o + k;
+        if (o >= N) return;
+        const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * 64)[i];
+        float acc[MT];
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 x = reinterpret_cast<const float4*>(sx[t])[i];
+                acc[t] = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                float a = acc[t];
+#pragma unroll
+                for (int m = 8; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+                const float f_val = __shfl_sync(0xffffffffu, a, 16);
+                if (lane == 0) {
+                    const size_t idx = (size_t) t * N + o;
+                    out[idx] = (1.0f - fast_tanh(f_val)) * cur[idx] + fast_tanh(a) * msg[idx];
+                }
+            }
+        }
+    }
+}
+
+/// 3-module batched k_control_up_combine_smallT for Q/K/V loop controllers (grid = ((N+15)/16, 3)).
+struct CtrlUpPtrs3 {
+    const float *wg0, *wg1, *wg2;
+    const float *wf0, *wf1, *wf2;
+    const float *c0, *c1, *c2;
+    const float *m0, *m1, *m2;
+    float *o0, *o1, *o2;
+};
+
+template <int MT, bool EXACT_T>
+__global__ void k_control_up_combine_smallT_3(CtrlUpPtrs3 cp, const float* __restrict__ ctrl64_base,
+                                              int T, int N) {
+    const int mod = blockIdx.y;
+    if (mod >= 3) return;
+    __shared__ float sx[MT][64];
+    const int n_t = EXACT_T ? MT : T;
+    const float* ctrl64 = ctrl64_base + (size_t) mod * (size_t) n_t * 64;
+    const int tot_x = n_t * 64;
+    for (int idx = threadIdx.x; idx < tot_x; idx += 256) {
+        sx[idx >> 6][idx & 63] = ctrl64[idx];
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int base_o = (blockIdx.x * 8 + warp) * 2;
+    const int half = lane >> 4;
+    const int i = lane & 15;
+    const float* wg_m = (mod == 0) ? cp.wg0 : ((mod == 1) ? cp.wg1 : cp.wg2);
+    const float* wf_m = (mod == 0) ? cp.wf0 : ((mod == 1) ? cp.wf1 : cp.wf2);
+    const float* wg = half ? wf_m : wg_m;
+    const float* cur = (mod == 0) ? cp.c0 : ((mod == 1) ? cp.c1 : cp.c2);
+    const float* msg = (mod == 0) ? cp.m0 : ((mod == 1) ? cp.m1 : cp.m2);
+    float* out = (mod == 0) ? cp.o0 : ((mod == 1) ? cp.o1 : cp.o2);
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
         const int o = base_o + k;
@@ -5131,6 +5289,7 @@ __global__ void __launch_bounds__(128, 6) k_attn_q8_gqa3_verify4_split(
 /// 4 warps (128 thr, 4 blk/SM, 21,760 B SMEM, 128 regs, 0 spills): each warp owns a private 16x136 sKV slice and steps
 /// independently with ZERO __syncthreads() inside the entire 800K KV loop, ZERO sS/sP SMEM via wmma_acc_to_matA_16x16,
 /// V prefetch overlapping QK^T, shifted-nsink bulk loop, lazy acc rescale, and single 4-warp epilogue combine.
+template <int T_ACT = 4>
 __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
         const float* __restrict__ Q,
         const int8_t* __restrict__ kq, const __half* __restrict__ ks,
@@ -5153,12 +5312,13 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     constexpr float kLog2e = 1.4426950408889634f;
     const float qscale_all = kq_scale * kLog2e;
 
+    constexpr int kQRows = 3 * T_ACT;
     const int p0 = pos0[0];
-    const int total = p0 + 4;
+    const int total = p0 + T_ACT;
     const int chunk_sz = max(64, (total + split_n - 1) / split_n);
     const int c_beg = sp * chunk_sz;
     if (c_beg >= total) {
-        if (tid < 12) {
+        if (tid < kQRows) {
             float* dst = split_out + (((size_t) (tid / 3) * split_n + sp) * n_head + (h0 + (tid % 3))) * 130;
             dst[128] = -1e30f;
             dst[129] = 0.0f;
@@ -5169,7 +5329,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
 
     {
         const int qr = tid >> 3, qc0 = (tid & 7) * 16;
-        const float* qp = (qr < 12) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
+        const float* qp = (qr < kQRows) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
         __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * STRIDE + qc0);
         if (qp) {
 #pragma unroll
@@ -5220,7 +5380,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     float rl1 = rl0;
 
     auto load_nsink = [&](int r) -> float {
-        return (r < 12) ? (-__ldg(&sink[(size_t) (r / 3) * n_head + (h0 + (r % 3))]) * kLog2e) : 0.0f;
+        return (r < kQRows) ? (-__ldg(&sink[(size_t) (r / 3) * n_head + (h0 + (r % 3))]) * kLog2e) : 0.0f;
     };
 
     float acc[8][8];
@@ -5361,7 +5521,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
 
     if (jb < c_end) {
         auto mask_bias = [&](float s, int r, int j) -> float {
-            if (r >= 12 || j >= c_end) return -1e30f;
+            if (r >= kQRows || j >= c_end) return -1e30f;
             const int rt = r / 3, h = h0 + (r % 3), pos_q = p0 + rt;
             if (j > pos_q) return -1e30f;
             const int d = pos_q - j;
@@ -5491,7 +5651,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
         s_wm[warp * 16 + acc_r1] = rm1; s_wl[warp * 16 + acc_r1] = rl1;
     }
     __syncthreads();
-    if (tid < 12) {
+    if (tid < kQRows) {
         float mg = -1e30f;
 #pragma unroll
         for (int w = 0; w < 4; ++w) if (s_wl[w * 16 + tid] > 0.0f) mg = fmaxf(mg, s_wm[w * 16 + tid]);
@@ -5503,8 +5663,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     }
     __syncthreads();
     {
-        const float cw0 = (acc_r0 < 12 && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
-        const float cw1 = (acc_r1 < 12 && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
+        const float cw0 = (acc_r0 < kQRows && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
+        const float cw1 = (acc_r1 < kQRows && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
             acc[n][0] *= cw0; acc[n][1] *= cw0; acc[n][4] *= cw0; acc[n][5] *= cw0;
@@ -5527,17 +5687,17 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     if (warp < 2) store_acc_smem((warp == 0) ? s_out : s_tmp);
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 2) store_acc_smem(s_tmp);
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 3) store_acc_smem(s_tmp);
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) {
+    for (int r = 0; r < kQRows; ++r) {
         float* dst = split_out + (((size_t) (r / 3) * split_n + sp) * n_head + (h0 + (r % 3))) * 130;
         dst[tid] = s_out[r * 128 + tid] + s_tmp[r * 128 + tid];
         if (tid == 0) {
@@ -5558,12 +5718,13 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     constexpr float kLog2e = 1.4426950408889634f;
     const float qscale_all = kq_scale * kLog2e;
 
+    constexpr int kQRows = 3 * T_ACT;
     const int p0 = pos0[0];
-    const int total = p0 + 4;
+    const int total = p0 + T_ACT;
     const int chunk_sz = max(64, (total + split_n - 1) / split_n);
     const int c_beg = sp * chunk_sz;
     if (c_beg >= total) {
-        if (tid < 12) {
+        if (tid < kQRows) {
             float* dst = split_out + (((size_t) (tid / 3) * split_n + sp) * n_head + (h0 + (tid % 3))) * 130;
             dst[128] = -1e30f;
             dst[129] = 0.0f;
@@ -5574,7 +5735,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
 
     {
         const int qr = tid >> 3, qc0 = (tid & 7) * 16;
-        const float* qp = (qr < 12) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
+        const float* qp = (qr < kQRows) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
         __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * 136 + qc0);
         if (qp) {
 #pragma unroll
@@ -5602,7 +5763,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     float rl1 = rl0;
 
     auto load_nsink = [&](int r) -> float {
-        return (r < 12) ? (-__ldg(&sink[(size_t) (r / 3) * n_head + (h0 + (r % 3))]) * kLog2e) : 0.0f;
+        return (r < kQRows) ? (-__ldg(&sink[(size_t) (r / 3) * n_head + (h0 + (r % 3))]) * kLog2e) : 0.0f;
     };
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[8];
@@ -5710,7 +5871,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     // Tail loop (causal + rel_tab; #pragma unroll 1 keeps bulk loop at 128 regs / 0 spills).
     if (jb < c_end) {
         auto mask_bias = [&](float s, int r, int j) -> float {
-            if (r >= 12 || j >= c_end) return -1e30f;
+            if (r >= kQRows || j >= c_end) return -1e30f;
             const int rt = r / 3, h = h0 + (r % 3), pos_q = p0 + rt;
             if (j > pos_q) return -1e30f;
             const int d = pos_q - j;
@@ -5819,7 +5980,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
         s_wm[warp * 16 + acc_r1] = rm1; s_wl[warp * 16 + acc_r1] = rl1;
     }
     __syncthreads();
-    if (tid < 12) {
+    if (tid < kQRows) {
         float mg = -1e30f;
 #pragma unroll
         for (int w = 0; w < 4; ++w) if (s_wl[w * 16 + tid] > 0.0f) mg = fmaxf(mg, s_wm[w * 16 + tid]);
@@ -5831,8 +5992,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     }
     __syncthreads();
     {
-        const float cw0 = (acc_r0 < 12 && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
-        const float cw1 = (acc_r1 < 12 && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
+        const float cw0 = (acc_r0 < kQRows && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
+        const float cw1 = (acc_r1 < kQRows && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
 #pragma unroll
         for (int n = 0; n < 8; ++n) wmma_rescale_acc(acc[n], cw0, cw1);
     }
@@ -5847,7 +6008,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     }
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 2) {
 #pragma unroll
@@ -5855,7 +6016,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     }
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 3) {
 #pragma unroll
@@ -5863,7 +6024,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
     }
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) {
+    for (int r = 0; r < kQRows; ++r) {
         float* dst = split_out + (((size_t) (r / 3) * split_n + sp) * n_head + (h0 + (r % 3))) * 130;
         dst[tid] = s_out[r * 128 + tid] + s_tmp[r * 128 + tid];
         if (tid == 0) {
@@ -5877,6 +6038,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
 /// Zero-Sync Warp-Independent Tensor-Core (WMMA 16x16x16) Split-KV Q8 SWA verify attention for T == 4 (is_swa=1, GQA-3, D=128):
 /// Packs 12 query rows (3 GQA heads x 4 tokens) into one 16x16x16 WMMA tile (12x less KV HBM traffic than scalar SWA!),
 /// 4 independent warps (ZERO __syncthreads() in KV loop, 21,760 B SMEM, 4 blk/SM), V prefetch overlapping QK^T, ring-buffer slot.
+template <int T_ACT = 4>
 __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
         const float* __restrict__ Q,
         const int8_t* __restrict__ kq, const __half* __restrict__ ks,
@@ -5899,14 +6061,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     constexpr float kLog2e = 1.4426950408889634f;
     const float qscale_all = kq_scale * kLog2e;
 
+    constexpr int kQRows = 3 * T_ACT;
     const int p0 = pos0[0];
     const int j_min = max(0, p0 - n_swa + 1);
-    const int j_max = p0 + 4;
+    const int j_max = p0 + T_ACT;
     const int n_tot = j_max - j_min;
     const int chunk_sz = max(64, (n_tot + split_n - 1) / split_n);
     const int c_beg = j_min + sp * chunk_sz;
     if (c_beg >= j_max) {
-        if (tid < 12) {
+        if (tid < kQRows) {
             float* dst = split_out + (((size_t) (tid / 3) * split_n + sp) * n_head + (h0 + (tid % 3))) * 130;
             dst[128] = -1e30f;
             dst[129] = 0.0f;
@@ -5917,7 +6080,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
 
     {
         const int qr = tid >> 3, qc0 = (tid & 7) * 16;
-        const float* qp = (qr < 12) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
+        const float* qp = (qr < kQRows) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
         __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * STRIDE + qc0);
         if (qp) {
 #pragma unroll
@@ -5985,7 +6148,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     const int cap_mask = cap - 1;
 
     auto mask_bias = [&](float s, int r, int j) -> float {
-        if (r >= 12 || j >= c_end) return -1e30f;
+        if (r >= kQRows || j >= c_end) return -1e30f;
         const int rt = r / 3, h = h0 + (r % 3), pos_q = p0 + rt;
         const int d = pos_q - j;
         if (d < 0 || d >= n_swa) return -1e30f;
@@ -6143,7 +6306,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
         s_wm[warp * 16 + acc_r1] = rm1; s_wl[warp * 16 + acc_r1] = rl1;
     }
     __syncthreads();
-    if (tid < 12) {
+    if (tid < kQRows) {
         float mg = -1e30f;
 #pragma unroll
         for (int w = 0; w < 4; ++w) if (s_wl[w * 16 + tid] > 0.0f) mg = fmaxf(mg, s_wm[w * 16 + tid]);
@@ -6158,8 +6321,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     }
     __syncthreads();
     {
-        const float cw0 = (acc_r0 < 12 && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
-        const float cw1 = (acc_r1 < 12 && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
+        const float cw0 = (acc_r0 < kQRows && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
+        const float cw1 = (acc_r1 < kQRows && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
             acc[n][0] *= cw0; acc[n][1] *= cw0; acc[n][4] *= cw0; acc[n][5] *= cw0;
@@ -6182,17 +6345,17 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     if (warp < 2) store_acc_smem((warp == 0) ? s_out : s_tmp);
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 2) store_acc_smem(s_tmp);
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 3) store_acc_smem(s_tmp);
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) {
+    for (int r = 0; r < kQRows; ++r) {
         float* dst = split_out + (((size_t) (r / 3) * split_n + sp) * n_head + (h0 + (r % 3))) * 130;
         dst[tid] = s_out[r * 128 + tid] + s_tmp[r * 128 + tid];
         if (tid == 0) {
@@ -6212,14 +6375,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     constexpr float kLog2e = 1.4426950408889634f;
     const float qscale_all = kq_scale * kLog2e;
 
+    constexpr int kQRows = 3 * T_ACT;
     const int p0 = pos0[0];
     const int j_min = max(0, p0 - n_swa + 1);
-    const int j_max = p0 + 4;
+    const int j_max = p0 + T_ACT;
     const int n_tot = j_max - j_min;
     const int chunk_sz = max(64, (n_tot + split_n - 1) / split_n);
     const int c_beg = j_min + sp * chunk_sz;
     if (c_beg >= j_max) {
-        if (tid < 12) {
+        if (tid < kQRows) {
             float* dst = split_out + (((size_t) (tid / 3) * split_n + sp) * n_head + (h0 + (tid % 3))) * 130;
             dst[128] = -1e30f;
             dst[129] = 0.0f;
@@ -6230,7 +6394,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
 
     {
         const int qr = tid >> 3, qc0 = (tid & 7) * 16;
-        const float* qp = (qr < 12) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
+        const float* qp = (qr < kQRows) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
         __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * 136 + qc0);
         if (qp) {
 #pragma unroll
@@ -6269,7 +6433,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     const int cap_mask = cap - 1;
 
     auto mask_bias = [&](float s, int r, int j) -> float {
-        if (r >= 12 || j >= c_end) return -1e30f;
+        if (r >= kQRows || j >= c_end) return -1e30f;
         const int rt = r / 3, h = h0 + (r % 3), pos_q = p0 + rt;
         const int d = pos_q - j;
         if (d < 0 || d >= n_swa) return -1e30f;
@@ -6396,7 +6560,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
         s_wm[warp * 16 + acc_r1] = rm1; s_wl[warp * 16 + acc_r1] = rl1;
     }
     __syncthreads();
-    if (tid < 12) {
+    if (tid < kQRows) {
         float mg = -1e30f;
 #pragma unroll
         for (int w = 0; w < 4; ++w) if (s_wl[w * 16 + tid] > 0.0f) mg = fmaxf(mg, s_wm[w * 16 + tid]);
@@ -6411,8 +6575,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     }
     __syncthreads();
     {
-        const float cw0 = (acc_r0 < 12 && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
-        const float cw1 = (acc_r1 < 12 && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
+        const float cw0 = (acc_r0 < kQRows && rl0 > 0.0f) ? fast_exp2f_hw(rm0 - s_mg[acc_r0]) : 0.0f;
+        const float cw1 = (acc_r1 < kQRows && rl1 > 0.0f) ? fast_exp2f_hw(rm1 - s_mg[acc_r1]) : 0.0f;
 #pragma unroll
         for (int n = 0; n < 8; ++n) wmma_rescale_acc(acc[n], cw0, cw1);
     }
@@ -6425,7 +6589,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     }
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 2) {
 #pragma unroll
@@ -6433,7 +6597,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     }
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
+    for (int r = 0; r < kQRows; ++r) s_out[r * 128 + tid] += s_tmp[r * 128 + tid];
     __syncthreads();
     if (warp == 3) {
 #pragma unroll
@@ -6441,7 +6605,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     }
     __syncthreads();
 #pragma unroll
-    for (int r = 0; r < 12; ++r) {
+    for (int r = 0; r < kQRows; ++r) {
         float* dst = split_out + (((size_t) (r / 3) * split_n + sp) * n_head + (h0 + (r % 3))) * 130;
         dst[tid] = s_out[r * 128 + tid] + s_tmp[r * 128 + tid];
         if (tid == 0) {

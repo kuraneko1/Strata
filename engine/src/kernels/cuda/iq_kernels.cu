@@ -1683,6 +1683,68 @@ __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_
     }
 }
 
+// Linear sequential 8-lane sub-warp row dot for Q5_K (TG == 13, n_embd == 2304: 9 blocks x 16 items = 144 items/row):
+// 100% lane balance (18 full iterations/lane), decodes each Q5_K weight once across all n tokens (bit-exact with S27<13>).
+template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_q5k_144_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                                     int t, float (&s)[NC]) {
+    using S = S27<13>;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+#pragma unroll 1
+    for (int k = t; k < 144; k += 8) {
+        const int kbx = k >> 4, iqs = (k & 15) << 1;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 8, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
+// Linear sequential 8-lane sub-warp row dot for Q8_0 (TD == 8, n_ff == 1152: 36 blocks of 32 values/row):
+// loads each 34-byte block_q8_0 ONCE across all n tokens (4x fewer d loads/fp32 muls than VDR_Q8_0=2), 0 spills.
+template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_q8_0_36_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                                     int t, float (&s)[NC]) {
+    const block_q8_0* bw = reinterpret_cast<const block_q8_0*>(row);
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    auto accum_blk = [&](int k) {
+        const block_q8_0* b = bw + k;
+        const float d0 = __half2float(b->d);
+        int q[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) q[i] = get_int_b2(b->qs, i);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (EXACT_N || c < n) {
+                const block_q8_1* bx = x + off[c] + k;
+                int sumi = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sumi = ggml_cuda_dp4a(q[i], get_int_b4(bx->qs, i), sumi);
+                s[c] += d0 * __low2float(bx->ds) * (float) sumi;
+            }
+        }
+    };
+#pragma unroll 1
+    for (int k = t; k < 32; k += 8) accum_blk(k);
+    if (t < 4) accum_blk(t + 32);
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
 // Linear sequential 8-lane sub-warp row dot for K = nb * ipb == 72 (TG == 40, NVFP4 with n_embd == 2304):
 // 4 rows/warp (32 rows/CTA), single linear HBM2/GDDR6X pass (eliminates 4x strided jumps & 2x accumulator regs).
 template<int NC, bool EXACT_N = false>
@@ -4519,6 +4581,133 @@ __global__ void __launch_bounds__(256, 4) native_down_nvfp4_36_kernel(
     }
 }
 
+// Standalone zero-spill fused Q5_K (type 13) Gate+Up + SiTU + Q8_1 quantization kernel for n_embd == 2304, n_ff % 32 == 0.
+// Same 32-row CTA + SMEM xq staging as native_gu_nvfp4_72_situ_q8_1_kernel (eliminates gate/up HBM roundtrip & situ launch).
+__global__ void __launch_bounds__(256, 4) native_gu_q5k_72_situ_q8_1_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq, NativeExpertLayout L, float beta, float lb,
+    block_q8_1* __restrict__ hq) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    __shared__ uint32_t s_xq_buf[GRP_NC * 72 * 9];
+    __shared__ float sh[GRP_NC][32];
+    const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = (int) blockIdx.x * 32 + subwarp;
+    const size_t g_off = (size_t) r * L.gu_row;
+    const size_t u_off = L.up_off + g_off;
+    const block_q8_1* s_xq = reinterpret_cast<const block_q8_1*>(s_xq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const float sg = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+        const float su = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int i = 0; i < n; ++i) {
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + i] * 72);
+                for (int j = threadIdx.x; j < 72 * 9; j += 256) s_xq_buf[i * (72 * 9) + j] = src[j];
+            }
+            iq_sync_lds();
+            float gg = 0.0f, uu = 0.0f;
+            if (n == 1) {
+                const int off1[1] = { 0 };
+                float s1[1];
+                row_dot_q5k_144_sub8<1, true>(blob + g_off, s_xq, off1, 1, t, s1);
+                if (t == 0) gg = s1[0] * sg;
+                row_dot_q5k_144_sub8<1, true>(blob + u_off, s_xq, off1, 1, t, s1);
+                if (t == 0) uu = s1[0] * su;
+            } else if (n == 2) {
+                const int off2[2] = { 0, 72 };
+                float s2[2];
+                row_dot_q5k_144_sub8<2, true>(blob + g_off, s_xq, off2, 2, t, s2);
+                if (t < 2) gg = ((t == 0) ? s2[0] : s2[1]) * sg;
+                row_dot_q5k_144_sub8<2, true>(blob + u_off, s_xq, off2, 2, t, s2);
+                if (t < 2) uu = ((t == 0) ? s2[0] : s2[1]) * su;
+            } else if (n == 3) {
+                const int off3[3] = { 0, 72, 144 };
+                float s3[3];
+                row_dot_q5k_144_sub8<3, true>(blob + g_off, s_xq, off3, 3, t, s3);
+                if (t < 3) gg = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sg;
+                row_dot_q5k_144_sub8<3, true>(blob + u_off, s_xq, off3, 3, t, s3);
+                if (t < 3) uu = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * su;
+            } else {
+                const int off4[4] = { 0, 72, 144, 216 };
+                float s4[4];
+                row_dot_q5k_144_sub8<4, true>(blob + g_off, s_xq, off4, 4, t, s4);
+                if (t < 4) gg = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * sg;
+                row_dot_q5k_144_sub8<4, true>(blob + u_off, s_xq, off4, 4, t, s4);
+                if (t < 4) uu = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * su;
+            }
+            if (t < n) {
+                const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
+                const float tu = lb > 0.0f ? lb * tanhf(uu / lb) : uu;
+                sh[t][subwarp] = tg * tu;
+            }
+            iq_sync_lds();
+            if (warp < n) {
+                q8_1_store(sh[warp][lane], hq, (long long) (e + warp) * L.n_ff + (long long) blockIdx.x * 32 + lane);
+            }
+        }
+    }
+}
+
+// Standalone zero-spill Q8_0 (type 8) down kernel for n_ff == 1152 (36 blocks, 8 lanes/row, 32 rows/block, SMEM hq).
+__global__ void __launch_bounds__(256, 4) native_down_q8_0_36_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
+    const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    __shared__ uint32_t s_hq_buf[GRP_NC * 36 * 9];
+    const int r = (int) blockIdx.x * 32 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    const bool valid_r = (r < L.n_embd);
+    const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 36);
+            const int words = n * (36 * 9);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+            iq_sync_lds();
+            if (valid_r) {
+                if (n == 1) {
+                    const int off1[1] = { 0 };
+                    float s1[1];
+                    row_dot_q8_0_36_sub8<1, true>(wr, s_hq, off1, 1, t, s1);
+                    if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                } else if (n == 2) {
+                    const int off2[2] = { 0, 36 };
+                    float s2[2];
+                    row_dot_q8_0_36_sub8<2, true>(wr, s_hq, off2, 2, t, s2);
+                    if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s2[0] : s2[1]) * sd;
+                } else if (n == 3) {
+                    const int off3[3] = { 0, 36, 72 };
+                    float s3[3];
+                    row_dot_q8_0_36_sub8<3, true>(wr, s_hq, off3, 3, t, s3);
+                    if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sd;
+                } else {
+                    const int off4[4] = { 0, 36, 72, 108 };
+                    float s4[4];
+                    row_dot_q8_0_36_sub8<4, true>(wr, s_hq, off4, 4, t, s4);
+                    if (t < 4) {
+                        const float v = (t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3];
+                        out[(size_t) ent_dst[e + t] * L.n_embd + r] = v * sd;
+                    }
+                }
+            }
+        }
+    }
+}
+
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
@@ -4613,6 +4802,13 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
     if constexpr (TD == 40) {
         if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 1152) {
             native_down_nvfp4_36_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            return;
+        }
+    }
+    if constexpr (TD == 8) {
+        if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 1152) {
+            const dim3 g32((unsigned) ((L.n_embd + 31) / 32), grid.y);
+            native_down_q8_0_36_kernel<<<g32, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             return;
         }
     }
@@ -6936,11 +7132,16 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool gs_layout = true;
 #endif
-    if (gs_layout && L.situ && L.gu_type == 40 && L.n_embd == 2304 && L.n_ff > 0 && (L.n_ff % 32) == 0 &&
+    if (gs_layout && L.situ && (L.gu_type == 40 || L.gu_type == 13) && L.n_embd == 2304 && L.n_ff > 0 && (L.n_ff % 32) == 0 &&
         L.had_block == 0 && g_exp_phase == 0 && !v1 && !g_old_kernels && !g_no_sub16_gu && !nib_layout(L)) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) gy);
-        native_gu_nvfp4_72_situ_q8_1_kernel<<<gl, 256, 0, s>>>(
-            grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
+        if (L.gu_type == 40) {
+            native_gu_nvfp4_72_situ_q8_1_kernel<<<gl, 256, 0, s>>>(
+                grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
+        } else {
+            native_gu_q5k_72_situ_q8_1_kernel<<<gl, 256, 0, s>>>(
+                grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
+        }
         gs_done = true;
         check("native_expert_grouped/gu+situ+q8_1");
     } else if (gs_layout && !L.situ && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
