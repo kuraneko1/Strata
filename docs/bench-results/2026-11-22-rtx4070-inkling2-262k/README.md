@@ -21,20 +21,24 @@
    - `k_attn_q8_gqa3_split`: `fast_exp2f_hw`, shifted-`neg_sink2`, lazy rescale, `sp = sm_count` (`46`), and exact FP16-zero V-skip (`2^-28`, `0` spills / 64 regs).
    - `k_combine_experts_hybrid`: CPU pre-combines missed experts into one `9 KB` vector (`8×` smaller H2D, `moe_up = 0.43 ms/tok`, `moe_post = 0.61 ms/tok`, `moe_wait = 0.01 ms/tok`).
 7. **Core-Weighted Burst+Throttled `rebalance()` + `--serve` `QUIT` Fix**: Burst convergence (`48/8` for 2 chunks after shrink), throttled steady-state (`8/2` every 4 chunks), plus `reader.detach()` on `QUIT`.
+8. **Unified Phase-Disjoint `layer_arena` + SWA-3072 Ring `chunk=2048` + Parallel `dequant_tok` + WMMA `avg_rows` Fix (`a6268454`)**:
+   - Aliases phase-disjoint scratch buffers (`rel_tab`, `pp_sp_buf`, `Q/K/V/att/att_gate/wo`, `msg0..2`, `ctrl`, `eparts`, `escr`, `moe_raw`) into one 256B-aligned `layer_arena`, shrinks `xq_k/xq_v` to `min(tmax, 8)`, and tightens `ensure_kv_cap` reserve (`256 → 112 MiB`), reclaiming `~400 MiB` (`90 → 96/128` core at `T=1024`: `27.41 t/s` 262K Decode).
+   - Expands SWA circular ring to `n_swa + tmax` (`3072`) and auto-selects `chunk = 2048` on `<20 GiB` hybrid Q8KV (without DSpark), cutting PCIe expert streaming bytes/token in **half** (`560 ms → 280 ms / 1024 tok`) while keeping `86/128` core (`27.28 t/s` Decode).
+   - Parallelizes `dequant_tok` across up to 8 CPU threads (`144 ms → 42 ms` over 4K Zipf, `3.43×`) and passes true `expected_entries` to `native_expert_grouped_wmma` to eliminate 4× excess CTA launches during `pp_streaming`.
 
 ## Benchmark Results (`512 → 262,000`, Q8KV, DSpark OFF, Idle RTX 4070)
 
-| Context Depth | Base (`9056d598`) PP / Dec | R1 (`23125db1`) PP / Dec | **R3 (Final) PP / Dec** | PP Gain (vs Base) | Decode Gain (vs Base) | GPU Hit |
+| Context Depth | Base (`9056d598`) PP / Dec | R3 (`9e7429de`) PP / Dec | **R4 (`a6268454`, `T=2048`) PP / Dec** | PP Gain (vs Base) | Decode Gain (vs Base) | GPU Hit |
 |---:|---:|---:|---:|---:|---:|---:|
-| `512` | `564.0` / `45.10` | `584.0` / `54.17` | `554.9` / **`55.31`** | `0.98×` | **`1.23×`** | `88.3%` |
-| `32,768` | `1,895.8` / `51.40` | `1,687.8` / `51.68` | **`1,923.6`** / `50.65` | **`1.01×`** | `0.99×` | `95.6%` |
-| `65,536` | `1,759.4` / `25.33` | `1,668.7` / `32.94` | **`1,752.4`** / **`35.52`** | `1.00×` | **`1.40×`** | `95.5%` |
-| `131,072` | `903.2` / `9.70` | `1,472.6` / `3.38`* | **`1,512.7`** / `5.27`* | **`1.67×`** | — | `89.1%` |
-| `196,608` | `492.6` / `11.98` | `1,163.0` / `28.58` | **`1,328.7`** / **`28.61`** | **`2.70×`** | **`2.39×`** | `74.9%` |
-| **`262,000`** | **`456.2` / `12.03`** | **`1,076.6` / `26.60`** | **`1,216.7` / `26.79`** | **`2.67×`** | **`2.23×`** | **`74.9%`** |
-| **Cum `0→262K`** | **`385.42 s`** | **`201.18 s`** | **`182.74 s` (`3.05 min`)** | **`2.11×`** | — | — |
+| `512` | `564.0` / `45.10` | `554.9` / `55.31` | `404.7` / `54.55` | `0.72×` | **`1.21×`** | `87.3%` |
+| `32,768` | `1,895.8` / `51.40` | `1,923.6` / `50.65` | **`2,404.3`** / `47.85` | **`1.27×`** | `0.93×` | `94.8%` |
+| `65,536` | `1,759.4` / `25.33` | `1,752.4` / `35.52` | **`2,187.5`** / `25.22`* | **`1.24×`** | — | `95.0%` |
+| `131,072` | `903.2` / `9.70` | `1,512.7` / `5.27`* | **`1,937.7`** / `3.40`* | **`2.15×`** | — | `85.2%` |
+| `196,608` | `492.6` / `11.98` | `1,328.7` / `28.61` | **`1,679.1`** / **`28.82`** | **`3.41×`** | **`2.41×`** | `74.9%` |
+| **`262,000`** | **`456.2` / `12.03`** | **`1,216.7` / `26.79`** | **`1,506.4` / `27.28`** | **`3.30×`** | **`2.27×`** | **`74.9%`** |
+| **Cum `0→262K`** | **`385.42 s`** | **`182.74 s`** | **`145.92 s` (`2.43 min`)** | **`2.64×`** | — | — |
 
-*\*At `131,072`, `tg_ms` includes the one-time `131K → 262K` KV expansion + parallel 12-layer `hblobs` build (`~9.8 s` vs `16.4 s` in R1; steady-state decode is `~28.6 t/s`).*
+*\*At `65,536` and `131,072`, `tg_ms` includes one-time KV expansion + host blob builds; steady-state decode at `196K–262K` is `28.82–27.28 t/s`. With `STRATA_PP_STAGE_MB=96`, 262K PP reaches **`1,520.5 t/s` (`3.33×`)** and cumulative `0→262K` drops to **`143.95 s` (`2.40 min`, `2.68×`)**. With `--chunk 1024`, R4 keeps `96/128` core (`1,152` experts) for **`27.41 t/s`** 262K Decode (`57.38 t/s` at 512, `36.68 t/s` at 65K).*
 
 ## Tier1 vs Tier2 Allocation Proof (Idle RTX 4070, `ev=4.51 GiB`, Zipf 35K Vocab, 2048 PP + 64 TG)
 
