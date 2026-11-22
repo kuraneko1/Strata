@@ -42,6 +42,10 @@ The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) f
 
 ## Benchmarks
 
+<p align="center">
+  <img src="docs/media/inkling2-benchmarks.png" width="960" alt="strata-inkling2 benchmarks on RTX 4070 12 GB and Tesla V100 32 GB">
+</p>
+
 All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--kv-q8`, zero quantization change).
 
 ### RTX 4070 12 GB (`sm_89`, Ryzen 7 5700X, DSpark OFF)
@@ -175,14 +179,43 @@ Startup logs print the active profile line so you can verify what was selected:
 
 Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCode, etc.) at `http://localhost:8085`.
 
-### 2. Standalone CLI / Benchmark
+### 2. Launch Command Examples
+
+Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the engine auto-selects the matching profile, chunk size, and KV strategy.
 
 ```bash
-# Quick throughput benchmark at 65K context
+# RTX 4070 12 GB — 65K fastest (auto: sm89 + core_resident_hybrid, chunk=1024, ~50 t/s @ 65K)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
-  --max-context 65536 \
-  --bench --max-new 128
+  --max-context 65536 --bench --max-new 128
+
+# RTX 4070 12 GB — 131K balanced (auto: sm89 + core_resident_hybrid, chunk=1024, ~38 t/s @ 131K)
+./engine/build/strata-inkling2 \
+  --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
+  --max-context 131072 --bench --max-new 128
+
+# RTX 4070 12 GB — 262K max context (auto: sm89 + tight_hybrid, chunk=2048, ~27 t/s @ 262K)
+./engine/build/strata-inkling2 \
+  --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
+  --max-context 262144 --bench --max-new 128
+
+# Tesla V100 32 GB — 819K + DSpark (auto: sm70 + full_vram, chunk=1024, 99–118 t/s)
+./engine/build-sm70/strata-inkling2 \
+  --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
+  --draft /path/to/Inkling-2-Mini-DSpark.gguf --draft-max 3 \
+  --max-context 819200 --bench --max-new 128
+```
+
+Quick API smoke test once `serve.server` is running on port `8085`:
+
+```bash
+curl -s http://localhost:8085/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Inkling-2-Mini-UD-Q4_K_M",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 64
+  }'
 ```
 
 ### 3. Optional Overrides
