@@ -1,198 +1,229 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="app/host/public/brand/strata-lockup-dark.svg">
-    <img src="app/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
+<div align="center">
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+# Strata — Inkling-2-Mini Edition
 
-<p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
-</p>
+**High-throughput, long-context CUDA + AVX2 hybrid inference for Inkling-2-Mini.**
 
-<p align="center">
-  <a href="https://github.com/kuraneko1/Strata"><img src="https://img.shields.io/badge/Fork-kuraneko1%2FStrata_(inkling2)-0ab887" alt="kuraneko1/Strata Fork"></a>
-  <a href="docs/INKLING2.md"><img src="https://img.shields.io/badge/Engine-strata--inkling2-2563eb" alt="Inkling-2-Mini Engine"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/kuraneko1/Strata" alt="MIT license"></a>
-</p>
+[![Repository](https://img.shields.io/badge/Repo-kuraneko1%2FStrata-0ab887)](https://github.com/kuraneko1/Strata)
+[![Engine](https://img.shields.io/badge/Engine-strata--inkling2-2563eb)](docs/INKLING2.md)
+[![Verified GPUs](https://img.shields.io/badge/Verified-RTX%204070%2012GB%20%C2%B7%20V100%2032GB-6d28d9)](#supported-hardware--auto-profiles)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-<p align="center"><sub><b>English</b> · <a href="docs/lang/README.zh-CN.md">简体中文</a> · <a href="docs/lang/README.ja.md">日本語</a> · <a href="docs/lang/README.de.md">Deutsch</a> · <a href="docs/lang/README.fr.md">Français</a> · <a href="docs/lang/README.es.md">Español</a> · <a href="docs/lang/README.pt-BR.md">Português</a> · <a href="docs/lang/README.pl.md">Polski</a></sub></p>
+[Highlights](#highlights) · [Profiles](#supported-hardware--auto-profiles) · [Benchmarks](#benchmarks) · [Build](#build-from-source) · [Quick Start](#quick-start) · [Architecture](#architecture--optimizations)
 
-**Free, open source, and yours to run.** Fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) adding the **`strata-inkling2`** CUDA + AVX2 hybrid engine and up to **262,144-token** context support for **Inkling-2-Mini**. Use Strata from source with your favorite coding tools or the built-in web UI.
+</div>
 
-> **Source distribution:** Build `strata-inkling2` locally for your NVIDIA GPU (`sm_75+`, e.g. `-DCMAKE_CUDA_ARCHITECTURES=native` or `86`/`89`/`120`). See the [Inkling-2-Mini build & tuning guide](docs/INKLING2.md).
+---
 
-## Models
+**`kuraneko1/Strata`** is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) focused on **`strata-inkling2`**: a dedicated CUDA + AVX2 hybrid inference engine for the **Inkling-2-Mini** (`inkling2`) looped-MoE architecture.
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+It runs **65K–262K** context on a single **12 GB consumer GPU (RTX 4070)** and **819K–1M** context on a **32 GB Tesla V100** with **zero quantization or precision changes**, served behind an OpenAI- and Anthropic-compatible HTTP API and built-in Web UI (`serve.server`).
 
-<details open>
-<summary><b>Inkling-2-Mini (`inkling2`, fork addition)</b></summary>
+## Highlights
 
-- Dedicated `strata-inkling2` CUDA + AVX2 hybrid engine with CUDA Graphs, compact-miss PCIe double-buffered prefill streaming, Q8 KV cache, and prefix checkpoint reuse (`65,536` / `262,144` context tested on RTX 4070 12 GB).
-- [Inkling-2-Mini build, benchmarks, and tuning guide](docs/INKLING2.md).
+- **Zero-knob automatic tuning (`SM arch × VRAM regime`)** — Choose `--max-context` (and optionally `--draft` for DSpark). The engine inspects the GPU architecture and live free VRAM to select the verified chunk size, KV allocation policy, staging budget, FA2 split-K width, and CUDA Graph mode via [profile_rules.hpp](engine/include/strata/inkling2/profile_rules.hpp).
+- **Zero quantization / precision compromises** — Native `UD-Q4_K_M` weights and `Q8` KV cache (`--kv-q8`), verified for 64/64 greedy token parity across optimization rounds.
+- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, 65K/131K runs with 100% of looped `tier1` core experts resident in VRAM (`50.4 t/s` at 65K, `38.2 t/s` at 131K), while 262K switches to `chunk=2048` compact-miss PCIe streaming (`1,506 t/s` prefill, `27.3 t/s` decode at 262K). On V100 32 GB, all 3,072 experts fit in VRAM up to 819K with DSpark (`99–118 t/s` decode).
+- **Drop-in OpenAI & Anthropic API** — Works directly with Claude Code, Codex CLI, OpenCode, and other local coding agents, plus upstream Strata's Qwen3.8-Flash-Next and Qwen3.6-35B-A3B engines.
 
-</details>
+## Supported Hardware & Auto-Profiles
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) from **VRAM regime** (`full_vram`, `core_resident_hybrid`, `tight_hybrid`) so tuning for 12 GB Ada GPUs never regresses 32 GB Volta GPUs (and vice versa).
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+| Verified GPU | `--max-context` | Auto-Resolved Profile | Prefill Chunk | KV Cache Strategy | Expert Placement |
+| --- | ---: | --- | ---: | --- | --- |
+| **RTX 4070 12 GB** (`sm_89`) | `65536` | `sm89 + core_resident_hybrid` | `1024` | Upfront `65K` (0s growth) | `1,827 / 3,072` (`tier1` 100%, `tier2` 24–25/128) |
+| **RTX 4070 12 GB** (`sm_89`) | `131072` | `sm89 + core_resident_hybrid` | `1024` | Upfront `131K` (0s growth) | `1,616 / 3,072` (`tier1` 100%, `tier2` 6–7/128) |
+| **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` | Dynamic `32K → 262K` | Adaptive eviction (`74.9%` hit @ 262K) |
+| **Tesla V100 32 GB** (`sm_70`) | `819200` (+ DSpark) | `sm70 + full_vram` | `1024` | Upfront `819K` | `3,072 / 3,072` (`100%` VRAM, `916 MiB` free) |
+| **Tesla V100 32 GB** (`sm_70`) | `1048576` | `sm70 + core_resident_hybrid` | `1024` | Dynamic | `2,897 / 3,072` (`tier1` 100%) |
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
+> **Other NVIDIA GPUs (`sm_75+`)**: Turing (`sm_75`), Ampere (`sm_86`), other Ada (`sm_89`), and Blackwell (`sm_120`, CUDA 13+) GPUs build and run via the safe `generic` profile and automatic VRAM sizing. Hardware verification and dedicated profiles currently cover **RTX 4070 12 GB** and **Tesla V100 32 GB**.
 
-</details>
+## Benchmarks
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--kv-q8`, zero quantization change).
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
+### RTX 4070 12 GB (`sm_89`, Ryzen 7 5700X, DSpark OFF)
 
-[Model guide and compatibility](docs/QWEN36.md).
+| Mode (`--max-context`) | Context Depth | Prefill | Decode | Hit Rate / Notes |
+| --- | ---: | ---: | ---: | --- |
+| **`65536`** (`core_resident_hybrid`) | `32K` | `1,903.8 t/s` | `59.8 t/s` | 0s mid-run KV growth |
+| **`65536`** (`core_resident_hybrid`) | `65K` | **`1,782.2 t/s`** | **`50.4 t/s`** | `96.2%` expert VRAM hit |
+| **`131072`** (`core_resident_hybrid`) | `65K` | `1,675.6 t/s` | `40.4 t/s` | 0s mid-run KV growth |
+| **`131072`** (`core_resident_hybrid`) | `130.5K` | **`1,524.1 t/s`** | **`38.2 t/s`** | `91.6%` expert VRAM hit |
+| **`262144`** (`tight_hybrid`, `T=2048`) | `32K` | `2,354.1 t/s` | `43.2 t/s` | 3.30× PP / 2.27× TG vs baseline at 262K |
+| **`262144`** (`tight_hybrid`, `T=2048`) | `196K` | `1,651.1 t/s` | `27.7 t/s` | Dynamic KV growth + eviction |
+| **`262144`** (`tight_hybrid`, `T=2048`) | `262K` | **`1,506.4 t/s`** | **`27.3 t/s`** | Cumulative `0 → 262K` in `2.43 min` |
 
-</details>
+Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md).
 
-<a id="the-other-sizes"></a>
+### Tesla V100-PCIE-32GB (`sm_70`, CUDA 12.9)
 
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
+| Mode (`--max-context`) | Context Depth | Prefill | Decode | Notes |
+| --- | ---: | ---: | ---: | --- |
+| **`819200`** (DSpark ON, `full_vram`) | `65K` | `2,428.7 t/s` | **`117.6 t/s`** | `3,072/3,072` experts, `916 MiB` free |
+| **`819200`** (DSpark ON, `full_vram`) | `131K` | `1,935.4 t/s` | **`110.8 t/s`** | Zero regression vs pre-R4 baseline |
+| **`819200`** (DSpark ON, `full_vram`) | `262K` | `1,483.7 t/s` | **`99.3 t/s`** | Verified up to `819,200` tokens |
+| **`1048576`** (DSpark OFF, `core_resident_hybrid`) | `1M` | — | **`54.4 t/s`** | `2,897/3,072` experts (`+90` vs pre-arena) |
 
-## Install
-
-<a id="option-a-the-strata-app"></a>
-
-### Desktop app
-
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
-
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
-
-<sub>Files: `Strata-0.2.17-windows-x64-setup.exe` · `Strata-0.2.17-linux-x86_64.AppImage` · `Strata-0.2.17-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
-```
-
-**Windows PowerShell**
-
-```powershell
-irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
-```
-
-On Windows, open a new terminal afterwards. Then:
-
-```sh
-strata launch
-```
-
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
-
-</details>
-
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
+Full V100 800K progression, Roofline analysis & chart: [2026-11-22 V100 800K Report](docs/bench-results/2026-11-22-v100-inkling2-800k/README.md).
 
 <a id="build-from-source"></a>
 
-[Build from source](docs/SOURCE_INSTALL.md) · [Build `strata-inkling2`](docs/INKLING2.md#build-from-source) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+## Build from Source
 
-<a id="what-you-need"></a>
+Requires **Linux x86_64** (AVX2 CPU), **CMake 3.24+**, a **C++20** compiler, and the **CUDA Toolkit** (CUDA 12.x/13.x for `sm_75+`; CUDA 12.x required for `sm_70` V100).
 
-## Hardware
+```bash
+git clone https://github.com/kuraneko1/Strata.git
+cd Strata
+```
 
-| Supported hardware | Guide |
+### 1. Local NVIDIA GPU (`sm_75+`, e.g. RTX 4070)
+
+```bash
+cmake -S engine -B engine/build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=native
+
+cmake --build engine/build --target strata-inkling2 -j
+```
+
+### 2. Portable Multi-GPU Binary (`sm_75+`, distributable)
+
+```bash
+cmake -S engine -B engine/build-dist \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON \
+  -DSTRATA_PORTABLE=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="75;86;89"   # add ;120 on CUDA 13.0+
+
+cmake --build engine/build-dist --target strata-inkling2 -j
+```
+
+### 3. Tesla V100 (`sm_70`, CUDA 12.x)
+
+```bash
+cmake -S engine -B engine/build-sm70 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON \
+  -DSTRATA_EXPERIMENTAL_SM60=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=70
+
+cmake --build engine/build-sm70 --target strata-inkling2 -j
+```
+
+### Profile Rules Unit Test (CPU-only)
+
+```bash
+g++ -std=c++20 -O2 -Wall -Wextra -Iengine/include \
+  engine/tests/program/inkling2_profile_rules_test.cpp \
+  -o /tmp/inkling2_profile_rules_test && /tmp/inkling2_profile_rules_test
+```
+
+## Quick Start
+
+### 1. Server Mode (OpenAI / Anthropic API + Web UI)
+
+Create a JSON config (e.g. `inkling2.json`). Simply change `--max-context` to switch tiers — the profile, chunk size, and KV policy adapt automatically:
+
+```json
+{
+  "arch": "inkling2",
+  "model_name": "Inkling-2-Mini-UD-Q4_K_M",
+  "exe": "/path/to/Strata/engine/build/strata-inkling2",
+  "args": [
+    "--model", "/path/to/Inkling-2-Mini-UD-Q4_K_M.gguf",
+    "--max-context", "262144",
+    "--serve"
+  ],
+  "tokenizer": "/path/to/strata_tokenizer",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 40
+  },
+  "fit_max_tokens": true,
+  "no_api_key": true
+}
+```
+
+Recommended `--max-context` presets:
+- **RTX 4070 12 GB — fastest daily coding (`65K`)**: `"--max-context", "65536"`
+- **RTX 4070 12 GB — balanced long context (`131K`)**: `"--max-context", "131072"`
+- **RTX 4070 12 GB — max context (`262K`)**: `"--max-context", "262144"`
+- **Tesla V100 32 GB — 819K + DSpark**: `"--max-context", "819200", "--draft", "/path/to/Inkling-2-Mini-DSpark.gguf", "--draft-max", "3"`
+
+Start the server:
+
+```bash
+PYTHONPATH=./terminal python3 -m serve.server \
+  --engine strata \
+  --config /path/to/inkling2.json \
+  --host 0.0.0.0 \
+  --port 8085 \
+  --no-api-key
+```
+
+Startup logs print the active profile line so you can verify what was selected:
+
+```text
+[inkling2] profile: arch=sm89 regime=tight_hybrid (cc=8.9, sm=46, free=10.4 GiB) -> chunk=2048 kv_grow=dynamic stage_mb=64 need_free=112MiB want_sp=5 d_hits=on
+```
+
+Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCode, etc.) at `http://localhost:8085`.
+
+### 2. Standalone CLI / Benchmark
+
+```bash
+# Quick throughput benchmark at 65K context
+./engine/build/strata-inkling2 \
+  --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
+  --max-context 65536 \
+  --bench --max-new 128
+```
+
+### 3. Optional Overrides
+
+Explicit CLI flags and environment variables always override auto-profile defaults:
+
+| Override | Purpose |
 | --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
-| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
+| `--chunk <N>` | Override auto-selected prefill chunk size (`1024` / `2048` / etc.) |
+| `--expert-vram <GiB>` | Override automatic MoE expert VRAM budget |
+| `--kv-q8` / `--kv-f16` | Quantized Q8 (default) or FP16 KV cache |
+| `STRATA_PP_STAGE_MB` | PCIe double-buffered staging size per buffer in MiB (`0` disables) |
+| `STRATA_PP_STREAM_T` | Minimum batch size `T` to engage PCIe prefill streaming |
+| `STRATA_TIER2_FLOOR` | Optional `tier2` expert slots reserved per layer before maximizing `tier1` |
+| `STRATA_MAX_PIN_MB` | Cap (`MiB`) on pinned host RAM for offloaded experts (`7168` default) |
+| `STRATA_NO_PIN_EXPERTS` | Disable `cudaHostAlloc` pinned host memory for offloaded experts |
 
-<a id="using-it"></a>
+See [docs/INKLING2.md](docs/INKLING2.md) for the complete CLI flag list and wire-format details.
 
-## Tools
-
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
-
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
-
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
 <a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
 
-## Help
+## Architecture & Optimizations
 
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](.github/CONTRIBUTING.md)
+`strata-inkling2` is engineered around a Roofline analysis of looped-MoE (`tier1` 3×-looped core layers + `tier2` outer layers) with Sliding Window Attention + Full Attention:
 
-## Support Strata
+- **Two-Axis Profile Table** ([profile_rules.hpp](engine/include/strata/inkling2/profile_rules.hpp)): Pure, CPU-testable rules keyed by `ArchProfile × VramRegime`. Keeps V100 `full_vram` on `want_sp=7` (`6` exact waves on 80 SMs) and skips `d_hits` atomics when all experts are VRAM-resident, while giving 12 GB `tight_hybrid` a tighter arena and `T=2048` prefill.
+- **Unified Phase-Disjoint `layer_arena`**: Reuses a single 256B-aligned scratch arena across disjoint layer phases (attention, message passing, MoE routing/grouped WMMA), reclaiming `~400 MiB` on 12 GB GPUs and `+264 MiB` on V100.
+- **Compact-Miss PCIe Double-Buffered Prefill (`pp_streaming`)**: Packs only VRAM-missing experts in contiguous host-to-device DMA runs into double-buffered staging (`pp_stage[2]`) with `expected_entries`-aware grouped WMMA launch sizing. Expanding the SWA circular ring to `n_swa + tmax` (`3072`) unlocks `chunk=2048` on hybrid `sm_89`, halving PCIe weight transfer bytes per token.
+- **Decode CUDA Graphs & Prefix Checkpoints**: Uses a single 36-layer `core_graph` when `tier1` is 100% resident (`full_vram` / `core_resident_hybrid`), per-layer `layer_pre_graph[48]` during partial offload (`tight_hybrid`), and prefix checkpoint caching for multi-turn coding sessions.
+- **Multi-Threaded `dequant_tok`**: Parallelizes CPU-side Q4_K/Q6_K token dequantization for `T >= 128`, cutting 4K-token host dequant latency by `3.4×`.
 
-**Help keep local AI open to everyone.** A GitHub sponsorship or a coffee helps fund development and testing on more hardware.
+## Upstream Models & Documentation
 
-<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors: sponsor Strata" height="48"></a>
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
+Everything from upstream Strata remains available in this repository:
 
-### Loyal supporters
+- **Inkling-2-Mini engine guide**: [docs/INKLING2.md](docs/INKLING2.md)
+- **Tesla V100 (`sm_70`) notes**: [docs/NVIDIA_V100.md](docs/NVIDIA_V100.md)
+- **Upstream models**: [Qwen3.8-Flash-Next](docs/MODELS.md) · [Qwen3.6-35B-A3B](docs/QWEN36.md)
+- **General documentation**: [How Strata works](docs/HOW_IT_WORKS.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Privacy & Safety](docs/SAFETY.md) · [Technical reference](AGENTS.md)
 
-Thank you to everyone who supports Strata.
+## Credits & License
 
-<!-- supporters:start (generated from the public GitHub sponsors: one row per level, the biggest supporters first and largest; private sponsors are not listed) -->
-<a href="https://github.com/codeconduit-official"><img src="https://images.weserv.nl/?url=github.com/codeconduit-official.png&w=240&h=240&fit=cover&mask=circle&output=png" width="120" height="120" alt="codeconduit-official" title="codeconduit-official"></a>
-
-<a href="https://github.com/kod88vn"><img src="https://images.weserv.nl/?url=github.com/kod88vn.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="kod88vn" title="kod88vn"></a>
-<a href="https://github.com/router0mail"><img src="https://images.weserv.nl/?url=github.com/router0mail.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="router0mail" title="router0mail"></a>
-<a href="https://github.com/kingdonb"><img src="https://images.weserv.nl/?url=github.com/kingdonb.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="kingdonb" title="kingdonb"></a>
-<a href="https://github.com/Daisame"><img src="https://images.weserv.nl/?url=github.com/Daisame.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="Daisame" title="Daisame"></a>
-
-<a href="https://github.com/ryan4yin"><img src="https://images.weserv.nl/?url=github.com/ryan4yin.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="ryan4yin" title="ryan4yin"></a>
-<a href="https://github.com/themactep"><img src="https://images.weserv.nl/?url=github.com/themactep.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="themactep" title="themactep"></a>
-<a href="https://github.com/macintog"><img src="https://images.weserv.nl/?url=github.com/macintog.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="macintog" title="macintog"></a>
-<a href="https://github.com/bisonbet"><img src="https://images.weserv.nl/?url=github.com/bisonbet.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="bisonbet" title="bisonbet"></a>
-<a href="https://github.com/vizv"><img src="https://images.weserv.nl/?url=github.com/vizv.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="vizv" title="vizv"></a>
-<a href="https://github.com/seoulworker"><img src="https://images.weserv.nl/?url=github.com/seoulworker.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="seoulworker" title="seoulworker"></a>
-<a href="https://github.com/jaceknoga"><img src="https://images.weserv.nl/?url=github.com/jaceknoga.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="jaceknoga" title="jaceknoga"></a>
-<a href="https://github.com/jackyini"><img src="https://images.weserv.nl/?url=github.com/jackyini.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="jackyini" title="jackyini"></a>
-<a href="https://github.com/moruku36"><img src="https://images.weserv.nl/?url=github.com/moruku36.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="moruku36" title="moruku36"></a>
-<a href="https://github.com/hrkgk"><img src="https://images.weserv.nl/?url=github.com/hrkgk.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="hrkgk" title="hrkgk"></a>
-<!-- supporters:end -->
-
-All supporters and how to support Strata: [SUPPORTERS.md](SUPPORTERS.md)
-
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
-
-<a id="option-c-let-your-ai-set-it-up"></a>
-
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
-
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
+- Built on [Niko1221/Strata](https://github.com/Niko1221/Strata) — see [Credits and model licenses](docs/HOW_IT_WORKS.md#credits).
+- Released under the [MIT License](LICENSE).
