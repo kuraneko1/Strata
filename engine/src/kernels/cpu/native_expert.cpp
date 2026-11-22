@@ -615,6 +615,8 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         const char* v = std::getenv("STRATA_CPU_IQ_ALL_EXACT1");
         return v && v[0] == '1' && v[1] == 0 && flavour_avx2() && !flavour_avx512();
     }();
+    // Non-SiTU (SwiGLU) quantized fast paths: skip when f.situ is set (Inkling-2 uses SiTU, not SwiGLU).
+    if (!f.situ) {
     // only where ggml's dot runs today (below the #152 multi-token rule): with STRATA_IQ_MT_MIN=1 a lone token keeps the
     // multi-token kernel, so a token's rows still do not depend on how many tokens share its expert
     if (exact_one && nt == 1 && nt < native_gu_mt_min(f.gu_type) && avx2 && !cpu_avx512_ok() &&
@@ -733,6 +735,7 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         iq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
+    }  // if (!f.situ)
     const int n = (int) f.n_embd;
     // NVFP4: the per-expert global scales from the blob's tail (1 and 1 otherwise). s_down goes on the down output:
     // folded into up it left the hidden near 1e-5, whose Q8_0 block scale is an FP16 subnormal (expert error 2-12%)

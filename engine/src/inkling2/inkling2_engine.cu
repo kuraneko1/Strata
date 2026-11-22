@@ -732,7 +732,11 @@ struct Engine {
     float *K_conv = nullptr, *V_conv = nullptr, *dyn_k = nullptr, *dyn_v = nullptr;
     float *sink = nullptr, *rel_tab = nullptr, *att = nullptr, *att_gate = nullptr, *wo = nullptr;
     float *attn_split = nullptr;     // [verify_max_t * kAttnSplitMax * n_head * 130] for split GQA-3 decode/verify
+    int attn_split_slots = 0;        // total (t, sp) slots in attn_split; every launch MUST satisfy T * sp <= attn_split_slots
     int sm_count = 80;
+    int fa2_256_bulk_smem = 87040;
+    bool can_fa2_192 = false;
+    bool can_fa2_256 = false;
     bool bf16_x_f16 = false;
     int attn_split_t1_full = 160;
     int attn_split_t1_swa = 20;
@@ -742,7 +746,8 @@ struct Engine {
     float* h_tok_buf = nullptr;      // pinned [tmax * N] FP32 for token embedding upload
     uint8_t* ckpt_pin = nullptr;     // reusable pinned staging buffer for fast SWA/conv checkpoint D2H
     size_t ckpt_pin_cap = 0;
-    uint16_t* act_bf16 = nullptr;    // [tmax * 2*N] (reused as BF16 or FP16 scratch)
+    uint16_t* act_bf16 = nullptr;    // FP16 scratch [max(tmax*2*N, 16*4*N)]
+    uint16_t* act_bf16_only = nullptr; // Dedicated BF16 scratch on sm_75+ (!bf16_x_f16) so BF16 projections never clobber FP16 act_bf16
 
     void *xq = nullptr, *xq_k = nullptr, *xq_v = nullptr, *escr = nullptr;
     size_t escr_bytes = 0;
@@ -965,7 +970,7 @@ struct Engine {
         cudaFree(sink);
         cudaFree(attn_split);
         cudaFree(router_logits); cudaFree(ewts);
-        cudaFree(logits); cudaFree(act_bf16);
+        cudaFree(logits); cudaFree(act_bf16); cudaFree(act_bf16_only);
         cudaFree(xq); cudaFree(xq_k); cudaFree(xq_v);
         cudaFree(layer_arena);
         cudaFree(ids); cudaFree(grp_start); cudaFree(n_groups); cudaFree(ent_dst); cudaFree(ent_tok); cudaFree(grp_ptr);
@@ -1062,15 +1067,17 @@ struct Engine {
         d_f32(&msg3, (size_t) tmax * N);
         d_f32(&qgr_t1, (size_t) (2 * hp.q_dim + hp.n_rel * hp.n_head + 2 * hp.kv_dim + 2 * hp.n_conv * hp.n_head_kv));
         d_f32(&sink, (size_t) tmax * hp.n_head);
-        d_f32(&attn_split, (size_t) verify_max_t * kAttnSplitMax * hp.n_head * 130);
-        int cur_dev = 0, cc_maj = 0, cc_min = 0;
+        attn_split_slots = verify_max_t * kAttnSplitMax;
+        d_f32(&attn_split, (size_t) attn_split_slots * hp.n_head * 130);
+        int cur_dev = 0, cc_maj = 0, cc_min = 0, max_smem_optin = 49152;
         cudaGetDevice(&cur_dev);
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, cur_dev);
         cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, cur_dev);
         cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, cur_dev);
+        cudaDeviceGetAttribute(&max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, cur_dev);
         bf16_x_f16 = gemm.bf16_converts_x() || profile.force_bf16_x_f16;
+        int64_t max_bf16_w = 0;
         {
-            int64_t max_bf16_w = 0;
             auto note_bf16 = [&](const DenseMat& W) {
                 if (W.type == 30 && W.d) max_bf16_w = std::max(max_bf16_w, W.n_out * W.n_in);
             };
@@ -1090,26 +1097,28 @@ struct Engine {
         attn_split_t1_full = std::clamp((sm_count * profile.t1_full_split_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
         attn_split_t1_swa = std::clamp((sm_count * profile.t1_swa_split_mult) / std::max(1, (int) hp.n_head_kv), 8, 24);
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
-        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_swa_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_swa_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_bulk, cudaFuncAttributeMaxDynamicSharedMemorySize, 94208);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_bulk, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_tail, cudaFuncAttributeMaxDynamicSharedMemorySize, 90112);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_256_tail, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributeMaxDynamicSharedMemorySize, 29184);
-        cudaFuncSetAttribute(k_attn_q8_gqa3_pp_wmma, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        // Gate high-SMEM FA2 kernels on cudaDevAttrMaxSharedMemoryPerBlockOptin so Turing (sm_75, 64 KB cap) cleanly falls back to pp_wmma (29 KB).
+        auto try_set_smem = [&](const void* fn, int bytes) -> bool {
+            if (max_smem_optin < bytes) return false;
+            const cudaError_t e1 = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+            if (e1 != cudaSuccess) { (void) cudaGetLastError(); return false; }
+            (void) cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            (void) cudaGetLastError();
+            return true;
+        };
+        try_set_smem((const void*) k_attn_q8_gqa3_verify4_wmma_split, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split, 24576);
+        can_fa2_192 =
+            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, false>, 98304) &&
+            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<true, false>, 98304) &&
+            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, true>, 98304);
+        fa2_256_bulk_smem = (cc_maj == 7 && cc_min < 5) ? 92160 : 87040;
+        can_fa2_256 =
+            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_256_bulk, fa2_256_bulk_smem) &&
+            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_256_tail, 87040);
+        try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_gqa3, 49152);
+        try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_t32, 49152);
+        try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma, 29184);
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
@@ -1117,10 +1126,16 @@ struct Engine {
         d_f32(&logits, (size_t) verify_max_t * hp.vocab_unpadded);
 
         CK(cudaMallocHost(&h_tok_buf, (size_t) tmax * N * sizeof(float)));
-        CK(cudaMalloc(&act_bf16, (size_t) tmax * 2 * N * sizeof(uint16_t)));
+        // Minimum sizing accommodates DSpark draft FFN down (block_n=8, K_in=4*N) and joint_proj even with small --chunk.
+        const size_t act_elems = std::max<size_t>((size_t) tmax * 2 * (size_t) N, (size_t) 16 * 4 * (size_t) N);
+        CK(cudaMalloc(&act_bf16, act_elems * sizeof(uint16_t)));
+        if (!bf16_x_f16 && max_bf16_w > 0) {
+            CK(cudaMalloc(&act_bf16_only, act_elems * sizeof(uint16_t)));
+        }
 
         const int q8_kv_rows = std::min(tmax, 8);
-        CK(cudaMalloc(&xq, (size_t) tmax * ((2 * N) / 32) * 36));
+        const size_t xq_blocks = std::max<size_t>((size_t) tmax * ((2 * (size_t) N) / 32), (size_t) 16 * ((4 * (size_t) N) / 32));
+        CK(cudaMalloc(&xq, xq_blocks * 36));
         CK(cudaMalloc(&xq_k, (size_t) q8_kv_rows * ((2 * N) / 32) * 36));
         CK(cudaMalloc(&xq_v, (size_t) q8_kv_rows * ((2 * N) / 32) * 36));
 
@@ -1373,8 +1388,9 @@ struct Engine {
                 gemm.bf16(xf16, wp, Y, T, N_out, K_in, 0, 0.0f, 0, true);
             } else {
                 const int64_t tot = (int64_t) T * K_in;
-                k_f32_to_bf16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(X, act_bf16, tot);
-                gemm.bf16(act_bf16, wp, Y, T, N_out, K_in);
+                uint16_t* xbf16 = act_bf16_only ? act_bf16_only : act_bf16;
+                k_f32_to_bf16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(X, xbf16, tot);
+                gemm.bf16(xbf16, wp, Y, T, N_out, K_in);
             }
             return;
         }
@@ -2589,12 +2605,7 @@ struct Engine {
             }
             const uint16_t* f16_q = (T > 8) ? act_bf16 : nullptr;
             const uint16_t* f16_k_pre = (T > 8) ? ((ink_src == in_q) ? act_bf16 : (act_bf16 + (size_t) T * N)) : nullptr;
-            // On sm_75+ (!bf16_x_f16), BF16 weights (attn_sink_proj, type 30) overwrite act_bf16 with BF16 bits!
-            // Only run attn_sink_proj before Q/Gate/R when T <= 8 or bf16_x_f16 == true (FP16 input); otherwise defer after Q/K/V.
-            const bool defer_sink = (T > 8 && !bf16_x_f16 && L.attn_sink_proj.type == 30);
-            if (!defer_sink) {
-                project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N, f16_q);
-            }
+            project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N, f16_q);
             float* pQ = Q;
             float* pGate = att_gate;
             float* pR = R;
@@ -2645,16 +2656,12 @@ struct Engine {
                         project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N, f16_v);
                     }
                 }
-                // Deferred BF16 sink projection (sm_75+, !bf16_x_f16): runs after all FP16 consumers of act_bf16 finish.
-                if (defer_sink) {
-                    project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N);
-                }
-                // Dynamic conv projections (BF16 on !is_swa): reuse f16_k_pre (act_bf16 + T*N) and f16_v (act_bf16)!
+                // Dynamic conv projections (BF16 on !is_swa): reuse f16_k_pre (act_bf16 + T*N) and f16_v (act_bf16 when attn_v wrote FP16)!
                 if (!is_swa && !(T == 1 && L.attn_kkc.d != nullptr)) {
                     project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N, bf16_x_f16 ? f16_k_pre : nullptr);
                 }
                 if (!is_swa && !(T == 1 && L.attn_vvc.d != nullptr)) {
-                    const uint16_t* f16_v_reuse = (T > 8 && bf16_x_f16) ? act_bf16 : nullptr;
+                    const uint16_t* f16_v_reuse = (T > 8 && bf16_x_f16 && (inv_src == in_q || L.attn_v.type != 0)) ? act_bf16 : nullptr;
                     project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N, f16_v_reuse);
                 }
             }
@@ -2724,8 +2731,9 @@ struct Engine {
             const void* att_xq_ready = nullptr;
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
+                    const int sp_cap = std::max(1, attn_split_slots / std::max(1, T));
                     if (is_swa && T == 4) {
-                        const int sp = std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16);
+                        const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
                         k_attn_q8_gqa3_verify4_swa_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
@@ -2739,7 +2747,7 @@ struct Engine {
                             kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale);
                         att_xq_ready = xq;
                     } else if (T == 4 && !is_swa) {
-                        const int sp = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
+                        const int sp = std::min(sp_cap, std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
                         k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
@@ -2747,17 +2755,17 @@ struct Engine {
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (T < 16) {
-                        const int sp = (T == 1)
+                        const int sp = std::min(sp_cap, (T == 1)
                             ? (is_swa ? attn_split_t1_swa : attn_split_t1_full)
                             : (is_swa ? std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv * T), 4, 24)
-                                      : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax));
+                                      : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax)));
                         k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa, (T <= 8) ? xq : nullptr);
                         if (T <= 8) att_xq_ready = xq;
-                    } else if (!is_swa && T >= 256 && pos >= 8192 &&
+                    } else if (can_fa2_256 && !is_swa && T >= 256 && pos >= 8192 &&
                                pp_sp_buf && pp_sp_bytes >= (size_t) T * (size_t) hp.n_head * 130 * sizeof(float) * 2) {
                         // Zero-sP, Zero-Spill 256-row FA2: pure bulk Split-KV [0, bulk_aligned) + 1 tail split [bulk_aligned, pos+T).
                         // Uses Region 0 pp_sp_buf inside layer_arena (zero extra VRAM; disjoint from Q/att_gate/att & rel_tab).
@@ -2782,8 +2790,7 @@ struct Engine {
                             }
                         }
                         const int total_sp = best_sp + 1;
-                        const int bulk_smem = (profile.arch.id == strata::inkling2::ArchId::Sm70Volta) ? 92160 : 87040;
-                        k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, (size_t) bulk_smem, st>>>(
+                        k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, (size_t) fa2_256_bulk_smem, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], sink, pp_sp_buf,
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], bulk_aligned, kq_scale, T, best_sp, total_sp);
                         k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv), 256, 87040, st>>>(
@@ -2791,7 +2798,7 @@ struct Engine {
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp);
                         k_attn_pp_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             pp_sp_buf, pGate, att, (int) hp.n_head, total_sp);
-                    } else if (T >= 128) {
+                    } else if (can_fa2_192 && T >= 128) {
                         const int q_tiles = (T + 63) / 64;
                         const int base_ctas = (int) hp.n_head_kv * q_tiles;
                         const size_t per_sp_bytes = (size_t) T * (size_t) hp.n_head * 130 * sizeof(float);
@@ -3112,7 +3119,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     }
     size_t fr_before_cpu = 0;
     CK(cudaMemGetInfo(&fr_before_cpu, &tot));
-    const int cpu_t = (E.pp_stage[0] && E.pp_stream_t > 1) ? std::min(E.tmax, E.pp_stream_t - 1) : E.tmax;
+    bool has_bf16_experts = false;
+    for (int ip = 0; ip < hp.n_phys; ++ip) {
+        if (m.layers[(size_t) ip].gu_type == 30) { has_bf16_experts = true; break; }
+    }
+    const int cpu_t = (!has_bf16_experts && E.pp_stage[0] && E.pp_stream_t > 1) ? std::min(E.tmax, E.pp_stream_t - 1) : E.tmax;
     E.init_cpu_bufs(cpu_t);
     {
         size_t fr_cpu = 0;
