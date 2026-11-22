@@ -1092,6 +1092,8 @@ struct Engine {
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
         cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
         cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_swa_wmma_split, cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
+        cudaFuncSetAttribute(k_attn_q8_gqa3_verify4_swa_wmma_split, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(k_attn_q8_gqa3_pp_fa2_192<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
@@ -1381,12 +1383,14 @@ struct Engine {
         if (T <= 8 && (K_in % blck) == 0) {
             if (!q8_ready) K::native_quantize_q8_1(X, xq, (int) K_in, T, st);
             const void* xq_ptr = q8_ready ? q8_ready : xq;
-            if (W.type == 8 && T >= 2 && (K_in % 256) == 0 && ((((uintptr_t) W.d) & 3u) == 0u)) {
+            if (W.type == 8 && T >= 1 && (K_in % 256) == 0 && ((((uintptr_t) W.d) & 3u) == 0u)) {
                 const unsigned nb = (unsigned) ((N_out + 3) / 4);
                 const uint8_t* w8 = (const uint8_t*) W.d;
                 const uint32_t* xu = (const uint32_t*) xq_ptr;
                 if (T == 4) {
                     k_mmvq_q8_0_smallT<4, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 4);
+                } else if (T == 1) {
+                    k_mmvq_q8_0_smallT<1, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
                 } else if (T == 8) {
                     k_mmvq_q8_0_smallT<8, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 8);
                 } else if (T == 2) {
@@ -1416,7 +1420,7 @@ struct Engine {
 
     bool try_project_pair_q8_0(const void* q8_ready, const DenseMat& W1, float* Y1, int64_t N1,
                                const DenseMat& W2, float* Y2, int64_t N2, int T, int64_t K_in) {
-        if (!q8_ready || W1.type != 8 || W2.type != 8 || T < 2 || T > 8) return false;
+        if (!q8_ready || W1.type != 8 || W2.type != 8 || T < 1 || T > 8) return false;
         if ((K_in % 256) != 0 || (N1 & 3) != 0) return false;
         if (((((uintptr_t) W1.d) | ((uintptr_t) W2.d)) & 3u) != 0u) return false;
         const unsigned nb = (unsigned) ((N1 + N2 + 3) / 4);
@@ -1425,6 +1429,8 @@ struct Engine {
         const uint32_t* xu = (const uint32_t*) q8_ready;
         if (T == 4) {
             k_mmvq_q8_0_smallT<4, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 4, w2, Y2, (int) N2);
+        } else if (T == 1) {
+            k_mmvq_q8_0_smallT<1, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 1, w2, Y2, (int) N2);
         } else if (T == 8) {
             k_mmvq_q8_0_smallT<8, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 8, w2, Y2, (int) N2);
         } else if (T == 2) {
@@ -2474,6 +2480,10 @@ struct Engine {
                             in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
                             xq, xq_k, xq_v, N, hp.rms_eps);
                         q8_pre_done = true;
+                    } else if (T > 8) {
+                        k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
+                            in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
+                            act_bf16, act_bf16 + (size_t) T * N, nullptr, N, hp.rms_eps);
                     } else {
                         k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
                     }
@@ -2481,6 +2491,8 @@ struct Engine {
                     if (fuse_q8_norm) {
                         k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_q, L.attn_norm, in_q, xq, N, hp.rms_eps);
                         q8_pre_done = true;
+                    } else if (T > 8) {
+                        k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, act_bf16, N, hp.rms_eps);
                     } else {
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, N, hp.rms_eps);
                     }
@@ -2492,6 +2504,10 @@ struct Engine {
                             in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
                             xq, xq_k, xq_v, N, hp.rms_eps);
                         q8_pre_done = true;
+                    } else if (T > 8) {
+                        k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
+                            in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
+                            act_bf16, act_bf16 + (size_t) T * N, nullptr, N, hp.rms_eps);
                     } else {
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
@@ -2509,6 +2525,10 @@ struct Engine {
                                 in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
                                 xq, xq_k, xq_v, N, hp.rms_eps);
                             q8_pre_done = true;
+                        } else if (T > 8) {
+                            k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
+                                in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
+                                act_bf16, act_bf16 + (size_t) T * N, nullptr, N, hp.rms_eps);
                         } else {
                             k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
                         }
@@ -2518,6 +2538,10 @@ struct Engine {
                                 in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
                                 xq, xq_k, xq_v, N, hp.rms_eps);
                             q8_pre_done = true;
+                        } else if (T > 8) {
+                            k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
+                                in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
+                                act_bf16, act_bf16 + (size_t) T * N, nullptr, N, hp.rms_eps);
                         } else {
                             k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
                             k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
@@ -2528,6 +2552,8 @@ struct Engine {
                     if (fuse_q8_norm) {
                         k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(cur, L.attn_norm, in_q, xq, N, hp.rms_eps);
                         q8_pre_done = true;
+                    } else if (T > 8) {
+                        k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_norm, in_q, act_bf16, N, hp.rms_eps);
                     } else {
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_norm, in_q, N, hp.rms_eps);
                     }
@@ -2539,6 +2565,10 @@ struct Engine {
                             cur, cur, cur, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
                             xq, xq_k, xq_v, N, hp.rms_eps);
                         q8_pre_done = true;
+                    } else if (T > 8) {
+                        k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
+                            cur, cur, cur, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
+                            act_bf16, act_bf16 + (size_t) T * N, nullptr, N, hp.rms_eps);
                     } else {
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_q_inp_norm, in_q, N, hp.rms_eps);
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
@@ -2557,12 +2587,8 @@ struct Engine {
                 if (ink_src != in_q) prep_q8(ink_src, xq_k, T, N);
                 if (inv_src != in_q && inv_src != ink_src) prep_q8(inv_src, xq_v, T, N);
             }
-            const uint16_t* f16_q = nullptr;
-            if (T > 8) {
-                const int64_t tot = (int64_t) T * N;
-                k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(in_q, act_bf16, tot);
-                f16_q = act_bf16;
-            }
+            const uint16_t* f16_q = (T > 8) ? act_bf16 : nullptr;
+            const uint16_t* f16_k_pre = (T > 8) ? ((ink_src == in_q) ? act_bf16 : (act_bf16 + (size_t) T * N)) : nullptr;
             project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N, f16_q);
             float* pQ = Q;
             float* pGate = att_gate;
@@ -2602,13 +2628,7 @@ struct Engine {
                         pDynK = kbuf + kv_dim;
                         project_preq(ink_src, xq_k_src, L.attn_kkc, kbuf, 1, L.attn_kkc.n_out, N);
                     } else {
-                        const uint16_t* f16_k = (T > 8 && ink_src == in_q) ? f16_q : nullptr;
-                        if (T > 8 && !f16_k) {
-                            const int64_t tot = (int64_t) T * N;
-                            k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(ink_src, act_bf16, tot);
-                            f16_k = act_bf16;
-                        }
-                        project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N, f16_k);
+                        project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N, f16_k_pre);
                     }
                     if (!is_swa && T == 1 && L.attn_vvc.d != nullptr) {
                         float* vbuf = qgr_t1 + 2 * q_dim + rel_dim + kv_dim + dyn_dim;
@@ -2616,16 +2636,17 @@ struct Engine {
                         pDynV = vbuf + kv_dim;
                         project_preq(inv_src, xq_v_src, L.attn_vvc, vbuf, 1, L.attn_vvc.n_out, N);
                     } else {
-                        const uint16_t* f16_v = (T > 8 && (inv_src == ink_src || (inv_src == in_q && ink_src == in_q))) ? act_bf16 : nullptr;
+                        const uint16_t* f16_v = (T > 8 && inv_src == in_q) ? f16_q : nullptr;
                         project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N, f16_v);
                     }
                 }
-                // Dynamic conv projections (BF16 on !is_swa) run after FP16 projections so they may reuse act_bf16 freely.
+                // Dynamic conv projections (BF16 on !is_swa): reuse f16_k_pre (act_bf16 + T*N) and f16_v (act_bf16)!
                 if (!is_swa && !(T == 1 && L.attn_kkc.d != nullptr)) {
-                    project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N);
+                    project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N, bf16_x_f16 ? f16_k_pre : nullptr);
                 }
                 if (!is_swa && !(T == 1 && L.attn_vvc.d != nullptr)) {
-                    project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N);
+                    const uint16_t* f16_v_reuse = (T > 8 && bf16_x_f16) ? act_bf16 : nullptr;
+                    project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N, f16_v_reuse);
                 }
             }
 
@@ -2694,7 +2715,15 @@ struct Engine {
             const void* att_xq_ready = nullptr;
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
-                    if (is_swa && T >= 1 && T <= 8) {
+                    if (is_swa && T == 4) {
+                        const int sp = std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16);
+                        k_attn_q8_gqa3_verify4_swa_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
+                            (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
+                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
+                        att_xq_ready = xq;
+                    } else if (is_swa && T >= 1 && T <= 8) {
                         k_attn_q8_gqa3_swa_1pass<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink,
                             pGate, att, xq, (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext,
@@ -2702,11 +2731,12 @@ struct Engine {
                         att_xq_ready = xq;
                     } else if (T == 4 && !is_swa) {
                         const int sp = std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
-                        k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 21760, st>>>(
+                        k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
-                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa);
+                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
+                        att_xq_ready = xq;
                     } else if (T < 16) {
                         const int sp = (T == 1)
                             ? (is_swa ? attn_split_t1_swa : attn_split_t1_full)
@@ -2716,7 +2746,8 @@ struct Engine {
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa);
+                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa, (T <= 8) ? xq : nullptr);
+                        if (T <= 8) att_xq_ready = xq;
                     } else if (!is_swa && T >= 256 && pos >= 8192 &&
                                pp_sp_buf && pp_sp_bytes >= (size_t) T * (size_t) hp.n_head * 130 * sizeof(float) * 2) {
                         // Zero-sP, Zero-Spill 256-row FA2: pure bulk Split-KV [0, bulk_aligned) + 1 tail split [bulk_aligned, pos+T).
