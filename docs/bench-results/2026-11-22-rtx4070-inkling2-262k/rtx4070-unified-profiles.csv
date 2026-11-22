@@ -1,0 +1,21 @@
+profile,max_context,depth,pp_tps,steady_dec_tps,gpu_hit_pct,notes
+65k,65536,16384,1792.1,54.91,91.0,sm89+core_resident_hybrid (chunk=1024; 65K KV upfront)
+65k,65536,32768,1874.0,61.67,95.4,sm89+core_resident_hybrid
+65k,65536,49152,1822.0,55.45,94.8,sm89+core_resident_hybrid
+65k,65536,65000,1671.4,50.08,92.8,sm89+core_resident_hybrid
+131k,131072,16384,1706.1,41.52,83.1,sm89+core_resident_hybrid (chunk=1024; 131K KV upfront)
+131k,131072,32768,1681.5,43.35,84.4,sm89+core_resident_hybrid
+131k,131072,49152,1652.3,44.47,85.5,sm89+core_resident_hybrid
+131k,131072,65536,1641.5,42.64,85.0,sm89+core_resident_hybrid
+131k,131072,98304,1564.6,36.80,85.0,sm89+core_resident_hybrid
+131k,131072,130500,1467.0,38.17,85.1,sm89+core_resident_hybrid
+262k,262144,16384,2176.3,52.81,90.1,sm89+tight_hybrid (chunk=2048; dynamic KV)
+262k,262144,32768,2330.4,58.02,93.6,sm89+tight_hybrid (KV->64K)
+262k,262144,49152,2211.9,53.43,93.1,sm89+tight_hybrid
+262k,262144,65536,2117.0,34.06,75.9,sm89+tight_hybrid (KV->131K)
+262k,262144,98304,1972.8,32.63,75.4,sm89+tight_hybrid
+262k,262144,131072,1851.2,30.26,74.9,sm89+tight_hybrid (KV->262K; post-recapture steady)
+262k,262144,163840,1708.7,29.34,74.9,sm89+tight_hybrid
+262k,262144,196608,1609.7,28.48,74.9,sm89+tight_hybrid
+262k,262144,229376,1522.8,27.55,74.8,sm89+tight_hybrid
+262k,262144,261500,1437.0,26.14,74.8,sm89+tight_hybrid

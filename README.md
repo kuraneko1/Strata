@@ -50,15 +50,15 @@ All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--k
   <img src="docs/media/bench-rtx4070.png" width="960" alt="RTX 4070 12 GB Prefill and Decode throughput vs context depth">
 </p>
 
-| Mode (`--max-context`) | Context Depth | Prefill | Decode | Hit Rate / Notes |
+| Mode (`--max-context`) | Context Depth | Prefill | Decode | Notes |
 | --- | ---: | ---: | ---: | --- |
-| **`65536`** (`core_resident_hybrid`) | `32K` | `1,903.8 t/s` | `59.8 t/s` | 0s mid-run KV growth |
-| **`65536`** (`core_resident_hybrid`) | `65K` | **`1,782.2 t/s`** | **`50.4 t/s`** | `96.2%` expert VRAM hit |
-| **`131072`** (`core_resident_hybrid`) | `65K` | `1,675.6 t/s` | `40.4 t/s` | 0s mid-run KV growth |
-| **`131072`** (`core_resident_hybrid`) | `130.5K` | **`1,524.1 t/s`** | **`38.2 t/s`** | `91.6%` expert VRAM hit |
-| **`262144`** (`tight_hybrid`, `T=2048`) | `32K` | `2,354.1 t/s` | `43.2 t/s` | 3.30× PP / 2.27× TG vs baseline at 262K |
-| **`262144`** (`tight_hybrid`, `T=2048`) | `196K` | `1,651.1 t/s` | `27.7 t/s` | Dynamic KV growth + eviction |
-| **`262144`** (`tight_hybrid`, `T=2048`) | `262K` | **`1,506.4 t/s`** | **`27.3 t/s`** | Cumulative `0 → 262K` in `2.43 min` |
+| **`65536`** (`core_resident_hybrid`) | `32K` | `1,874.0 t/s` | **`61.7 t/s`** | `95.4%` hit, 0s mid-run KV growth |
+| **`65536`** (`core_resident_hybrid`) | `65K` | **`1,671.4 t/s`** | **`50.1 t/s`** | `92.8%` hit, 0s mid-run KV growth |
+| **`131072`** (`core_resident_hybrid`) | `64K` | `1,641.5 t/s` | `42.6 t/s` | 0s mid-run KV growth |
+| **`131072`** (`core_resident_hybrid`) | `130.5K` | **`1,467.0 t/s`** | **`38.2 t/s`** | `85.1%` hit, 0s mid-run KV growth |
+| **`262144`** (`tight_hybrid`, `T=2048`) | `32K` | `2,330.4 t/s` | `58.0 t/s` | Dynamic KV (`32K → 262K`) |
+| **`262144`** (`tight_hybrid`, `T=2048`) | `128K` | `1,851.2 t/s` | `30.3 t/s` | Post-expansion steady decode |
+| **`262144`** (`tight_hybrid`, `T=2048`) | `256K` | **`1,437.0–1,506.4 t/s`** | **`26.1–27.3 t/s`** | `3.3×` PP / `2.3×` decode vs baseline |
 
 Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md).
 
