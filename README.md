@@ -60,6 +60,8 @@ All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--k
 | **`262144`** (`tight_hybrid`, `T=2048`) | `128K` | `1,851.2 t/s` | `30.3 t/s` | Post-expansion steady decode |
 | **`262144`** (`tight_hybrid`, `T=2048`) | `256K` | **`1,437.0–1,506.4 t/s`** | **`26.1–27.3 t/s`** | `3.3×` PP / `2.3×` decode vs baseline |
 
+> **Why `262K` decode steps down at `64K`**: `tight_hybrid` starts with a `32K` KV cache and doubles it on demand (`32K → 64K → 131K → 262K`) so short prompts stay fast (`53–58 t/s`). Crossing `64K` triggers the `64K → 131K` KV expansion (`+1.04 GiB`), evicting the remaining `tier2` experts to CPU and stepping decode down onto the `131K` curve (`~34 t/s`), while `65K`/`131K` profiles pre-allocate their full KV upfront with zero mid-run expansion pauses.
+
 Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md).
 
 ### Tesla V100-PCIE-32GB (`sm_70`, CUDA 12.9)
