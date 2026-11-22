@@ -1254,6 +1254,7 @@ struct Engine {
         return true;
     }
 
+
     void init_cpu_bufs(int cpu_t) {
         const int64_t N = m->hp.n_embd;
         const int64_t cpu_ent = (int64_t) cpu_t * m->hp.n_expert_used;
@@ -1465,6 +1466,7 @@ struct Engine {
         return true;
     }
 
+
     bool try_project_pair_q8_0(const void* q8_ready, const DenseMat& W1, float* Y1, int64_t N1,
                                const DenseMat& W2, float* Y2, int64_t N2, int T, int64_t K_in) {
         if (!q8_ready || W1.type != 8 || W2.type != 8 || W1.q8_in_place || W2.q8_in_place || T < 1 || T > 8) return false;
@@ -1486,6 +1488,47 @@ struct Engine {
             k_mmvq_q8_0_smallT<3, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 3, w2, Y2, (int) N2);
         } else {
             k_mmvq_q8_0_smallT<8, false, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, T, w2, Y2, (int) N2);
+        }
+        return true;
+    }
+
+    bool try_project_multi_q8_0(const void* q8_ready, int nmat,
+                                const DenseMat& W0, float* Y0, int64_t N0,
+                                const DenseMat& W1, float* Y1, int64_t N1,
+                                const DenseMat& W2, float* Y2, int64_t N2,
+                                const DenseMat* W3, float* Y3, int64_t N3,
+                                const DenseMat* W4, float* Y4, int64_t N4,
+                                int T, int64_t K_in) {
+        if (!q8_ready || T < 1 || T > 8 || (K_in % 256) != 0) return false;
+        if (W0.type != 8 || W1.type != 8 || W2.type != 8 || W0.q8_in_place || W1.q8_in_place || W2.q8_in_place) return false;
+        if ((N0 & 3) != 0 || (N1 & 3) != 0) return false;
+        if (((((uintptr_t) W0.d) | ((uintptr_t) W1.d) | ((uintptr_t) W2.d)) & 3u) != 0u) return false;
+        int64_t tot_n = N0 + N1 + N2;
+        if (nmat == 5) {
+            if (!W3 || !W4 || W3->type != 8 || W4->type != 8 || W3->q8_in_place || W4->q8_in_place) return false;
+            if ((N2 & 3) != 0 || (N3 & 3) != 0) return false;
+            if (((((uintptr_t) W3->d) | ((uintptr_t) W4->d)) & 3u) != 0u) return false;
+            tot_n += N3 + N4;
+        }
+        Q8MultiSpec sp{(const uint8_t*) W0.d, (const uint8_t*) W1.d, (const uint8_t*) W2.d,
+                       W3 ? (const uint8_t*) W3->d : nullptr, W4 ? (const uint8_t*) W4->d : nullptr,
+                       Y0, Y1, Y2, Y3, Y4, (int) N0, (int) N1, (int) N2, (int) N3, (int) N4};
+        const unsigned nb = (unsigned) ((tot_n + 3) / 4);
+        const uint32_t* xu = (const uint32_t*) q8_ready;
+        if (nmat == 3) {
+            if (T == 4) k_mmvq_q8_0_smallT_multi<4, true, 3><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 4);
+            else if (T == 3) k_mmvq_q8_0_smallT_multi<3, true, 3><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 3);
+            else if (T == 2) k_mmvq_q8_0_smallT_multi<2, true, 3><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 2);
+            else if (T == 1) k_mmvq_q8_0_smallT_multi<1, true, 3><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 1);
+            else if (T == 8) k_mmvq_q8_0_smallT_multi<8, true, 3><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 8);
+            else k_mmvq_q8_0_smallT_multi<8, false, 3><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, T);
+        } else {
+            if (T == 4) k_mmvq_q8_0_smallT_multi<4, true, 5><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 4);
+            else if (T == 3) k_mmvq_q8_0_smallT_multi<3, true, 5><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 3);
+            else if (T == 2) k_mmvq_q8_0_smallT_multi<2, true, 5><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 2);
+            else if (T == 1) k_mmvq_q8_0_smallT_multi<1, true, 5><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 1);
+            else if (T == 8) k_mmvq_q8_0_smallT_multi<8, true, 5><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, 8);
+            else k_mmvq_q8_0_smallT_multi<8, false, 5><<<nb, 128, 0, st>>>(sp, xu, (int) K_in, T);
         }
         return true;
     }
@@ -1568,6 +1611,27 @@ struct Engine {
         MixOuts mo{};
         for (int i = 0; i < (swa_bcast ? 3 : n_q); ++i) mo.p[i] = outs[i];
         k_mix_normed<<<dim3((unsigned) n_q, (unsigned) T), kThreads, 0, st>>>(np, D, query, mo, n_q, N, inv_sqrt_n, swa_bcast);
+    }
+
+    bool try_run_mix_normed_q8(const std::vector<float*>& n_blocks, const float* c, const float* query,
+                               float* const* outs, const NormQ8Out3& nq8, int n_q, int T) {
+        const auto& hp = m->hp;
+        const int N = (int) hp.n_embd;
+        const int B = (int) n_blocks.size();
+        const int D = B + 1;
+        if (T < 1 || N != 2304 || D > 8 || (n_q != 1 && n_q != 3)) return false;
+        NormMixPtrs np{};
+        for (int i = 0; i < B; ++i) np.p[i] = n_blocks[(size_t) (B - 1 - i)];
+        np.p[B] = c;
+        MixOuts4 mo4{};
+        for (int i = 0; i < n_q; ++i) mo4.p[i] = outs[i];
+        const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
+        if (n_q == 1) {
+            k_mix_normed_fused_1pass_q8<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
+        } else {
+            k_mix_normed_fused_1pass_q8<3><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
+        }
+        return true;
     }
 
     void run_control(const float* c, const float* msg, const PhysLayer& L, int mod, float* out, int T) {
@@ -2546,6 +2610,25 @@ struct Engine {
             bool q8_pre_done = false;
             if (L.attn_res_query) {
                 float* outs[3] = {in_q, in_k, in_v};
+                bool fused_mix_q8 = false;
+                if (!has_msg && fuse_q8_norm) {
+                    if (is_swa) {
+                        NormQ8Out3 nq8{L.attn_norm, nullptr, nullptr, xq, nullptr, nullptr};
+                        if (try_run_mix_normed_q8(norm_blocks, cur, L.attn_res_query, outs, nq8, 1, T)) {
+                            fused_mix_q8 = true;
+                            q8_pre_done = true;
+                            ink_src = in_q;
+                            inv_src = in_q;
+                        }
+                    } else {
+                        NormQ8Out3 nq8{L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm, xq, xq_k, xq_v};
+                        if (try_run_mix_normed_q8(norm_blocks, cur, L.attn_res_query, outs, nq8, 3, T)) {
+                            fused_mix_q8 = true;
+                            q8_pre_done = true;
+                        }
+                    }
+                }
+                if (!fused_mix_q8) {
                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
                 if (has_msg) {
                     const bool can_ctrl3 = (T >= 2 && T <= 8 && (N & 3) == 0 && hp.loop_gate_rank == 64 &&
@@ -2618,6 +2701,7 @@ struct Engine {
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
                     }
+                }
                 }
             } else {
                 if (has_msg) {
@@ -2711,6 +2795,14 @@ struct Engine {
                 pK = pR + rel_dim;
                 pV = pK + kv_dim;
                 project_preq(in_q, xq, L.attn_qgrkv, qgr_t1, 1, L.attn_qgrkv.n_out, N);
+            } else if (T >= 2 && T <= 8 && ink_src == in_q && inv_src == in_q &&
+                       try_project_multi_q8_0(xq, 5, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim,
+                                              L.attn_rel, R, rel_dim, &L.attn_k, K, kv_dim, &L.attn_v, V, kv_dim, T, N)) {
+                // Fused 5-way Q+Gate+R+K+V in 1 launch on shared xq!
+                if (!is_swa) {
+                    project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N, nullptr);
+                    project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N, nullptr);
+                }
             } else {
                 if (T == 1 && L.attn_qgr.d != nullptr) {
                     pQ = qgr_t1;
@@ -2718,12 +2810,16 @@ struct Engine {
                     pR = qgr_t1 + 2 * q_dim;
                     project_preq(in_q, xq, L.attn_qgr, qgr_t1, 1, L.attn_qgr.n_out, N);
                 } else {
-                    if (!try_project_pair_bf16(in_q, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N) &&
-                        !try_project_pair_q8_0(xq, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N)) {
-                        project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N, f16_q);
-                        project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N, f16_q);
+                    if (!(T >= 2 && T <= 8 &&
+                          try_project_multi_q8_0(xq, 3, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim,
+                                                 L.attn_rel, R, rel_dim, nullptr, nullptr, 0, nullptr, nullptr, 0, T, N))) {
+                        if (!try_project_pair_bf16(in_q, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N) &&
+                            !try_project_pair_q8_0(xq, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N)) {
+                            project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N, f16_q);
+                            project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N, f16_q);
+                        }
+                        project_preq(in_q, xq, L.attn_rel, R, T, rel_dim, N, f16_q);
                     }
-                    project_preq(in_q, xq, L.attn_rel, R, T, rel_dim, N, f16_q);
                 }
                 const bool paired_kv = (T >= 2 && T <= 8 && inv_src == ink_src &&
                                         (try_project_pair_bf16(ink_src, L.attn_k, K, kv_dim, L.attn_v, V, kv_dim, T, N) ||
@@ -2978,24 +3074,33 @@ struct Engine {
 
             // MoE
             float* ffn_mix_out[1] = {in_ffn};
-            run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
-            if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
-            if (T <= 8 && !include_route_t1 && (N & 31) == 0) {
-                k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
-            } else if (T >= 16 && (N & 3) == 0) {
-                k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
-            } else {
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+            const bool ffn_want_q8 = (T <= 8 && (N & 31) == 0);
+            bool ffn_fused_q8 = false;
+            if (!has_msg && ffn_want_q8) {
+                NormQ8Out3 nq8{L.ffn_norm, nullptr, nullptr, xq, nullptr, nullptr};
+                ffn_fused_q8 = try_run_mix_normed_q8(norm_blocks, ffn_inp, L.ffn_res_query, ffn_mix_out, nq8, 1, T);
+            }
+            if (!ffn_fused_q8) {
+                run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
+                if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
+                if (ffn_want_q8) {
+                    k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
+                } else if (T >= 16 && (N & 3) == 0) {
+                    k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
+                } else {
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+                }
             }
             if (include_route_t1) {
-                // Capture h_h D2H + router + k_route + h_ids/h_ewts D2H inside layer_pre_graph[il] (-240 API calls/tok!)
+                // Capture h_h D2H + router + k_route + h_ids/h_ewts D2H inside layer_pre_graph/verify_pre_graph!
                 const int Kp = (int) hp.n_expert_used;
-                CK(cudaMemcpyAsync(h_h, in_ffn, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
-                project_f32(in_ffn, L.ffn_gate_inp, router_logits, 1, hp.n_expert, N);
-                k_route_inkling2<<<1, 32, 0, st>>>(
+                const int n_ent = T * Kp;
+                CK(cudaMemcpyAsync(h_h, in_ffn, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
+                project_f32(in_ffn, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
+                k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
                     router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale, L.d_hits);
-                CK(cudaMemcpyAsync(h_ids, ids, (size_t) Kp * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
-                CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) Kp * sizeof(float), cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) n_ent * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_out += ms_since(tp_d3); }
         };
@@ -3025,7 +3130,7 @@ struct Engine {
             float* hst = conv_hist[(size_t) il];
             float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             const bool is_hy = (L.n_slots < hp.n_expert);
-            const bool xq_ffn_ready = (T <= 8 && !pre_routed_t1 && (N & 31) == 0);
+            const bool xq_ffn_ready = (T <= 8 && (N & 31) == 0);
             const bool f16_ffn_ready = (T >= 16 && (N & 3) == 0);
             const bool fuse_comb_conv = (!is_hy && T <= 8);
             run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv, f16_ffn_ready);
@@ -3083,7 +3188,7 @@ struct Engine {
                                            !prof_detail && !pp_streaming && save_conv_trace && capture_dspark);
             const bool use_pre_graph = use_t1_pre_graph || use_vf_pre_graph;
             const int ip_cur = hp.loop_layer(il);
-            const bool include_route_t1 = use_t1_pre_graph && (m->layers[(size_t) ip_cur].n_slots < hp.n_expert);
+            const bool include_route_t1 = use_pre_graph && (m->layers[(size_t) ip_cur].n_slots < hp.n_expert);
             auto& pre_vec = use_t1_pre_graph ? layer_pre_graph : verify_pre_graph;
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (pre_vec[(size_t) il] || !graph_oom)) {
@@ -3134,12 +3239,16 @@ struct Engine {
         const int rows = (all_row_logits || out_picks != nullptr) ? T : 1;
         const bool fuse_head_q8 = (compute_logits && rows == T && T <= 8 && (N & 31) == 0);
         if (compute_logits || (capture_dspark && dspark && d_tgt_feat[3])) {
-            float* out_head[1] = {in_ffn};
-            run_mix_normed(norm_blocks, cur, false, m->output_res_query, out_head, 1, T, 0);
-            if (fuse_head_q8) {
-                k_rms_norm_q8_1<<<(unsigned) T, (N == 2304) ? 768 : kThreads, 0, st>>>(in_ffn, m->output_norm, cur, xq, N, hp.rms_eps);
-            } else {
-                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
+            float* out_head[1] = {cur};
+            NormQ8Out3 nq8_h{m->output_norm, nullptr, nullptr, fuse_head_q8 ? xq : nullptr, nullptr, nullptr};
+            if (!try_run_mix_normed_q8(norm_blocks, cur, m->output_res_query, out_head, nq8_h, 1, T)) {
+                float* out_tmp[1] = {in_ffn};
+                run_mix_normed(norm_blocks, cur, false, m->output_res_query, out_tmp, 1, T, 0);
+                if (fuse_head_q8) {
+                    k_rms_norm_q8_1<<<(unsigned) T, (N == 2304) ? 768 : kThreads, 0, st>>>(in_ffn, m->output_norm, cur, xq, N, hp.rms_eps);
+                } else {
+                    k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
+                }
             }
             if (capture_dspark && dspark && d_tgt_feat[3]) {
                 CK(cudaMemcpyAsync(d_tgt_feat[3], cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
@@ -3208,7 +3317,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     // Keep extra headroom when hybrid-offloading so CUDA graphs + desktop fit OOM-free
     // (CoreResidentHybrid pre-allocates full KV & uses 1 compact core_graph, so 160 MiB reserve leaves ~135 MiB live free).
     if (vram_gib < 0.0 && budget < all_exps_bytes) {
-        const size_t extra_resv = core_res_hy ? ((size_t) 16 << 20) : ((size_t) 144 << 20);
+        const size_t extra_resv = core_res_hy ? ((size_t) 16 << 20) : ((size_t) 32 << 20);
         budget = budget > extra_resv ? (budget - extra_resv) : 0;
     }
     if (budget < all_exps_bytes && stage_mb > 0 && max_exp_stride > 0) {
