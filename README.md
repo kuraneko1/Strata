@@ -32,8 +32,8 @@ The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) f
 
 | Verified GPU | `--max-context` | Auto-Resolved Profile | Prefill Chunk | KV Cache Strategy | Expert Placement |
 | --- | ---: | --- | ---: | --- | --- |
-| **RTX 4070 12 GB** (`sm_89`) | `65536` | `sm89 + core_resident_hybrid` | `1024` | Upfront `65K` (0s growth) | `1,827 / 3,072` (`tier1` 100%, `tier2` 24–25/128) |
-| **RTX 4070 12 GB** (`sm_89`) | `131072` | `sm89 + core_resident_hybrid` | `1024` | Upfront `131K` (0s growth) | `1,616 / 3,072` (`tier1` 100%, `tier2` 6–7/128) |
+| **RTX 4070 12 GB** (`sm_89`) | `65536` | `sm89 + core_resident_hybrid` | `2048` | Upfront `65K` (0s growth) | `1,764 / 3,072` (`tier1` 100%, `tier2` 18–20/128) |
+| **RTX 4070 12 GB** (`sm_89`) | `131072` | `sm89 + core_resident_hybrid` | `2048` | Upfront `131K` (0s growth) | `1,554 / 3,072` (`tier1` 100%, `tier2` 1–2/128) |
 | **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` | Dynamic `32K → 262K` | Adaptive eviction (`74.9%` hit @ 262K) |
 | **Tesla V100 32 GB** (`sm_70`) | `819200` (+ DSpark) | `sm70 + full_vram` | `1024` | Upfront `819K` | `3,072 / 3,072` (`100%` VRAM, `916 MiB` free) |
 | **Tesla V100 32 GB** (`sm_70`) | `1048576` | `sm70 + core_resident_hybrid` | `1024` | Dynamic | `2,897 / 3,072` (`tier1` 100%) |
@@ -52,10 +52,10 @@ All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--k
 
 | Mode (`--max-context`) | Context Depth | Prefill | Decode | Notes |
 | --- | ---: | ---: | ---: | --- |
-| **`65536`** (`core_resident_hybrid`) | `32K` | `1,874.0 t/s` | **`61.7 t/s`** | `95.4%` hit, 0s mid-run KV growth |
-| **`65536`** (`core_resident_hybrid`) | `65K` | **`1,671.4 t/s`** | **`50.1 t/s`** | `92.8%` hit, 0s mid-run KV growth |
-| **`131072`** (`core_resident_hybrid`) | `64K` | `1,641.5 t/s` | `42.6 t/s` | 0s mid-run KV growth |
-| **`131072`** (`core_resident_hybrid`) | `130.5K` | **`1,467.0 t/s`** | **`38.2 t/s`** | `85.1%` hit, 0s mid-run KV growth |
+| **`65536`** (`core_resident_hybrid`, `T=2048`) | `32K` | **`2,250.4 t/s`** | **`57.1 t/s`** | `tier1` 100%, 0s mid-run KV growth |
+| **`65536`** (`core_resident_hybrid`, `T=2048`) | `65K` | **`2,014.1 t/s`** | **`45.0 t/s`** | `90.4%` hit (`--chunk 1024`: `1,671 / 50.1 t/s`) |
+| **`131072`** (`core_resident_hybrid`, `T=2048`) | `64K` | **`1,987.6 t/s`** | `35.4 t/s` | `tier1` 100%, 0s mid-run KV growth |
+| **`131072`** (`core_resident_hybrid`, `T=2048`) | `130.5K` | **`1,771.9 t/s`** | **`31.5 t/s`** | `--chunk 1024`: `1,467 / 38.2 t/s` |
 | **`262144`** (`tight_hybrid`, `T=2048`) | `32K` | `2,330.4 t/s` | `58.0 t/s` | Dynamic KV (`32K → 262K`) |
 | **`262144`** (`tight_hybrid`, `T=2048`) | `128K` | `1,851.2 t/s` | `30.3 t/s` | Post-expansion steady decode |
 | **`262144`** (`tight_hybrid`, `T=2048`) | `256K` | **`1,437.0–1,506.4 t/s`** | **`26.1–27.3 t/s`** | `3.3×` PP / `2.3×` decode vs baseline |
@@ -188,17 +188,17 @@ Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCo
 Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the engine auto-selects the matching profile, chunk size, and KV strategy.
 
 ```bash
-# RTX 4070 12 GB — 65K fastest (auto: sm89 + core_resident_hybrid, chunk=1024, ~50 t/s @ 65K)
+# RTX 4070 12 GB — 65K fastest (auto: sm89 + core_resident_hybrid, chunk=2048, ~2,014 PP / ~45–57 t/s Dec)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --max-context 65536 --bench --max-new 128
 
-# RTX 4070 12 GB — 131K balanced (auto: sm89 + core_resident_hybrid, chunk=1024, ~38 t/s @ 131K)
+# RTX 4070 12 GB — 131K balanced (auto: sm89 + core_resident_hybrid, chunk=2048, ~1,772 PP / ~32–37 t/s Dec)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --max-context 131072 --bench --max-new 128
 
-# RTX 4070 12 GB — 262K max context (auto: sm89 + tight_hybrid, chunk=2048, ~27 t/s @ 262K)
+# RTX 4070 12 GB — 262K max context (auto: sm89 + tight_hybrid, chunk=2048, ~1,437–1,506 PP / ~26–27 t/s Dec)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --max-context 262144 --bench --max-new 128

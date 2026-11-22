@@ -2722,7 +2722,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const bool core_res_hy = (E.profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
-    const size_t reserve = core_res_hy ? ((size_t) 160 << 20) : ((size_t) 256 << 20);
+    const size_t reserve = core_res_hy ? ((size_t) 144 << 20) : ((size_t) 256 << 20);
     size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                     : (fr > reserve ? fr - reserve : 0);
 
@@ -2735,9 +2735,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         max_exp_stride = std::max(max_exp_stride, m.layers[(size_t) ip].stride);
         all_exps_bytes += (size_t) ne * m.layers[(size_t) ip].stride;
     }
-    // Keep extra headroom when hybrid-offloading so CUDA pre-graphs + desktop fit OOM-free (CoreResidentHybrid uses 1 core_graph).
+    // Keep extra headroom when hybrid-offloading so CUDA graphs + desktop fit OOM-free
+    // (CoreResidentHybrid pre-allocates full KV & uses 1 compact core_graph, so 160 MiB reserve leaves ~135 MiB live free).
     if (vram_gib < 0.0 && budget < all_exps_bytes) {
-        const size_t extra_resv = core_res_hy ? ((size_t) 64 << 20) : ((size_t) 144 << 20);
+        const size_t extra_resv = core_res_hy ? ((size_t) 16 << 20) : ((size_t) 144 << 20);
         budget = budget > extra_resv ? (budget - extra_resv) : 0;
     }
     if (budget < all_exps_bytes && stage_mb > 0 && max_exp_stride > 0) {

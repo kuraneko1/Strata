@@ -33,9 +33,11 @@ struct ArchProfile {
     int t1_full_split_mult = 8;           // attn_split_t1_full = clamp(sm_count * mult / n_head_kv, 40, kAttnSplitMax)
     int t1_swa_split_mult = 2;            // attn_split_t1_swa  = clamp(sm_count * mult / n_head_kv, 8, 24)
     int pp_stage_mb = 64;                 // Default pp_streaming ring slot size (MiB)
-    int pp_stage_cnt_pref = 3;            // Preferred ring slot count (3 x 64 MiB = 192 MiB)
+    int pp_stage_cnt_pref = 3;            // Preferred ring slot count in TightHybrid (3 x 64 MiB = 192 MiB)
+    int pp_stage_cnt_core = 2;            // Preferred ring slot count in CoreResidentHybrid (2 x 64 MiB saves 64 MiB for experts)
     int kv_grow_reserve_mib = 112;        // Extra VRAM headroom during dynamic KV growth
     bool allow_tight_chunk_2048 = false;  // Measured win on sm_89 12GB TightHybrid (halves PCIe streaming bytes/tok)
+    bool allow_core_chunk_2048 = false;   // Measured win on sm_89 12GB CoreResidentHybrid when tier1 still fits 128/128
 };
 
 inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
@@ -67,8 +69,10 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.t1_swa_split_mult = 2;
         p.pp_stage_mb = 64;
         p.pp_stage_cnt_pref = 3;
+        p.pp_stage_cnt_core = 2;
         p.kv_grow_reserve_mib = 112;
         p.allow_tight_chunk_2048 = true;
+        p.allow_core_chunk_2048 = true;
         return p;
     }
     ArchProfile p;
@@ -176,14 +180,24 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     }
 
     // 2. Prefill chunk size (user --chunk always wins):
-    //    - FullVram & CoreResidentHybrid prefer 1024 (preserves core_all_gpu=true & tier2 slots on 65K/131K).
+    //    - FullVram keeps 1024 (no PCIe expert streaming to amortize).
+    //    - CoreResidentHybrid on measured sm_89 Q8KV (no draft) promotes to 2048 when tier1 still fits 128/128
+    //      with upfront full_kv_init + SWA-3072 ring + 2x64MiB staging, boosting prefill +25-35% without losing core_graph.
     //    - TightHybrid on measured sm_89 Q8KV (no draft) uses 2048 (SWA-3072 ring halves PCIe streaming bytes/tok).
+    const size_t swa_kv_2048 = (size_t) std::max(0, in.n_swa_layers) * (size_t) (std::max(1, in.n_swa) + 2048) * in.kv_bytes_per_tok;
+    const size_t stage_bytes_core = (size_t) out.arch.pp_stage_cnt_core * ((size_t) out.arch.pp_stage_mb * MiB);
+    const size_t engine_overhead_2048 = 704 * MiB;
+    const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + 160 * MiB;
+
     if (in.requested_chunk > 0) {
         out.chunk = std::clamp(in.requested_chunk, 1, 4096);
     } else {
         const size_t init_kv_bytes = (size_t) std::max(0, in.n_full_layers) * (size_t) out.full_kv_init * in.kv_bytes_per_tok;
         if (out.regime == VramRegime::TightHybrid && out.arch.allow_tight_chunk_2048 &&
             in.kv_q8 && !in.has_draft && in.vram_free_bytes > init_kv_bytes + ((size_t) 4 << 30)) {
+            out.chunk = 2048;
+        } else if (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_2048 &&
+                   in.kv_q8 && !in.has_draft && in.vram_free_bytes >= core_hybrid_2048_need) {
             out.chunk = 2048;
         } else if (in.vram_free_bytes > init_kv_bytes + ((size_t) 4 << 30)) {
             out.chunk = 1024;
@@ -205,6 +219,10 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
         out.pp_stage_mb = 0;
         out.pp_stage_cnt_pref = 0;
         out.use_d_hits = false;
+    } else if (out.regime == VramRegime::CoreResidentHybrid) {
+        out.pp_stage_mb = out.arch.pp_stage_mb;
+        out.pp_stage_cnt_pref = out.arch.pp_stage_cnt_core;
+        out.use_d_hits = true;
     } else {
         out.pp_stage_mb = out.arch.pp_stage_mb;
         out.pp_stage_cnt_pref = out.arch.pp_stage_cnt_pref;

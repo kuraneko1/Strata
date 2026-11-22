@@ -1,15 +1,15 @@
 profile,max_context,depth,pp_tps,steady_dec_tps,gpu_hit_pct,notes
-65k,65536,16384,1792.1,54.91,91.0,sm89+core_resident_hybrid (chunk=1024; 65K KV upfront)
-65k,65536,32768,1874.0,61.67,95.4,sm89+core_resident_hybrid
-65k,65536,49152,1822.0,55.45,94.8,sm89+core_resident_hybrid
-65k,65536,65000,1671.4,50.08,92.8,sm89+core_resident_hybrid
-131k,131072,16384,1706.1,41.52,83.1,sm89+core_resident_hybrid (chunk=1024; 131K KV upfront)
-131k,131072,32768,1681.5,43.35,84.4,sm89+core_resident_hybrid
-131k,131072,49152,1652.3,44.47,85.5,sm89+core_resident_hybrid
-131k,131072,65536,1641.5,42.64,85.0,sm89+core_resident_hybrid
-131k,131072,98304,1564.6,36.80,85.0,sm89+core_resident_hybrid
-131k,131072,130500,1467.0,38.17,85.1,sm89+core_resident_hybrid
-262k,262144,16384,2176.3,52.81,90.1,sm89+tight_hybrid (chunk=2048; dynamic KV)
+65k,65536,16384,2194.4,52.19,89.4,sm89+core_resident_hybrid (chunk=2048; 2x64MiB stage; 65K KV upfront; tier1=128/128)
+65k,65536,32768,2250.4,57.05,91.5,sm89+core_resident_hybrid
+65k,65536,49152,2162.6,53.51,93.3,sm89+core_resident_hybrid
+65k,65536,65000,2014.1,45.00,90.4,sm89+core_resident_hybrid (cum 30.10s; --chunk 1024 gives 1671 PP / 50.1 Dec)
+131k,131072,16384,2066.0,37.16,78.0,sm89+core_resident_hybrid (chunk=2048; 2x64MiB stage; 131K KV upfront; tier1=128/128)
+131k,131072,32768,2166.9,36.90,78.7,sm89+core_resident_hybrid
+131k,131072,49152,2087.2,35.21,79.2,sm89+core_resident_hybrid
+131k,131072,65536,1987.6,35.40,78.3,sm89+core_resident_hybrid
+131k,131072,98304,1908.8,34.13,78.2,sm89+core_resident_hybrid
+131k,131072,130500,1771.9,31.52,79.0,sm89+core_resident_hybrid (cum 66.76s; --chunk 1024 gives 1467 PP / 38.2 Dec)
+262k,262144,16384,2176.3,52.81,90.1,sm89+tight_hybrid (chunk=2048; 3x64MiB stage; dynamic KV)
 262k,262144,32768,2330.4,58.02,93.6,sm89+tight_hybrid (KV->64K)
 262k,262144,49152,2211.9,53.43,93.1,sm89+tight_hybrid
 262k,262144,65536,2117.0,34.06,75.9,sm89+tight_hybrid (KV->131K)
