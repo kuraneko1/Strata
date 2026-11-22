@@ -7929,7 +7929,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
 bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                                 const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
                                 int64_t cap_groups, int64_t cap_entries, const void* x_f16, void* scratch, float* out,
-                                void* stream) {
+                                void* stream, int64_t expected_entries) {
     if (cap_groups <= 0 || cap_entries <= 0 || L.had_block > 0 || L.gu_nib) return false;
     if (L.n_embd % 256 != 0 || L.n_ff % 128 != 0) return false;
     if (L.gu_type != 40 && L.gu_type != 12 && L.gu_type != 13 && L.gu_type != 8) return false;
@@ -7962,7 +7962,8 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     if (cc_ok[dev] != 2) return false;
 
     cudaStream_t s = (cudaStream_t) stream;
-    const int avg_rows = (int) ((cap_entries + cap_groups - 1) / cap_groups);
+    const int64_t est_ent = (expected_entries > 0) ? std::min(cap_entries, expected_entries) : cap_entries;
+    const int avg_rows = (int) ((est_ent + cap_groups - 1) / cap_groups);
     const int ch_per_e64 = std::clamp((avg_rows + 47) / 48, 1, 4);
     const bool use_bm128 = (avg_rows >= 32);
     const int ch_per_e128 = std::clamp((avg_rows + 95) / 96, 1, 4);
@@ -8009,7 +8010,7 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     }
     check("native_expert_grouped_wmma/gu");
 
-    const unsigned act_blocks = (unsigned) std::min<int64_t>(4096, ((cap_entries * L.n_ff) + 255) / 256);
+    const unsigned act_blocks = (unsigned) std::min<int64_t>(4096, ((est_ent * L.n_ff) + 255) / 256);
     if (L.situ) {
         situ_f16_valid_kernel<<<act_blocks, 256, 0, s>>>(gate, up, h16, grp_start, n_groups, (int) L.n_ff, L.situ_beta, L.situ_linear_beta);
     } else {
