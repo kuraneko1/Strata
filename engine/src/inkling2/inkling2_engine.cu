@@ -739,6 +739,7 @@ struct Engine {
     int sm_count = 80;
     int fa2_256_bulk_smem = 87040;
     bool can_fa2_192 = false;
+    bool can_ctrl_wmma = false;
     bool can_fa2_256 = false;
     bool bf16_x_f16 = false;
     int attn_split_t1_full = 160;
@@ -1119,6 +1120,8 @@ struct Engine {
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<4>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<3>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<2>, 24576);
+        can_ctrl_wmma = (cc_maj >= 7);
+        cudaFuncSetAttribute((const void*) k_control_up_combine_pp_wmma, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         can_fa2_192 =
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, false, false>, 98304) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<true, false, false>, 98304) &&
@@ -1646,9 +1649,17 @@ struct Engine {
             const int64_t n_x64 = (int64_t) T * R;
             if ((size_t) (n_wd + 2 * n_wu) * sizeof(uint16_t) <= ctrl_w16_bytes) {
                 uint16_t* w_down16 = ctrl_w16;
+                k_control_prep_f16<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, act_bf16, N, hp.rms_eps);
+                if (R == 64 && (N % 64) == 0 && can_ctrl_wmma) {
+                    // Convert ONLY W_down -> FP16, run loop_down GEMM, then fuse gain+forget+combine in 1 WMMA kernel!
+                    k_f32_to_f16<<<(unsigned) ((n_wd + 255) / 256), 256, 0, st>>>((const float*) L.loop_down[mod].d, w_down16, n_wd);
+                    gemm.f16(act_bf16, w_down16, ctrl64, T, R, 2 * N);
+                    k_control_up_combine_pp_wmma<<<dim3((unsigned) (N / 64), (unsigned) ((T + 63) / 64)), 256, 0, st>>>(
+                        c, msg, ctrl64, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d, out, T, N);
+                    return;
+                }
                 uint16_t* w_gain16 = w_down16 + n_wd;
                 uint16_t* w_fgt16  = w_gain16 + n_wu;
-                k_control_prep_f16<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, act_bf16, N, hp.rms_eps);
                 const int64_t tot_w4 = (n_wd + 2 * n_wu) >> 2;
                 k_f32_to_f16_ctrl_w<<<(unsigned) ((tot_w4 + 255) / 256), 256, 0, st>>>(
                     (const float*) L.loop_down[mod].d, (const float*) L.loop_gain[mod].d,
@@ -1820,12 +1831,20 @@ struct Engine {
             }
             project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
             if (fused_rg) {
-                const int blk = (T <= 4) ? 128 : 256;
-                k_route_and_group_smallT<<<1, blk, 0, st>>>(
-                    router_logits, L.exp_probs_b, ids, ewts, L.d_slot_of, L.d_blobs, L.stride,
-                    T, (int) hp.n_expert, Kp, hp.expert_weights_scale,
-                    grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                    (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+                if (T == 1) {
+                    k_route_and_group_t1_warp<<<1, 32, 0, st>>>(
+                        router_logits, L.exp_probs_b, ids, ewts, L.d_slot_of, L.d_blobs, L.stride,
+                        (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                        grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                        (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+                } else {
+                    const int blk = (T <= 4) ? 128 : 256;
+                    k_route_and_group_smallT<<<1, blk, 0, st>>>(
+                        router_logits, L.exp_probs_b, ids, ewts, L.d_slot_of, L.d_blobs, L.stride,
+                        T, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                        grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                        (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+                }
             } else {
                 k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
                     router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
@@ -2862,6 +2881,20 @@ struct Engine {
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
             const auto tp_d2 = Clock::now();
             const int apply_tau = is_swa ? 0 : 1;
+            const int max_rel = is_swa ? std::min<int>((int) hp.n_swa, (int) hp.n_rel_ext) : (int) hp.n_rel_ext;
+            const bool fused_pre_attn_t1 = (T == 1 && kv_q8 && hp.head_dim == 128 && hp.n_rel == 16 && !save_conv_trace);
+            if (fused_pre_attn_t1) {
+                const int d_splits = (max_rel > 512) ? 4 : 2;
+                const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
+                k_pre_attn_t1_fused<<<n_ctas, 128, 0, st>>>(
+                    pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                    hst, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                    pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
+                    L.attn_rel_bias, sink, rel_tab,
+                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, max_rel,
+                    kv_cap[(size_t) il], is_swa ? 1 : 0, hp.rms_eps, apply_tau, pos0_d,
+                    (int) hp.log_scale_floor, hp.log_scale_alpha, d_splits);
+            } else {
             const bool fused_kv_q8 = (T < 32 && kv_q8 && hp.head_dim == 128);
             if (fused_kv_q8) {
                 k_shortconv_kv_clip_norm_store_q8<<<dim3((unsigned) hp.n_head_kv, 2), 128, 0, st>>>(
@@ -2908,7 +2941,6 @@ struct Engine {
 
             const bool fuse_swa_rel_pp = kv_q8 && is_swa && can_fa2_192 && T >= 128 &&
                                          hp.n_rel == 16 && hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128;
-            const int max_rel = is_swa ? std::min<int>((int) hp.n_swa, (int) hp.n_rel_ext) : (int) hp.n_rel_ext;
             if (!fuse_swa_rel_pp) {
                 if (T >= 32 && hp.n_rel == 16) {
                     k_rel_table_t32<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 31) / 32)), kThreads, 0, st>>>(
@@ -2922,6 +2954,9 @@ struct Engine {
                         pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T);
                 }
             }
+            }
+            const bool fuse_swa_rel_pp = kv_q8 && is_swa && can_fa2_192 && T >= 128 &&
+                                         hp.n_rel == 16 && hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128;
             const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
             const void* att_xq_ready = nullptr;
             if (kv_q8) {

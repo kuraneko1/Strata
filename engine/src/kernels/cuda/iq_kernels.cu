@@ -8026,14 +8026,615 @@ __device__ __forceinline__ void dq_sub16_k64_store(const uint8_t* row_ptr, int k
 }
 #endif
 
+/// Flat LPT tile-list builder for grouped WMMA (1 CTA, <=256 groups, <2 us):
+/// Emits all full BM-row tiles first (heavy work), then partial <BM tail tiles (fills final wave),
+/// eliminating hot-expert straggler serialization across Zipfian MoE routing distributions.
+template <int BM>
+__global__ void k_build_wmma_tiles(const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
+                                   int32_t* __restrict__ tile_g, int32_t* __restrict__ tile_c0,
+                                   int32_t* __restrict__ n_tiles) {
+    __shared__ int32_t s_wf[8], s_wr[8], s_wf_off[8], s_wr_off[8], s_tot_full;
+    const int ng = *n_groups;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int e0 = (tid < ng) ? grp_start[tid] : 0;
+    const int e1 = (tid < ng) ? grp_start[tid + 1] : 0;
+    const int len = max(0, e1 - e0);
+    const int n_full = len / BM;
+    const int has_rem = ((len - n_full * BM) > 0) ? 1 : 0;
+    int f_inc = n_full, r_inc = has_rem;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int fu = __shfl_up_sync(0xffffffffu, f_inc, d);
+        const int ru = __shfl_up_sync(0xffffffffu, r_inc, d);
+        if (lane >= d) { f_inc += fu; r_inc += ru; }
+    }
+    if (lane == 31) {
+        s_wf[warp] = f_inc;
+        s_wr[warp] = r_inc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int fa = 0, ra = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            s_wf_off[w] = fa; fa += s_wf[w];
+            s_wr_off[w] = ra; ra += s_wr[w];
+        }
+        s_tot_full = fa;
+        *n_tiles = fa + ra;
+    }
+    __syncthreads();
+    if (tid < ng) {
+        const int f_base = s_wf_off[warp] + f_inc - n_full;
+        for (int k = 0; k < n_full; ++k) {
+            tile_g[f_base + k] = tid;
+            tile_c0[f_base + k] = e0 + k * BM;
+        }
+        if (has_rem) {
+            const int r_pos = s_tot_full + s_wr_off[warp] + r_inc - 1;
+            tile_g[r_pos] = tid;
+            tile_c0[r_pos] = e0 + n_full * BM;
+        }
+    }
+}
+
+__device__ __forceinline__ float wmma_situ_eval(float gv, float uv, float beta, float inv_b, float lb, float inv_lb) {
+    const float xc = fmaxf(-9.0f, fminf(9.0f, gv * inv_b));
+    const float th_g = __fdividef(2.0f, 1.0f + __expf(-2.0f * xc)) - 1.0f;
+    const float tg = beta * th_g * __fdividef(1.0f, 1.0f + __expf(-gv));
+    float tu = uv;
+    if (lb > 0.0f) {
+        const float xu = fmaxf(-9.0f, fminf(9.0f, uv * inv_lb));
+        tu = lb * (__fdividef(2.0f, 1.0f + __expf(-2.0f * xu)) - 1.0f);
+    }
+    return __fmul_rn(tg, tu);
+}
+
+/// Fused Dual Gate+Up + In-Register SiTU BM=64 grouped WMMA (BN_OUT=64, SW=128 = 64 gate + 64 up):
+/// Halves X global loads, eliminates gate/up FP32 HBM round-trip (9x less epilogue traffic), eliminates situ_f16_valid_kernel,
+/// uses flat LPT tile list (zero hot-expert stragglers), and writes h16 in a single 64x64 SMEM pass!
+template <int WT>
+__global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_64_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ tile_g, const int32_t* __restrict__ tile_c0, const int32_t* __restrict__ n_tiles,
+    const int32_t* __restrict__ ent_idx, const __half* __restrict__ X, NativeExpertLayout L,
+    float beta, float lb, __half* __restrict__ h16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    const int nt = *n_tiles;
+    if ((int) blockIdx.y >= nt) return;
+    constexpr int BM = 64, WK = 64, LD = 72;
+    __shared__ __align__(16) __half smem[(BM + 128) * LD];
+    __shared__ __half s_ue4m3[256];
+    __half* sx = smem;
+    __half* sw = smem + BM * LD;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    if constexpr (WT == 40) {
+        s_ue4m3[tid] = ue4m3_to_half_halved((uint8_t) tid);
+        __syncthreads();
+    }
+
+    const int g = tile_g[blockIdx.y];
+    const int c0 = tile_c0[blockIdx.y];
+    const int e1 = grp_start[g + 1];
+    const int rows = min(BM, e1 - c0);
+    const int col0 = (int) blockIdx.x * 64;
+    const size_t row_stride = L.gu_row;
+    const int K = (int) L.n_embd;
+    const int N_out = (int) L.n_ff;
+
+    const int wm = warp >> 2;  // 0..1 (32 rows/warp)
+    const int wn = warp & 3;   // 0..3 (16 paired gate+up cols/warp)
+    const int wr = tid >> 2, sb = tid & 3;
+    const int xr = wr, xc = sb * 16;
+
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* we_g = blob + (size_t) (col0 + wr) * row_stride;
+    const uint8_t* we_u = blob + L.up_off + (size_t) (col0 + wr) * row_stride;
+    const float sc_g = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+    const float sc_u = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+
+    const bool x_ok = (xr < rows);
+    const int in_row = x_ok ? ent_idx[c0 + xr] : 0;
+    const __half* xp = X + (size_t) in_row * K + xc;
+
+#if __CUDA_ARCH__ < 750
+    const int lane = tid & 31;
+    const int qa_row = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3);
+    const int kb_row = ((lane & 16) >> 2) + (lane & 8) + (lane & 3);
+    const int acc_r0 = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 1);
+    const int acc_r1 = acc_r0 + 2;
+    const int acc_c0 = (lane & 8) + (lane & 2);
+    const int acc_c1 = acc_c0 + 4;
+    const __half* sx_r0 = sx + (wm * 32 + qa_row) * LD;
+    const __half* sw_r0 = sw + (wn * 16 + kb_row) * LD;
+    const __half* sw_r1 = sw + (64 + wn * 16 + kb_row) * LD;
+    auto hmma_rc = [](float d[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, {%0, %1, %2, %3, %4, %5, %6, %7};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+            : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+    };
+    float acc[2][2][8];
+#pragma unroll
+    for (int mr = 0; mr < 2; ++mr) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+    }
+#else
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+    for (int mr = 0; mr < 2; ++mr) {
+        wmma::fill_fragment(acc[mr][0], 0.0f);
+        wmma::fill_fragment(acc[mr][1], 0.0f);
+    }
+#endif
+
+    if constexpr (WT == 40) {
+        const uint8_t* wpg = we_g;
+        const uint8_t* wpu = we_u;
+        uint32_t nw0_g = *reinterpret_cast<const uint32_t*>(wpg + 4 + sb * 8);
+        uint32_t nw1_g = *reinterpret_cast<const uint32_t*>(wpg + 8 + sb * 8);
+        uint8_t ndb_g = wpg[sb];
+        uint32_t nw0_u = *reinterpret_cast<const uint32_t*>(wpu + 4 + sb * 8);
+        uint32_t nw1_u = *reinterpret_cast<const uint32_t*>(wpu + 8 + sb * 8);
+        uint8_t ndb_u = wpu[sb];
+        uint4 nx0 = x_ok ? *reinterpret_cast<const uint4*>(xp)     : make_uint4(0, 0, 0, 0);
+        uint4 nx1 = x_ok ? *reinterpret_cast<const uint4*>(xp + 8) : make_uint4(0, 0, 0, 0);
+
+        *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = nx0;
+        *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = nx1;
+        dq_nvfp4_sub16_store_sc(nw0_g, nw1_g, s_ue4m3[ndb_g], sw + wr * LD + sb * 16);
+        dq_nvfp4_sub16_store_sc(nw0_u, nw1_u, s_ue4m3[ndb_u], sw + (64 + wr) * LD + sb * 16);
+        __syncthreads();
+
+        for (int k0 = 0; k0 < K; k0 += WK) {
+            const bool has_next = (k0 + WK < K);
+            if (has_next) {
+                wpg += 36; wpu += 36;
+                const __half* nxp = xp + k0 + WK;
+                nw0_g = *reinterpret_cast<const uint32_t*>(wpg + 4 + sb * 8);
+                nw1_g = *reinterpret_cast<const uint32_t*>(wpg + 8 + sb * 8);
+                ndb_g = wpg[sb];
+                nw0_u = *reinterpret_cast<const uint32_t*>(wpu + 4 + sb * 8);
+                nw1_u = *reinterpret_cast<const uint32_t*>(wpu + 8 + sb * 8);
+                ndb_u = wpu[sb];
+                nx0 = x_ok ? *reinterpret_cast<const uint4*>(nxp)     : make_uint4(0, 0, 0, 0);
+                nx1 = x_ok ? *reinterpret_cast<const uint4*>(nxp + 8) : make_uint4(0, 0, 0, 0);
+            }
+#if __CUDA_ARCH__ < 750
+#pragma unroll
+            for (int kk = 0; kk < WK; kk += 8) {
+                const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                for (int mr = 0; mr < 2; ++mr) {
+                    const uint4 a = *reinterpret_cast<const uint4*>(sx_r0 + mr * 16 * LD + kk);
+                    hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                    hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                    hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                    hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                }
+            }
+#else
+#pragma unroll
+            for (int kk = 0; kk < WK; kk += 16) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb0, fb1;
+                wmma::load_matrix_sync(fb0, sw + (wn * 16) * LD + kk, LD);
+                wmma::load_matrix_sync(fb1, sw + (64 + wn * 16) * LD + kk, LD);
+#pragma unroll
+                for (int mr = 0; mr < 2; ++mr) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::load_matrix_sync(fa, sx + (wm * 32 + mr * 16) * LD + kk, LD);
+                    wmma::mma_sync(acc[mr][0], fa, fb0, acc[mr][0]);
+                    wmma::mma_sync(acc[mr][1], fa, fb1, acc[mr][1]);
+                }
+            }
+#endif
+            if (has_next) {
+                __syncthreads();
+                *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = nx0;
+                *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = nx1;
+                dq_nvfp4_sub16_store_sc(nw0_g, nw1_g, s_ue4m3[ndb_g], sw + wr * LD + sb * 16);
+                dq_nvfp4_sub16_store_sc(nw0_u, nw1_u, s_ue4m3[ndb_u], sw + (64 + wr) * LD + sb * 16);
+                __syncthreads();
+            }
+        }
+    } else {
+        for (int k0 = 0; k0 < K; k0 += WK) {
+            const __half* cxp = xp + k0;
+            *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x_ok ? *reinterpret_cast<const uint4*>(cxp)     : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x_ok ? *reinterpret_cast<const uint4*>(cxp + 8) : make_uint4(0, 0, 0, 0);
+            dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16);
+            dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16);
+            __syncthreads();
+#if __CUDA_ARCH__ < 750
+#pragma unroll
+            for (int kk = 0; kk < WK; kk += 8) {
+                const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                for (int mr = 0; mr < 2; ++mr) {
+                    const uint4 a = *reinterpret_cast<const uint4*>(sx_r0 + mr * 16 * LD + kk);
+                    hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                    hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                    hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                    hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                }
+            }
+#else
+#pragma unroll
+            for (int kk = 0; kk < WK; kk += 16) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb0, fb1;
+                wmma::load_matrix_sync(fb0, sw + (wn * 16) * LD + kk, LD);
+                wmma::load_matrix_sync(fb1, sw + (64 + wn * 16) * LD + kk, LD);
+#pragma unroll
+                for (int mr = 0; mr < 2; ++mr) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::load_matrix_sync(fa, sx + (wm * 32 + mr * 16) * LD + kk, LD);
+                    wmma::mma_sync(acc[mr][0], fa, fb0, acc[mr][0]);
+                    wmma::mma_sync(acc[mr][1], fa, fb1, acc[mr][1]);
+                }
+            }
+#endif
+            __syncthreads();
+        }
+    }
+
+    const float inv_b = __fdividef(1.0f, beta);
+    const float inv_lb = lb > 0.0f ? __fdividef(1.0f, lb) : 0.0f;
+#if __CUDA_ARCH__ < 750
+#pragma unroll
+    for (int mr = 0; mr < 2; ++mr) {
+        const int r0 = wm * 32 + mr * 16 + acc_r0;
+        const int r1 = wm * 32 + mr * 16 + acc_r1;
+        if (r0 < rows) {
+            __half* dst0 = h16 + (size_t) (c0 + r0) * N_out + col0 + wn * 16;
+            *reinterpret_cast<__half2*>(dst0 + acc_c0) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][0], sc_g), __fmul_rn(acc[mr][1][0], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][1], sc_g), __fmul_rn(acc[mr][1][1], sc_u), beta, inv_b, lb, inv_lb));
+            *reinterpret_cast<__half2*>(dst0 + acc_c1) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][4], sc_g), __fmul_rn(acc[mr][1][4], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][5], sc_g), __fmul_rn(acc[mr][1][5], sc_u), beta, inv_b, lb, inv_lb));
+        }
+        if (r1 < rows) {
+            __half* dst1 = h16 + (size_t) (c0 + r1) * N_out + col0 + wn * 16;
+            *reinterpret_cast<__half2*>(dst1 + acc_c0) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][2], sc_g), __fmul_rn(acc[mr][1][2], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][3], sc_g), __fmul_rn(acc[mr][1][3], sc_u), beta, inv_b, lb, inv_lb));
+            *reinterpret_cast<__half2*>(dst1 + acc_c1) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][6], sc_g), __fmul_rn(acc[mr][1][6], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][7], sc_g), __fmul_rn(acc[mr][1][7], sc_u), beta, inv_b, lb, inv_lb));
+        }
+    }
+#else
+#pragma unroll
+    for (int mr = 0; mr < 2; ++mr) {
+#pragma unroll
+        for (int i = 0; i < acc[mr][0].num_elements; ++i) {
+            acc[mr][0].x[i] = wmma_situ_eval(__fmul_rn(acc[mr][0].x[i], sc_g), __fmul_rn(acc[mr][1].x[i], sc_u), beta, inv_b, lb, inv_lb);
+        }
+    }
+    __syncthreads();
+    float* s_out = reinterpret_cast<float*>(smem);
+    wmma::store_matrix_sync(s_out + (wm * 32) * 64 + wn * 16,      acc[0][0], 64, wmma::mem_row_major);
+    wmma::store_matrix_sync(s_out + (wm * 32 + 16) * 64 + wn * 16, acc[1][0], 64, wmma::mem_row_major);
+    __syncthreads();
+    for (int i4 = tid; i4 < rows * 16; i4 += 256) {
+        const int r = i4 >> 4, c = (i4 & 15) << 2;
+        const float4 v = reinterpret_cast<const float4*>(s_out)[i4];
+        __half2 p0 = __floats2half2_rn(v.x, v.y);
+        __half2 p1 = __floats2half2_rn(v.z, v.w);
+        uint2 out2;
+        memcpy(&out2.x, &p0, 4);
+        memcpy(&out2.y, &p1, 4);
+        *reinterpret_cast<uint2*>(h16 + (size_t) (c0 + r) * N_out + col0 + c) = out2;
+    }
+#endif
+#else
+    (void) grp_ptr; (void) grp_start; (void) tile_g; (void) tile_c0; (void) n_tiles; (void) ent_idx; (void) X; (void) L; (void) beta; (void) lb; (void) h16;
+#endif
+}
+
+/// Fused Dual Gate+Up + In-Register SiTU BM=128 grouped WMMA (BN_OUT=64, SW=128 = 64 gate + 64 up):
+/// Uses flat LPT tile list, halves X loads, eliminates gate/up HBM round-trip & situ_f16_valid_kernel!
+/// On Volta sm_70: zero SMEM / zero barrier epilogue writing half2 straight to h16; on sm_75+: 1-shot 128x64 SMEM pass!
+template <int WT>
+__global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ tile_g, const int32_t* __restrict__ tile_c0, const int32_t* __restrict__ n_tiles,
+    const int32_t* __restrict__ ent_idx, const __half* __restrict__ X, NativeExpertLayout L,
+    float beta, float lb, __half* __restrict__ h16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    const int nt = *n_tiles;
+    if ((int) blockIdx.y >= nt) return;
+    constexpr int BM = 128, WK = 64, LD = 72;
+    __shared__ __align__(16) __half smem[(BM + 128) * LD];
+    __shared__ __half s_ue4m3[256];
+    __half* sx = smem;
+    __half* sw = smem + BM * LD;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    if constexpr (WT == 40) {
+        s_ue4m3[tid] = ue4m3_to_half_halved((uint8_t) tid);
+        __syncthreads();
+    }
+
+    const int g = tile_g[blockIdx.y];
+    const int c0 = tile_c0[blockIdx.y];
+    const int e1 = grp_start[g + 1];
+    const int rows = min(BM, e1 - c0);
+    const bool has_hi = (rows > 64);
+    const int col0 = (int) blockIdx.x * 64;
+    const size_t row_stride = L.gu_row;
+    const int K = (int) L.n_embd;
+    const int N_out = (int) L.n_ff;
+
+    const int wm = warp >> 2;  // 0..1
+    const int wn = warp & 3;   // 0..3 (16 paired gate+up cols/warp)
+    const int wr = tid >> 2, sb = tid & 3;
+    const int xr = wr, xc = sb * 16;
+
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* we_g = blob + (size_t) (col0 + wr) * row_stride;
+    const uint8_t* we_u = blob + L.up_off + (size_t) (col0 + wr) * row_stride;
+    const float sc_g = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+    const float sc_u = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+
+    const bool x0_ok = (xr < rows);
+    const bool x1_ok = ((xr + 64) < rows);
+    const int in_row0 = x0_ok ? ent_idx[c0 + xr] : 0;
+    const int in_row1 = x1_ok ? ent_idx[c0 + xr + 64] : 0;
+    const __half* xp0 = X + (size_t) in_row0 * K + xc;
+    const __half* xp1 = X + (size_t) in_row1 * K + xc;
+
+#if __CUDA_ARCH__ < 750
+    const int lane = tid & 31;
+    const int qa_row = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3);
+    const int kb_row = ((lane & 16) >> 2) + (lane & 8) + (lane & 3);
+    const int acc_r0 = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 1);
+    const int acc_r1 = acc_r0 + 2;
+    const int acc_c0 = (lane & 8) + (lane & 2);
+    const int acc_c1 = acc_c0 + 4;
+    const __half* sw_r0 = sw + (wn * 16 + kb_row) * LD;
+    const __half* sw_r1 = sw + (64 + wn * 16 + kb_row) * LD;
+    auto hmma_rc = [](float d[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, {%0, %1, %2, %3, %4, %5, %6, %7};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+            : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+    };
+    float acc[4][2][8];
+#pragma unroll
+    for (int mr = 0; mr < 4; ++mr) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+    }
+#else
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
+#pragma unroll
+    for (int mr = 0; mr < 4; ++mr) {
+        wmma::fill_fragment(acc[mr][0], 0.0f);
+        wmma::fill_fragment(acc[mr][1], 0.0f);
+    }
+#endif
+
+    if (has_hi) {
+#if __CUDA_ARCH__ < 750
+        const __half* sx_hi = sx + (wm * 64 + qa_row) * LD;
+#endif
+        uint32_t pf_w0[2], pf_w1[2];
+        uint8_t pf_d[2];
+        if constexpr (WT == 40) {
+            pf_w0[0] = *reinterpret_cast<const uint32_t*>(we_g + 4 + sb * 8);
+            pf_w1[0] = *reinterpret_cast<const uint32_t*>(we_g + 8 + sb * 8);
+            pf_d[0] = we_g[sb];
+            pf_w0[1] = *reinterpret_cast<const uint32_t*>(we_u + 4 + sb * 8);
+            pf_w1[1] = *reinterpret_cast<const uint32_t*>(we_u + 8 + sb * 8);
+            pf_d[1] = we_u[sb];
+        }
+        for (int k0 = 0; k0 < K; k0 += WK) {
+            const __half* cxp0 = xp0 + k0;
+            const __half* cxp1 = xp1 + k0;
+            *reinterpret_cast<uint4*>(sx + xr * LD + xc)            = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8)        = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc)     = x1_ok ? *reinterpret_cast<const uint4*>(cxp1)     : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc + 8) = x1_ok ? *reinterpret_cast<const uint4*>(cxp1 + 8) : make_uint4(0, 0, 0, 0);
+            if constexpr (WT == 40) {
+                dq_nvfp4_sub16_store_sc(pf_w0[0], pf_w1[0], s_ue4m3[pf_d[0]], sw + wr * LD + sb * 16);
+                dq_nvfp4_sub16_store_sc(pf_w0[1], pf_w1[1], s_ue4m3[pf_d[1]], sw + (64 + wr) * LD + sb * 16);
+            } else {
+                dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16);
+                dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16);
+            }
+            __syncthreads();
+            if constexpr (WT == 40) {
+                if (k0 + WK < K) {
+                    const size_t koff = (size_t) ((k0 + WK) >> 6) * 36;
+                    const uint8_t* wng = we_g + koff;
+                    const uint8_t* wnu = we_u + koff;
+                    pf_w0[0] = *reinterpret_cast<const uint32_t*>(wng + 4 + sb * 8);
+                    pf_w1[0] = *reinterpret_cast<const uint32_t*>(wng + 8 + sb * 8);
+                    pf_d[0] = wng[sb];
+                    pf_w0[1] = *reinterpret_cast<const uint32_t*>(wnu + 4 + sb * 8);
+                    pf_w1[1] = *reinterpret_cast<const uint32_t*>(wnu + 8 + sb * 8);
+                    pf_d[1] = wnu[sb];
+                }
+            }
+#if __CUDA_ARCH__ < 750
+#pragma unroll 1
+            for (int kk = 0; kk < WK; kk += 8) {
+                const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                for (int mr = 0; mr < 4; ++mr) {
+                    const uint4 a = *reinterpret_cast<const uint4*>(sx_hi + mr * 16 * LD + kk);
+                    hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                    hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                    hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                    hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                }
+            }
+#else
+#pragma unroll
+            for (int kk = 0; kk < WK; kk += 16) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb0, fb1;
+                wmma::load_matrix_sync(fb0, sw + (wn * 16) * LD + kk, LD);
+                wmma::load_matrix_sync(fb1, sw + (64 + wn * 16) * LD + kk, LD);
+#pragma unroll
+                for (int mr = 0; mr < 4; ++mr) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::load_matrix_sync(fa, sx + (wm * 64 + mr * 16) * LD + kk, LD);
+                    wmma::mma_sync(acc[mr][0], fa, fb0, acc[mr][0]);
+                    wmma::mma_sync(acc[mr][1], fa, fb1, acc[mr][1]);
+                }
+            }
+#endif
+            __syncthreads();
+        }
+    } else {
+#if __CUDA_ARCH__ < 750
+        const __half* sx_lo = sx + (wm * 32 + qa_row) * LD;
+#endif
+        uint32_t pf_w0[2], pf_w1[2];
+        uint8_t pf_d[2];
+        if constexpr (WT == 40) {
+            pf_w0[0] = *reinterpret_cast<const uint32_t*>(we_g + 4 + sb * 8);
+            pf_w1[0] = *reinterpret_cast<const uint32_t*>(we_g + 8 + sb * 8);
+            pf_d[0] = we_g[sb];
+            pf_w0[1] = *reinterpret_cast<const uint32_t*>(we_u + 4 + sb * 8);
+            pf_w1[1] = *reinterpret_cast<const uint32_t*>(we_u + 8 + sb * 8);
+            pf_d[1] = we_u[sb];
+        }
+        for (int k0 = 0; k0 < K; k0 += WK) {
+            const __half* cxp0 = xp0 + k0;
+            *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
+            if constexpr (WT == 40) {
+                dq_nvfp4_sub16_store_sc(pf_w0[0], pf_w1[0], s_ue4m3[pf_d[0]], sw + wr * LD + sb * 16);
+                dq_nvfp4_sub16_store_sc(pf_w0[1], pf_w1[1], s_ue4m3[pf_d[1]], sw + (64 + wr) * LD + sb * 16);
+            } else {
+                dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16);
+                dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16);
+            }
+            __syncthreads();
+            if constexpr (WT == 40) {
+                if (k0 + WK < K) {
+                    const size_t koff = (size_t) ((k0 + WK) >> 6) * 36;
+                    const uint8_t* wng = we_g + koff;
+                    const uint8_t* wnu = we_u + koff;
+                    pf_w0[0] = *reinterpret_cast<const uint32_t*>(wng + 4 + sb * 8);
+                    pf_w1[0] = *reinterpret_cast<const uint32_t*>(wng + 8 + sb * 8);
+                    pf_d[0] = wng[sb];
+                    pf_w0[1] = *reinterpret_cast<const uint32_t*>(wnu + 4 + sb * 8);
+                    pf_w1[1] = *reinterpret_cast<const uint32_t*>(wnu + 8 + sb * 8);
+                    pf_d[1] = wnu[sb];
+                }
+            }
+#if __CUDA_ARCH__ < 750
+#pragma unroll 1
+            for (int kk = 0; kk < WK; kk += 8) {
+                const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                for (int mr = 0; mr < 2; ++mr) {
+                    const uint4 a = *reinterpret_cast<const uint4*>(sx_lo + mr * 16 * LD + kk);
+                    hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                    hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                    hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                    hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                }
+            }
+#else
+#pragma unroll
+            for (int kk = 0; kk < WK; kk += 16) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb0, fb1;
+                wmma::load_matrix_sync(fb0, sw + (wn * 16) * LD + kk, LD);
+                wmma::load_matrix_sync(fb1, sw + (64 + wn * 16) * LD + kk, LD);
+#pragma unroll
+                for (int mr = 0; mr < 2; ++mr) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::load_matrix_sync(fa, sx + (wm * 32 + mr * 16) * LD + kk, LD);
+                    wmma::mma_sync(acc[mr][0], fa, fb0, acc[mr][0]);
+                    wmma::mma_sync(acc[mr][1], fa, fb1, acc[mr][1]);
+                }
+            }
+#endif
+            __syncthreads();
+        }
+    }
+
+    const float inv_b = __fdividef(1.0f, beta);
+    const float inv_lb = lb > 0.0f ? __fdividef(1.0f, lb) : 0.0f;
+#if __CUDA_ARCH__ < 750
+    const int mr_lim = has_hi ? 4 : 2;
+    const int wm_base = has_hi ? (wm * 64) : (wm * 32);
+#pragma unroll
+    for (int mr = 0; mr < 4; ++mr) {
+        if (mr >= mr_lim) break;
+        const int r0 = wm_base + mr * 16 + acc_r0;
+        const int r1 = wm_base + mr * 16 + acc_r1;
+        if (r0 < rows) {
+            __half* dst0 = h16 + (size_t) (c0 + r0) * N_out + col0 + wn * 16;
+            *reinterpret_cast<__half2*>(dst0 + acc_c0) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][0], sc_g), __fmul_rn(acc[mr][1][0], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][1], sc_g), __fmul_rn(acc[mr][1][1], sc_u), beta, inv_b, lb, inv_lb));
+            *reinterpret_cast<__half2*>(dst0 + acc_c1) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][4], sc_g), __fmul_rn(acc[mr][1][4], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][5], sc_g), __fmul_rn(acc[mr][1][5], sc_u), beta, inv_b, lb, inv_lb));
+        }
+        if (r1 < rows) {
+            __half* dst1 = h16 + (size_t) (c0 + r1) * N_out + col0 + wn * 16;
+            *reinterpret_cast<__half2*>(dst1 + acc_c0) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][2], sc_g), __fmul_rn(acc[mr][1][2], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][3], sc_g), __fmul_rn(acc[mr][1][3], sc_u), beta, inv_b, lb, inv_lb));
+            *reinterpret_cast<__half2*>(dst1 + acc_c1) = __floats2half2_rn(
+                wmma_situ_eval(__fmul_rn(acc[mr][0][6], sc_g), __fmul_rn(acc[mr][1][6], sc_u), beta, inv_b, lb, inv_lb),
+                wmma_situ_eval(__fmul_rn(acc[mr][0][7], sc_g), __fmul_rn(acc[mr][1][7], sc_u), beta, inv_b, lb, inv_lb));
+        }
+    }
+#else
+    const int mr_lim = has_hi ? 4 : 2;
+    const int wm_base = has_hi ? (wm * 64) : (wm * 32);
+    float* s_out = reinterpret_cast<float*>(smem);
+#pragma unroll
+    for (int mr = 0; mr < 4; ++mr) {
+        if (mr >= mr_lim) break;
+#pragma unroll
+        for (int i = 0; i < acc[mr][0].num_elements; ++i) {
+            acc[mr][0].x[i] = wmma_situ_eval(__fmul_rn(acc[mr][0].x[i], sc_g), __fmul_rn(acc[mr][1].x[i], sc_u), beta, inv_b, lb, inv_lb);
+        }
+        wmma::store_matrix_sync(s_out + (wm_base + mr * 16) * 64 + wn * 16, acc[mr][0], 64, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int i4 = tid; i4 < rows * 16; i4 += 256) {
+        const int r = i4 >> 4, c = (i4 & 15) << 2;
+        const float4 v = reinterpret_cast<const float4*>(s_out)[i4];
+        __half2 p0 = __floats2half2_rn(v.x, v.y);
+        __half2 p1 = __floats2half2_rn(v.z, v.w);
+        uint2 out2;
+        memcpy(&out2.x, &p0, 4);
+        memcpy(&out2.y, &p1, 4);
+        *reinterpret_cast<uint2*>(h16 + (size_t) (c0 + r) * N_out + col0 + c) = out2;
+    }
+#endif
+#else
+    (void) grp_ptr; (void) grp_start; (void) tile_g; (void) tile_c0; (void) n_tiles; (void) ent_idx; (void) X; (void) L; (void) beta; (void) lb; (void) h16;
+#endif
+}
+
 /// BM=64 WK=64 grouped WMMA kernel (NVFP4=40, Q8_0=8, Q5_K=13, Q4_K=12) with 18-27KB smem and register prefetch.
 /// On Volta sm_70 (__CUDA_ARCH__ < 750): uses native PTX HMMA.884 (mma.sync.aligned.m8n8k4.row.col) + LDS.128 +
 /// register-direct float2 epilogue + 3-blk/SM occupancy.
-template <int WT, bool IS_DOWN, int BN>
+template <int WT, bool IS_DOWN, int BN, bool USE_TILES = false>
 __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_idx,
-    const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1) {
+    const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1,
+    const int32_t* __restrict__ tile_g = nullptr, const int32_t* __restrict__ tile_c0 = nullptr,
+    const int32_t* __restrict__ n_tiles = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     constexpr int BM = 64, WK = 64, LD = 72;
@@ -8089,13 +8690,19 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
     };
 #endif
 
-    for (int g = (int) blockIdx.z; g < ng; g += (int) gridDim.z) {
+    if constexpr (USE_TILES) {
+        if ((int) blockIdx.y >= *n_tiles) return;
+    }
+    for (int gi = USE_TILES ? 0 : (int) blockIdx.z; gi < (USE_TILES ? 1 : ng); gi += (USE_TILES ? 1 : (int) gridDim.z)) {
+        const int g = USE_TILES ? tile_g[blockIdx.y] : gi;
         const uint8_t* blob = (const uint8_t*) grp_ptr[g];
         const uint8_t* we_t = blob + role_off + (size_t) (col0 + wr) * row_stride;
         const float sc = L.tail_off ? ((const float*) (blob + L.tail_off))[IS_DOWN ? 2 : (is_up ? 1 : 0)] : 1.0f;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        const int c_begin = USE_TILES ? tile_c0[blockIdx.y] : (e0 + (int) blockIdx.y * BM);
+        const int c_end   = USE_TILES ? min(e1, c_begin + 1) : e1;
 
-        for (int c0 = e0 + (int) blockIdx.y * BM; c0 < e1; c0 += ch_per_e * BM) {
+        for (int c0 = c_begin; c0 < c_end; c0 += ch_per_e * BM) {
             const int rows = min(BM, e1 - c0);
             const bool x_ok = (xr < rows);
             const int in_row = x_ok ? (IS_DOWN ? (c0 + xr) : ent_idx[c0 + xr]) : 0;
@@ -8314,11 +8921,13 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
 /// Adaptive BM=128 (fast MR=2 for <=64 rows, single-weight-load MR=4 for 65..128 rows), BN=128, WK=64, 2 blk/SM (37 KB SMEM).
 /// Cuts expert weight reloads in half on long prefills (T >= 512) and runs BN=128 + vectorized decode for NVFP4/Q5_K/Q4_K/Q8_0.
 /// On Volta sm_70 (__CUDA_ARCH__ < 750): uses native PTX HMMA.884 + LDS.128 + register-direct float2 epilogue.
-template <int WT, bool IS_DOWN>
+template <int WT, bool IS_DOWN, bool USE_TILES = false>
 __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_idx,
-    const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1) {
+    const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1,
+    const int32_t* __restrict__ tile_g = nullptr, const int32_t* __restrict__ tile_c0 = nullptr,
+    const int32_t* __restrict__ n_tiles = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     constexpr int BM = 128, BN = 128, WK = 64, LD = 72;
@@ -8369,13 +8978,19 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     };
 #endif
 
-    for (int g = (int) blockIdx.z; g < ng; g += (int) gridDim.z) {
+    if constexpr (USE_TILES) {
+        if ((int) blockIdx.y >= *n_tiles) return;
+    }
+    for (int gi = USE_TILES ? 0 : (int) blockIdx.z; gi < (USE_TILES ? 1 : ng); gi += (USE_TILES ? 1 : (int) gridDim.z)) {
+        const int g = USE_TILES ? tile_g[blockIdx.y] : gi;
         const uint8_t* blob = (const uint8_t*) grp_ptr[g];
         const uint8_t* we_t = blob + role_off + (size_t) (col0 + wr) * row_stride;
         const float sc = L.tail_off ? ((const float*) (blob + L.tail_off))[IS_DOWN ? 2 : (is_up ? 1 : 0)] : 1.0f;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        const int c_begin = USE_TILES ? tile_c0[blockIdx.y] : (e0 + (int) blockIdx.y * BM);
+        const int c_end   = USE_TILES ? min(e1, c_begin + 1) : e1;
 
-        for (int c0 = e0 + (int) blockIdx.y * BM; c0 < e1; c0 += ch_per_e * BM) {
+        for (int c0 = c_begin; c0 < c_end; c0 += ch_per_e * BM) {
             const int rows = min(BM, e1 - c0);
             const bool has_hi = (rows > 64);
             const bool x0_ok = (xr < rows);
@@ -8592,10 +9207,12 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                     __syncthreads();
                     const int r_start = mh * 64;
                     const int n_valid = max(0, min(rows, r_start + 64) - r_start);
-                    for (int i = tid; i < n_valid * BN; i += 256) {
-                        const int r = r_start + (i >> 7), c = i & 127;
+                    for (int i4 = tid; i4 < n_valid * (BN / 4); i4 += 256) {
+                        const int r = r_start + (i4 >> 5), c4 = i4 & 31;
                         const int out_row = IS_DOWN ? ent_idx[c0 + r] : (c0 + r);
-                        dst_mat[(size_t) out_row * N_out + col0 + c] = s_out[i] * sc;
+                        const float4 v = reinterpret_cast<const float4*>(s_out)[i4];
+                        reinterpret_cast<float4*>(dst_mat + (size_t) out_row * N_out + col0)[c4] =
+                            make_float4(v.x * sc, v.y * sc, v.z * sc, v.w * sc);
                     }
                     __syncthreads();
                 }
@@ -8659,6 +9276,16 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             cudaFuncSetAttribute(wmma_grouped_128_kernel<12, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<8, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<8, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_128_kernel<40, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_128_kernel<8, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<40>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<13>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<12>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<8>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<40>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<13>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<12>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<8>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         }
     }
     if (cc_ok[dev] != 2) return false;
@@ -8677,75 +9304,140 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     __half* h16 = (__half*) ((uint8_t*) scratch + 2 * fa);
 
     const bool is_volta = (cc_volta[dev] != 0);
-    if (use_bm128 && (L.gu_type != 40 || is_volta)) {
-        const dim3 ggu128((unsigned) (2 * L.n_ff / 128), (unsigned) ch_per_e128, (unsigned) cap_groups);
-        if (L.gu_type == 40) {
-            wmma_grouped_128_kernel<40, false><<<ggu128, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
-        } else if (L.gu_type == 13) {
-            wmma_grouped_128_kernel<13, false><<<ggu128, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
-        } else if (L.gu_type == 12) {
-            wmma_grouped_128_kernel<12, false><<<ggu128, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+    // Fused GU+SiTU BM=128 uses 1-shot vectorized uint2 epilogue & halves NVFP4 weight reads on BOTH Volta & Ada!
+    const bool can_fused_gu_situ = L.situ && (L.n_ff % 64 == 0) && cap_groups <= 256;
+    const bool gu_bm128 = use_bm128 && (can_fused_gu_situ || L.gu_type != 40 || is_volta);
+    const bool dn_bm128 = use_bm128 && (L.d_type != 40 || is_volta);
+    const int gu_bm = gu_bm128 ? 128 : 64;
+    const int64_t cap_tiles_gu = (cap_entries / gu_bm) + cap_groups;
+    const bool use_fused_gu_situ = can_fused_gu_situ &&
+                                   cap_tiles_gu > 0 && cap_tiles_gu <= 65535 &&
+                                   ((size_t) (cap_tiles_gu * 2 + 1) * sizeof(int32_t) <= 2 * fa);
+
+    int32_t* tile_g = nullptr;
+    int32_t* tile_c0 = nullptr;
+    int32_t* n_tiles = nullptr;
+    if (use_fused_gu_situ) {
+        tile_g = (int32_t*) scratch;
+        tile_c0 = tile_g + cap_tiles_gu;
+        n_tiles = tile_c0 + cap_tiles_gu;
+        if (gu_bm128) {
+            k_build_wmma_tiles<128><<<1, 256, 0, s>>>(grp_start, n_groups, tile_g, tile_c0, n_tiles);
+            const dim3 ggu_f((unsigned) (L.n_ff / 64), (unsigned) cap_tiles_gu);
+            if (L.gu_type == 40) {
+                wmma_grouped_gu_situ_128_kernel<40><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else if (L.gu_type == 13) {
+                wmma_grouped_gu_situ_128_kernel<13><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else if (L.gu_type == 12) {
+                wmma_grouped_gu_situ_128_kernel<12><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else {
+                wmma_grouped_gu_situ_128_kernel<8><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            }
         } else {
-            wmma_grouped_128_kernel<8, false><<<ggu128, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            k_build_wmma_tiles<64><<<1, 256, 0, s>>>(grp_start, n_groups, tile_g, tile_c0, n_tiles);
+            const dim3 ggu_f((unsigned) (L.n_ff / 64), (unsigned) cap_tiles_gu);
+            if (L.gu_type == 40) {
+                wmma_grouped_gu_situ_64_kernel<40><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else if (L.gu_type == 13) {
+                wmma_grouped_gu_situ_64_kernel<13><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else if (L.gu_type == 12) {
+                wmma_grouped_gu_situ_64_kernel<12><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else {
+                wmma_grouped_gu_situ_64_kernel<8><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            }
         }
+        check("native_expert_grouped_wmma/gu_situ");
     } else {
-        const int gu_bn = (L.gu_type == 40 && use_bn128) ? 128 : 64;
-        const dim3 ggu64((unsigned) (2 * L.n_ff / gu_bn), (unsigned) ch_per_e64, (unsigned) cap_groups);
-        if (L.gu_type == 40) {
-            if (use_bn128) {
-                wmma_grouped_64_kernel<40, false, 128><<<ggu64, 256, 0, s>>>(
+        if (gu_bm128) {
+            const dim3 ggu128((unsigned) (2 * L.n_ff / 128), (unsigned) ch_per_e128, (unsigned) cap_groups);
+            if (L.gu_type == 40) {
+                wmma_grouped_128_kernel<40, false, false><<<ggu128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            } else if (L.gu_type == 13) {
+                wmma_grouped_128_kernel<13, false, false><<<ggu128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            } else if (L.gu_type == 12) {
+                wmma_grouped_128_kernel<12, false, false><<<ggu128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
             } else {
-                wmma_grouped_64_kernel<40, false, 64><<<ggu64, 256, 0, s>>>(
+                wmma_grouped_128_kernel<8, false, false><<<ggu128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
             }
-        } else if (L.gu_type == 13) {
-            wmma_grouped_64_kernel<13, false, 64><<<ggu64, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
-        } else if (L.gu_type == 12) {
-            wmma_grouped_64_kernel<12, false, 64><<<ggu64, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
         } else {
-            wmma_grouped_64_kernel<8, false, 64><<<ggu64, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            const int gu_bn = (L.gu_type == 40 && use_bn128) ? 128 : 64;
+            const dim3 ggu64((unsigned) (2 * L.n_ff / gu_bn), (unsigned) ch_per_e64, (unsigned) cap_groups);
+            if (L.gu_type == 40) {
+                if (use_bn128) {
+                    wmma_grouped_64_kernel<40, false, 128, false><<<ggu64, 256, 0, s>>>(
+                        grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+                } else {
+                    wmma_grouped_64_kernel<40, false, 64, false><<<ggu64, 256, 0, s>>>(
+                        grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+                }
+            } else if (L.gu_type == 13) {
+                wmma_grouped_64_kernel<13, false, 64, false><<<ggu64, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            } else if (L.gu_type == 12) {
+                wmma_grouped_64_kernel<12, false, 64, false><<<ggu64, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            } else {
+                wmma_grouped_64_kernel<8, false, 64, false><<<ggu64, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            }
         }
-    }
-    check("native_expert_grouped_wmma/gu");
+        check("native_expert_grouped_wmma/gu");
 
-    const unsigned act_blocks = (unsigned) std::min<int64_t>(4096, ((est_ent * L.n_ff) + 255) / 256);
-    if (L.situ) {
-        situ_f16_valid_kernel<<<act_blocks, 256, 0, s>>>(gate, up, h16, grp_start, n_groups, (int) L.n_ff, L.situ_beta, L.situ_linear_beta);
-    } else {
-        swiglu_f16_valid_kernel<<<act_blocks, 256, 0, s>>>(gate, up, h16, grp_start, n_groups, (int) L.n_ff);
-    }
-    check("native_expert_grouped_wmma/act");
-
-    if (use_bm128 && (L.d_type != 40 || is_volta)) {
-        const dim3 gd128((unsigned) (L.n_embd / 128), (unsigned) ch_per_e128, (unsigned) cap_groups);
-        if (L.d_type == 40) {
-            wmma_grouped_128_kernel<40, true><<<gd128, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+        const unsigned act_blocks = (unsigned) std::min<int64_t>(4096, ((est_ent * L.n_ff) + 255) / 256);
+        if (L.situ) {
+            situ_f16_valid_kernel<<<act_blocks, 256, 0, s>>>(gate, up, h16, grp_start, n_groups, (int) L.n_ff, L.situ_beta, L.situ_linear_beta);
         } else {
-            wmma_grouped_128_kernel<8, true><<<gd128, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+            swiglu_f16_valid_kernel<<<act_blocks, 256, 0, s>>>(gate, up, h16, grp_start, n_groups, (int) L.n_ff);
+        }
+        check("native_expert_grouped_wmma/act");
+    }
+
+    const bool dn_use_tiles = (tile_g != nullptr && dn_bm128 && gu_bm128);
+    if (dn_bm128) {
+        if (dn_use_tiles) {
+            const dim3 gd128((unsigned) (L.n_embd / 128), (unsigned) cap_tiles_gu, 1u);
+            if (L.d_type == 40) {
+                wmma_grouped_128_kernel<40, true, true><<<gd128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr, tile_g, tile_c0, n_tiles);
+            } else {
+                wmma_grouped_128_kernel<8, true, true><<<gd128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr, tile_g, tile_c0, n_tiles);
+            }
+        } else {
+            const dim3 gd128((unsigned) (L.n_embd / 128), (unsigned) ch_per_e128, (unsigned) cap_groups);
+            if (L.d_type == 40) {
+                wmma_grouped_128_kernel<40, true, false><<<gd128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+            } else {
+                wmma_grouped_128_kernel<8, true, false><<<gd128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+            }
         }
     } else {
         const int d_bn = (L.d_type == 40 && use_bn128) ? 128 : 64;
         const dim3 gd64((unsigned) (L.n_embd / d_bn), (unsigned) ch_per_e64, (unsigned) cap_groups);
         if (L.d_type == 40) {
             if (use_bn128) {
-                wmma_grouped_64_kernel<40, true, 128><<<gd64, 256, 0, s>>>(
+                wmma_grouped_64_kernel<40, true, 128, false><<<gd64, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
             } else {
-                wmma_grouped_64_kernel<40, true, 64><<<gd64, 256, 0, s>>>(
+                wmma_grouped_64_kernel<40, true, 64, false><<<gd64, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
             }
         } else {
-            wmma_grouped_64_kernel<8, true, 64><<<gd64, 256, 0, s>>>(
+            wmma_grouped_64_kernel<8, true, 64, false><<<gd64, 256, 0, s>>>(
                 grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
         }
     }
