@@ -126,6 +126,7 @@ struct DenseMat {
     int64_t n_out = 0;
     void* d = nullptr;
     size_t bytes = 0;
+    bool q8_in_place = false;
 };
 
 struct GpuWeightStore {
@@ -211,12 +212,14 @@ struct GpuWeightStore {
         }
         const size_t bytes = rb * (size_t) ne1;
         uint8_t* d = gpu_alloc<uint8_t>(bytes);
+        bool packed_in_place = false;
         if (t->type == 8 && pack_q8_in_place && K::native_q8_0_packed_eligible((int) ne0, (int) ne1)) {
             std::vector<uint8_t> packed(bytes);
             K::native_q8_0_pack_host(raw, packed.data(), (int) ne0, (int) ne1);
             CK(cudaMemcpy(d, packed.data(), bytes, cudaMemcpyHostToDevice));
             K::native_q8_0_packed_register(d, d, (int) ne0, (int) ne1);
             q8_packed_keys.push_back(d);
+            packed_in_place = true;
         } else {
             CK(cudaMemcpy(d, raw, bytes, cudaMemcpyHostToDevice));
             if (t->type == 8 && pack_q8_extra && K::native_q8_0_packed_enabled() && K::native_q8_0_packed_eligible((int) ne0, (int) ne1)) {
@@ -229,7 +232,7 @@ struct GpuWeightStore {
             }
         }
         if (t->type != 30 && t->type != 0 && t->type != 1) has_quant_dense = true;
-        return DenseMat{(int) t->type, ne0, ne1, d, bytes};
+        return DenseMat{(int) t->type, ne0, ne1, d, bytes, packed_in_place};
     }
 };
 
@@ -1228,7 +1231,7 @@ struct Engine {
 
         CK(cudaMallocHost(&h_ids, (size_t) max_ent * sizeof(int32_t)));
         CK(cudaMallocHost(&h_ewts, (size_t) max_ent * sizeof(float)));
-        CK(cudaMallocHost(&h_cpu_sum, (size_t) N * sizeof(float)));
+        CK(cudaMallocHost(&h_cpu_sum, (size_t) std::max(verify_max_t, 8) * (size_t) N * sizeof(float)));
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_rebal, cudaEventDisableTiming));
         CK(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking));
@@ -1399,7 +1402,7 @@ struct Engine {
         if (T <= 8 && (K_in % blck) == 0) {
             if (!q8_ready) K::native_quantize_q8_1(X, xq, (int) K_in, T, st);
             const void* xq_ptr = q8_ready ? q8_ready : xq;
-            if (W.type == 8 && T >= 1 && (K_in % 256) == 0 && ((((uintptr_t) W.d) & 3u) == 0u)) {
+            if (W.type == 8 && !W.q8_in_place && T >= 1 && (K_in % 256) == 0 && ((((uintptr_t) W.d) & 3u) == 0u)) {
                 const unsigned nb = (unsigned) ((N_out + 3) / 4);
                 const uint8_t* w8 = (const uint8_t*) W.d;
                 const uint32_t* xu = (const uint32_t*) xq_ptr;
@@ -1434,9 +1437,27 @@ struct Engine {
         project_preq(X, nullptr, W, Y, T, N_out, K_in);
     }
 
+    bool try_project_pair_bf16(const float* X, const DenseMat& W1, float* Y1, int64_t N1,
+                               const DenseMat& W2, float* Y2, int64_t N2, int T, int64_t K_in) {
+        if (W1.type != 30 || W2.type != 30 || T < 2 || T > 8 || (K_in % 8) != 0) return false;
+        const unsigned nb = (unsigned) ((N1 + N2 + 7) / 8);
+        const uint16_t* w1 = (const uint16_t*) W1.d;
+        const uint16_t* w2 = (const uint16_t*) W2.d;
+        if (T == 4) {
+            k_gemm_bf16_smallT_warp<4, true, true><<<nb, 256, 0, st>>>(w1, X, Y1, (int) K_in, (int) N1, 4, w2, Y2, (int) N2);
+        } else if (T == 2) {
+            k_gemm_bf16_smallT_warp<2, true, true><<<nb, 256, 0, st>>>(w1, X, Y1, (int) K_in, (int) N1, 2, w2, Y2, (int) N2);
+        } else if (T == 3) {
+            k_gemm_bf16_smallT_warp<3, true, true><<<nb, 256, 0, st>>>(w1, X, Y1, (int) K_in, (int) N1, 3, w2, Y2, (int) N2);
+        } else {
+            k_gemm_bf16_smallT_warp<8, false, true><<<nb, 256, 0, st>>>(w1, X, Y1, (int) K_in, (int) N1, T, w2, Y2, (int) N2);
+        }
+        return true;
+    }
+
     bool try_project_pair_q8_0(const void* q8_ready, const DenseMat& W1, float* Y1, int64_t N1,
                                const DenseMat& W2, float* Y2, int64_t N2, int T, int64_t K_in) {
-        if (!q8_ready || W1.type != 8 || W2.type != 8 || T < 1 || T > 8) return false;
+        if (!q8_ready || W1.type != 8 || W2.type != 8 || W1.q8_in_place || W2.q8_in_place || T < 1 || T > 8) return false;
         if ((K_in % 256) != 0 || (N1 & 3) != 0) return false;
         if (((((uintptr_t) W1.d) | ((uintptr_t) W2.d)) & 3u) != 0u) return false;
         const unsigned nb = (unsigned) ((N1 + N2 + 3) / 4);
@@ -1701,8 +1722,8 @@ struct Engine {
 
         const auto tp_moe_r0 = Clock::now();
         if (!pre_routed_t1) {
-            if (need_cpu && T == 1 && !pp_streaming) {
-                CK(cudaMemcpyAsync(h_h, x_norm, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
+            if (need_cpu && T >= 1 && T <= 8 && !pp_streaming) {
+                CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
             project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
             if (fused_rg) {
@@ -1789,8 +1810,11 @@ struct Engine {
         if (need_cpu) {
             if (!pre_routed_t1) {
                 CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
-                if (T == 1) CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) Kp * sizeof(float), cudaMemcpyDeviceToHost, st));
-                else CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost, st));
+                if (T >= 1 && T <= 8) {
+                    CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) n_ent * sizeof(float), cudaMemcpyDeviceToHost, st));
+                } else {
+                    CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost, st));
+                }
             }
             CK(cudaEventRecord(ev_route, st));
         }
@@ -1887,30 +1911,36 @@ struct Engine {
                     else p_d_cpu_nv += c_ms;
                 }
                 const auto tp_u0 = Clock::now();
-                if (T == 1) {
-                    // Pre-combine all CPU-missed experts into 1 single N-float vector (9 KB vs 72 KB H2D, 0 k_merge_cpu!).
-                    bool first = true;
-                    for (int e = 0; e < Kp; ++e) {
-                        if (!h_miss[e]) continue;
-                        const float w = h_ewts[e];
-                        const float* src = cpu_out + (size_t) e * N;
-                        if (first) {
-                            for (int i = 0; i < N; ++i) h_cpu_sum[i] = w * src[i];
-                            first = false;
-                        } else {
-                            for (int i = 0; i < N; ++i) h_cpu_sum[i] += w * src[i];
+                if (T >= 1 && T <= std::max(verify_max_t, 8) && !skip_combine) {
+                    // Pre-combine all CPU-missed experts per token into T x N floats (8x smaller H2D, 0 k_merge_cpu!).
+                    for (int t = 0; t < T; ++t) {
+                        float* dst = h_cpu_sum + (size_t) t * N;
+                        const int base = t * Kp;
+                        bool first = true;
+                        for (int k = 0; k < Kp; ++k) {
+                            if (!h_miss[base + k]) continue;
+                            const float w = h_ewts[base + k];
+                            const float* src = cpu_out + (size_t) (base + k) * N;
+                            if (first) {
+                                for (int i = 0; i < N; ++i) dst[i] = w * src[i];
+                                first = false;
+                            } else {
+                                for (int i = 0; i < N; ++i) dst[i] += w * src[i];
+                            }
                         }
+                        if (first) std::memset(dst, 0, (size_t) N * sizeof(float));
                     }
+                    const size_t sum_bytes = (size_t) T * (size_t) N * sizeof(float);
                     if (has_gpu) {
-                        CK(cudaMemcpyAsync(ecpu, h_cpu_sum, (size_t) N * sizeof(float), cudaMemcpyHostToDevice, st));
+                        CK(cudaMemcpyAsync(ecpu, h_cpu_sum, sum_bytes, cudaMemcpyHostToDevice, st));
                         if (prof) { CK(cudaStreamSynchronize(st)); p_moe_up_ms += ms_since(tp_u0); }
                         const auto tp_p0 = Clock::now();
                         const int n4 = ((N & 3) == 0) ? (N >> 2) : N;
-                        k_combine_experts_hybrid<<<(unsigned) ((n4 + 255) / 256), 256, 0, st>>>(
+                        k_combine_experts_hybrid<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) T), 256, 0, st>>>(
                             eparts, ewts, ids, L.d_slot_of, ecpu, moe_raw, N, Kp);
                         if (prof) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
                     } else {
-                        CK(cudaMemcpyAsync(moe_raw, h_cpu_sum, (size_t) N * sizeof(float), cudaMemcpyHostToDevice, st));
+                        CK(cudaMemcpyAsync(moe_raw, h_cpu_sum, sum_bytes, cudaMemcpyHostToDevice, st));
                         if (prof) { CK(cudaStreamSynchronize(st)); p_moe_up_ms += ms_since(tp_u0); }
                     }
                     return;
@@ -2629,14 +2659,16 @@ struct Engine {
                     pR = qgr_t1 + 2 * q_dim;
                     project_preq(in_q, xq, L.attn_qgr, qgr_t1, 1, L.attn_qgr.n_out, N);
                 } else {
-                    if (!try_project_pair_q8_0(xq, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N)) {
+                    if (!try_project_pair_bf16(in_q, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N) &&
+                        !try_project_pair_q8_0(xq, L.attn_q, Q, q_dim, L.attn_gate, att_gate, q_dim, T, N)) {
                         project_preq(in_q, xq, L.attn_q, Q, T, q_dim, N, f16_q);
                         project_preq(in_q, xq, L.attn_gate, att_gate, T, q_dim, N, f16_q);
                     }
                     project_preq(in_q, xq, L.attn_rel, R, T, rel_dim, N, f16_q);
                 }
-                const bool paired_kv = (T >= 2 && T <= 8 && xq_v_src == xq_k_src &&
-                                        try_project_pair_q8_0(xq_k_src, L.attn_k, K, kv_dim, L.attn_v, V, kv_dim, T, N));
+                const bool paired_kv = (T >= 2 && T <= 8 && inv_src == ink_src &&
+                                        (try_project_pair_bf16(ink_src, L.attn_k, K, kv_dim, L.attn_v, V, kv_dim, T, N) ||
+                                         try_project_pair_q8_0(xq_k_src, L.attn_k, K, kv_dim, L.attn_v, V, kv_dim, T, N)));
                 if (!paired_kv) {
                     if (!is_swa && T == 1 && L.attn_kkc.d != nullptr) {
                         float* kbuf = qgr_t1 + 2 * q_dim + rel_dim;
@@ -3074,7 +3106,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const bool core_res_hy = (E.profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
-    const size_t reserve = core_res_hy ? ((size_t) 144 << 20) : ((size_t) 256 << 20);
+    // DSpark adds dflare_graph + markov_graphs + verify_core_graph; keep 288 MiB headroom when enabled.
+    const size_t reserve = core_res_hy
+        ? (E.verify_max_t > 1 ? ((size_t) 288 << 20) : ((size_t) 144 << 20))
+        : ((size_t) 256 << 20);
     size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                     : (fr > reserve ? fr - reserve : 0);
 
@@ -3592,7 +3627,7 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
             if (out_hit_eos) *out_hit_eos = true;
             break;
         }
-        if (E.hybrid && (emitted % 8 < (1 + m))) E.rebalance(E.core_all_gpu ? 4 : 6);
+        if (E.hybrid && (emitted % 8 < (1 + m))) E.rebalance(E.core_all_gpu ? 8 : 12, 2);
     }
 }
 
@@ -3875,8 +3910,8 @@ int run(int argc, char** argv) {
                     if (dspark) dspark->inject(E, pos_pre, tc);
                     live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
                     if (E.hybrid) {
-                        if (E.rebal_burst > 0) { E.rebalance(48, 8); --E.rebal_burst; }
-                        else if ((++E.pp_chunk_cnt & 3) == 0) E.rebalance(8, 2);
+                        if (E.rebal_burst > 0) { E.rebalance(192, 16); --E.rebal_burst; }
+                        else if ((++E.pp_chunk_cnt & 3) == 0) E.rebalance(16, 2);
                     }
                     const double el_ms = ms_since(t_pp0);
                     const double done_fresh = (double) (off + (size_t) tc - reuse);
@@ -3955,6 +3990,7 @@ int run(int argc, char** argv) {
             w = E.forward(prompt.data() + off, tc, false, nullptr, false, dspark != nullptr, 0, nullptr, is_last_w);
             if (dspark) dspark->inject(E, p0, tc);
         }
+        if (E.hybrid) E.rebalance(192, 16);
         if (max_new > 0) {
             if (dspark && max_new >= 2) {
                 std::vector<int32_t> wd;

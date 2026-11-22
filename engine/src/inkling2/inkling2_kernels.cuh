@@ -1217,28 +1217,65 @@ __global__ void k_gemm_bf16_smallT_cta(const uint16_t* __restrict__ W, const flo
 }
 
 /// Small-T (2..8) BF16-weight x FP32-activation GEMM (n_out > 128): 8 warps/block, 1 warp per output row.
-template <int MT, bool EXACT_T>
+/// Small-T (1..8) BF16-weight x FP32-activation GEMM (n_out > 128): 8 warps/CTA, 1 warp per output row.
+/// Uses 16-byte LDG.128 (uint4 = 8 BF16s/load) when n_in % 8 == 0, plus optional PAIR fusion (W1->Y1, W2->Y2).
+template <int MT, bool EXACT_T, bool PAIR = false>
 __global__ void k_gemm_bf16_smallT_warp(const uint16_t* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y,
-                                        int n_in, int n_out, int T) {
+                                        int n_in, int n_out, int T,
+                                        const uint16_t* __restrict__ W2 = nullptr, float* __restrict__ Y2 = nullptr, int n_out2 = 0) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int o = blockIdx.x * 8 + warp;
-    if (o >= n_out) return;
-    const int n4 = n_in >> 2;
-    const uint2* wr = reinterpret_cast<const uint2*>(W + (size_t) o * n_in);
+    const int o_all = blockIdx.x * 8 + warp;
+    const int tot_out = PAIR ? (n_out + n_out2) : n_out;
+    if (o_all >= tot_out) return;
+    const bool use2 = PAIR && (o_all >= n_out);
+    const int o = use2 ? (o_all - n_out) : o_all;
+    const uint16_t* Wsrc = use2 ? W2 : W;
+    float* Ydst = use2 ? Y2 : Y;
+    const int out_stride = use2 ? n_out2 : n_out;
+
     float acc[MT];
 #pragma unroll
     for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
-    for (int i = lane; i < n4; i += 32) {
-        const uint2 w2 = wr[i];
-        const float w0 = __uint_as_float((w2.x & 0xFFFFu) << 16);
-        const float w1 = __uint_as_float(w2.x & 0xFFFF0000u);
-        const float w2f = __uint_as_float((w2.y & 0xFFFFu) << 16);
-        const float w3 = __uint_as_float(w2.y & 0xFFFF0000u);
+
+    if ((n_in & 7) == 0) {
+        const int n8 = n_in >> 3;
+        const uint4* wr = reinterpret_cast<const uint4*>(Wsrc + (size_t) o * n_in);
+        for (int i = lane; i < n8; i += 32) {
+            const uint4 w4 = wr[i];
+            const float w0 = __uint_as_float((w4.x & 0xFFFFu) << 16);
+            const float w1 = __uint_as_float(w4.x & 0xFFFF0000u);
+            const float w2 = __uint_as_float((w4.y & 0xFFFFu) << 16);
+            const float w3 = __uint_as_float(w4.y & 0xFFFF0000u);
+            const float w4f = __uint_as_float((w4.z & 0xFFFFu) << 16);
+            const float w5 = __uint_as_float(w4.z & 0xFFFF0000u);
+            const float w6 = __uint_as_float((w4.w & 0xFFFFu) << 16);
+            const float w7 = __uint_as_float(w4.w & 0xFFFF0000u);
 #pragma unroll
-        for (int t = 0; t < MT; ++t) {
-            if (EXACT_T || t < T) {
-                const float4 b = reinterpret_cast<const float4*>(X + (size_t) t * n_in)[i];
-                acc[t] += w0 * b.x + w1 * b.y + w2f * b.z + w3 * b.w;
+            for (int t = 0; t < MT; ++t) {
+                if (EXACT_T || t < T) {
+                    const float4* xr = reinterpret_cast<const float4*>(X + (size_t) t * n_in);
+                    const float4 b0 = xr[i * 2];
+                    const float4 b1 = xr[i * 2 + 1];
+                    acc[t] += (w0 * b0.x + w1 * b0.y + w2 * b0.z + w3 * b0.w)
+                            + (w4f * b1.x + w5 * b1.y + w6 * b1.z + w7 * b1.w);
+                }
+            }
+        }
+    } else {
+        const int n4 = n_in >> 2;
+        const uint2* wr = reinterpret_cast<const uint2*>(Wsrc + (size_t) o * n_in);
+        for (int i = lane; i < n4; i += 32) {
+            const uint2 w2 = wr[i];
+            const float w0 = __uint_as_float((w2.x & 0xFFFFu) << 16);
+            const float w1 = __uint_as_float(w2.x & 0xFFFF0000u);
+            const float w2f = __uint_as_float((w2.y & 0xFFFFu) << 16);
+            const float w3 = __uint_as_float(w2.y & 0xFFFF0000u);
+#pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                if (EXACT_T || t < T) {
+                    const float4 b = reinterpret_cast<const float4*>(X + (size_t) t * n_in)[i];
+                    acc[t] += w0 * b.x + w1 * b.y + w2f * b.z + w3 * b.w;
+                }
             }
         }
     }
@@ -1248,7 +1285,7 @@ __global__ void k_gemm_bf16_smallT_warp(const uint16_t* __restrict__ W, const fl
             float v = acc[t];
 #pragma unroll
             for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-            if (lane == 0) Y[(size_t) t * n_out + o] = v;
+            if (lane == 0) Ydst[(size_t) t * out_stride + o] = v;
         }
     }
 }
@@ -6887,29 +6924,33 @@ __global__ void k_combine_experts_hybrid(const float* __restrict__ eparts, const
                                          const int32_t* __restrict__ ids, const int32_t* __restrict__ slot_of,
                                          const float* __restrict__ cpu_sum, float* __restrict__ out,
                                          int N, int top_k) {
+    const int t = (int) blockIdx.y;
+    const size_t base = (size_t) t * top_k;
+    const float* cs = cpu_sum + (size_t) t * N;
+    float* dst = out + (size_t) t * N;
     if ((N & 3) == 0) {
         const int n4 = N >> 2;
         const int i4 = blockIdx.x * blockDim.x + threadIdx.x;
         if (i4 >= n4) return;
-        const float4 c = reinterpret_cast<const float4*>(cpu_sum)[i4];
+        const float4 c = reinterpret_cast<const float4*>(cs)[i4];
         float sx = c.x, sy = c.y, sz = c.z, sw = c.w;
         for (int k = 0; k < top_k; ++k) {
-            if (slot_of[ids[k]] >= 0) {
-                const float w = ewts[k];
-                const float4 v = reinterpret_cast<const float4*>(eparts + (size_t) k * N)[i4];
+            if (slot_of[ids[base + k]] >= 0) {
+                const float w = ewts[base + k];
+                const float4 v = reinterpret_cast<const float4*>(eparts + (base + k) * N)[i4];
                 sx += w * v.x; sy += w * v.y; sz += w * v.z; sw += w * v.w;
             }
         }
-        reinterpret_cast<float4*>(out)[i4] = make_float4(sx, sy, sz, sw);
+        reinterpret_cast<float4*>(dst)[i4] = make_float4(sx, sy, sz, sw);
         return;
     }
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    float s = cpu_sum[i];
+    float s = cs[i];
     for (int k = 0; k < top_k; ++k) {
-        if (slot_of[ids[k]] >= 0) s += ewts[k] * eparts[(size_t) k * N + i];
+        if (slot_of[ids[base + k]] >= 0) s += ewts[base + k] * eparts[(base + k) * N + i];
     }
-    out[i] = s;
+    dst[i] = s;
 }
 
 __global__ void k_merge_cpu(float* __restrict__ eparts, const float* __restrict__ ecpu,

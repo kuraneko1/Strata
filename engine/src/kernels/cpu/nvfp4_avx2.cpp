@@ -56,13 +56,20 @@ inline int prefetch_distance() {
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
 
-// sub-blocks 2 h and 2 h + 1 (16 bytes of qs) as their 32 signed doubled E2M1 values, in element order
-inline __m256i values32(const uint8_t* qs, const __m128i kv) {
+// sub-blocks 2 h and 2 h + 1 (16 bytes of qs) as their 32 signed doubled E2M1 values, and magnitudes in parallel
+alignas(16) constexpr uint8_t kAbsFp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, 1, 2, 3, 4, 6, 8, 12};
+
+inline void values32_both(const uint8_t* qs, const __m128i kv, const __m128i ka, __m256i& v_out, __m256i& a_out) {
     const __m128i q = _mm_loadu_si128((const __m128i*) qs);
     const __m128i m4 = _mm_set1_epi8(0x0F);
-    const __m128i lo = _mm_shuffle_epi8(kv, _mm_and_si128(q, m4));
-    const __m128i hi = _mm_shuffle_epi8(kv, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
-    return _mm256_set_m128i(_mm_unpackhi_epi64(lo, hi), _mm_unpacklo_epi64(lo, hi));
+    const __m128i ql = _mm_and_si128(q, m4);
+    const __m128i qh = _mm_and_si128(_mm_srli_epi16(q, 4), m4);
+    const __m128i lo = _mm_shuffle_epi8(kv, ql);
+    const __m128i hi = _mm_shuffle_epi8(kv, qh);
+    const __m128i alo = _mm_shuffle_epi8(ka, ql);
+    const __m128i ahi = _mm_shuffle_epi8(ka, qh);
+    v_out = _mm256_set_m128i(_mm_unpackhi_epi64(lo, hi), _mm_unpacklo_epi64(lo, hi));
+    a_out = _mm256_set_m128i(_mm_unpackhi_epi64(alo, ahi), _mm_unpacklo_epi64(alo, ahi));
 }
 
 inline float hsum8(const __m256 x) {   // ggml's hsum_float_8
@@ -93,17 +100,17 @@ struct Acts {   // per token and block, the two Q8_0 blocks' scales; built once 
 template <int NT>
 inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
     const __m128i kv = _mm_loadu_si128((const __m128i*) kvalues_fp4);
+    const __m128i ka = _mm_loadu_si128((const __m128i*) kAbsFp4);
     const __m256i ones = _mm256_set1_epi16(1);
     __m256 acc[NT];
     for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
     const block_nvfp4* x = (const block_nvfp4*) row;
     const int prefetch_ahead = prefetch_distance();
     for (int ib = 0; ib < a.nb; ++ib) {
-        if (prefetch_ahead > 0) _mm_prefetch((const char*) (x + ib) + prefetch_ahead, _MM_HINT_T0);
-        const __m256i v01 = values32(x[ib].qs, kv), v23 = values32(x[ib].qs + 16, kv);
-        const __m256i a01 = _mm256_sign_epi8(v01, v01), a23 = _mm256_sign_epi8(v23, v23);
-        // lanes 0-3 ue4m3(d[0]), 4-7 d[1] (and d[2], d[3]): times a broadcast d_q8, each lane is ggml's scalar
-        // ue4m3(d[s]) * d_q8, rounded the same
+        if (prefetch_ahead > 0 && (ib & 1) == 0) _mm_prefetch((const char*) (x + ib) + prefetch_ahead, _MM_HINT_T0);
+        __m256i v01, a01, v23, a23;
+        values32_both(x[ib].qs, kv, ka, v01, a01);
+        values32_both(x[ib].qs + 16, kv, ka, v23, a23);
         const __m256 u01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x[ib].d[0]]));
         const __m256 u23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x[ib].d[2]]));
         for (int t = 0; t < NT; ++t) {
@@ -122,13 +129,67 @@ inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
     for (int t = 0; t < NT; ++t) res[t] = hsum8(acc[t]);
 }
 
+// Fused 2-row dot (gate+up or adjacent down rows): loads activations ONCE per block & doubles Zen3 FMA ILP, bit-exact.
+template <int NT>
+inline void row_dot_pair(const uint8_t* row0, const uint8_t* row1, const Acts& a, float* res0, float* res1) {
+    const __m128i kv = _mm_loadu_si128((const __m128i*) kvalues_fp4);
+    const __m128i ka = _mm_loadu_si128((const __m128i*) kAbsFp4);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc0[NT], acc1[NT];
+    for (int t = 0; t < NT; ++t) { acc0[t] = _mm256_setzero_ps(); acc1[t] = _mm256_setzero_ps(); }
+    const block_nvfp4* x0 = (const block_nvfp4*) row0;
+    const block_nvfp4* x1 = (const block_nvfp4*) row1;
+    const int prefetch_ahead = prefetch_distance();
+    for (int ib = 0; ib < a.nb; ++ib) {
+        if (prefetch_ahead > 0 && (ib & 1) == 0) {
+            _mm_prefetch((const char*) (x0 + ib) + prefetch_ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) (x1 + ib) + prefetch_ahead, _MM_HINT_T0);
+        }
+        __m256i v0_01, a0_01, v0_23, a0_23;
+        values32_both(x0[ib].qs, kv, ka, v0_01, a0_01);
+        values32_both(x0[ib].qs + 16, kv, ka, v0_23, a0_23);
+        const __m256 u0_01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x0[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x0[ib].d[0]]));
+        const __m256 u0_23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x0[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x0[ib].d[2]]));
+
+        __m256i v1_01, a1_01, v1_23, a1_23;
+        values32_both(x1[ib].qs, kv, ka, v1_01, a1_01);
+        values32_both(x1[ib].qs + 16, kv, ka, v1_23, a1_23);
+        const __m256 u1_01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x1[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x1[ib].d[0]]));
+        const __m256 u1_23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x1[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x1[ib].d[2]]));
+
+        for (int t = 0; t < NT; ++t) {
+            const block_q8_0* yb = a.y[t] + 2 * ib;
+            const __m256i q01 = _mm256_loadu_si256((const __m256i*) yb[0].qs);
+            const __m256i q23 = _mm256_loadu_si256((const __m256i*) yb[1].qs);
+            const float* dy = a.dy + (size_t) t * 2 * a.nb + 2 * ib;
+            const __m256 dy0 = _mm256_broadcast_ss(dy);
+            const __m256 dy1 = _mm256_broadcast_ss(dy + 1);
+
+            const __m256i p0_1 = _mm256_madd_epi16(_mm256_maddubs_epi16(a0_01, _mm256_sign_epi8(q01, v0_01)), ones);
+            const __m256i p0_2 = _mm256_madd_epi16(_mm256_maddubs_epi16(a0_23, _mm256_sign_epi8(q23, v0_23)), ones);
+            acc0[t] = _mm256_fmadd_ps(_mm256_mul_ps(u0_01, dy0), _mm256_cvtepi32_ps(p0_1), acc0[t]);
+            acc0[t] = _mm256_fmadd_ps(_mm256_mul_ps(u0_23, dy1), _mm256_cvtepi32_ps(p0_2), acc0[t]);
+
+            const __m256i p1_1 = _mm256_madd_epi16(_mm256_maddubs_epi16(a1_01, _mm256_sign_epi8(q01, v1_01)), ones);
+            const __m256i p1_2 = _mm256_madd_epi16(_mm256_maddubs_epi16(a1_23, _mm256_sign_epi8(q23, v1_23)), ones);
+            acc1[t] = _mm256_fmadd_ps(_mm256_mul_ps(u1_01, dy0), _mm256_cvtepi32_ps(p1_1), acc1[t]);
+            acc1[t] = _mm256_fmadd_ps(_mm256_mul_ps(u1_23, dy1), _mm256_cvtepi32_ps(p1_2), acc1[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) { res0[t] = hsum8(acc0[t]); res1[t] = hsum8(acc1[t]); }
+}
+
 template <int NT, bool SITU = false>
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, const Acts& a, float* const* ff, int r0, int r1,
              float sg, float su, float beta = 4.f, float lb = 25.f) {
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot<NT>(blob + (size_t) r * gu_row, a, g);
-        row_dot<NT>(blob + up_off + (size_t) r * gu_row, a, u);
+        if constexpr (NT <= 3) {
+            row_dot_pair<NT>(blob + (size_t) r * gu_row, blob + up_off + (size_t) r * gu_row, a, g, u);
+        } else {
+            row_dot<NT>(blob + (size_t) r * gu_row, a, g);
+            row_dot<NT>(blob + up_off + (size_t) r * gu_row, a, u);
+        }
         for (int t = 0; t < NT; ++t) {   // native_gu_rows' ggml path, operation for operation
             const float gs = g[t] * sg, us = u[t] * su;
             if constexpr (SITU) {
@@ -144,10 +205,20 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, const Acts& a, f
 
 template <int NT>
 void dot_rows(const uint8_t* w, size_t row_bytes, const Acts& a, float* const* out, int r0, int r1, float scale) {
-    float res[NT];
-    for (int r = r0; r < r1; ++r) {
-        row_dot<NT>(w + (size_t) r * row_bytes, a, res);
-        for (int t = 0; t < NT; ++t) out[t][r] = res[t] * scale;
+    float res0[NT], res1[NT];
+    int r = r0;
+    if constexpr (NT <= 3) {
+        for (; r + 1 < r1; r += 2) {
+            row_dot_pair<NT>(w + (size_t) r * row_bytes, w + (size_t) (r + 1) * row_bytes, a, res0, res1);
+            for (int t = 0; t < NT; ++t) {
+                out[t][r] = res0[t] * scale;
+                out[t][r + 1] = res1[t] * scale;
+            }
+        }
+    }
+    for (; r < r1; ++r) {
+        row_dot<NT>(w + (size_t) r * row_bytes, a, res0);
+        for (int t = 0; t < NT; ++t) out[t][r] = res0[t] * scale;
     }
 }
 

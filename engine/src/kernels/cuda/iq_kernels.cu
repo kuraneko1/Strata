@@ -1647,6 +1647,8 @@ __device__ __forceinline__ void row_dot_20_sub8(const uint8_t* row, const block_
 // 8-lane sub-warp row dot for K = nb * ipb == 36 (TD == 40, NVFP4 with n_ff == 1152): 4 rows per warp (32 rows per
 // 256-thread block), 89% lane balance, minimal register pressure, bitwise identical addition tree to row_dot_multi.
 template<int NC, bool EXACT_N = false>
+// Linear sequential 8-lane sub-warp row dot for K = nb * ipb == 36 (TG == 40, NVFP4 with n_ff == 1152):
+// single contiguous streaming pass over HBM2/GDDR6X, minimal registers (4 vs 8+ accumulators), zero spills.
 __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                                 int t, float (&s)[NC], const float* __restrict__ s_ue4m3 = nullptr) {
     using S = Split<40>;
@@ -1657,34 +1659,20 @@ __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] = S::apply(w, x + off[c] + kbx * 2, iqs);
     }
+#pragma unroll
+    for (int step = 8; step <= 24; step += 8) {
+        const int k = t + step, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
     if (t < 4) {
         const int k = t + 32, kbx = k >> 1, iqs = (k & 1) << 2;
         const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
-    }
-    {
-        const int k = t + 16, kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
-#pragma unroll
-        for (int c = 0; c < NC; ++c)
-            if (EXACT_N || c < n) s[c] = __fadd_rn(s[c], S::apply(w, x + off[c] + kbx * 2, iqs));
-    }
-    float s8[NC];
-    {
-        const int k = t + 8, kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
-#pragma unroll
-        for (int c = 0; c < NC; ++c)
-            if (EXACT_N || c < n) s8[c] = S::apply(w, x + off[c] + kbx * 2, iqs);
-    }
-    {
-        const int k = t + 24, kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
-#pragma unroll
-        for (int c = 0; c < NC; ++c)
-            if (EXACT_N || c < n) s[c] = __fadd_rn(s[c], __fadd_rn(s8[c], S::apply(w, x + off[c] + kbx * 2, iqs)));
     }
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
@@ -1695,8 +1683,8 @@ __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_
     }
 }
 
-// 8-lane sub-warp row dot for K = nb * ipb == 72 (TG == 40, NVFP4 with n_embd == 2304): 4 rows per warp (32 rows per
-// 256-thread block), 100% active lanes, non-unrolled k-loops to prevent register spills, bitwise identical to row_dot_multi.
+// Linear sequential 8-lane sub-warp row dot for K = nb * ipb == 72 (TG == 40, NVFP4 with n_embd == 2304):
+// 4 rows/warp (32 rows/CTA), single linear HBM2/GDDR6X pass (eliminates 4x strided jumps & 2x accumulator regs).
 template<int NC, bool EXACT_N = false>
 __device__ __forceinline__ void row_dot_72_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                                 int t, float (&s)[NC], const float* __restrict__ s_ue4m3 = nullptr) {
@@ -1704,53 +1692,16 @@ __device__ __forceinline__ void row_dot_72_sub8(const uint8_t* row, const block_
 #pragma unroll
     for (int c = 0; c < NC; ++c) s[c] = 0.0f;
 #pragma unroll 1
-    for (int k = t; k < 72; k += 32) {
+    for (int k = t; k < 72; k += 8) {
         const int kbx = k >> 1, iqs = (k & 1) << 2;
         const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
     }
-    float st[NC];
-#pragma unroll
-    for (int c = 0; c < NC; ++c) st[c] = 0.0f;
-#pragma unroll 1
-    for (int k = t + 16; k < 72; k += 32) {
-        const int kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
-#pragma unroll
-        for (int c = 0; c < NC; ++c)
-            if (EXACT_N || c < n) st[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
-    }
-#pragma unroll
-    for (int c = 0; c < NC; ++c)
-        if (EXACT_N || c < n) s[c] = __fadd_rn(s[c], st[c]);
-
-    float s8[NC];
-#pragma unroll
-    for (int c = 0; c < NC; ++c) s8[c] = 0.0f;
-#pragma unroll 1
-    for (int k = t + 8; k < 72; k += 32) {
-        const int kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
-#pragma unroll
-        for (int c = 0; c < NC; ++c)
-            if (EXACT_N || c < n) s8[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
-    }
-#pragma unroll
-    for (int c = 0; c < NC; ++c) st[c] = 0.0f;
-#pragma unroll 1
-    for (int k = t + 24; k < 72; k += 32) {
-        const int kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
-#pragma unroll
-        for (int c = 0; c < NC; ++c)
-            if (EXACT_N || c < n) st[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
-    }
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
         if (EXACT_N || c < n) {
-            s[c] = __fadd_rn(s[c], __fadd_rn(s8[c], st[c]));
 #pragma unroll
             for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
         }
@@ -4477,13 +4428,27 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
                 if (t == 0) gg = s1[0] * sg;
                 row_dot_72_sub8<1, true>(blob + u_off, s_xq, off1, 1, t, s1, s_ue4m3);
                 if (t == 0) uu = s1[0] * su;
+            } else if (n == 2) {
+                const int off2[2] = { 0, 72 };
+                float s2[2];
+                row_dot_72_sub8<2, true>(blob + g_off, s_xq, off2, 2, t, s2, s_ue4m3);
+                if (t < 2) gg = ((t == 0) ? s2[0] : s2[1]) * sg;
+                row_dot_72_sub8<2, true>(blob + u_off, s_xq, off2, 2, t, s2, s_ue4m3);
+                if (t < 2) uu = ((t == 0) ? s2[0] : s2[1]) * su;
+            } else if (n == 3) {
+                const int off3[3] = { 0, 72, 144 };
+                float s3[3];
+                row_dot_72_sub8<3, true>(blob + g_off, s_xq, off3, 3, t, s3, s_ue4m3);
+                if (t < 3) gg = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sg;
+                row_dot_72_sub8<3, true>(blob + u_off, s_xq, off3, 3, t, s3, s_ue4m3);
+                if (t < 3) uu = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * su;
             } else {
                 const int off4[4] = { 0, 72, 144, 216 };
                 float s4[4];
-                row_dot_72_sub8<4, false>(blob + g_off, s_xq, off4, n, t, s4, s_ue4m3);
-                if (t < n) gg = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * sg;
-                row_dot_72_sub8<4, false>(blob + u_off, s_xq, off4, n, t, s4, s_ue4m3);
-                if (t < n) uu = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * su;
+                row_dot_72_sub8<4, true>(blob + g_off, s_xq, off4, 4, t, s4, s_ue4m3);
+                if (t < 4) gg = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * sg;
+                row_dot_72_sub8<4, true>(blob + u_off, s_xq, off4, 4, t, s4, s_ue4m3);
+                if (t < 4) uu = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * su;
             }
             if (t < n) {
                 const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
@@ -4530,11 +4495,21 @@ __global__ void __launch_bounds__(256, 4) native_down_nvfp4_36_kernel(
                     float s1[1];
                     row_dot_36_sub8<1, true>(wr, s_hq, off1, 1, t, s1, s_ue4m3);
                     if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                } else if (n == 2) {
+                    const int off2[2] = { 0, 36 };
+                    float s2[2];
+                    row_dot_36_sub8<2, true>(wr, s_hq, off2, 2, t, s2, s_ue4m3);
+                    if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s2[0] : s2[1]) * sd;
+                } else if (n == 3) {
+                    const int off3[3] = { 0, 36, 72 };
+                    float s3[3];
+                    row_dot_36_sub8<3, true>(wr, s_hq, off3, 3, t, s3, s_ue4m3);
+                    if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sd;
                 } else {
                     const int off4[4] = { 0, 36, 72, 108 };
                     float s4[4];
-                    row_dot_36_sub8<4, false>(wr, s_hq, off4, n, t, s4, s_ue4m3);
-                    if (t < n) {
+                    row_dot_36_sub8<4, true>(wr, s_hq, off4, 4, t, s4, s_ue4m3);
+                    if (t < 4) {
                         const float v = (t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3];
                         out[(size_t) ent_dst[e + t] * L.n_embd + r] = v * sd;
                     }

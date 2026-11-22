@@ -1387,6 +1387,27 @@ __global__ void k_dspark_prep_joint(const float* __restrict__ state, const void*
     }
 }
 
+__global__ void k_dspark_prep_joint_d(const float* __restrict__ state, const void* __restrict__ markov_w1, int w1_type,
+                                      const int32_t* __restrict__ prev_id_d, const float* __restrict__ hidden_i,
+                                      const float* __restrict__ context, float* __restrict__ joint_inp, int rank, int N) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = 2 * rank + 2 * N;
+    if (i >= total) return;
+    if (i < rank) {
+        joint_inp[i] = state[i];
+    } else if (i < 2 * rank) {
+        const int c = i - rank;
+        const size_t idx = (size_t) (*prev_id_d) * rank + c;
+        if (w1_type == 30) joint_inp[i] = bf16_to_f32_d(((const uint16_t*) markov_w1)[idx]);
+        else if (w1_type == 1) joint_inp[i] = __half2float(((const __half*) markov_w1)[idx]);
+        else joint_inp[i] = ((const float*) markov_w1)[idx];
+    } else if (i < 2 * rank + N) {
+        joint_inp[i] = hidden_i[i - 2 * rank];
+    } else {
+        joint_inp[i] = context[i - 2 * rank - N];
+    }
+}
+
 __global__ void k_dspark_rnn_update(const float* __restrict__ joint_out, const float* __restrict__ joint_b,
                                     float* __restrict__ state, float* __restrict__ latent, int rank) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1646,9 +1667,13 @@ struct DsparkEngine {
     float* rnn_corr = nullptr;       // [N]
     float* h_pred = nullptr;         // [N]
     int32_t* pos_d = nullptr;        // [1] device pos for CUDA Graph DFlare capture
+    int32_t* d_draft_ids = nullptr;  // [8] device token chain [anchor, d0, d1, ...] for zero-sync Markov graph
+    int32_t* h_draft_ids_pin = nullptr; // pinned [8] host staging for d_draft_ids
     float* h_anchor_pin = nullptr;   // pinned [N] host buffer for async anchor upload
     cudaGraphExec_t dflare_graph_short = nullptr; // captured 3-layer DFlare block (pos < 256)
     cudaGraphExec_t dflare_graph_split = nullptr; // captured 3-layer DFlare block (pos >= 256, WMMA Split-KV)
+    cudaGraphExec_t markov_graphs[8] = {};        // captured greedy Markov chains indexed by n_draft (1..7)
+    bool markov_graph_oom[8] = {};
     std::vector<float> h_anchor;     // [N]
 
     // Stats
@@ -1661,6 +1686,9 @@ struct DsparkEngine {
     ~DsparkEngine() {
         if (dflare_graph_short) cudaGraphExecDestroy(dflare_graph_short);
         if (dflare_graph_split) cudaGraphExecDestroy(dflare_graph_split);
+        for (int i = 0; i < 8; ++i) {
+            if (markov_graphs[i]) cudaGraphExecDestroy(markov_graphs[i]);
+        }
         for (auto* p : kq) cudaFree(p);
         for (auto* p : vq) cudaFree(p);
         for (auto* p : ks) cudaFree(p);
@@ -1687,6 +1715,8 @@ struct DsparkEngine {
         cudaFree(rnn_corr);
         cudaFree(h_pred);
         cudaFree(pos_d);
+        cudaFree(d_draft_ids);
+        if (h_draft_ids_pin) cudaFreeHost(h_draft_ids_pin);
         if (h_anchor_pin) cudaFreeHost(h_anchor_pin);
     }
 
@@ -1746,6 +1776,11 @@ struct DsparkEngine {
         d_f32(&rnn_corr, (size_t) hp.n_embd);
         d_f32(&h_pred, (size_t) hp.n_embd);
         CK(cudaMalloc(&pos_d, sizeof(int32_t)));
+        CK(cudaMalloc(&d_draft_ids, 8 * sizeof(int32_t)));
+        if (cudaMallocHost(&h_draft_ids_pin, 8 * sizeof(int32_t)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            h_draft_ids_pin = nullptr;
+        }
         if (cudaMallocHost(&h_anchor_pin, (size_t) hp.n_embd * sizeof(float)) != cudaSuccess) {
             (void) cudaGetLastError();
             h_anchor_pin = nullptr;
@@ -1938,44 +1973,114 @@ struct DsparkEngine {
         }
 
         // 3. Recurrent Markov chain for i = 1 .. n_draft
-        int32_t prev_id = anchor;
         const int joint_tot = 2 * rank + 2 * N;
-        for (int i = 0; i < n_draft; ++i) {
-            const float* hi = block_cur + (size_t) (i + 1) * N;
-            dspark_detail::k_dspark_prep_joint<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
-                rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N);
-            E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
-            dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
-                joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
-            E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
-            dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
-                h_pred, hi, rnn_corr, dm->hidden_out_b, N);
-            E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
-            if (out_logits) {
-                k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
-                    E.logits, hp.vocab_unpadded, hp.softcap);
-                auto& row_lg = (*out_logits)[(size_t) i];
-                row_lg.resize((size_t) hp.vocab_unpadded);
-                CK(cudaMemcpyAsync(row_lg.data(), E.logits, (size_t) hp.vocab_unpadded * sizeof(float),
+        if (!out_logits && n_draft >= 1 && n_draft <= 7 && d_draft_ids) {
+            // Zero-sync device-side greedy Markov chain (1 graph launch + 1 single D2H copy instead of n_draft syncs!)
+            if (h_draft_ids_pin) {
+                h_draft_ids_pin[0] = anchor;
+                CK(cudaMemcpyAsync(d_draft_ids, h_draft_ids_pin, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+            } else {
+                CK(cudaMemcpyAsync(d_draft_ids, &anchor, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+            }
+            auto emit_markov = [&]() {
+                for (int i = 0; i < n_draft; ++i) {
+                    const float* hi = block_cur + (size_t) (i + 1) * N;
+                    dspark_detail::k_dspark_prep_joint_d<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
+                        rnn_state, dm->markov_w1, dm->markov_w1_type, d_draft_ids + i, hi, f_rnn_last, joint_inp, rank, N);
+                    E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+                    dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
+                        joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
+                    E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
+                    dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
+                        h_pred, hi, rnn_corr, dm->hidden_out_b, N);
+                    E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
+                    if (hp.vocab_unpadded >= 4096 && E.argmax_val && E.argmax_idx) {
+                        constexpr int kArgBlks = 64;
+                        k_argmax_stage1<<<dim3(kArgBlks, 1), 256, 0, E.st>>>(
+                            E.logits, E.argmax_val, E.argmax_idx, (int) hp.vocab_unpadded);
+                        k_argmax_stage2<<<1, 32, 0, E.st>>>(
+                            E.argmax_val, E.argmax_idx, d_draft_ids + i + 1, kArgBlks);
+                    } else {
+                        k_argmax<<<1, 256, 0, E.st>>>(E.logits, d_draft_ids + i + 1, (int) hp.vocab_unpadded);
+                    }
+                }
+            };
+            if (!E.prof && !markov_graph_oom[n_draft]) {
+                cudaGraphExec_t& mg = markov_graphs[n_draft];
+                if (!mg) {
+                    cudaGraph_t g = nullptr;
+                    if (cudaStreamBeginCapture(E.st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                        emit_markov();
+                        if (cudaStreamEndCapture(E.st, &g) == cudaSuccess && g) {
+                            if (cudaGraphInstantiate(&mg, g, nullptr, nullptr, 0) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                mg = nullptr;
+                                markov_graph_oom[n_draft] = true;
+                            }
+                            cudaGraphDestroy(g);
+                        } else {
+                            (void) cudaGetLastError();
+                            markov_graph_oom[n_draft] = true;
+                        }
+                    } else {
+                        (void) cudaGetLastError();
+                        markov_graph_oom[n_draft] = true;
+                    }
+                }
+                if (mg) CK(cudaGraphLaunch(mg, E.st));
+                else emit_markov();
+            } else {
+                emit_markov();
+            }
+            if (h_draft_ids_pin) {
+                CK(cudaMemcpyAsync(h_draft_ids_pin + 1, d_draft_ids + 1, (size_t) n_draft * sizeof(int32_t),
                                    cudaMemcpyDeviceToHost, E.st));
                 CK(cudaStreamSynchronize(E.st));
-                prev_id = sample_fn(i, row_lg);
+                for (int i = 0; i < n_draft; ++i) out_tokens[(size_t) i] = h_draft_ids_pin[1 + i];
             } else {
-                if (hp.vocab_unpadded >= 4096 && E.argmax_val && E.argmax_idx) {
-                    constexpr int kArgBlks = 64;
-                    k_argmax_stage1<<<dim3(kArgBlks, 1), 256, 0, E.st>>>(
-                        E.logits, E.argmax_val, E.argmax_idx, (int) hp.vocab_unpadded);
-                    k_argmax_stage2<<<1, 32, 0, E.st>>>(
-                        E.argmax_val, E.argmax_idx, E.pick_d, kArgBlks);
-                } else {
-                    k_argmax<<<1, 256, 0, E.st>>>(E.logits, E.pick_d, (int) hp.vocab_unpadded);
-                }
-                int32_t next_id = 0;
-                CK(cudaMemcpyAsync(&next_id, E.pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, E.st));
+                CK(cudaMemcpyAsync(out_tokens.data(), d_draft_ids + 1, (size_t) n_draft * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, E.st));
                 CK(cudaStreamSynchronize(E.st));
-                prev_id = next_id;
             }
-            out_tokens[(size_t) i] = prev_id;
+        } else {
+            int32_t prev_id = anchor;
+            for (int i = 0; i < n_draft; ++i) {
+                const float* hi = block_cur + (size_t) (i + 1) * N;
+                dspark_detail::k_dspark_prep_joint<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
+                    rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N);
+                E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+                dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
+                    joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
+                E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
+                dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
+                    h_pred, hi, rnn_corr, dm->hidden_out_b, N);
+                E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
+                if (out_logits) {
+                    k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
+                        E.logits, hp.vocab_unpadded, hp.softcap);
+                    auto& row_lg = (*out_logits)[(size_t) i];
+                    row_lg.resize((size_t) hp.vocab_unpadded);
+                    CK(cudaMemcpyAsync(row_lg.data(), E.logits, (size_t) hp.vocab_unpadded * sizeof(float),
+                                       cudaMemcpyDeviceToHost, E.st));
+                    CK(cudaStreamSynchronize(E.st));
+                    prev_id = sample_fn(i, row_lg);
+                } else {
+                    if (hp.vocab_unpadded >= 4096 && E.argmax_val && E.argmax_idx) {
+                        constexpr int kArgBlks = 64;
+                        k_argmax_stage1<<<dim3(kArgBlks, 1), 256, 0, E.st>>>(
+                            E.logits, E.argmax_val, E.argmax_idx, (int) hp.vocab_unpadded);
+                        k_argmax_stage2<<<1, 32, 0, E.st>>>(
+                            E.argmax_val, E.argmax_idx, E.pick_d, kArgBlks);
+                    } else {
+                        k_argmax<<<1, 256, 0, E.st>>>(E.logits, E.pick_d, (int) hp.vocab_unpadded);
+                    }
+                    int32_t next_id = 0;
+                    CK(cudaMemcpyAsync(&next_id, E.pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, E.st));
+                    CK(cudaStreamSynchronize(E.st));
+                    prev_id = next_id;
+                }
+                out_tokens[(size_t) i] = prev_id;
+            }
         }
         ++n_draft_calls;
         n_drafted += n_draft;

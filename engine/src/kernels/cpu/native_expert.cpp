@@ -737,6 +737,16 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     }
     }  // if (!f.situ)
     const int n = (int) f.n_embd;
+    // Bit-exact AVX2 multi-token Q5_K gate+up+SiTU (default ON for nt >= 2 unless STRATA_KQ256=0).
+    static const bool kq_q5k = [] {
+        const char* v = std::getenv("STRATA_KQ256");
+        return cpu_avx2_ok() && (v == nullptr || std::atoi(v) != 0);
+    }();
+    if (kq_q5k && f.situ && f.gu_type == 13 && f.tail_off == 0 && nt >= 2 &&
+        (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
+        kq256_gu_rows_situ(f.gu_type, blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, f.situ_beta, f.situ_linear_beta);
+        return;
+    }
     // NVFP4: the per-expert global scales from the blob's tail (1 and 1 otherwise). s_down goes on the down output:
     // folded into up it left the hidden near 1e-5, whose Q8_0 block scale is an FP16 subnormal (expert error 2-12%)
     float sg = 1.f, su = 1.f;
@@ -840,6 +850,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool kq_q80_def = [] { const char* v = std::getenv("STRATA_KQ256"); return v == nullptr || std::atoi(v) != 0; }();
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
@@ -855,7 +866,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8) &&
+    if (cpu_avx2_ok() && nt >= 2 && ((f.d_type == 7 && kq) || (f.d_type == 8 && kq_q80_def)) &&
         (Arithmetic == NativeArithmetic::Default || (flavour_avx2()))) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

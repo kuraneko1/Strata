@@ -144,6 +144,92 @@ void q4k_dot(const block_q4_K* x, int nb, const void* const* act, int nt, float*
     }
 }
 
+// ---- Q5_K x Q8_K (ggml_vec_dot_q5_K_q8_K, __AVX2__), bit-exact per token
+template <int NT>
+void q5k_dot_t(const block_q5_K* x, int nb, const void* const* act, float* res) {
+    static const uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    const __m128i mzero = _mm_setzero_si128();
+    const __m256i mone = _mm256_set1_epi8(1);
+    __m256 acc[NT];
+    float summs[NT];
+    for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); summs[t] = 0.0f; }
+    for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*) (x + i + 2), _MM_HINT_T0);
+            _mm_prefetch((const char*) (x + i + 2) + 64, _MM_HINT_T0);
+            _mm_prefetch((const char*) (x + i + 2) + 128, _MM_HINT_T0);
+        }
+        const float xd = half_at(&x[i], 0), xdmin = half_at(&x[i], 1);
+        uint32_t utmp[4];
+        std::memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32((int) utmp[3], (int) utmp[2],
+                                                                           (int) utmp[1], (int) utmp[0]));
+        const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = _mm256_insertf128_si256(_mm256_castsi128_si256(sc128), sc128, 1);
+        const __m256i hbits = _mm256_loadu_si256((const __m256i*) x[i].qh);
+        __m256i hmask = mone;
+        __m256i scale_0[4], scale_1[4], q5_0[4], q5_1[4];
+        const uint8_t* q5 = x[i].qs;
+        int bit = 0;
+        for (int j = 0; j < QK_K / 64; ++j) {
+            scale_0[j] = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 0));
+            scale_1[j] = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
+            const __m256i q5bits = _mm256_loadu_si256((const __m256i*) q5);
+            q5 += 32;
+            const __m256i q5l_0 = _mm256_and_si256(q5bits, m4);
+            const __m256i q5h_0 = _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+            q5_0[j] = _mm256_add_epi8(q5l_0, q5h_0);
+            hmask = _mm256_slli_epi16(hmask, 1);
+            const __m256i q5l_1 = _mm256_and_si256(_mm256_srli_epi16(q5bits, 4), m4);
+            const __m256i q5h_1 = _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+            q5_1[j] = _mm256_add_epi8(q5l_1, q5h_1);
+            hmask = _mm256_slli_epi16(hmask, 1);
+        }
+        for (int t = 0; t < NT; ++t) {
+            const block_q8_K* y = (const block_q8_K*) act[t] + i;
+            const float d = y->d * xd;
+            const float dmin = -y->d * xdmin;
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i*) y->bsums);
+            const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+            const __m128i prod = _mm_madd_epi16(mins, q8s);
+            const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
+            summs[t] += dmin * _mm_extract_epi32(hsum, 0);
+            const int8_t* q8 = y->qs;
+            __m256i sumi = _mm256_setzero_si256();
+            for (int j = 0; j < QK_K / 64; ++j) {
+                const __m256i q8_0 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+                __m256i p16_0 = _mm256_maddubs_epi16(q5_0[j], q8_0);
+                __m256i p16_1 = _mm256_maddubs_epi16(q5_1[j], q8_1);
+                p16_0 = _mm256_madd_epi16(scale_0[j], p16_0);
+                p16_1 = _mm256_madd_epi16(scale_1[j], p16_1);
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
+            }
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum_float_8(acc[t]) + summs[t];
+}
+
+void q5k_dot_nt(const block_q5_K* x, int nb, const void* const* act, int nt, float* res) {
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        switch (k) {
+            case 1: q5k_dot_t<1>(x, nb, act + t0, res + t0); break;
+            case 2: q5k_dot_t<2>(x, nb, act + t0, res + t0); break;
+            case 3: q5k_dot_t<3>(x, nb, act + t0, res + t0); break;
+            default: q5k_dot_t<4>(x, nb, act + t0, res + t0); break;
+        }
+    }
+}
+
 // ---- Q5_1 x Q8_1 (ggml_vec_dot_q5_1_q8_1, __AVX2__)
 template <int NT>
 void q5_1_dot(const block_q5_1* x, int nb, const void* const* act, float* res) {
@@ -175,6 +261,7 @@ void q8_0_dot(const block_q8_0* x, int nb, const void* const* act, float* res) {
     __m256 acc[NT];
     for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
+        if ((ib & 1) == 0 && ib + 4 < nb) _mm_prefetch((const char*) (x + ib + 4), _MM_HINT_T0);
         const float xd = h2f(x[ib].d);
         const __m256i qx = _mm256_loadu_si256((const __m256i*) x[ib].qs);
         const __m256i ax = _mm256_sign_epi8(qx, qx);
@@ -217,6 +304,7 @@ void q8_0_dot_nt(const block_q8_0* x, int nb, const void* const* act, int nt, fl
 void dot_rows(int type, const uint8_t* row, int n, const void* const* act, int nt, float* res) {
     switch (type) {
         case 12: q4k_dot((const block_q4_K*) row, n / QK_K, act, nt, res); break;
+        case 13: q5k_dot_nt((const block_q5_K*) row, n / QK_K, act, nt, res); break;
         case 7: q5_1_dot_nt((const block_q5_1*) row, n / QK5_1, act, nt, res); break;
         case 8: q8_0_dot_nt((const block_q8_0*) row, n / QK8_0, act, nt, res); break;
         default: break;
@@ -282,6 +370,24 @@ void kq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
             dot_rows(type, blob + up_off + (size_t) r * gu_row, n, act + t0, m, u);
             // native_gu_rows' own SwiGLU expression: the same bits as the per-token ggml path
             for (int t = 0; t < m; ++t) ff[t0 + t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+        }
+    }
+}
+
+void kq256_gu_rows_situ(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                        int nt, float* const* ff, int r0, int r1, float beta, float lb) {
+    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+        const int m = nt - t0 < MAXT ? nt - t0 : MAXT;
+        float g[MAXT], u[MAXT];
+        for (int r = r0; r < r1; ++r) {
+            dot_rows(type, blob + (size_t) r * gu_row, n, act + t0, m, g);
+            dot_rows(type, blob + up_off + (size_t) r * gu_row, n, act + t0, m, u);
+            for (int t = 0; t < m; ++t) {
+                const float gs = g[t], us = u[t];
+                const float tg = beta * std::tanh(gs / beta);
+                const float tu = lb > 0.f ? lb * std::tanh(us / lb) : us;
+                ff[t0 + t][r] = (tg / (1.f + std::exp(-gs))) * tu;
+            }
         }
     }
 }

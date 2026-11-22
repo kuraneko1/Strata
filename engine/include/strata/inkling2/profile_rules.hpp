@@ -160,7 +160,10 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     const bool cap_allows_core = !in.expert_vram_forced || (in.expert_vram_cap_bytes >= in.tier1_experts_bytes + stage_bytes_pref);
 
     const size_t full_vram_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + in.all_experts_bytes + 128 * MiB;
-    const size_t core_hybrid_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + stage_bytes_pref + in.tier1_experts_bytes + 128 * MiB;
+    const size_t dspark_kv_need = in.has_draft
+                                ? ((size_t) std::max(1, in.max_ctx) * in.kv_bytes_per_tok + 256 * MiB)
+                                : 0;
+    const size_t core_hybrid_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + stage_bytes_pref + in.tier1_experts_bytes + dspark_kv_need + 128 * MiB;
 
     if (in.all_experts_bytes > 0 && cap_allows_full && in.vram_free_bytes >= full_vram_need) {
         out.regime = VramRegime::FullVram;
@@ -220,11 +223,11 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
         out.pp_stage_cnt_pref = 0;
         out.use_d_hits = false;
     } else if (out.regime == VramRegime::CoreResidentHybrid) {
-        out.pp_stage_mb = out.arch.pp_stage_mb;
+        out.pp_stage_mb = (in.has_draft && in.vram_total_bytes <= ((size_t) 13 << 30)) ? 16 : out.arch.pp_stage_mb;
         out.pp_stage_cnt_pref = out.arch.pp_stage_cnt_core;
         out.use_d_hits = true;
     } else {
-        out.pp_stage_mb = out.arch.pp_stage_mb;
+        out.pp_stage_mb = (in.has_draft && in.vram_total_bytes <= ((size_t) 13 << 30)) ? 16 : out.arch.pp_stage_mb;
         out.pp_stage_cnt_pref = out.arch.pp_stage_cnt_pref;
         out.use_d_hits = true;
     }
