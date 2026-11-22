@@ -1632,6 +1632,119 @@ __device__ __forceinline__ void row_dot_20_sub8(const uint8_t* row, const block_
     }
 }
 
+// 8-lane sub-warp row dot for K = nb * ipb == 36 (TD == 40, NVFP4 with n_ff == 1152): 4 rows per warp (32 rows per
+// 256-thread block), 89% lane balance, minimal register pressure, bitwise identical addition tree to row_dot_multi.
+template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                                int t, float (&s)[NC]) {
+    using S = Split<40>;
+    {
+        const int k = t, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] = S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    if (t < 4) {
+        const int k = t + 32, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    {
+        const int k = t + 16, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] = __fadd_rn(s[c], S::apply(w, x + off[c] + kbx * 2, iqs));
+    }
+    float s8[NC];
+    {
+        const int k = t + 8, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s8[c] = S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    {
+        const int k = t + 24, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] = __fadd_rn(s[c], __fadd_rn(s8[c], S::apply(w, x + off[c] + kbx * 2, iqs)));
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
+// 8-lane sub-warp row dot for K = nb * ipb == 72 (TG == 40, NVFP4 with n_embd == 2304): 4 rows per warp (32 rows per
+// 256-thread block), 100% active lanes, non-unrolled k-loops to prevent register spills, bitwise identical to row_dot_multi.
+template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_72_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                                int t, float (&s)[NC]) {
+    using S = Split<40>;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+#pragma unroll 1
+    for (int k = t; k < 72; k += 32) {
+        const int kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    float st[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) st[c] = 0.0f;
+#pragma unroll 1
+    for (int k = t + 16; k < 72; k += 32) {
+        const int kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) st[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (EXACT_N || c < n) s[c] = __fadd_rn(s[c], st[c]);
+
+    float s8[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s8[c] = 0.0f;
+#pragma unroll 1
+    for (int k = t + 8; k < 72; k += 32) {
+        const int kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s8[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) st[c] = 0.0f;
+#pragma unroll 1
+    for (int k = t + 24; k < 72; k += 32) {
+        const int kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) st[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+            s[c] = __fadd_rn(s[c], __fadd_rn(s8[c], st[c]));
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
 // 16-lane sub-warp row dot for K = nb * ipb == 20 (TD == 42, Q2_0, and TD == 40, NVFP4, with n_ff == 640):
 // 2 rows per warp (16 rows per 256-thread block), bitwise identical addition tree to row_dot_multi.
 template<int TY, int NC, bool EXACT_N = false>
@@ -4263,10 +4376,102 @@ bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cu
     return true;
 }
 
+// Standalone zero-spill NVFP4 (type 40) gate/up kernel for n_embd == 2304 (72 dots, 8 lanes/row, 32 rows/block, SMEM xq).
+__global__ void __launch_bounds__(256, 3) native_gu_nvfp4_72_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq, NativeExpertLayout L, float* __restrict__ gate, float* __restrict__ up) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ uint32_t s_xq_buf[GRP_NC * 72 * 9];
+    const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
+    const int row = blockIdx.x * 32 + subwarp;
+    const bool valid_row = (row < 2 * L.n_ff);
+    const bool is_up = valid_row && (row >= L.n_ff);
+    const int r = valid_row ? (is_up ? row - (int) L.n_ff : row) : 0;
+    const size_t w_off = (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+    float* dst = is_up ? up : gate;
+    const block_q8_1* s_xq = reinterpret_cast<const block_q8_1*>(s_xq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const float sc = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[is_up ? 1 : 0] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int i = 0; i < n; ++i) {
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + i] * 72);
+                for (int j = threadIdx.x; j < 72 * 9; j += 256) s_xq_buf[i * (72 * 9) + j] = src[j];
+            }
+            iq_sync_lds();
+            if (valid_row) {
+                if (n == 1) {
+                    const int off1[1] = { 0 };
+                    float s1[1];
+                    row_dot_72_sub8<1, true>(wr, s_xq, off1, 1, t, s1);
+                    if (t == 0) dst[(size_t) e * L.n_ff + r] = s1[0] * sc;
+                } else {
+                    const int off4[4] = { 0, 72, 144, 216 };
+                    float s4[4];
+                    row_dot_72_sub8<4, false>(wr, s_xq, off4, n, t, s4);
+                    if (t < n) dst[(size_t) (e + t) * L.n_ff + r] = s4[t] * sc;
+                }
+            }
+        }
+    }
+}
+
+// Standalone zero-spill NVFP4 (type 40) down kernel for n_ff == 1152 (36 dots, 8 lanes/row, 32 rows/block, SMEM hq).
+__global__ void __launch_bounds__(256, 4) native_down_nvfp4_36_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
+    const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ uint32_t s_hq_buf[GRP_NC * 36 * 9];
+    const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    const bool valid_r = (r < L.n_embd);
+    const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 36);
+            const int words = n * (36 * 9);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+            iq_sync_lds();
+            if (valid_r) {
+                if (n == 1) {
+                    const int off1[1] = { 0 };
+                    float s1[1];
+                    row_dot_36_sub8<1, true>(wr, s_hq, off1, 1, t, s1);
+                    if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                } else {
+                    const int off4[4] = { 0, 36, 72, 108 };
+                    float s4[4];
+                    row_dot_36_sub8<4, false>(wr, s_hq, off4, n, t, s4);
+                    if (t < n) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                }
+            }
+        }
+    }
+}
+
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                float* gate, float* up) {
+    if constexpr (TG == 40) {
+        if (!g_old_kernels && !::strata::kernels::g_no_sub16_gu && L.n_embd == 2304) {
+            native_gu_nvfp4_72_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            return;
+        }
+    }
     // the sub-16 rows (row_dot_80_sub16) assume 80 dots per row: (n_embd / qk) * ipb == 80. The APR trellis types
     // (qk 128, ipb 8: 160 dots at n_embd 2560) take the full-warp multi kernel, as before the sub-16 kernels.
     const bool g_no_sub16_gu = ::strata::kernels::g_no_sub16_gu || (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb != 80;
@@ -4348,6 +4553,12 @@ template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out) {
+    if constexpr (TD == 40) {
+        if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 1152) {
+            native_down_nvfp4_36_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            return;
+        }
+    }
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels || split_off<TD>()) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if constexpr (kTqType<TD>) {   // the trellis down types: the codebook staged where tq_stage_on() or tq_sub8_on()
@@ -6631,9 +6842,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // That was the case of Q8_0 gate/up (320 calls at 2560; UD-Q6_K_XL layer 2, the rt-q8 drafter) with STRATA_KQ_SPLIT=1;
     // the old test (qk != 128, not Q4_K / Q5_K) gives the same 16 / 8 as this one for every other split type (IQ*, Q2_0,
     // NVFP4: 80 calls; Q4_K / Q5_K / APR trellis: 160).
+    const bool gu_sub8_nvfp4_72 = !g_old_kernels && !g_no_sub16_gu && L.gu_type == 40 && L.n_embd == 2304;
     const bool gu_sub16_rows = !g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
                                gu_calls(L.gu_type, L.n_embd) == 80;
-    const int gu_rows = gu_sub16_rows ? 16 : GU_ROWS;
+    const int gu_rows = gu_sub8_nvfp4_72 ? 32 : (gu_sub16_rows ? 16 : GU_ROWS);
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906)
@@ -6770,7 +6982,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     if (g_exp_phase == 1) return;
     const bool tq_sub8 = (L.d_type == 144 || L.d_type == 146) && !g_old_kernels && !g_no_sub16_gu && L.n_ff == 640 && (tq_stage_on() || tq_sub8_on());   // the trellis down rows as 8-lane rows
-    const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 || tq_sub8 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+    const bool d_sub8_nvfp4_36 = !g_old_kernels && !g_no_sub16_gu && L.d_type == 40 && L.n_ff == 1152;
+    const int d_rows = d_sub8_nvfp4_36 ? 32 : ((!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 || tq_sub8 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8);
     const int tq_ch = tq_sub8 ? tq_row_chunks() : 1;   // the staged trellis down kernel takes this many 32-row chunks a block
     const dim3 gd((unsigned) (((L.n_embd + d_rows - 1) / d_rows + tq_ch - 1) / tq_ch), (unsigned) gy);
 #if STRATA_DOWN_WS_BUILT
@@ -7549,15 +7762,19 @@ __device__ __forceinline__ void dq_sub16_k64_store(const uint8_t* row_ptr, int k
 #endif
 
 /// BM=64 WK=64 grouped WMMA kernel (NVFP4=40, Q8_0=8, Q5_K=13, Q4_K=12) with 18-27KB smem and register prefetch.
+/// On Volta sm_70 (__CUDA_ARCH__ < 750): uses native PTX HMMA.884 (mma.sync.aligned.m8n8k4.row.col) + LDS.128 +
+/// register-direct float2 epilogue + 3-blk/SM occupancy.
 template <int WT, bool IS_DOWN, int BN>
-__global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_grouped_64_kernel(
+__global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_idx,
     const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     constexpr int BM = 64, WK = 64, LD = 72;
+#if __CUDA_ARCH__ >= 750
     constexpr int MW = (BN == 128) ? 2 : 4;
+#endif
     constexpr int NW = (BN == 128) ? 4 : 2;
     constexpr int MR = (BN == 128) ? 2 : 1;
     __shared__ __align__(16) __half smem[(BM + BN) * LD];
@@ -7587,6 +7804,26 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
     const int wr = tid >> 2, sb = tid & 3;
     const int xr = tid >> 2, xc = (tid & 3) * 16;
 
+#if __CUDA_ARCH__ < 750
+    const int lane = tid & 31;
+    const int qa_row = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3);
+    const int kb_row = ((lane & 16) >> 2) + (lane & 8) + (lane & 3);
+    const int acc_r0 = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 1);
+    const int acc_r1 = acc_r0 + 2;
+    const int acc_c0 = (lane & 8) + (lane & 2);
+    const int acc_c1 = acc_c0 + 4;
+    const __half* sx_r0 = sx + (wm * MR * 16 + qa_row) * LD;
+    const __half* sw_r0 = sw + (wn * 32 + kb_row) * LD;
+    const __half* sw_r1 = sw + (wn * 32 + 16 + kb_row) * LD;
+    auto hmma_rc = [](float d[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, {%0, %1, %2, %3, %4, %5, %6, %7};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+            : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+    };
+#endif
+
     for (int g = (int) blockIdx.z; g < ng; g += (int) gridDim.z) {
         const uint8_t* blob = (const uint8_t*) grp_ptr[g];
         const uint8_t* we_t = blob + role_off + (size_t) (col0 + wr) * row_stride;
@@ -7599,12 +7836,21 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
             const int in_row = x_ok ? (IS_DOWN ? (c0 + xr) : ent_idx[c0 + xr]) : 0;
             const __half* xp = X + (size_t) in_row * K + xc;
 
+#if __CUDA_ARCH__ < 750
+            float acc[MR][2][8];
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+            }
+#else
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MR][2];
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 wmma::fill_fragment(acc[mr][0], 0.0f);
                 wmma::fill_fragment(acc[mr][1], 0.0f);
             }
+#endif
 
             if constexpr (WT == 40) {
                 constexpr int NB = BN / 64;
@@ -7645,6 +7891,21 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
                         nx1 = x_ok ? *reinterpret_cast<const uint4*>(nxp + 8) : make_uint4(0, 0, 0, 0);
                         wp = nwp;
                     }
+#if __CUDA_ARCH__ < 750
+#pragma unroll
+                    for (int kk = 0; kk < WK; kk += 8) {
+                        const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                        const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                        for (int mr = 0; mr < MR; ++mr) {
+                            const uint4 a = *reinterpret_cast<const uint4*>(sx_r0 + mr * 16 * LD + kk);
+                            hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                            hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                            hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                            hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                        }
+                    }
+#else
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 16) {
                         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb0, fb1;
@@ -7658,6 +7919,7 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
                             wmma::mma_sync(acc[mr][1], fa, fb1, acc[mr][1]);
                         }
                     }
+#endif
                     if (has_next) {
                         __syncthreads();
                         *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = nx0;
@@ -7681,6 +7943,21 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
                         dq_sub16_k64_store<WT>(we_t + (size_t) rb * row_stride, k0, sb, sw + (rb + wr) * LD + sb * 16);
                     }
                     __syncthreads();
+#if __CUDA_ARCH__ < 750
+#pragma unroll
+                    for (int kk = 0; kk < WK; kk += 8) {
+                        const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                        const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                        for (int mr = 0; mr < MR; ++mr) {
+                            const uint4 a = *reinterpret_cast<const uint4*>(sx_r0 + mr * 16 * LD + kk);
+                            hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                            hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                            hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                            hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                        }
+                    }
+#else
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 16) {
                         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[MR];
@@ -7697,10 +7974,35 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
                             wmma::mma_sync(acc[mr][1], fa[mr], fb1, acc[mr][1]);
                         }
                     }
+#endif
                     __syncthreads();
                 }
             }
 
+#if __CUDA_ARCH__ < 750
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int r0 = wm * MR * 16 + mr * 16 + acc_r0;
+                const int r1 = wm * MR * 16 + mr * 16 + acc_r1;
+                if (r0 < rows) {
+                    const int out_r0 = IS_DOWN ? ent_idx[c0 + r0] : (c0 + r0);
+                    float* dst0 = dst_mat + (size_t) out_r0 * N_out + col0 + wn * 32;
+                    *reinterpret_cast<float2*>(dst0 + acc_c0)      = make_float2(acc[mr][0][0] * sc, acc[mr][0][1] * sc);
+                    *reinterpret_cast<float2*>(dst0 + acc_c1)      = make_float2(acc[mr][0][4] * sc, acc[mr][0][5] * sc);
+                    *reinterpret_cast<float2*>(dst0 + 16 + acc_c0) = make_float2(acc[mr][1][0] * sc, acc[mr][1][1] * sc);
+                    *reinterpret_cast<float2*>(dst0 + 16 + acc_c1) = make_float2(acc[mr][1][4] * sc, acc[mr][1][5] * sc);
+                }
+                if (r1 < rows) {
+                    const int out_r1 = IS_DOWN ? ent_idx[c0 + r1] : (c0 + r1);
+                    float* dst1 = dst_mat + (size_t) out_r1 * N_out + col0 + wn * 32;
+                    *reinterpret_cast<float2*>(dst1 + acc_c0)      = make_float2(acc[mr][0][2] * sc, acc[mr][0][3] * sc);
+                    *reinterpret_cast<float2*>(dst1 + acc_c1)      = make_float2(acc[mr][0][6] * sc, acc[mr][0][7] * sc);
+                    *reinterpret_cast<float2*>(dst1 + 16 + acc_c0) = make_float2(acc[mr][1][2] * sc, acc[mr][1][3] * sc);
+                    *reinterpret_cast<float2*>(dst1 + 16 + acc_c1) = make_float2(acc[mr][1][6] * sc, acc[mr][1][7] * sc);
+                }
+            }
+            __syncthreads();
+#else
             __syncthreads();
             float* s_out = reinterpret_cast<float*>(smem);
             if constexpr (BN == 64) {
@@ -7736,6 +8038,7 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
                     __syncthreads();
                 }
             }
+#endif
         }
     }
 #else
@@ -7745,6 +8048,7 @@ __global__ void __launch_bounds__(256, (WT == 40 && BN == 128) ? 2 : 3) wmma_gro
 
 /// Adaptive BM=128 (fast MR=2 for <=64 rows, single-weight-load MR=4 for 65..128 rows), BN=128, WK=64, 2 blk/SM (37 KB SMEM).
 /// Cuts expert weight reloads in half on long prefills (T >= 512) and runs BN=128 + vectorized decode for NVFP4/Q5_K/Q4_K/Q8_0.
+/// On Volta sm_70 (__CUDA_ARCH__ < 750): uses native PTX HMMA.884 + LDS.128 + register-direct float2 epilogue.
 template <int WT, bool IS_DOWN>
 __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
@@ -7781,6 +8085,25 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     const int wr = tid >> 2, sb = tid & 3;
     const int xr = wr, xc = sb * 16;
 
+#if __CUDA_ARCH__ < 750
+    const int lane = tid & 31;
+    const int qa_row = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3);
+    const int kb_row = ((lane & 16) >> 2) + (lane & 8) + (lane & 3);
+    const int acc_r0 = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 1);
+    const int acc_r1 = acc_r0 + 2;
+    const int acc_c0 = (lane & 8) + (lane & 2);
+    const int acc_c1 = acc_c0 + 4;
+    const __half* sw_r0 = sw + (wn * 32 + kb_row) * LD;
+    const __half* sw_r1 = sw + (wn * 32 + 16 + kb_row) * LD;
+    auto hmma_rc = [](float d[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, {%0, %1, %2, %3, %4, %5, %6, %7};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+            : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+    };
+#endif
+
     for (int g = (int) blockIdx.z; g < ng; g += (int) gridDim.z) {
         const uint8_t* blob = (const uint8_t*) grp_ptr[g];
         const uint8_t* we_t = blob + role_off + (size_t) (col0 + wr) * row_stride;
@@ -7797,14 +8120,26 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
             const __half* xp0 = X + (size_t) in_row0 * K + xc;
             const __half* xp1 = X + (size_t) in_row1 * K + xc;
 
+#if __CUDA_ARCH__ < 750
+            float acc[4][2][8];
+#pragma unroll
+            for (int mr = 0; mr < 4; ++mr) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+            }
+#else
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
 #pragma unroll
             for (int mr = 0; mr < 4; ++mr) {
                 wmma::fill_fragment(acc[mr][0], 0.0f);
                 wmma::fill_fragment(acc[mr][1], 0.0f);
             }
+#endif
 
             if (has_hi) {
+#if __CUDA_ARCH__ < 750
+                const __half* sx_hi = sx + (wm * 64 + qa_row) * LD;
+#endif
                 for (int k0 = 0; k0 < K; k0 += WK) {
                     const __half* cxp0 = xp0 + k0;
                     const __half* cxp1 = xp1 + k0;
@@ -7828,6 +8163,21 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                         }
                     }
                     __syncthreads();
+#if __CUDA_ARCH__ < 750
+#pragma unroll 1
+                    for (int kk = 0; kk < WK; kk += 8) {
+                        const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                        const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                        for (int mr = 0; mr < 4; ++mr) {
+                            const uint4 a = *reinterpret_cast<const uint4*>(sx_hi + mr * 16 * LD + kk);
+                            hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                            hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                            hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                            hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                        }
+                    }
+#else
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 16) {
                         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb0, fb1;
@@ -7841,9 +8191,13 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                             wmma::mma_sync(acc[mr][1], fa, fb1, acc[mr][1]);
                         }
                     }
+#endif
                     __syncthreads();
                 }
             } else {
+#if __CUDA_ARCH__ < 750
+                const __half* sx_lo = sx + (wm * 32 + qa_row) * LD;
+#endif
                 for (int k0 = 0; k0 < K; k0 += WK) {
                     const __half* cxp0 = xp0 + k0;
                     *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
@@ -7864,6 +8218,21 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                         }
                     }
                     __syncthreads();
+#if __CUDA_ARCH__ < 750
+#pragma unroll 1
+                    for (int kk = 0; kk < WK; kk += 8) {
+                        const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
+                        const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+#pragma unroll
+                        for (int mr = 0; mr < 2; ++mr) {
+                            const uint4 a = *reinterpret_cast<const uint4*>(sx_lo + mr * 16 * LD + kk);
+                            hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
+                            hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
+                            hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
+                            hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                        }
+                    }
+#else
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 16) {
                         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb0, fb1;
@@ -7877,10 +8246,38 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                             wmma::mma_sync(acc[mr][1], fa, fb1, acc[mr][1]);
                         }
                     }
+#endif
                     __syncthreads();
                 }
             }
 
+#if __CUDA_ARCH__ < 750
+            const int mr_lim = has_hi ? 4 : 2;
+            const int wm_base = has_hi ? (wm * 64) : (wm * 32);
+#pragma unroll
+            for (int mr = 0; mr < 4; ++mr) {
+                if (mr >= mr_lim) break;
+                const int r0 = wm_base + mr * 16 + acc_r0;
+                const int r1 = wm_base + mr * 16 + acc_r1;
+                if (r0 < rows) {
+                    const int out_r0 = IS_DOWN ? ent_idx[c0 + r0] : (c0 + r0);
+                    float* dst0 = dst_mat + (size_t) out_r0 * N_out + col0 + wn * 32;
+                    *reinterpret_cast<float2*>(dst0 + acc_c0)      = make_float2(acc[mr][0][0] * sc, acc[mr][0][1] * sc);
+                    *reinterpret_cast<float2*>(dst0 + acc_c1)      = make_float2(acc[mr][0][4] * sc, acc[mr][0][5] * sc);
+                    *reinterpret_cast<float2*>(dst0 + 16 + acc_c0) = make_float2(acc[mr][1][0] * sc, acc[mr][1][1] * sc);
+                    *reinterpret_cast<float2*>(dst0 + 16 + acc_c1) = make_float2(acc[mr][1][4] * sc, acc[mr][1][5] * sc);
+                }
+                if (r1 < rows) {
+                    const int out_r1 = IS_DOWN ? ent_idx[c0 + r1] : (c0 + r1);
+                    float* dst1 = dst_mat + (size_t) out_r1 * N_out + col0 + wn * 32;
+                    *reinterpret_cast<float2*>(dst1 + acc_c0)      = make_float2(acc[mr][0][2] * sc, acc[mr][0][3] * sc);
+                    *reinterpret_cast<float2*>(dst1 + acc_c1)      = make_float2(acc[mr][0][6] * sc, acc[mr][0][7] * sc);
+                    *reinterpret_cast<float2*>(dst1 + 16 + acc_c0) = make_float2(acc[mr][1][2] * sc, acc[mr][1][3] * sc);
+                    *reinterpret_cast<float2*>(dst1 + 16 + acc_c1) = make_float2(acc[mr][1][6] * sc, acc[mr][1][7] * sc);
+                }
+            }
+            __syncthreads();
+#else
             float* s_out = reinterpret_cast<float*>(smem);
             if (has_hi) {
                 for (int mh = 0; mh < 2; ++mh) {
@@ -7917,6 +8314,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 }
                 __syncthreads();
             }
+#endif
         }
     }
 #else
@@ -7936,12 +8334,15 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     if (L.d_type != 40 && L.d_type != 8) return false;
 
     static int cc_ok[64];
+    static int cc_volta[64];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
     if (!cc_ok[dev]) {
-        int maj = 0;
+        int maj = 0, mnr = 0;
         if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        (void) cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev);
         cc_ok[dev] = (maj >= 7) ? 2 : 1;
+        cc_volta[dev] = (maj == 7 && mnr < 5) ? 1 : 0;
         if (maj >= 7) {
             cudaFuncSetAttribute(wmma_grouped_64_kernel<40, false, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_64_kernel<40, true, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
@@ -7974,9 +8375,13 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     float* up = (float*) ((uint8_t*) scratch + fa);
     __half* h16 = (__half*) ((uint8_t*) scratch + 2 * fa);
 
-    if (use_bm128 && L.gu_type != 40) {
+    const bool is_volta = (cc_volta[dev] != 0);
+    if (use_bm128 && (L.gu_type != 40 || is_volta)) {
         const dim3 ggu128((unsigned) (2 * L.n_ff / 128), (unsigned) ch_per_e128, (unsigned) cap_groups);
-        if (L.gu_type == 13) {
+        if (L.gu_type == 40) {
+            wmma_grouped_128_kernel<40, false><<<ggu128, 256, 0, s>>>(
+                grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+        } else if (L.gu_type == 13) {
             wmma_grouped_128_kernel<13, false><<<ggu128, 256, 0, s>>>(
                 grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
         } else if (L.gu_type == 12) {
@@ -8018,10 +8423,15 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     }
     check("native_expert_grouped_wmma/act");
 
-    if (use_bm128 && L.d_type != 40) {
+    if (use_bm128 && (L.d_type != 40 || is_volta)) {
         const dim3 gd128((unsigned) (L.n_embd / 128), (unsigned) ch_per_e128, (unsigned) cap_groups);
-        wmma_grouped_128_kernel<8, true><<<gd128, 256, 0, s>>>(
-            grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+        if (L.d_type == 40) {
+            wmma_grouped_128_kernel<40, true><<<gd128, 256, 0, s>>>(
+                grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+        } else {
+            wmma_grouped_128_kernel<8, true><<<gd128, 256, 0, s>>>(
+                grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+        }
     } else {
         const int d_bn = (L.d_type == 40 && use_bn128) ? 128 : 64;
         const dim3 gd64((unsigned) (L.n_embd / d_bn), (unsigned) ch_per_e64, (unsigned) cap_groups);

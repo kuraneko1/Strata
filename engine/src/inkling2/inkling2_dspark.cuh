@@ -1458,7 +1458,15 @@ struct DsparkEngine {
                 CK(cudaStreamSynchronize(E.st));
                 prev_id = sample_fn(i, row_lg);
             } else {
-                k_argmax<<<1, 256, 0, E.st>>>(E.logits, E.pick_d, (int) hp.vocab_unpadded);
+                if (hp.vocab_unpadded >= 4096 && E.argmax_val && E.argmax_idx) {
+                    constexpr int kArgBlks = 64;
+                    k_argmax_stage1<<<dim3(kArgBlks, 1), 256, 0, E.st>>>(
+                        E.logits, E.argmax_val, E.argmax_idx, (int) hp.vocab_unpadded);
+                    k_argmax_stage2<<<1, 32, 0, E.st>>>(
+                        E.argmax_val, E.argmax_idx, E.pick_d, kArgBlks);
+                } else {
+                    k_argmax<<<1, 256, 0, E.st>>>(E.logits, E.pick_d, (int) hp.vocab_unpadded);
+                }
                 int32_t next_id = 0;
                 CK(cudaMemcpyAsync(&next_id, E.pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, E.st));
                 CK(cudaStreamSynchronize(E.st));

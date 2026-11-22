@@ -591,6 +591,54 @@ __global__ void k_control_up_combine_t1(const float* __restrict__ cur, const flo
     }
 }
 
+/// Fused small-T (2..8) loop_gain + loop_forget ([R=64 -> N] F32) + k_control_combine:
+/// Loads W_gain/W_forget ONCE per output row across all T tokens against SMEM ctrl64[T][64].
+/// Eliminates 2x cuBLAS SGEMM + splitKreduce + k_control_combine per module during verify decode.
+template <int MT, bool EXACT_T>
+__global__ void k_control_up_combine_smallT(const float* __restrict__ cur, const float* __restrict__ msg,
+                                            const float* __restrict__ w_gain, const float* __restrict__ w_forget,
+                                            const float* __restrict__ ctrl64, float* __restrict__ out,
+                                            int T, int N) {
+    __shared__ float sx[MT][64];
+    const int tot_x = (EXACT_T ? MT : T) * 64;
+    for (int idx = threadIdx.x; idx < tot_x; idx += 256) {
+        sx[idx >> 6][idx & 63] = ctrl64[idx];
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int base_o = (blockIdx.x * 8 + warp) * 2;
+    const int half = lane >> 4;
+    const int i = lane & 15;
+    const float* wg = half ? w_forget : w_gain;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int o = base_o + k;
+        if (o >= N) return;
+        const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * 64)[i];
+        float acc[MT];
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 x = reinterpret_cast<const float4*>(sx[t])[i];
+                acc[t] = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                float a = acc[t];
+#pragma unroll
+                for (int m = 8; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+                const float f_val = __shfl_sync(0xffffffffu, a, 16);
+                if (lane == 0) {
+                    const size_t idx = (size_t) t * N + o;
+                    out[idx] = (1.0f - fast_tanh(f_val)) * cur[idx] + fast_tanh(a) * msg[idx];
+                }
+            }
+        }
+    }
+}
+
 /// High-occupancy F32 GEMV for small n_out (1 CTA of 128 threads per output row).
 __global__ void k_gemv_f32_cta(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
                                int n_in, int n_out) {
@@ -607,6 +655,164 @@ __global__ void k_gemv_f32_cta(const float* __restrict__ W, const float* __restr
     }
     acc = block_sum(acc, sh);
     if (threadIdx.x == 0) y[o] = acc;
+}
+
+/// Small-T (2..8) F32 GEMM for small n_out (<= 128): 1 CTA of 256 threads per output row,
+/// reads W ONCE across all T tokens (eliminates cuBLAS SGEMM + splitKreduce overhead on loop_down / router).
+template <int MT, bool EXACT_T>
+__global__ void k_gemm_f32_smallT_cta(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y,
+                                      int n_in, int n_out, int T) {
+    __shared__ float s_sum[MT][8];
+    const int o = blockIdx.x;
+    if (o >= n_out) return;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n4 = n_in >> 2;
+    const float4* wr = reinterpret_cast<const float4*>(W + (size_t) o * n_in);
+    float acc[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
+    for (int i = tid; i < n4; i += 256) {
+        const float4 a = wr[i];
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 b = reinterpret_cast<const float4*>(X + (size_t) t * n_in)[i];
+                acc[t] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (EXACT_T || t < T) {
+            float v = acc[t];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0) s_sum[t][warp] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < (EXACT_T ? MT : T)) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) s += s_sum[tid][w];
+        Y[(size_t) tid * n_out + o] = s;
+    }
+}
+
+/// Small-T (2..8) F32 GEMM for larger n_out (> 128): 8 warps/block, 1 warp per output row, reads W ONCE across T tokens.
+template <int MT, bool EXACT_T>
+__global__ void k_gemm_f32_smallT_warp(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y,
+                                       int n_in, int n_out, int T) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 8 + warp;
+    if (o >= n_out) return;
+    const int n4 = n_in >> 2;
+    const float4* wr = reinterpret_cast<const float4*>(W + (size_t) o * n_in);
+    float acc[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
+    for (int i = lane; i < n4; i += 32) {
+        const float4 a = wr[i];
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 b = reinterpret_cast<const float4*>(X + (size_t) t * n_in)[i];
+                acc[t] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (EXACT_T || t < T) {
+            float v = acc[t];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0) Y[(size_t) t * n_out + o] = v;
+        }
+    }
+}
+
+/// Small-T (2..8) BF16-weight x FP32-activation GEMM (n_out <= 128): 1 CTA of 256 threads per output row.
+/// Reads BF16 weights ONCE via uint2 (4 BF16s) across all T tokens; eliminates bf16->f16 + f32->f16 + cutlass + splitKreduce.
+template <int MT, bool EXACT_T>
+__global__ void k_gemm_bf16_smallT_cta(const uint16_t* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y,
+                                       int n_in, int n_out, int T) {
+    __shared__ float s_sum[MT][8];
+    const int o = blockIdx.x;
+    if (o >= n_out) return;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n4 = n_in >> 2;
+    const uint2* wr = reinterpret_cast<const uint2*>(W + (size_t) o * n_in);
+    float acc[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
+    for (int i = tid; i < n4; i += 256) {
+        const uint2 w2 = wr[i];
+        const float w0 = __uint_as_float((w2.x & 0xFFFFu) << 16);
+        const float w1 = __uint_as_float(w2.x & 0xFFFF0000u);
+        const float w2f = __uint_as_float((w2.y & 0xFFFFu) << 16);
+        const float w3 = __uint_as_float(w2.y & 0xFFFF0000u);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 b = reinterpret_cast<const float4*>(X + (size_t) t * n_in)[i];
+                acc[t] += w0 * b.x + w1 * b.y + w2f * b.z + w3 * b.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (EXACT_T || t < T) {
+            float v = acc[t];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0) s_sum[t][warp] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < (EXACT_T ? MT : T)) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) s += s_sum[tid][w];
+        Y[(size_t) tid * n_out + o] = s;
+    }
+}
+
+/// Small-T (2..8) BF16-weight x FP32-activation GEMM (n_out > 128): 8 warps/block, 1 warp per output row.
+template <int MT, bool EXACT_T>
+__global__ void k_gemm_bf16_smallT_warp(const uint16_t* __restrict__ W, const float* __restrict__ X, float* __restrict__ Y,
+                                        int n_in, int n_out, int T) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 8 + warp;
+    if (o >= n_out) return;
+    const int n4 = n_in >> 2;
+    const uint2* wr = reinterpret_cast<const uint2*>(W + (size_t) o * n_in);
+    float acc[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
+    for (int i = lane; i < n4; i += 32) {
+        const uint2 w2 = wr[i];
+        const float w0 = __uint_as_float((w2.x & 0xFFFFu) << 16);
+        const float w1 = __uint_as_float(w2.x & 0xFFFF0000u);
+        const float w2f = __uint_as_float((w2.y & 0xFFFFu) << 16);
+        const float w3 = __uint_as_float(w2.y & 0xFFFF0000u);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 b = reinterpret_cast<const float4*>(X + (size_t) t * n_in)[i];
+                acc[t] += w0 * b.x + w1 * b.y + w2f * b.z + w3 * b.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (EXACT_T || t < T) {
+            float v = acc[t];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0) Y[(size_t) t * n_out + o] = v;
+        }
+    }
 }
 
 /// Causal 4-tap shortconv (+ optional dynamic per-head taps for full-attn K/V).
@@ -4888,6 +5094,87 @@ __global__ void k_argmax(const float* __restrict__ logits, int32_t* __restrict__
         __syncthreads();
     }
     if (threadIdx.x == 0) pick[blockIdx.x] = si[0];
+}
+
+/// Multi-block argmax stage 1: grid(n_blk, rows), block 256. Saturates all SMs on 200K+ vocab.
+__global__ void k_argmax_stage1(const float* __restrict__ logits, float* __restrict__ p_val,
+                                int32_t* __restrict__ p_idx, int V) {
+    __shared__ float sv[8];
+    __shared__ int32_t si[8];
+    const int b = blockIdx.x, row_id = blockIdx.y, n_blk = gridDim.x;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const float* row = logits + (size_t) row_id * V;
+    float mv = -1e30f;
+    int32_t mi = 0;
+    const int stride = n_blk * 256;
+    if ((((uintptr_t) row) & 15u) == 0u) {
+        const int v4 = V >> 2;
+        const float4* row4 = reinterpret_cast<const float4*>(row);
+        for (int i4 = b * 256 + tid; i4 < v4; i4 += stride) {
+            const float4 v = row4[i4];
+            const int base = i4 << 2;
+            if (v.x > mv) { mv = v.x; mi = base; }
+            if (v.y > mv) { mv = v.y; mi = base + 1; }
+            if (v.z > mv) { mv = v.z; mi = base + 2; }
+            if (v.w > mv) { mv = v.w; mi = base + 3; }
+        }
+        if (b == 0) {
+            const int tail_start = v4 << 2;
+            for (int i = tail_start + tid; i < V; i += 256) {
+                const float v = row[i];
+                if (v > mv) { mv = v; mi = i; }
+            }
+        }
+    } else {
+        for (int i = b * 256 + tid; i < V; i += stride) {
+            const float v = row[i];
+            if (v > mv) { mv = v; mi = i; }
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+        if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+    }
+    if (lane == 0) { sv[warp] = mv; si[warp] = mi; }
+    __syncthreads();
+    if (warp == 0) {
+        mv = (lane < 8) ? sv[lane] : -1e30f;
+        mi = (lane < 8) ? si[lane] : 0;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+            const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+            if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+        }
+        if (lane == 0) {
+            p_val[row_id * n_blk + b] = mv;
+            p_idx[row_id * n_blk + b] = mi;
+        }
+    }
+}
+
+/// Multi-block argmax stage 2: grid(rows), block 32 (pure warp reduction, zero SMEM).
+__global__ void k_argmax_stage2(const float* __restrict__ p_val, const int32_t* __restrict__ p_idx,
+                                int32_t* __restrict__ pick, int n_blk) {
+    const int row_id = blockIdx.x, lane = threadIdx.x;
+    const float* pv = p_val + row_id * n_blk;
+    const int32_t* pi = p_idx + row_id * n_blk;
+    float mv = -1e30f;
+    int32_t mi = 0;
+    for (int i = lane; i < n_blk; i += 32) {
+        const float v = pv[i];
+        const int32_t idx = pi[i];
+        if (v > mv || (v == mv && idx < mi)) { mv = v; mi = idx; }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+        if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+    }
+    if (lane == 0) pick[row_id] = mi;
 }
 
 struct SwaLayerPtrs {

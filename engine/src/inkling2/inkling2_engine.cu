@@ -749,6 +749,8 @@ struct Engine {
     int32_t *ids = nullptr, *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
     unsigned long long* grp_ptr = nullptr;
     int32_t *tok_d = nullptr, *pos0_d = nullptr, *pick_d = nullptr;
+    float* argmax_val = nullptr;
+    int32_t* argmax_idx = nullptr;
 
     // Hybrid CPU pool staging
     int32_t* h_ids = nullptr;        // [tmax * top_k]
@@ -968,6 +970,7 @@ struct Engine {
         cudaFree(layer_arena);
         cudaFree(ids); cudaFree(grp_start); cudaFree(n_groups); cudaFree(ent_dst); cudaFree(ent_tok); cudaFree(grp_ptr);
         cudaFree(tok_d); cudaFree(pos0_d); cudaFree(pick_d);
+        cudaFree(argmax_val); cudaFree(argmax_idx);
         cudaFree(d_miss); cudaFree(ecpu);
         cudaFreeHost(h_tok_buf);
         if (ckpt_pin) cudaFreeHost(ckpt_pin);
@@ -1203,6 +1206,8 @@ struct Engine {
         CK(cudaMalloc(&tok_d, (size_t) tmax * sizeof(int32_t)));
         CK(cudaMalloc(&pos0_d, sizeof(int32_t)));
         CK(cudaMalloc(&pick_d, (size_t) tmax * sizeof(int32_t)));
+        CK(cudaMalloc(&argmax_val, (size_t) verify_max_t * 64 * sizeof(float)));
+        CK(cudaMalloc(&argmax_idx, (size_t) verify_max_t * 64 * sizeof(int32_t)));
 
         CK(cudaMallocHost(&h_ids, (size_t) max_ent * sizeof(int32_t)));
         CK(cudaMallocHost(&h_ewts, (size_t) max_ent * sizeof(float)));
@@ -1303,6 +1308,29 @@ struct Engine {
             const uint16_t* wp = (const uint16_t*) W.d;
             if (T == 1) {
                 K::bf16_gemv_fp32_mmvf(X, wp, Y, K_in, N_out, st);
+            } else if (T >= 2 && T <= 8 && (K_in % 4) == 0 && ((((uintptr_t) wp) & 7u) == 0u) && ((((uintptr_t) X) & 15u) == 0u)) {
+                if (N_out <= 128) {
+                    if (T == 4) {
+                        k_gemm_bf16_smallT_cta<4, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 4);
+                    } else if (T == 2) {
+                        k_gemm_bf16_smallT_cta<2, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 2);
+                    } else if (T == 3) {
+                        k_gemm_bf16_smallT_cta<3, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 3);
+                    } else {
+                        k_gemm_bf16_smallT_cta<8, false><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    }
+                } else {
+                    const unsigned nb = (unsigned) ((N_out + 7) / 8);
+                    if (T == 4) {
+                        k_gemm_bf16_smallT_warp<4, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 4);
+                    } else if (T == 2) {
+                        k_gemm_bf16_smallT_warp<2, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 2);
+                    } else if (T == 3) {
+                        k_gemm_bf16_smallT_warp<3, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 3);
+                    } else {
+                        k_gemm_bf16_smallT_warp<8, false><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    }
+                }
             } else if (bf16_x_f16) {
                 const uint16_t* xf16 = f16_ready;
                 if (!xf16) {
@@ -1347,6 +1375,31 @@ struct Engine {
             }
             return;
         }
+        if (T >= 2 && T <= 8 && (K_in % 4) == 0) {
+            if (N_out <= 128) {
+                if (T == 4) {
+                    k_gemm_f32_smallT_cta<4, true><<<(unsigned) N_out, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, 4);
+                } else if (T == 2) {
+                    k_gemm_f32_smallT_cta<2, true><<<(unsigned) N_out, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, 2);
+                } else if (T == 3) {
+                    k_gemm_f32_smallT_cta<3, true><<<(unsigned) N_out, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, 3);
+                } else {
+                    k_gemm_f32_smallT_cta<8, false><<<(unsigned) N_out, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, T);
+                }
+            } else {
+                const unsigned nb = (unsigned) ((N_out + 7) / 8);
+                if (T == 4) {
+                    k_gemm_f32_smallT_warp<4, true><<<nb, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, 4);
+                } else if (T == 2) {
+                    k_gemm_f32_smallT_warp<2, true><<<nb, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, 2);
+                } else if (T == 3) {
+                    k_gemm_f32_smallT_warp<3, true><<<nb, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, 3);
+                } else {
+                    k_gemm_f32_smallT_warp<8, false><<<nb, 256, 0, st>>>(W, X, Y, (int) K_in, (int) N_out, T);
+                }
+            }
+            return;
+        }
         const float alpha = 1.0f, beta = 0.0f;
         CKB(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) N_out, T, (int) K_in, &alpha, W, (int) K_in, X, (int) K_in, &beta, Y, (int) N_out));
     }
@@ -1363,7 +1416,7 @@ struct Engine {
         for (int i = 0; i < B; ++i) np.p[i] = n_blocks[(size_t) (B - 1 - i)];
         np.p[B] = c_already_normed ? c : norm_cur;
         const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
-        if (T >= 16 && (N & 3) == 0 && D <= 8 && (n_q == 1 || n_q == 3)) {
+        if (T >= 1 && (N & 3) == 0 && D <= 8 && (n_q == 1 || n_q == 3)) {
             MixOuts4 mo4{};
             for (int i = 0; i < (swa_bcast ? 3 : n_q); ++i) mo4.p[i] = outs[i];
             if (n_q == 1) {
@@ -1407,11 +1460,28 @@ struct Engine {
         }
         k_control_prep<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, ctrl2N, N, hp.rms_eps);
         project(ctrl2N, L.loop_down[mod], ctrl64, T, hp.loop_gate_rank, 2 * N);
-        if (T == 1 && hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
-            k_control_up_combine_t1<<<(unsigned) ((N + 31) / 32), 256, 0, st>>>(
-                c, msg, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d,
-                ctrl64, out, (int) hp.loop_gate_rank, N);
-            return;
+        if (hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
+            if (T == 1) {
+                k_control_up_combine_t1<<<(unsigned) ((N + 31) / 32), 256, 0, st>>>(
+                    c, msg, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d,
+                    ctrl64, out, (int) hp.loop_gate_rank, N);
+                return;
+            }
+            if (T >= 2 && T <= 8) {
+                const unsigned nb = (unsigned) ((N + 15) / 16);
+                const float* wg = (const float*) L.loop_gain[mod].d;
+                const float* wf = (const float*) L.loop_forget[mod].d;
+                if (T == 4) {
+                    k_control_up_combine_smallT<4, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 4, N);
+                } else if (T == 2) {
+                    k_control_up_combine_smallT<2, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 2, N);
+                } else if (T == 3) {
+                    k_control_up_combine_smallT<3, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 3, N);
+                } else {
+                    k_control_up_combine_smallT<8, false><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, T, N);
+                }
+                return;
+            }
         }
         project(ctrl64, L.loop_gain[mod], ctrl_g, T, N, hp.loop_gate_rank);
         project(ctrl64, L.loop_forget[mod], ctrl_f, T, N, hp.loop_gate_rank);
@@ -2243,7 +2313,7 @@ struct Engine {
                     np.p[B] = bank_last_norm;
                     MixOuts4 mo4{};
                     mo4.p[0] = msg0; mo4.p[1] = msg3; mo4.p[2] = msg1; mo4.p[3] = msg2;
-                    if (T >= 16 && (N & 3) == 0 && B + 1 <= 8) {
+                    if (T >= 1 && (N & 3) == 0 && B + 1 <= 8) {
                         k_mix_normed_fused<4><<<(unsigned) T, kThreads, 0, st>>>(
                             np, B + 1, q_attn, q_kv, mo4, N, 1.0f / std::sqrt((float) N), 0);
                     } else {
@@ -2699,8 +2769,18 @@ struct Engine {
         const float* head_h = (rows == T) ? cur : (cur + (size_t) (T - 1) * N);
         project(head_h, m->output_weight, logits, rows, hp.vocab_unpadded, N);
         const int64_t tot_lg = (int64_t) rows * hp.vocab_unpadded;
-        k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);
-        k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+        if (copy_logits && hp.softcap > 0.0f) {
+            k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);
+        }
+        if (hp.vocab_unpadded >= 4096 && argmax_val && argmax_idx && rows <= verify_max_t) {
+            constexpr int kArgBlks = 64;
+            k_argmax_stage1<<<dim3(kArgBlks, (unsigned) rows), 256, 0, st>>>(
+                logits, argmax_val, argmax_idx, (int) hp.vocab_unpadded);
+            k_argmax_stage2<<<(unsigned) rows, 32, 0, st>>>(
+                argmax_val, argmax_idx, pick_d, kArgBlks);
+        } else {
+            k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+        }
         std::vector<int32_t> tmp_picks((size_t) rows, 0);
         if (copy_logits && out_logits) {
             out_logits->resize((size_t) tot_lg);
