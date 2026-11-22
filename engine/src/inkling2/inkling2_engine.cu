@@ -2589,7 +2589,12 @@ struct Engine {
             }
             const uint16_t* f16_q = (T > 8) ? act_bf16 : nullptr;
             const uint16_t* f16_k_pre = (T > 8) ? ((ink_src == in_q) ? act_bf16 : (act_bf16 + (size_t) T * N)) : nullptr;
-            project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N, f16_q);
+            // On sm_75+ (!bf16_x_f16), BF16 weights (attn_sink_proj, type 30) overwrite act_bf16 with BF16 bits!
+            // Only run attn_sink_proj before Q/Gate/R when T <= 8 or bf16_x_f16 == true (FP16 input); otherwise defer after Q/K/V.
+            const bool defer_sink = (T > 8 && !bf16_x_f16 && L.attn_sink_proj.type == 30);
+            if (!defer_sink) {
+                project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N, f16_q);
+            }
             float* pQ = Q;
             float* pGate = att_gate;
             float* pR = R;
@@ -2639,6 +2644,10 @@ struct Engine {
                         const uint16_t* f16_v = (T > 8 && inv_src == in_q) ? f16_q : nullptr;
                         project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N, f16_v);
                     }
+                }
+                // Deferred BF16 sink projection (sm_75+, !bf16_x_f16): runs after all FP16 consumers of act_bf16 finish.
+                if (defer_sink) {
+                    project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N);
                 }
                 // Dynamic conv projections (BF16 on !is_swa): reuse f16_k_pre (act_bf16 + T*N) and f16_v (act_bf16)!
                 if (!is_swa && !(T == 1 && L.attn_kkc.d != nullptr)) {
