@@ -42,13 +42,13 @@ The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) f
 
 ## Benchmarks
 
-<p align="center">
-  <img src="docs/media/inkling2-benchmarks.png" width="960" alt="strata-inkling2 benchmarks on RTX 4070 12 GB and Tesla V100 32 GB">
-</p>
-
 All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--kv-q8`, zero quantization change).
 
 ### RTX 4070 12 GB (`sm_89`, Ryzen 7 5700X, DSpark OFF)
+
+<p align="center">
+  <img src="docs/media/bench-rtx4070.png" width="960" alt="RTX 4070 12 GB Prefill and Decode throughput vs context depth">
+</p>
 
 | Mode (`--max-context`) | Context Depth | Prefill | Decode | Hit Rate / Notes |
 | --- | ---: | ---: | ---: | --- |
@@ -63,6 +63,10 @@ All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--k
 Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md).
 
 ### Tesla V100-PCIE-32GB (`sm_70`, CUDA 12.9)
+
+<p align="center">
+  <img src="docs/media/bench-v100.png" width="960" alt="Tesla V100 32 GB Prefill and Decode throughput vs context depth">
+</p>
 
 | Mode (`--max-context`) | Context Depth | Prefill | Decode | Notes |
 | --- | ---: | ---: | ---: | --- |
