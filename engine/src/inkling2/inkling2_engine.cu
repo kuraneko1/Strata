@@ -739,7 +739,10 @@ struct Engine {
     int attn_split_slots = 0;        // total (t, sp) slots in attn_split; every launch MUST satisfy T * sp <= attn_split_slots
     int sm_count = 80;
     int fa2_256_bulk_smem = 87040;
+    int fa2_256_tail_smem = 52224;
+    int fa2_192_swa_smem = 69632;
     bool can_fa2_192 = false;
+    bool can_fa2_192_swa_fast = false;
     bool can_ctrl_wmma = false;
     bool can_fa2_256 = false;
     bool bf16_x_f16 = false;
@@ -1281,10 +1284,14 @@ struct Engine {
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<true, false, false>, 98304) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, true, false>, 98304) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, true, true>, 98304);
+        fa2_192_swa_smem = (cc_maj == 7 && cc_min < 5) ? 73728 : 69632;
+        can_fa2_192_swa_fast = ((cc_maj == 7 && cc_min < 5) || cc_maj >= 8) &&
+            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192_swa_fast, fa2_192_swa_smem);
         fa2_256_bulk_smem = (cc_maj == 7 && cc_min < 5) ? 92160 : 87040;
+        fa2_256_tail_smem = (cc_maj == 7 && cc_min < 5) ? 55296 : 52224;
         can_fa2_256 =
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_256_bulk, fa2_256_bulk_smem) &&
-            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_256_tail, 87040);
+            try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_256_tail, fa2_256_tail_smem);
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_gqa3, 49152);
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_t32, 49152);
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma, 29184);
@@ -2221,6 +2228,14 @@ struct Engine {
                 run_gpu_res();
                 run_staged();
             }
+            if (post_conv && post_conv->w_conv && T >= 32 && (N & 3) == 0 && !post_conv->hist_trace) {
+                const int n4 = N >> 2;
+                k_combine_experts_shortconv_pp<<<dim3((unsigned) ((n4 + 63) / 64), (unsigned) ((T + 63) / 64)), 64, 0, st>>>(
+                    eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
+                    N, Kp, post_conv->hist_offset, T);
+                if (prof) { CK(cudaStreamSynchronize(st)); p_moe_gpu_ms += ms_since(tp_moe_r0); }
+                return true;
+            }
             const int n4 = ((N & 3) == 0) ? (N >> 2) : N;
             const unsigned c_blk = ((n4 % 192) == 0) ? 192u : 256u;
             k_combine_experts<<<dim3((unsigned) ((n4 + (int) c_blk - 1) / (int) c_blk), (unsigned) T), c_blk, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
@@ -2413,6 +2428,14 @@ struct Engine {
             k_combine_experts_shortconv<<<(unsigned) ((N + 31) / 32), 32, 0, st>>>(
                 eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
                 N, Kp, post_conv->hist_offset, T, post_conv->hist_trace, post_conv->hist_trace_stride);
+            if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
+            return true;
+        }
+        if (post_conv && post_conv->w_conv && T >= 32 && (N & 3) == 0 && !post_conv->hist_trace) {
+            const int n4 = N >> 2;
+            k_combine_experts_shortconv_pp<<<dim3((unsigned) ((n4 + 63) / 64), (unsigned) ((T + 63) / 64)), 64, 0, st>>>(
+                eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
+                N, Kp, post_conv->hist_offset, T);
             if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
             return true;
         }
@@ -3548,10 +3571,11 @@ struct Engine {
                             }
                         }
                         const int total_sp = best_sp + 1;
+                        const int q_tiles_128 = (T + 127) / 128;
                         k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, (size_t) fa2_256_bulk_smem, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], sink, pp_sp_buf,
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], bulk_aligned, kq_scale, T, best_sp, total_sp);
-                        k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv), 256, 87040, st>>>(
+                        k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles_128), (unsigned) hp.n_head_kv), 256, (size_t) fa2_256_tail_smem, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pp_sp_buf,
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp);
                         k_attn_pp_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
@@ -3582,6 +3606,12 @@ struct Engine {
                                 (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale, T, best_sp);
                             k_attn_pp_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                                 pp_sp_buf, pGate, att, (int) hp.n_head, best_sp, want_att_f16 ? act_bf16 : nullptr);
+                            if (want_att_f16) att_f16_ready = act_bf16;
+                        } else if (is_swa && fuse_swa_rel_pp && can_fa2_192_swa_fast) {
+                            k_attn_q8_gqa3_pp_fa2_192_swa_fast<<<dim3((unsigned) q_tiles, (unsigned) hp.n_head_kv), 384, (size_t) fa2_192_swa_smem, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], sink, pGate, att,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale, T,
+                                pR, L.attn_rel_bias, want_att_f16 ? act_bf16 : nullptr);
                             if (want_att_f16) att_f16_ready = act_bf16;
                         } else if (is_swa && fuse_swa_rel_pp) {
                             k_attn_q8_gqa3_pp_fa2_192<false, true, true><<<dim3((unsigned) q_tiles, (unsigned) hp.n_head_kv), 256, 97280, st>>>(
@@ -3729,8 +3759,9 @@ struct Engine {
             const bool f16_ffn_ready = (T >= 16 && (N & 3) == 0);
             const bool fuse_comb_conv = (!is_hy && T <= 8);
             const PostConvSpec hy_conv{L.ffn_post_conv, hst, ffn_inp, cur, 2 * (int) kv_dim + N, h_tr, total_conv_floats};
+            const bool want_pp_comb_conv = (T >= 32 && !save_conv_trace && (N & 3) == 0 && (!is_hy || pp_streaming));
             const bool post_conv_done = run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv,
-                                                f16_ffn_ready, (is_hy && T <= 8 && !pp_streaming) ? &hy_conv : nullptr);
+                                                f16_ffn_ready, ((is_hy && T <= 8 && !pp_streaming) || want_pp_comb_conv) ? &hy_conv : nullptr);
             const auto tp_mp0 = Clock::now();
             if (post_conv_done) {
                 // Already fused k_combine_experts[_hybrid]_shortconv directly into cur!
