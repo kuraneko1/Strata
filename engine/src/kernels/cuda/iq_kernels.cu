@@ -1455,6 +1455,7 @@ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1's two 16-value sub-
         }
         return r;
     }
+    template<bool USE_LUT = true>
     __device__ static W load_lut(const void* __restrict__ vbq, int kbx, int iqs, const float* __restrict__ s_ue4m3) {
         const block_nvfp4* bq4 = (const block_nvfp4*) vbq + kbx;
         W r;
@@ -1463,7 +1464,9 @@ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1's two 16-value sub-
             const int iqs0 = iqs + 2 * i, iqs1 = iqs0 + 1, is = iqs0 >> 1;
             r.v0[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs0), kvalues_fp4);
             r.v1[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs1), kvalues_fp4);
-            r.sc[i] = s_ue4m3 ? s_ue4m3[bq4->d[is]] : ue4m3_to_f32_half(bq4->d[is]);
+            const uint8_t d = __ldg(&bq4->d[is]);
+            if constexpr (USE_LUT) r.sc[i] = s_ue4m3[d];
+            else r.sc[i] = ue4m3_to_f32_half(d);
         }
         return r;
     }
@@ -1646,7 +1649,7 @@ __device__ __forceinline__ void row_dot_20_sub8(const uint8_t* row, const block_
 
 // 8-lane sub-warp row dot for K = nb * ipb == 36 (TD == 40, NVFP4 with n_ff == 1152): 4 rows per warp (32 rows per
 // 256-thread block), 89% lane balance, minimal register pressure, bitwise identical addition tree to row_dot_multi.
-template<int NC, bool EXACT_N = false>
+template<int NC, bool EXACT_N = false, bool USE_LUT = true>
 // Linear sequential 8-lane sub-warp row dot for K = nb * ipb == 36 (TG == 40, NVFP4 with n_ff == 1152):
 // single contiguous streaming pass over HBM2/GDDR6X, minimal registers (4 vs 8+ accumulators), zero spills.
 __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
@@ -1654,7 +1657,7 @@ __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_
     using S = Split<40>;
     {
         const int k = t, kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+        const typename S::W w = S::template load_lut<USE_LUT>(row, kbx, iqs, s_ue4m3);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] = S::apply(w, x + off[c] + kbx * 2, iqs);
@@ -1662,14 +1665,14 @@ __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_
 #pragma unroll
     for (int step = 8; step <= 24; step += 8) {
         const int k = t + step, kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+        const typename S::W w = S::template load_lut<USE_LUT>(row, kbx, iqs, s_ue4m3);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
     }
     if (t < 4) {
         const int k = t + 32, kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+        const typename S::W w = S::template load_lut<USE_LUT>(row, kbx, iqs, s_ue4m3);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
@@ -1747,7 +1750,7 @@ __device__ __forceinline__ void row_dot_q8_0_36_sub8(const uint8_t* row, const b
 
 // Linear sequential 8-lane sub-warp row dot for K = nb * ipb == 72 (TG == 40, NVFP4 with n_embd == 2304):
 // 4 rows/warp (32 rows/CTA), single linear HBM2/GDDR6X pass (eliminates 4x strided jumps & 2x accumulator regs).
-template<int NC, bool EXACT_N = false>
+template<int NC, bool EXACT_N = false, bool USE_LUT = true>
 __device__ __forceinline__ void row_dot_72_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                                 int t, float (&s)[NC], const float* __restrict__ s_ue4m3 = nullptr) {
     using S = Split<40>;
@@ -1756,7 +1759,7 @@ __device__ __forceinline__ void row_dot_72_sub8(const uint8_t* row, const block_
 #pragma unroll 1
     for (int k = t; k < 72; k += 8) {
         const int kbx = k >> 1, iqs = (k & 1) << 2;
-        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+        const typename S::W w = S::template load_lut<USE_LUT>(row, kbx, iqs, s_ue4m3);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
@@ -1768,6 +1771,35 @@ __device__ __forceinline__ void row_dot_72_sub8(const uint8_t* row, const block_
             for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
         }
     }
+}
+
+// Single-pass fused Gate+Up 8-lane sub-warp row dot for T == 1 (NC=1): sequentially applies Gate then Up per k-step
+// so wg and wu never overlap in registers (STACK: 0!), sharing L1-resident bx, bitwise identical to row_dot_72_sub8.
+__device__ __forceinline__ void row_dot_72_gu_sub8_t1(const uint8_t* row_g, const uint8_t* row_u,
+                                                      const block_q8_1* x, int t, float& sg_out, float& su_out,
+                                                      const float* __restrict__ s_ue4m3) {
+    using S = Split<40>;
+    float sg = 0.0f, su = 0.0f;
+#pragma unroll 1
+    for (int k = t; k < 72; k += 8) {
+        const int kbx = k >> 1, iqs = (k & 1) << 2;
+        const block_q8_1* bx = x + kbx * 2;
+        {
+            const typename S::W wg = S::template load_lut<true>(row_g, kbx, iqs, s_ue4m3);
+            sg += S::apply(wg, bx, iqs);
+        }
+        {
+            const typename S::W wu = S::template load_lut<true>(row_u, kbx, iqs, s_ue4m3);
+            su += S::apply(wu, bx, iqs);
+        }
+    }
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) {
+        sg += __shfl_xor_sync(0xffffffffu, sg, o);
+        su += __shfl_xor_sync(0xffffffffu, su, o);
+    }
+    sg_out = sg;
+    su_out = su;
 }
 
 // 16-lane sub-warp row dot for K = nb * ipb == 20 (TD == 42, Q2_0, and TD == 40, NVFP4, with n_ff == 640):
@@ -4525,6 +4557,78 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
     }
 }
 
+// Standalone T=1 (single-entry-per-group) L1-direct fused NVFP4 Gate+Up+SiTU+Q8_1 kernel:
+// Drops 10.4 KB s_xq_buf SMEM & staging barrier (higher occupancy), fuses Gate+Up in a single k-loop, bit-exact.
+__global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+    const block_q8_1* __restrict__ xq, NativeExpertLayout L, float beta, float lb,
+    block_q8_1* __restrict__ hq) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    __shared__ float sh[32];
+    __shared__ float s_ue4m3[256];
+    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    iq_sync_lds();
+    const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = (int) blockIdx.x * 32 + subwarp;
+    const size_t g_off = (size_t) r * L.gu_row;
+    const size_t u_off = L.up_off + g_off;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const float sg = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+        const float su = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const block_q8_1* xe = xq + (size_t) ent_tok[e] * 72;
+            float s_g = 0.0f, s_u = 0.0f;
+            row_dot_72_gu_sub8_t1(blob + g_off, blob + u_off, xe, t, s_g, s_u, s_ue4m3);
+            if (t == 0) {
+                const float gg = s_g * sg;
+                const float uu = s_u * su;
+                const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
+                const float tu = lb > 0.0f ? lb * tanhf(uu / lb) : uu;
+                sh[subwarp] = tg * tu;
+            }
+            iq_sync_lds();
+            if (warp == 0) {
+                q8_1_store(sh[lane], hq, (long long) e * L.n_ff + (long long) blockIdx.x * 32 + lane);
+            }
+            if (e + 1 < e1 || g + (int) gridDim.y < ng) iq_sync_lds();
+        }
+    }
+}
+
+// Standalone T=1 (128-thr = 16 rows/CTA) L1-direct NVFP4 down kernel for n_ff == 1152:
+// Doubles CTA count (72 -> 144 per expert: fixes V100 1.80-wave tail), skips s_hq_buf SMEM staging & per-group barriers.
+__global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
+    const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    __shared__ float s_ue4m3[256];
+    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
+    iq_sync_lds();
+    const int r = (int) blockIdx.x * 16 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    if (r >= L.n_embd) return;
+    const size_t w_off = L.down_off + (size_t) r * L.d_row;
+    const int off1[1] = { 0 };
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            float s1[1];
+            row_dot_36_sub8<1, true, true>(wr, hq + (size_t) e * 36, off1, 1, t, s1, s_ue4m3);
+            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+        }
+    }
+}
+
 // Standalone zero-spill NVFP4 (type 40) down kernel for n_ff == 1152 (36 dots, 8 lanes/row, 32 rows/block, SMEM hq).
 __global__ void __launch_bounds__(256, 4) native_down_nvfp4_36_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
@@ -4798,9 +4902,14 @@ bool launch_gu_swiglu(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, c
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
-                 float* out) {
+                 float* out, int64_t cap_entries = 0) {
     if constexpr (TD == 40) {
         if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 1152) {
+            if (cap_entries > 0 && cap_entries <= 8) {
+                const dim3 g16((unsigned) ((L.n_embd + 15) / 16), grid.y);
+                native_down_nvfp4_36_t1_kernel<<<g16, 128, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                return;
+            }
             native_down_nvfp4_36_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             return;
         }
@@ -7143,8 +7252,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         L.had_block == 0 && g_exp_phase == 0 && !v1 && !g_old_kernels && !g_no_sub16_gu && !nib_layout(L)) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) gy);
         if (L.gu_type == 40) {
-            native_gu_nvfp4_72_situ_q8_1_kernel<<<gl, 256, 0, s>>>(
-                grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
+            if (cap_entries <= 8) {
+                native_gu_nvfp4_72_situ_q8_1_t1_kernel<<<gl, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
+            } else {
+                native_gu_nvfp4_72_situ_q8_1_kernel<<<gl, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
+            }
         } else {
             native_gu_q5k_72_situ_q8_1_kernel<<<gl, 256, 0, s>>>(
                 grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
@@ -7296,7 +7410,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     if (!expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out))   // STRATA_EXPDEC=1
     switch (L.d_type) {
-#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, cap_entries); break;
         STRATA_D_FMTS(STRATA_DOWN)
 #undef STRATA_DOWN
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);

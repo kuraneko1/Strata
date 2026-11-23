@@ -66,8 +66,6 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
     const float2* inputs2 = reinterpret_cast<const float2*>(x);
     __shared__ float partials[32];
-    if (t < 32) partials[t] = 0.0f;
-    __syncthreads();
     float acc = 0.0f;
     if (BLOCK_SIZE == 256 && fast != 0 && n_in == 2560) {
         // STRATA_SMALL_UNR bit 0: the router-shaped single-column read, five passes of one weight pair each (all in range), constant
@@ -105,7 +103,7 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
         // All lanes have the same reduced value; one store avoids a same-value shared-memory race.
         if ((t & 31) == 0) partials[t / 32] = acc;
         __syncthreads();
-        if (t < 32) acc = mmvf_warp_sum(partials[t]);
+        if (t < 32) acc = mmvf_warp_sum((t < (BLOCK_SIZE >> 5)) ? partials[t] : 0.0f);
     }
     if (t == 0) y[blockIdx.x] = acc;
 }

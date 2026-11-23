@@ -20,13 +20,14 @@ __device__ __forceinline__ float warp_max_d(float v) {
     return v;
 }
 
-/// Mix 4 target feature tensors via softmax(fuse_row[0..3]) and RMSNorm: grid (T), block 256.
+/// Mix 4 target feature tensors via softmax(fuse_row[0..3]) and RMSNorm:
+/// Single-pass 576-thr float4 register-cached when N == 2304 && blockDim.x == 576 (0 dst re-reads!).
 __global__ void k_dspark_mix_features(const float* __restrict__ f0, const float* __restrict__ f1,
                                       const float* __restrict__ f2, const float* __restrict__ f3,
                                       const float* __restrict__ fuse_row, const float* __restrict__ norm_w,
                                       float* __restrict__ out, int N, float eps) {
     __shared__ float sw[4];
-    __shared__ float ssum[8];
+    __shared__ float ssum[32];
     const int t = blockIdx.x;
     if (threadIdx.x == 0) {
         float a[4] = {fuse_row[0], fuse_row[1], fuse_row[2], fuse_row[3]};
@@ -40,6 +41,31 @@ __global__ void k_dspark_mix_features(const float* __restrict__ f0, const float*
     const float w0 = sw[0], w1 = sw[1], w2 = sw[2], w3 = sw[3];
     const size_t base = (size_t) t * N;
     float* dst = out + base;
+    if (N == 2304 && blockDim.x == 576) {
+        const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+        const float4 v0 = reinterpret_cast<const float4*>(f0 + base)[tid];
+        const float4 v1 = reinterpret_cast<const float4*>(f1 + base)[tid];
+        const float4 v2 = reinterpret_cast<const float4*>(f2 + base)[tid];
+        const float4 v3 = reinterpret_cast<const float4*>(f3 + base)[tid];
+        const float4 x = make_float4(
+            w0 * v0.x + w1 * v1.x + w2 * v2.x + w3 * v3.x,
+            w0 * v0.y + w1 * v1.y + w2 * v2.y + w3 * v3.y,
+            w0 * v0.z + w1 * v1.z + w2 * v2.z + w3 * v3.z,
+            w0 * v0.w + w1 * v1.w + w2 * v2.w + w3 * v3.w);
+        float acc = warp_sum_d(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
+        if (lane == 0) ssum[warp] = acc;
+        __syncthreads();
+        if (warp == 0) {
+            float tot = (lane < 18) ? ssum[lane] : 0.0f;
+            tot = warp_sum_d(tot);
+            if (lane == 0) ssum[0] = rsqrtf(tot / 2304.0f + eps);
+        }
+        __syncthreads();
+        const float sc = ssum[0];
+        const float4 nw = __ldg(reinterpret_cast<const float4*>(norm_w) + tid);
+        reinterpret_cast<float4*>(dst)[tid] = make_float4(x.x * sc * nw.x, x.y * sc * nw.y, x.z * sc * nw.z, x.w * sc * nw.w);
+        return;
+    }
     float acc = 0.0f;
     for (int c = threadIdx.x; c < N; c += blockDim.x) {
         const size_t i = base + c;
@@ -65,14 +91,18 @@ __global__ void k_dspark_mix_features(const float* __restrict__ f0, const float*
 }
 
 /// Fused per-head RMSNorm(k) + NeoX RoPE(k) + Q8 store for injected k_ctx, v_ctx.
+/// Reads pos0 from `pos0_d[0]` when non-null (enabling CUDA Graph capture of inject!), else uses `pos0_imm`.
 /// Grid (n_head_kv, T), Block 64 (d = 0..63 pairs (d, d+64) for D=128).
 __global__ void k_dspark_norm_rope_kv_store_q8(const float* __restrict__ K, const float* __restrict__ V,
                                                const float* __restrict__ k_norm_w,
                                                int8_t* __restrict__ kq, __half* __restrict__ ks,
                                                int8_t* __restrict__ vq, __half* __restrict__ vs,
-                                               int n_head_kv, int pos0, int cap, int is_swa,
-                                               float eps, float freq_base, int n_rot) {
+                                               int n_head_kv, int pos0_imm, const int32_t* __restrict__ pos0_d,
+                                               int cap, int is_swa, float eps, float freq_base, int n_rot) {
     __shared__ float s_red[2];
+    __shared__ float s_red_k[2];
+    __shared__ float s_red_v[2];
+    const int pos0 = pos0_d ? pos0_d[0] : pos0_imm;
     const int hkv = blockIdx.x, t = blockIdx.y;
     const int d = threadIdx.x;   // 0..63
     const int warp = d >> 5;
@@ -103,12 +133,10 @@ __global__ void k_dspark_norm_rope_kv_store_q8(const float* __restrict__ K, cons
 
     float ak = warp_max_d(fmaxf(fabsf(k0), fabsf(k1)));
     float av = warp_max_d(fmaxf(fabsf(v0), fabsf(v1)));
-    if ((d & 31) == 0) { s_red[warp] = ak; }
+    if ((d & 31) == 0) { s_red_k[warp] = ak; s_red_v[warp] = av; }
     __syncthreads();
-    const float amax_k = fmaxf(s_red[0], s_red[1]);
-    if ((d & 31) == 0) { s_red[warp] = av; }
-    __syncthreads();
-    const float amax_v = fmaxf(s_red[0], s_red[1]);
+    const float amax_k = fmaxf(s_red_k[0], s_red_k[1]);
+    const float amax_v = fmaxf(s_red_v[0], s_red_v[1]);
 
     const int pos = pos0 + t;
     const int slot = is_swa ? (pos % cap) : pos;
@@ -1645,7 +1673,6 @@ struct DsparkEngine {
     float* ctx_norm = nullptr;       // [tmax * N]
     float* ctx_k = nullptr;          // [tmax * kv_dim]
     float* ctx_v = nullptr;          // [tmax * kv_dim]
-    float* f_rnn_buf = nullptr;      // [tmax * N]
     float* f_rnn_last = nullptr;     // [N]
 
     float* block_cur = nullptr;      // [block_size * N]
@@ -1655,7 +1682,7 @@ struct DsparkEngine {
     float* V = nullptr;              // [block_size * kv_dim]
     float* att = nullptr;            // [block_size * q_dim]
     float* split_out = nullptr;      // [block_size * split_full * n_head * 130]
-    int split_full = 40;
+    int split_full = 120;
     float* wo = nullptr;             // [block_size * N]
     float* gate = nullptr;           // [block_size * n_ff]
     float* up = nullptr;             // [block_size * n_ff]
@@ -1666,7 +1693,9 @@ struct DsparkEngine {
     float* rnn_latent = nullptr;     // [rank]
     float* rnn_corr = nullptr;       // [N]
     float* h_pred = nullptr;         // [N]
-    int32_t* pos_d = nullptr;        // [1] device pos for CUDA Graph DFlare capture
+    int32_t* pos_d = nullptr;        // [1] device pos for CUDA Graph DFlare / inject capture
+    int32_t* h_pos_pin = nullptr;    // [1] pinned host pos for zero-sync DFlare H2D
+    int32_t* h_inj_pos_pin = nullptr;// [1] separate pinned host pos for inject H2D (no race with subsequent draft()!)
     int32_t* d_draft_ids = nullptr;  // [8] device token chain [anchor, d0, d1, ...] for zero-sync Markov graph
     int32_t* h_draft_ids_pin = nullptr; // pinned [8] host staging for d_draft_ids
     float* h_anchor_pin = nullptr;   // pinned [N] host buffer for async anchor upload
@@ -1674,6 +1703,8 @@ struct DsparkEngine {
     cudaGraphExec_t dflare_graph_split = nullptr; // captured 3-layer DFlare block (pos >= 256, WMMA Split-KV)
     cudaGraphExec_t markov_graphs[8] = {};        // captured greedy Markov chains indexed by n_draft (1..7)
     bool markov_graph_oom[8] = {};
+    cudaGraphExec_t inject_graphs[9] = {};        // captured inject(T=1..8, feat_off=0) graphs
+    bool inject_graph_oom[9] = {};
     std::vector<float> h_anchor;     // [N]
 
     // Stats
@@ -1689,6 +1720,9 @@ struct DsparkEngine {
         for (int i = 0; i < 8; ++i) {
             if (markov_graphs[i]) cudaGraphExecDestroy(markov_graphs[i]);
         }
+        for (int i = 0; i < 9; ++i) {
+            if (inject_graphs[i]) cudaGraphExecDestroy(inject_graphs[i]);
+        }
         for (auto* p : kq) cudaFree(p);
         for (auto* p : vq) cudaFree(p);
         for (auto* p : ks) cudaFree(p);
@@ -1696,7 +1730,6 @@ struct DsparkEngine {
         cudaFree(ctx_norm);
         cudaFree(ctx_k);
         cudaFree(ctx_v);
-        cudaFree(f_rnn_buf);
         cudaFree(f_rnn_last);
         cudaFree(block_cur);
         cudaFree(x_norm);
@@ -1716,6 +1749,8 @@ struct DsparkEngine {
         cudaFree(h_pred);
         cudaFree(pos_d);
         cudaFree(d_draft_ids);
+        if (h_pos_pin) cudaFreeHost(h_pos_pin);
+        if (h_inj_pos_pin) cudaFreeHost(h_inj_pos_pin);
         if (h_draft_ids_pin) cudaFreeHost(h_draft_ids_pin);
         if (h_anchor_pin) cudaFreeHost(h_anchor_pin);
     }
@@ -1743,7 +1778,6 @@ struct DsparkEngine {
         d_f32(&ctx_norm, (size_t) tmax * hp.n_embd);
         d_f32(&ctx_k, (size_t) tmax * hp.kv_dim);
         d_f32(&ctx_v, (size_t) tmax * hp.kv_dim);
-        d_f32(&f_rnn_buf, (size_t) tmax * hp.n_embd);
         d_f32(&f_rnn_last, (size_t) hp.n_embd);
 
         d_f32(&block_cur, (size_t) B * hp.n_embd);
@@ -1755,7 +1789,7 @@ struct DsparkEngine {
         int dev = 0, n_sm = 80;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
-        split_full = std::clamp((n_sm * 24) / std::max(1, hp.n_head_kv), 40, 240);
+        split_full = std::clamp((n_sm * 12) / std::max(1, hp.n_head_kv), 40, 120);
         d_f32(&split_out, (size_t) B * split_full * hp.n_head * 130);
         cudaFuncSetAttribute(dspark_detail::k_dspark_attn_q8_wmma_split<false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
@@ -1776,6 +1810,14 @@ struct DsparkEngine {
         d_f32(&rnn_corr, (size_t) hp.n_embd);
         d_f32(&h_pred, (size_t) hp.n_embd);
         CK(cudaMalloc(&pos_d, sizeof(int32_t)));
+        if (cudaMallocHost(&h_pos_pin, sizeof(int32_t)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            h_pos_pin = nullptr;
+        }
+        if (cudaMallocHost(&h_inj_pos_pin, sizeof(int32_t)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            h_inj_pos_pin = nullptr;
+        }
         CK(cudaMalloc(&d_draft_ids, 8 * sizeof(int32_t)));
         if (cudaMallocHost(&h_draft_ids_pin, 8 * sizeof(int32_t)) != cudaSuccess) {
             (void) cudaGetLastError();
@@ -1842,19 +1884,76 @@ struct DsparkEngine {
         pos = new_pos;
     }
 
-    /// Inject `T` committed target feature vectors (from pos0 .. pos0+T-1) into DSpark KV + update `f_rnn_last`.
+    /// Inject `T` committed target feature vectors (from pos0 .. pos0+T-1, starting at row `feat_off` of d_tgt_feat)
+    /// into DSpark KV + update `f_rnn_last`. Captures `inject_graphs[T]` for T = 1..8 (feat_off == 0)!
     template <typename EngineT>
-    void inject(EngineT& E, int pos0, int T) {
+    void inject(EngineT& E, int pos0, int T, int feat_off = 0) {
         if (T <= 0) return;
         const auto t0 = Clock::now();
         const auto& hp = dm->hp;
-        const float* f0 = E.d_tgt_feat[0];
-        const float* f1 = E.d_tgt_feat[1];
-        const float* f2 = E.d_tgt_feat[2];
-        const float* f3 = E.d_tgt_feat[3];
+        const size_t row_skip = (size_t) feat_off * (size_t) hp.n_embd;
+        const float* f0 = E.d_tgt_feat[0] + row_skip;
+        const float* f1 = E.d_tgt_feat[1] + row_skip;
+        const float* f2 = E.d_tgt_feat[2] + row_skip;
+        const float* f3 = E.d_tgt_feat[3] + row_skip;
+        const int mix_blk = (hp.n_embd == 2304) ? 576 : 256;
+        const bool can_graph = (feat_off == 0 && T >= 1 && T <= 8 && !E.prof && !inject_graph_oom[T]);
+        if (can_graph) {
+            if (h_inj_pos_pin) {
+                *h_inj_pos_pin = pos0;
+                CK(cudaMemcpyAsync(pos_d, h_inj_pos_pin, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+            } else {
+                CK(cudaMemcpyAsync(pos_d, &pos0, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+            }
+            cudaGraphExec_t& ig = inject_graphs[T];
+            if (!ig) {
+                cudaGraph_t g = nullptr;
+                if (cudaStreamBeginCapture(E.st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                    for (int il = 0; il < hp.n_layer; ++il) {
+                        const auto& L = dm->layers[(size_t) il];
+                        dspark_detail::k_dspark_mix_features<<<(unsigned) T, mix_blk, 0, E.st>>>(
+                            f0, f1, f2, f3, dm->dspark_fuse + il * 4, L.dflare_norm, ctx_norm, hp.n_embd, hp.rms_eps);
+                        E.prep_q8(ctx_norm, E.xq, T, hp.n_embd);
+                        if (!E.try_project_pair_q8_0(E.xq, L.attn_k_ctx, ctx_k, hp.kv_dim,
+                                                     L.attn_v_ctx, ctx_v, hp.kv_dim, T, hp.n_embd)) {
+                            E.project_preq(ctx_norm, E.xq, L.attn_k_ctx, ctx_k, T, hp.kv_dim, hp.n_embd);
+                            E.project_preq(ctx_norm, E.xq, L.attn_v_ctx, ctx_v, T, hp.kv_dim, hp.n_embd);
+                        }
+                        dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 64, 0, E.st>>>(
+                            ctx_k, ctx_v, L.attn_k_ctx_norm,
+                            kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                            hp.n_head_kv, 0, pos_d, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                            hp.rms_eps, hp.freq_base, hp.n_rot);
+                    }
+                    const size_t last_off = (size_t) (T - 1) * (size_t) hp.n_embd;
+                    dspark_detail::k_dspark_mix_features<<<1, mix_blk, 0, E.st>>>(
+                        f0 + last_off, f1 + last_off, f2 + last_off, f3 + last_off,
+                        dm->dspark_fuse + hp.n_layer * 4, dm->dspark_norm, f_rnn_last, hp.n_embd, hp.rms_eps);
+                    if (cudaStreamEndCapture(E.st, &g) == cudaSuccess && g) {
+                        if (cudaGraphInstantiate(&ig, g, nullptr, nullptr, 0) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            ig = nullptr;
+                            inject_graph_oom[T] = true;
+                        }
+                        cudaGraphDestroy(g);
+                    } else {
+                        (void) cudaGetLastError();
+                        inject_graph_oom[T] = true;
+                    }
+                } else {
+                    (void) cudaGetLastError();
+                    inject_graph_oom[T] = true;
+                }
+            }
+            if (ig) {
+                CK(cudaGraphLaunch(ig, E.st));
+                pos = pos0 + T;
+                return;
+            }
+        }
         for (int il = 0; il < hp.n_layer; ++il) {
             const auto& L = dm->layers[(size_t) il];
-            dspark_detail::k_dspark_mix_features<<<(unsigned) T, 256, 0, E.st>>>(
+            dspark_detail::k_dspark_mix_features<<<(unsigned) T, mix_blk, 0, E.st>>>(
                 f0, f1, f2, f3, dm->dspark_fuse + il * 4, L.dflare_norm, ctx_norm, hp.n_embd, hp.rms_eps);
             E.prep_q8(ctx_norm, E.xq, T, hp.n_embd);
             if (!E.try_project_pair_q8_0(T <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, hp.kv_dim,
@@ -1865,13 +1964,13 @@ struct DsparkEngine {
             dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 64, 0, E.st>>>(
                 ctx_k, ctx_v, L.attn_k_ctx_norm,
                 kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
-                hp.n_head_kv, pos0, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                hp.n_head_kv, pos0, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
                 hp.rms_eps, hp.freq_base, hp.n_rot);
         }
-        dspark_detail::k_dspark_mix_features<<<(unsigned) T, 256, 0, E.st>>>(
-            f0, f1, f2, f3, dm->dspark_fuse + hp.n_layer * 4, dm->dspark_norm, f_rnn_buf, hp.n_embd, hp.rms_eps);
-        CK(cudaMemcpyAsync(f_rnn_last, f_rnn_buf + (size_t) (T - 1) * hp.n_embd,
-                           (size_t) hp.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, E.st));
+        const size_t last_off = (size_t) (T - 1) * (size_t) hp.n_embd;
+        dspark_detail::k_dspark_mix_features<<<1, mix_blk, 0, E.st>>>(
+            f0 + last_off, f1 + last_off, f2 + last_off, f3 + last_off,
+            dm->dspark_fuse + hp.n_layer * 4, dm->dspark_norm, f_rnn_last, hp.n_embd, hp.rms_eps);
         pos = pos0 + T;
         if (E.prof) {
             CK(cudaStreamSynchronize(E.st));
@@ -1897,7 +1996,12 @@ struct DsparkEngine {
         float* anchor_src = h_anchor_pin ? h_anchor_pin : h_anchor.data();
         E.m->dequant_tok(anchor, anchor_src);
         CK(cudaMemcpyAsync(x_norm, anchor_src, (size_t) N * sizeof(float), cudaMemcpyHostToDevice, E.st));
-        CK(cudaMemcpyAsync(pos_d, &pos, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+        if (h_pos_pin) {
+            *h_pos_pin = pos;
+            CK(cudaMemcpyAsync(pos_d, h_pos_pin, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+        } else {
+            CK(cudaMemcpyAsync(pos_d, &pos, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+        }
 
         // 2. 3 DFlare transformer layers over block_cur [block_n, N] + output_norm + rnn_state zeroing (CUDA Graph captured)
         const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
@@ -1908,7 +2012,7 @@ struct DsparkEngine {
                 block_cur, dm->mask_embd, block_n, N);
             for (int il = 0; il < hp.n_layer; ++il) {
                 const auto& L = dm->layers[(size_t) il];
-                const int rms_blk = (N == 2304) ? 768 : kThreads;
+                const int rms_blk = (N == 2304) ? 576 : kThreads;
                 k_rms_norm_q8_1<<<(unsigned) block_n, rms_blk, 0, E.st>>>(block_cur, L.attn_norm, x_norm, E.xq, N, hp.rms_eps);
                 E.project_preq(x_norm, E.xq, L.attn_q, Q, block_n, hp.q_dim, N);
                 if (!E.try_project_pair_q8_0(E.xq, L.attn_k, K, hp.kv_dim, L.attn_v, V, hp.kv_dim, block_n, N)) {
@@ -1926,7 +2030,7 @@ struct DsparkEngine {
                         dspark_detail::k_dspark_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) block_n), 128, 0, E.st>>>(
                             split_out, att, hp.n_head, pos_d, split_full, 0, hp.n_swa, E.xq);
                     } else {
-                        const int sp_swa = std::min(split_full, 10);
+                        const int sp_swa = std::min(split_full, 24);
                         dspark_detail::k_dspark_attn_q8_wmma_split<true><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp_swa), 128, 18432, E.st>>>(
                             Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, split_out,
                             hp.n_head, hp.n_head_kv, kv_cap[(size_t) il], hp.n_swa, pos_d, block_n, kq_scale, sp_swa);
@@ -1943,7 +2047,7 @@ struct DsparkEngine {
                 dspark_detail::k_dspark_add<<<(unsigned) (((int64_t) block_n * N + 255) / 256), 256, 0, E.st>>>(
                     block_cur, block_cur, wo, (int64_t) block_n * N);
 
-                k_rms_norm_q8_1<<<(unsigned) block_n, (N == 2304) ? 768 : kThreads, 0, E.st>>>(block_cur, L.ffn_norm, x_norm, E.xq, N, hp.rms_eps);
+                k_rms_norm_q8_1<<<(unsigned) block_n, (N == 2304) ? 576 : kThreads, 0, E.st>>>(block_cur, L.ffn_norm, x_norm, E.xq, N, hp.rms_eps);
                 if (!E.try_project_pair_q8_0(E.xq, L.ffn_gate, gate, hp.n_ff, L.ffn_up, up, hp.n_ff, block_n, N)) {
                     E.project_preq(x_norm, E.xq, L.ffn_gate, gate, block_n, hp.n_ff, N);
                     E.project_preq(x_norm, E.xq, L.ffn_up, up, block_n, hp.n_ff, N);
