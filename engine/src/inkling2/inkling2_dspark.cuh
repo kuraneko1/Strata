@@ -1706,6 +1706,8 @@ struct DsparkEngine {
     cudaGraphExec_t inject_graphs[9] = {};        // captured inject(T=1..8, feat_off=0) graphs
     bool inject_graph_oom[9] = {};
     std::vector<float> h_anchor;     // [N]
+    bool ctx_aliased = false;
+    bool split_aliased = false;
 
     // Stats
     int64_t n_draft_calls = 0;
@@ -1714,22 +1716,65 @@ struct DsparkEngine {
     double draft_ms = 0.0;
     double inject_ms = 0.0;
 
+    void destroy_kv_graphs() {
+        if (dflare_graph_short) { cudaGraphExecDestroy(dflare_graph_short); dflare_graph_short = nullptr; }
+        if (dflare_graph_split) { cudaGraphExecDestroy(dflare_graph_split); dflare_graph_split = nullptr; }
+        for (int i = 0; i < 9; ++i) {
+            if (inject_graphs[i]) { cudaGraphExecDestroy(inject_graphs[i]); inject_graphs[i] = nullptr; }
+            inject_graph_oom[i] = false;
+        }
+    }
+
+    /// Rebind aliased arena buffers (ctx_norm/k/v and split_out) when Engine switches Prefill <-> Decode arena.
+    void rebind_arena(uint8_t* ext_arena, size_t ext_arena_bytes, int cur_tmax) {
+        destroy_kv_graphs();
+        for (int i = 0; i < 8; ++i) {
+            if (markov_graphs[i]) { cudaGraphExecDestroy(markov_graphs[i]); markov_graphs[i] = nullptr; }
+            markov_graph_oom[i] = false;
+        }
+        if (!ctx_aliased && !split_aliased) return;
+        const auto& hp = dm->hp;
+        auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
+        constexpr size_t kArenaBase = (size_t) 16 << 20;
+        const int eff_t = std::max(cur_tmax, 16);
+        const size_t sz_cn = align256((size_t) eff_t * hp.n_embd * sizeof(float));
+        const size_t sz_ck = align256((size_t) eff_t * hp.kv_dim * sizeof(float));
+        const size_t sz_cv = align256((size_t) eff_t * hp.kv_dim * sizeof(float));
+        if (ctx_aliased) {
+            if (!ext_arena || ext_arena_bytes < kArenaBase + sz_cn + sz_ck + sz_cv) {
+                std::fprintf(stderr, "strata-inkling2: dspark rebind_arena ctx overflow (%zu < %zu)\n",
+                             ext_arena_bytes, kArenaBase + sz_cn + sz_ck + sz_cv);
+                std::exit(1);
+            }
+            ctx_norm = reinterpret_cast<float*>(ext_arena + kArenaBase);
+            ctx_k    = reinterpret_cast<float*>(ext_arena + kArenaBase + sz_cn);
+            ctx_v    = reinterpret_cast<float*>(ext_arena + kArenaBase + sz_cn + sz_ck);
+        }
+        const size_t sz_sp = align256((size_t) hp.block_size * split_full * hp.n_head * 130 * sizeof(float));
+        if (split_aliased) {
+            if (!ext_arena || ext_arena_bytes < kArenaBase + sz_sp) {
+                std::fprintf(stderr, "strata-inkling2: dspark rebind_arena split overflow (%zu < %zu)\n",
+                             ext_arena_bytes, kArenaBase + sz_sp);
+                std::exit(1);
+            }
+            split_out = reinterpret_cast<float*>(ext_arena + kArenaBase);
+        }
+    }
+
     ~DsparkEngine() {
-        if (dflare_graph_short) cudaGraphExecDestroy(dflare_graph_short);
-        if (dflare_graph_split) cudaGraphExecDestroy(dflare_graph_split);
+        destroy_kv_graphs();
         for (int i = 0; i < 8; ++i) {
             if (markov_graphs[i]) cudaGraphExecDestroy(markov_graphs[i]);
-        }
-        for (int i = 0; i < 9; ++i) {
-            if (inject_graphs[i]) cudaGraphExecDestroy(inject_graphs[i]);
         }
         for (auto* p : kq) cudaFree(p);
         for (auto* p : vq) cudaFree(p);
         for (auto* p : ks) cudaFree(p);
         for (auto* p : vs) cudaFree(p);
-        cudaFree(ctx_norm);
-        cudaFree(ctx_k);
-        cudaFree(ctx_v);
+        if (!ctx_aliased) {
+            cudaFree(ctx_norm);
+            cudaFree(ctx_k);
+            cudaFree(ctx_v);
+        }
         cudaFree(f_rnn_last);
         cudaFree(block_cur);
         cudaFree(x_norm);
@@ -1737,7 +1782,7 @@ struct DsparkEngine {
         cudaFree(K);
         cudaFree(V);
         cudaFree(att);
-        cudaFree(split_out);
+        if (!split_aliased) cudaFree(split_out);
         cudaFree(wo);
         cudaFree(gate);
         cudaFree(up);
@@ -1755,7 +1800,8 @@ struct DsparkEngine {
         if (h_anchor_pin) cudaFreeHost(h_anchor_pin);
     }
 
-    void init(const DsparkModel& model, int max_ctx, int max_t) {
+    void init(const DsparkModel& model, int max_ctx, int max_t,
+              int init_full_cap = 0, uint8_t* ext_arena = nullptr, size_t ext_arena_bytes = 0) {
         dm = &model;
         ctx = max_ctx;
         tmax = std::max(max_t, 16);
@@ -1765,8 +1811,9 @@ struct DsparkEngine {
         ks.resize((size_t) hp.n_layer, nullptr);
         vs.resize((size_t) hp.n_layer, nullptr);
         kv_cap.resize((size_t) hp.n_layer, 0);
+        const int full_init = (init_full_cap > 0) ? std::min(max_ctx, init_full_cap) : max_ctx;
         for (int il = 0; il < hp.n_layer; ++il) {
-            const int cap = hp.is_swa(il) ? hp.n_swa : max_ctx;
+            const int cap = hp.is_swa(il) ? hp.n_swa : full_init;
             kv_cap[(size_t) il] = cap;
             CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
             CK(cudaMalloc(&vq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
@@ -1774,10 +1821,23 @@ struct DsparkEngine {
             CK(cudaMalloc(&vs[(size_t) il], (size_t) cap * hp.n_head_kv * sizeof(__half)));
         }
         auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
+        auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
         const int B = hp.block_size;
-        d_f32(&ctx_norm, (size_t) tmax * hp.n_embd);
-        d_f32(&ctx_k, (size_t) tmax * hp.kv_dim);
-        d_f32(&ctx_v, (size_t) tmax * hp.kv_dim);
+        constexpr size_t kArenaBase = (size_t) 16 << 20;  // keep clear of E.logits at arena offset 0
+        const size_t sz_cn = align256((size_t) tmax * hp.n_embd * sizeof(float));
+        const size_t sz_ck = align256((size_t) tmax * hp.kv_dim * sizeof(float));
+        const size_t sz_cv = align256((size_t) tmax * hp.kv_dim * sizeof(float));
+        if (ext_arena && ext_arena_bytes >= kArenaBase + sz_cn + sz_ck + sz_cv) {
+            ctx_norm = reinterpret_cast<float*>(ext_arena + kArenaBase);
+            ctx_k    = reinterpret_cast<float*>(ext_arena + kArenaBase + sz_cn);
+            ctx_v    = reinterpret_cast<float*>(ext_arena + kArenaBase + sz_cn + sz_ck);
+            ctx_aliased = true;
+        } else {
+            d_f32(&ctx_norm, (size_t) tmax * hp.n_embd);
+            d_f32(&ctx_k, (size_t) tmax * hp.kv_dim);
+            d_f32(&ctx_v, (size_t) tmax * hp.kv_dim);
+            ctx_aliased = false;
+        }
         d_f32(&f_rnn_last, (size_t) hp.n_embd);
 
         d_f32(&block_cur, (size_t) B * hp.n_embd);
@@ -1790,7 +1850,14 @@ struct DsparkEngine {
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
         split_full = std::clamp((n_sm * 12) / std::max(1, hp.n_head_kv), 40, 120);
-        d_f32(&split_out, (size_t) B * split_full * hp.n_head * 130);
+        const size_t sz_sp = align256((size_t) B * split_full * hp.n_head * 130 * sizeof(float));
+        if (ext_arena && ext_arena_bytes >= kArenaBase + sz_sp) {
+            split_out = reinterpret_cast<float*>(ext_arena + kArenaBase);
+            split_aliased = true;
+        } else {
+            d_f32(&split_out, (size_t) B * split_full * hp.n_head * 130);
+            split_aliased = false;
+        }
         cudaFuncSetAttribute(dspark_detail::k_dspark_attn_q8_wmma_split<false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
         cudaFuncSetAttribute(dspark_detail::k_dspark_attn_q8_wmma_split<false>,
@@ -1834,6 +1901,91 @@ struct DsparkEngine {
     void reset(cudaStream_t st) {
         pos = 0;
         CK(cudaMemsetAsync(f_rnn_last, 0, (size_t) dm->hp.n_embd * sizeof(float), st));
+    }
+
+    int count_full_layers() const {
+        int n = 0;
+        for (int il = 0; il < dm->hp.n_layer; ++il) {
+            if (!dm->hp.is_swa(il)) ++n;
+        }
+        return n;
+    }
+
+    void grow_full_kv(int new_cap, cudaStream_t st) {
+        const auto& hp = dm->hp;
+        const int nhkv = hp.n_head_kv;
+        bool grew = false;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            if (hp.is_swa(il)) continue;
+            const int old_cap = kv_cap[(size_t) il];
+            if (new_cap <= old_cap) continue;
+            if (!grew) {
+                destroy_kv_graphs();
+                grew = true;
+            }
+            const size_t n_old = (size_t) std::min<int64_t>(pos, old_cap);
+            const size_t b_kv_head = n_old * 128 * sizeof(int8_t);
+            const size_t b_s_head = n_old * sizeof(__half);
+            const size_t old_kv_stride = (size_t) old_cap * 128;
+            const size_t new_kv_stride = (size_t) new_cap * 128;
+            const size_t per_tok = (size_t) hp.kv_dim * 2 + (size_t) nhkv * sizeof(__half) * 2;
+            size_t fr = 0, tot = 0;
+            CK(cudaMemGetInfo(&fr, &tot));
+            const bool direct_d2d = (fr >= (size_t) new_cap * per_tok + ((size_t) 64 << 20));
+            if (direct_d2d) {
+                int8_t *nkq = nullptr, *nvq = nullptr;
+                __half *nks = nullptr, *nvs = nullptr;
+                CK(cudaMalloc(&nkq, (size_t) new_cap * hp.kv_dim * sizeof(int8_t)));
+                CK(cudaMalloc(&nvq, (size_t) new_cap * hp.kv_dim * sizeof(int8_t)));
+                CK(cudaMalloc(&nks, (size_t) new_cap * nhkv * sizeof(__half)));
+                CK(cudaMalloc(&nvs, (size_t) new_cap * nhkv * sizeof(__half)));
+                if (n_old > 0) {
+                    for (int h = 0; h < nhkv; ++h) {
+                        CK(cudaMemcpyAsync(nkq + (size_t) h * new_kv_stride, kq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToDevice, st));
+                        CK(cudaMemcpyAsync(nvq + (size_t) h * new_kv_stride, vq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToDevice, st));
+                        CK(cudaMemcpyAsync(nks + (size_t) h * new_cap,       ks[(size_t) il] + (size_t) h * old_cap,       b_s_head,  cudaMemcpyDeviceToDevice, st));
+                        CK(cudaMemcpyAsync(nvs + (size_t) h * new_cap,       vs[(size_t) il] + (size_t) h * old_cap,       b_s_head,  cudaMemcpyDeviceToDevice, st));
+                    }
+                    CK(cudaStreamSynchronize(st));
+                }
+                cudaFree(kq[(size_t) il]); cudaFree(vq[(size_t) il]);
+                cudaFree(ks[(size_t) il]); cudaFree(vs[(size_t) il]);
+                kq[(size_t) il] = nkq; vq[(size_t) il] = nvq;
+                ks[(size_t) il] = nks; vs[(size_t) il] = nvs;
+            } else {
+                std::vector<uint8_t> stage;
+                if (n_old > 0) {
+                    stage.resize((size_t) nhkv * (2 * b_kv_head + 2 * b_s_head));
+                    uint8_t* p = stage.data();
+                    for (int h = 0; h < nhkv; ++h) {
+                        CK(cudaMemcpyAsync(p, kq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToHost, st)); p += b_kv_head;
+                        CK(cudaMemcpyAsync(p, vq[(size_t) il] + (size_t) h * old_kv_stride, b_kv_head, cudaMemcpyDeviceToHost, st)); p += b_kv_head;
+                        CK(cudaMemcpyAsync(p, ks[(size_t) il] + (size_t) h * old_cap,       b_s_head,  cudaMemcpyDeviceToHost, st)); p += b_s_head;
+                        CK(cudaMemcpyAsync(p, vs[(size_t) il] + (size_t) h * old_cap,       b_s_head,  cudaMemcpyDeviceToHost, st)); p += b_s_head;
+                    }
+                    CK(cudaStreamSynchronize(st));
+                }
+                cudaFree(kq[(size_t) il]); cudaFree(vq[(size_t) il]);
+                cudaFree(ks[(size_t) il]); cudaFree(vs[(size_t) il]);
+                kq[(size_t) il] = nullptr; vq[(size_t) il] = nullptr;
+                ks[(size_t) il] = nullptr; vs[(size_t) il] = nullptr;
+                CK(cudaMalloc(&kq[(size_t) il], (size_t) new_cap * hp.kv_dim * sizeof(int8_t)));
+                CK(cudaMalloc(&vq[(size_t) il], (size_t) new_cap * hp.kv_dim * sizeof(int8_t)));
+                CK(cudaMalloc(&ks[(size_t) il], (size_t) new_cap * nhkv * sizeof(__half)));
+                CK(cudaMalloc(&vs[(size_t) il], (size_t) new_cap * nhkv * sizeof(__half)));
+                if (n_old > 0) {
+                    const uint8_t* p = stage.data();
+                    for (int h = 0; h < nhkv; ++h) {
+                        CK(cudaMemcpyAsync(kq[(size_t) il] + (size_t) h * new_kv_stride, p, b_kv_head, cudaMemcpyHostToDevice, st)); p += b_kv_head;
+                        CK(cudaMemcpyAsync(vq[(size_t) il] + (size_t) h * new_kv_stride, p, b_kv_head, cudaMemcpyHostToDevice, st)); p += b_kv_head;
+                        CK(cudaMemcpyAsync(ks[(size_t) il] + (size_t) h * new_cap,       p, b_s_head,  cudaMemcpyHostToDevice, st)); p += b_s_head;
+                        CK(cudaMemcpyAsync(vs[(size_t) il] + (size_t) h * new_cap,       p, b_s_head,  cudaMemcpyHostToDevice, st)); p += b_s_head;
+                    }
+                    CK(cudaStreamSynchronize(st));
+                }
+            }
+            kv_cap[(size_t) il] = new_cap;
+        }
     }
 
     size_t checkpoint_bytes() const {

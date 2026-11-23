@@ -183,20 +183,23 @@ int main() {
         check(p.full_kv_init == 16384, "16K ctx still allocates 16K KV upfront");
     }
 
-    // 9. RTX 4070 12GB with DSpark enabled accounts for DSpark KV + shrinks pp_stage_mb to 16 MiB
+    // 9. RTX 4070 12GB with DSpark enabled uses chunk=2048 + full 64 MiB pp_stage (freed during decode via phase-split)
     {
         auto in131 = rtx4070_12g(131072, /*draft=*/true);
         in131.vram_free_bytes = (size_t) (9.50 * (double) GiB);
         const auto p131 = resolve_inkling2_profile(in131);
         std::printf("%s\n", format_profile_line(in131, p131).c_str());
         check(p131.regime == VramRegime::TightHybrid, "RTX 4070 131K + DSpark demotes cleanly to TightHybrid");
-        check(p131.pp_stage_mb == 16, "RTX 4070 12GB + DSpark uses compact 16 MiB pp_stage");
+        check(p131.chunk == 2048, "RTX 4070 131K + DSpark uses chunk=2048");
+        check(p131.pp_stage_mb == 64, "RTX 4070 12GB + DSpark TightHybrid uses 64 MiB pp_stage");
+        check(p131.kv_grow_reserve_mib == 80, "RTX 4070 12GB + DSpark TightHybrid uses 80 MiB kv grow reserve");
 
         auto in65 = rtx4070_12g(65536, /*draft=*/true);
         in65.vram_free_bytes = (size_t) (9.50 * (double) GiB);
         const auto p65 = resolve_inkling2_profile(in65);
         check(p65.regime == VramRegime::CoreResidentHybrid, "RTX 4070 65K + DSpark keeps CoreResidentHybrid");
-        check(p65.pp_stage_mb == 16, "RTX 4070 65K + DSpark uses compact 16 MiB pp_stage");
+        check(p65.chunk == 2048, "RTX 4070 65K + DSpark uses chunk=2048");
+        check(p65.pp_stage_mb == 64, "RTX 4070 65K + DSpark uses 64 MiB pp_stage");
     }
 
     if (fails > 0) {

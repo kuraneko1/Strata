@@ -193,7 +193,10 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     //    - TightHybrid on measured sm_89 Q8KV (no draft) uses 2048 (SWA-3072 ring halves PCIe streaming bytes/tok).
     const size_t swa_kv_2048 = (size_t) std::max(0, in.n_swa_layers) * (size_t) (std::max(1, in.n_swa) + 2048) * in.kv_bytes_per_tok;
     const size_t engine_overhead_2048 = 576 * MiB;
-    const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + 160 * MiB;
+    const size_t dspark_kv_2048_need = in.has_draft
+                                     ? ((size_t) std::max(1, in.max_ctx) * in.kv_bytes_per_tok + 128 * MiB)
+                                     : 0;
+    const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_2048_need + 160 * MiB;
     const size_t full_vram_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + in.all_experts_bytes + dspark_kv_need + 256 * MiB;
 
     if (in.requested_chunk > 0) {
@@ -204,10 +207,10 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
             in.kv_q8 && in.vram_free_bytes >= full_vram_2048_need) {
             out.chunk = 2048;
         } else if (out.regime == VramRegime::TightHybrid && out.arch.allow_tight_chunk_2048 &&
-            in.kv_q8 && !in.has_draft && in.vram_free_bytes > init_kv_bytes + ((size_t) 4 << 30)) {
+            in.kv_q8 && in.vram_free_bytes > init_kv_bytes + ((size_t) 4 << 30)) {
             out.chunk = 2048;
         } else if (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_2048 &&
-                   in.kv_q8 && !in.has_draft && in.vram_free_bytes >= core_hybrid_2048_need) {
+                   in.kv_q8 && in.vram_free_bytes >= core_hybrid_2048_need) {
             out.chunk = 2048;
         } else if (in.vram_free_bytes > init_kv_bytes + ((size_t) 4 << 30)) {
             out.chunk = 1024;
@@ -230,12 +233,13 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
         out.pp_stage_cnt_pref = 0;
         out.use_d_hits = false;
     } else if (out.regime == VramRegime::CoreResidentHybrid) {
-        out.pp_stage_mb = (in.has_draft && in.vram_total_bytes <= ((size_t) 13 << 30)) ? 16 : out.arch.pp_stage_mb;
+        out.pp_stage_mb = out.arch.pp_stage_mb;
         out.pp_stage_cnt_pref = out.arch.pp_stage_cnt_core;
         out.use_d_hits = true;
     } else {
-        out.pp_stage_mb = (in.has_draft && in.vram_total_bytes <= ((size_t) 13 << 30)) ? 16 : out.arch.pp_stage_mb;
+        out.pp_stage_mb = out.arch.pp_stage_mb;
         out.pp_stage_cnt_pref = out.arch.pp_stage_cnt_pref;
+        if (in.has_draft && in.vram_total_bytes <= ((size_t) 13 << 30)) out.kv_grow_reserve_mib = 80;
         out.use_d_hits = true;
     }
 

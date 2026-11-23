@@ -757,6 +757,7 @@ struct Engine {
     uint8_t* swa_bak = nullptr;
     float* d_conv_trace = nullptr;   // [verify_max_t][n_layer][layer_conv_floats]
     float* d_tgt_feat[4] = {};       // [tmax * N] captured at dspark.target_layers
+    float* h_tgt_feat_pin[4] = {};   // non-null when d_tgt_feat is zero-copy mapped pinned RAM (Hybrid VRAM save)
     double p_draft_ms = 0.0;
 
     // Activation scratch (all allocated up to tmax rows; phase-disjoint buffers share layer_arena)
@@ -790,6 +791,13 @@ struct Engine {
     bool can_ctrl_wmma = false;
     bool can_fa2_256 = false;
     bool bf16_x_f16 = false;
+    bool has_bf16_dense = false;
+    static constexpr int kDecodePhaseCap = 24;
+    bool in_decode_phase = false;
+    size_t prefill_ephemeral_bytes = 0;
+    size_t decode_ephemeral_bytes = 0;
+    int saved_pp_stage_cnt = 0;
+    size_t saved_pp_stage_bytes = 0;
     int attn_split_t1_full = 160;
     int attn_split_t1_swa = 20;
     float *router_logits = nullptr, *ewts = nullptr, *eparts = nullptr, *moe_raw = nullptr;
@@ -948,11 +956,11 @@ struct Engine {
     // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM,
     // plus per-layer pre-route graphs (attn + mix + ffn_norm + route).
     cudaGraphExec_t core_graph = nullptr;
-    cudaGraphExec_t verify_core_graph = nullptr;
+    cudaGraphExec_t verify_core_graph[9] = {};
     // Full 48-layer + swa_bak + head + argmax/softcap graphs for Full-VRAM (T=1..8, capture_dspark, want_softcap, want_argmax)
     cudaGraphExec_t full_decode_graph[9][2][2][2] = {};
     std::vector<cudaGraphExec_t> layer_pre_graph;
-    std::vector<cudaGraphExec_t> verify_pre_graph;
+    std::vector<cudaGraphExec_t> verify_pre_graph[9];
     uint32_t* h_hits_pin = nullptr;
     bool core_all_gpu = false;
     bool graph_oom = false;
@@ -1141,17 +1149,147 @@ struct Engine {
         if (ckpt_pin) CK(cudaStreamSynchronize(st));
     }
 
+    void free_ephemeral_bufs() {
+        for (int b = 0; b < 9; ++b) {
+            if (norm_blk_buf[b]) { cudaFree(norm_blk_buf[b]); norm_blk_buf[b] = nullptr; }
+        }
+        if (prelude_cur_buf) { cudaFree(prelude_cur_buf); prelude_cur_buf = nullptr; }
+        if (cur) { cudaFree(cur); cur = nullptr; }
+        if (ffn_inp) { cudaFree(ffn_inp); ffn_inp = nullptr; }
+        if (msg3) { cudaFree(msg3); msg3 = nullptr; }
+        if (sink) { cudaFree(sink); sink = nullptr; }
+        if (router_logits) { cudaFree(router_logits); router_logits = nullptr; }
+        if (ewts) { cudaFree(ewts); ewts = nullptr; }
+        if (act_bf16) { cudaFree(act_bf16); act_bf16 = nullptr; }
+        act_bf16_only = nullptr;
+        if (layer_arena) { cudaFree(layer_arena); layer_arena = nullptr; }
+        layer_arena_bytes = 0;
+    }
+
+    size_t alloc_ephemeral_bufs(int cap_t) {
+        const auto& hp = m->hp;
+        const int N = (int) hp.n_embd;
+        const int64_t max_ent = (int64_t) cap_t * hp.n_expert_used;
+        auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
+        auto a256 = [](size_t n) -> size_t { return (n + 255) & ~(size_t) 255; };
+        size_t total_b = 0;
+
+        for (int b = 0; b < norm_blk_cnt; ++b) {
+            d_f32(&norm_blk_buf[b], (size_t) cap_t * N);
+            total_b += (size_t) cap_t * N * sizeof(float);
+        }
+        d_f32(&prelude_cur_buf, (size_t) cap_t * N); total_b += (size_t) cap_t * N * sizeof(float);
+        d_f32(&cur, (size_t) cap_t * N);             total_b += (size_t) cap_t * N * sizeof(float);
+        d_f32(&ffn_inp, (size_t) cap_t * N);         total_b += (size_t) cap_t * N * sizeof(float);
+        d_f32(&msg3, (size_t) cap_t * N);            total_b += (size_t) cap_t * N * sizeof(float);
+        d_f32(&sink, (size_t) cap_t * hp.n_head);    total_b += (size_t) cap_t * hp.n_head * sizeof(float);
+        d_f32(&router_logits, (size_t) cap_t * hp.n_expert); total_b += (size_t) cap_t * hp.n_expert * sizeof(float);
+        d_f32(&ewts, (size_t) max_ent);              total_b += (size_t) max_ent * sizeof(float);
+
+        const size_t act_elems = std::max<size_t>((size_t) cap_t * 2 * (size_t) N, (size_t) 16 * 4 * (size_t) N);
+        CK(cudaMalloc(&act_bf16, act_elems * sizeof(uint16_t)));
+        total_b += act_elems * sizeof(uint16_t);
+
+        const size_t sz_N = a256((size_t) cap_t * (size_t) N * sizeof(float));
+        const size_t sz_2N = a256((size_t) cap_t * 2 * (size_t) N * sizeof(float));
+        const size_t sz_q = a256((size_t) cap_t * (size_t) hp.q_dim * sizeof(float));
+        const size_t sz_kv = a256((size_t) cap_t * (size_t) hp.kv_dim * sizeof(float));
+        const size_t sz_rel = a256((size_t) cap_t * (size_t) (hp.n_rel * hp.n_head) * sizeof(float));
+        const size_t sz_dyn = a256((size_t) cap_t * (size_t) (hp.n_conv * hp.n_head_kv) * sizeof(float));
+        const size_t sz_c64 = a256((size_t) cap_t * (size_t) hp.loop_gate_rank * sizeof(float));
+        ctrl_w16_bytes = a256((size_t) (hp.loop_gate_rank * 2 * N + 2 * N * hp.loop_gate_rank) * sizeof(uint16_t));
+        const size_t sz_reltab = a256((size_t) cap_t * (size_t) hp.n_head * (size_t) hp.n_rel_ext * sizeof(float));
+
+        const size_t reg0_qkv = 3 * sz_N + 4 * sz_kv + sz_rel + 2 * sz_dyn;
+        const size_t per_sp_bytes = (size_t) cap_t * (size_t) hp.n_head * 130 * sizeof(float);
+        const size_t attn_split_bytes = (size_t) attn_split_slots * (size_t) hp.n_head * 130 * sizeof(float);
+        const size_t want_sp = (size_t) std::max(2, profile.want_sp);
+        const size_t reg0_bytes = a256(std::max({reg0_qkv, want_sp * per_sp_bytes, attn_split_bytes}));
+        const size_t reg1_bytes = a256(std::max(3 * sz_N, 3 * sz_q));
+        const size_t reg2_ctrl = sz_2N + 3 * sz_N + sz_c64 + ctrl_w16_bytes;
+        const size_t reg2_bytes = a256(std::max(reg2_ctrl, sz_reltab));
+        const size_t overlay_a_bytes = reg0_bytes + reg1_bytes + reg2_bytes;
+        const size_t overlay_a_ctrl_inffn = reg0_bytes + reg1_bytes + reg2_ctrl + sz_N;
+
+        eparts_bytes = a256((size_t) max_ent * (size_t) N * sizeof(float));
+        bool all_situ_fused = (hp.n_ff % 64 == 0 && hp.n_expert <= 256);
+        for (const auto& L : m->layers) {
+            if (!L.L.situ || !K::native_expert_wmma_supported(L.L)) { all_situ_fused = false; break; }
+        }
+        if (all_situ_fused) {
+            const size_t escr_wmma = K::native_expert_wmma_fused_scratch_bytes(max_ent, hp.n_expert, hp.n_ff);
+            const size_t escr_small = K::native_expert_scratch_bytes(std::min<int64_t>(max_ent, 16 * hp.n_expert_used), hp.n_ff);
+            escr_bytes = a256(std::max(escr_wmma, escr_small));
+        } else {
+            escr_bytes = a256(K::native_expert_scratch_bytes(max_ent, hp.n_ff));
+        }
+        const size_t overlay_b_bytes = eparts_bytes + escr_bytes + sz_N + sz_N;
+        const size_t logits_bytes = a256((size_t) verify_max_t * (size_t) hp.vocab_unpadded * sizeof(float));
+        const size_t dspark_arena_min = (verify_max_t > 1) ? ((size_t) 28 << 20) : 0;
+
+        layer_arena_bytes = std::max({overlay_a_bytes, overlay_b_bytes, overlay_a_ctrl_inffn, logits_bytes, dspark_arena_min});
+        CK(cudaMalloc(&layer_arena, layer_arena_bytes));
+        total_b += layer_arena_bytes;
+        auto aptr = [&](size_t off) -> float* { return reinterpret_cast<float*>(layer_arena + off); };
+
+        size_t o = 0;
+        in_q = aptr(o); o += sz_N;
+        in_k = aptr(o); o += sz_N;
+        in_v = aptr(o); o += sz_N;
+        K = aptr(o); o += sz_kv;
+        V = aptr(o); o += sz_kv;
+        R = aptr(o); o += sz_rel;
+        K_conv = aptr(o); o += sz_kv;
+        V_conv = aptr(o); o += sz_kv;
+        dyn_k = aptr(o); o += sz_dyn;
+        dyn_v = aptr(o); o += sz_dyn;
+        pp_sp_buf = aptr(0);
+        pp_sp_bytes = reg0_bytes;
+        attn_split = aptr(0);
+        wo = aptr(0);
+
+        const size_t reg1_off = reg0_bytes;
+        msg0 = aptr(reg1_off + 0 * sz_N);
+        msg1 = aptr(reg1_off + 1 * sz_N);
+        msg2 = aptr(reg1_off + 2 * sz_N);
+        Q = aptr(reg1_off + 0 * sz_q);
+        att_gate = aptr(reg1_off + 1 * sz_q);
+        att = aptr(reg1_off + 2 * sz_q);
+
+        const size_t reg2_off = reg1_off + reg1_bytes;
+        o = reg2_off;
+        ctrl2N = aptr(o); o += sz_2N;
+        act_bf16_only = (!bf16_x_f16 && has_bf16_dense) ? reinterpret_cast<uint16_t*>(ctrl2N) : nullptr;
+        ctrl_g = aptr(o); o += sz_N;
+        ctrl_f = aptr(o); o += sz_N;
+        ctrl64 = aptr(o); o += sz_c64;
+        norm_cur = aptr(o); o += sz_N;
+        ctrl_w16 = reinterpret_cast<uint16_t*>(layer_arena + o);
+        rel_tab = aptr(reg2_off);
+
+        eparts = aptr(0);
+        escr = layer_arena + eparts_bytes;
+        moe_raw = aptr(eparts_bytes + escr_bytes);
+        in_ffn = aptr(layer_arena_bytes - sz_N);
+        logits = aptr(0);
+        return total_b;
+    }
+
     ~Engine() {
         flush_ckpt_bg();
         if (core_graph) cudaGraphExecDestroy(core_graph);
-        if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
+        for (int t = 0; t < 9; ++t) {
+            if (verify_core_graph[t]) cudaGraphExecDestroy(verify_core_graph[t]);
+        }
         for (int t = 0; t < 9; ++t)
             for (int c = 0; c < 2; ++c)
                 for (int s = 0; s < 2; ++s)
                     for (int a = 0; a < 2; ++a)
                         if (full_decode_graph[t][c][s][a]) cudaGraphExecDestroy(full_decode_graph[t][c][s][a]);
         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
-        for (auto g : verify_pre_graph) if (g) cudaGraphExecDestroy(g);
+        for (int t = 0; t < 9; ++t) {
+            for (auto g : verify_pre_graph[t]) if (g) cudaGraphExecDestroy(g);
+        }
         if (h_hits_pin) cudaFreeHost(h_hits_pin);
         for (auto* p : kc) cudaFree(p);
         for (auto* p : vc) cudaFree(p);
@@ -1162,18 +1300,13 @@ struct Engine {
         cudaFree(conv_hist_pool);
         cudaFree(swa_bak);
         cudaFree(d_conv_trace);
-        for (auto* p : d_tgt_feat) cudaFree(p);
-        for (auto* p : norm_blk_buf) cudaFree(p);
-        cudaFree(prelude_cur_buf);
-        cudaFree(cur); cudaFree(ffn_inp);
-        cudaFree(msg3);
+        for (int k = 0; k < 4; ++k) {
+            if (h_tgt_feat_pin[k]) cudaFreeHost(h_tgt_feat_pin[k]);
+            else cudaFree(d_tgt_feat[k]);
+        }
+        free_ephemeral_bufs();
         cudaFree(qgr_t1);
-        cudaFree(sink);
-        cudaFree(router_logits); cudaFree(ewts);
-        cudaFree(act_bf16);
-        act_bf16_only = nullptr;
         cudaFree(xq); cudaFree(xq_k); cudaFree(xq_v);
-        cudaFree(layer_arena);
         cudaFree(ids); cudaFree(grp_start); cudaFree(n_groups); cudaFree(ent_dst); cudaFree(ent_tok); cudaFree(grp_ptr);
         cudaFree(d_router_done);
         cudaFree(pos0_d); cudaFree(pick_d);
@@ -1279,15 +1412,7 @@ struct Engine {
 
         auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
         norm_blk_cnt = (hp.core_start == 6 && hp.core_end == 18 && hp.attn_res_block_size == 6 && hp.num_loops == 3) ? 5 : 9;
-        for (int b = 0; b < norm_blk_cnt; ++b) {
-            d_f32(&norm_blk_buf[b], (size_t) tmax * N);
-        }
-        d_f32(&prelude_cur_buf, (size_t) tmax * N);
-        d_f32(&cur, (size_t) tmax * N);
-        d_f32(&ffn_inp, (size_t) tmax * N);
-        d_f32(&msg3, (size_t) tmax * N);
         d_f32(&qgr_t1, (size_t) (2 * hp.q_dim + hp.n_rel * hp.n_head + 2 * hp.kv_dim + 2 * hp.n_conv * hp.n_head_kv));
-        d_f32(&sink, (size_t) tmax * hp.n_head);
         attn_split_slots = verify_max_t * kAttnSplitMax;
         int cur_dev = 0, cc_maj = 0, cc_min = 0, max_smem_optin = 49152;
         cudaGetDevice(&cur_dev);
@@ -1310,6 +1435,7 @@ struct Engine {
                 }
             }
             if (max_bf16_w > 0) {
+                has_bf16_dense = true;
                 gemm.reserve_bf16_tc(max_bf16_w, bf16_x_f16 ? 0 : (int64_t) tmax * 2 * N);
             }
         }
@@ -1325,9 +1451,11 @@ struct Engine {
             (void) cudaGetLastError();
             return true;
         };
+        try_set_smem((const void*) k_attn_q8_gqa3_verify4_wmma_split<5>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_wmma_split<4>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_wmma_split<3>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_wmma_split<2>, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<5>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<4>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<3>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<2>, 24576);
@@ -1351,15 +1479,10 @@ struct Engine {
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma, 29184);
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
-        d_f32(&router_logits, (size_t) tmax * hp.n_expert);
-        d_f32(&ewts, (size_t) max_ent);
 
         CK(cudaMallocHost(&h_tok_buf, (size_t) tmax * N * sizeof(float)));
         CK(cudaMallocHost(&h_is_img_pin, (size_t) tmax * sizeof(uint8_t)));
         CK(cudaMalloc(&d_is_img, (size_t) tmax * sizeof(uint8_t)));
-        // Minimum sizing accommodates DSpark draft FFN down (block_n=8, K_in=4*N) and joint_proj even with small --chunk.
-        const size_t act_elems = std::max<size_t>((size_t) tmax * 2 * (size_t) N, (size_t) 16 * 4 * (size_t) N);
-        CK(cudaMalloc(&act_bf16, act_elems * sizeof(uint16_t)));
 
         const int q8_kv_rows = std::min(tmax, 8);
         // xq is only ever used for T <= 8 (decode/verify) and DSpark block_n=8 (4*N).
@@ -1368,99 +1491,8 @@ struct Engine {
         CK(cudaMalloc(&xq_k, (size_t) q8_kv_rows * ((2 * N) / 32) * 36));
         CK(cudaMalloc(&xq_v, (size_t) q8_kv_rows * ((2 * N) / 32) * 36));
 
-        // Unified phase-disjoint scratch arena (256-byte aligned overlays; saves ~250+ MiB at T=1024/2048):
-        //   Overlay A (Pre-Attn / Attn / Post-Attn):
-        //     Region 0: {in_q, in_k, in_v, K, V, R, K_conv, V_conv, dyn_k, dyn_v} | {pp_sp_buf / attn_split} | {wo}
-        //     Region 1: {msg0, msg1, msg2} | {Q, att_gate, att}
-        //     Region 2: {ctrl2N, ctrl_g, ctrl_f, ctrl64, norm_cur, ctrl_w16} | {rel_tab}
-        //   Overlay B (MoE): {eparts, escr, moe_raw} + tail {in_ffn} (disjoint from Overlay B & reg2_ctrl!)
-        //   Overlay C (Output Head): {logits} at offset 0 (all other overlays dead at head!)
-        auto a256 = [](size_t n) -> size_t { return (n + 255) & ~(size_t) 255; };
-        const size_t sz_N = a256((size_t) tmax * (size_t) N * sizeof(float));
-        const size_t sz_2N = a256((size_t) tmax * 2 * (size_t) N * sizeof(float));
-        const size_t sz_q = a256((size_t) tmax * (size_t) hp.q_dim * sizeof(float));
-        const size_t sz_kv = a256((size_t) tmax * (size_t) hp.kv_dim * sizeof(float));
-        const size_t sz_rel = a256((size_t) tmax * (size_t) (hp.n_rel * hp.n_head) * sizeof(float));
-        const size_t sz_dyn = a256((size_t) tmax * (size_t) (hp.n_conv * hp.n_head_kv) * sizeof(float));
-        const size_t sz_c64 = a256((size_t) tmax * (size_t) hp.loop_gate_rank * sizeof(float));
-        ctrl_w16_bytes = a256((size_t) (hp.loop_gate_rank * 2 * N + 2 * N * hp.loop_gate_rank) * sizeof(uint16_t));
-        const size_t sz_reltab = a256((size_t) tmax * (size_t) hp.n_head * (size_t) hp.n_rel_ext * sizeof(float));
-
-        const size_t reg0_qkv = 3 * sz_N + 4 * sz_kv + sz_rel + 2 * sz_dyn;
-        const size_t per_sp_bytes = (size_t) tmax * (size_t) hp.n_head * 130 * sizeof(float);
-        const size_t attn_split_bytes = (size_t) attn_split_slots * (size_t) hp.n_head * 130 * sizeof(float);
-        const size_t want_sp = (size_t) std::max(2, profile.want_sp);
-        const size_t reg0_bytes = a256(std::max({reg0_qkv, want_sp * per_sp_bytes, attn_split_bytes}));
-        const size_t reg1_bytes = a256(std::max(3 * sz_N, 3 * sz_q));
-        const size_t reg2_ctrl = sz_2N + 3 * sz_N + sz_c64 + ctrl_w16_bytes;
-        const size_t reg2_bytes = a256(std::max(reg2_ctrl, sz_reltab));
-        const size_t overlay_a_bytes = reg0_bytes + reg1_bytes + reg2_bytes;
-        const size_t overlay_a_ctrl_inffn = reg0_bytes + reg1_bytes + reg2_ctrl + sz_N;
-
-        eparts_bytes = a256((size_t) max_ent * (size_t) N * sizeof(float));
-        bool all_situ_fused = (hp.n_ff % 64 == 0 && hp.n_expert <= 256);
-        for (const auto& L : m->layers) {
-            if (!L.L.situ || !K::native_expert_wmma_supported(L.L)) { all_situ_fused = false; break; }
-        }
-        if (all_situ_fused) {
-            const size_t escr_wmma = K::native_expert_wmma_fused_scratch_bytes(max_ent, hp.n_expert, hp.n_ff);
-            const size_t escr_small = K::native_expert_scratch_bytes(std::min<int64_t>(max_ent, 16 * hp.n_expert_used), hp.n_ff);
-            escr_bytes = a256(std::max(escr_wmma, escr_small));
-        } else {
-            escr_bytes = a256(K::native_expert_scratch_bytes(max_ent, hp.n_ff));
-        }
-        const size_t overlay_b_bytes = eparts_bytes + escr_bytes + sz_N + sz_N; // + tail sz_N for in_ffn
-        const size_t logits_bytes = a256((size_t) verify_max_t * (size_t) hp.vocab_unpadded * sizeof(float));
-
-        layer_arena_bytes = std::max({overlay_a_bytes, overlay_b_bytes, overlay_a_ctrl_inffn, logits_bytes});
-        CK(cudaMalloc(&layer_arena, layer_arena_bytes));
-        auto aptr = [&](size_t off) -> float* { return reinterpret_cast<float*>(layer_arena + off); };
-
-        // Overlay A - Region 0
-        size_t o = 0;
-        in_q = aptr(o); o += sz_N;
-        in_k = aptr(o); o += sz_N;
-        in_v = aptr(o); o += sz_N;
-        K = aptr(o); o += sz_kv;
-        V = aptr(o); o += sz_kv;
-        R = aptr(o); o += sz_rel;
-        K_conv = aptr(o); o += sz_kv;
-        V_conv = aptr(o); o += sz_kv;
-        dyn_k = aptr(o); o += sz_dyn;
-        dyn_v = aptr(o); o += sz_dyn;
-        pp_sp_buf = aptr(0);
-        pp_sp_bytes = reg0_bytes;
-        attn_split = aptr(0);
-        wo = aptr(0);
-
-        // Overlay A - Region 1
-        const size_t reg1_off = reg0_bytes;
-        msg0 = aptr(reg1_off + 0 * sz_N);
-        msg1 = aptr(reg1_off + 1 * sz_N);
-        msg2 = aptr(reg1_off + 2 * sz_N);
-        Q = aptr(reg1_off + 0 * sz_q);
-        att_gate = aptr(reg1_off + 1 * sz_q);
-        att = aptr(reg1_off + 2 * sz_q);
-
-        // Overlay A - Region 2
-        const size_t reg2_off = reg1_off + reg1_bytes;
-        o = reg2_off;
-        ctrl2N = aptr(o); o += sz_2N;
-        // Zero-VRAM BF16 scratch on sm_80+ (!bf16_x_f16): aliases ctrl2N (dead during all Q/K/V/Gate/R/Sink/Conv/Out projections; size = 4*tmax*N uint16 >= 2*tmax*N).
-        act_bf16_only = (!bf16_x_f16 && max_bf16_w > 0) ? reinterpret_cast<uint16_t*>(ctrl2N) : nullptr;
-        ctrl_g = aptr(o); o += sz_N;
-        ctrl_f = aptr(o); o += sz_N;
-        ctrl64 = aptr(o); o += sz_c64;
-        norm_cur = aptr(o); o += sz_N;
-        ctrl_w16 = reinterpret_cast<uint16_t*>(layer_arena + o);
-        rel_tab = aptr(reg2_off);
-
-        // Overlay B (MoE) + tail in_ffn + Overlay C (logits)
-        eparts = aptr(0);
-        escr = layer_arena + eparts_bytes;
-        moe_raw = aptr(eparts_bytes + escr_bytes);
-        in_ffn = aptr(layer_arena_bytes - sz_N);
-        logits = aptr(0);
+        prefill_ephemeral_bytes = alloc_ephemeral_bufs(tmax);
+        in_decode_phase = false;
 
         CK(cudaMalloc(&ids, (size_t) max_ent * sizeof(int32_t)));
         CK(cudaMalloc(&grp_start, (size_t) (hp.n_expert + 1) * sizeof(int32_t)));
@@ -1498,7 +1530,7 @@ struct Engine {
         CK(cudaMallocHost(&h_ewts, (size_t) max_ent * sizeof(float)));
         CK(cudaMallocHost(&h_cpu_sum, (size_t) std::max(verify_max_t, 8) * (size_t) N * sizeof(float)));
         CK(cudaMallocHost(&h_hits_pin, (size_t) hp.n_phys * (size_t) hp.n_expert * sizeof(uint32_t)));
-        verify_pre_graph.assign((size_t) hp.n_layer, nullptr);
+        for (int t = 0; t < 9; ++t) verify_pre_graph[t].assign((size_t) hp.n_layer, nullptr);
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         for (int i = 0; i < kMaxRebalLayers; ++i) {
             CK(cudaEventCreateWithFlags(&ev_rebal_layer[i], cudaEventDisableTiming));
@@ -1582,8 +1614,19 @@ struct Engine {
     void enable_dspark(DsparkEngine* ds) {
         dspark = ds;
         const auto& hp = m->hp;
+        const bool map_tgt_feat = (profile.regime != strata::inkling2::VramRegime::FullVram);
+        const size_t feat_bytes = (size_t) tmax * (size_t) hp.n_embd * sizeof(float);
         for (int k = 0; k < 4; ++k) {
-            if (!d_tgt_feat[k]) CK(cudaMalloc(&d_tgt_feat[k], (size_t) tmax * hp.n_embd * sizeof(float)));
+            if (!d_tgt_feat[k]) {
+                if (map_tgt_feat &&
+                    cudaHostAlloc(&h_tgt_feat_pin[k], feat_bytes, cudaHostAllocMapped) == cudaSuccess) {
+                    CK(cudaHostGetDevicePointer(&d_tgt_feat[k], h_tgt_feat_pin[k], 0));
+                } else {
+                    (void) cudaGetLastError();
+                    h_tgt_feat_pin[k] = nullptr;
+                    CK(cudaMalloc(&d_tgt_feat[k], feat_bytes));
+                }
+            }
         }
         const size_t total_conv = (size_t) hp.n_layer * layer_conv_floats;
         if (!d_conv_trace) CK(cudaMalloc(&d_conv_trace, (size_t) verify_max_t * total_conv * sizeof(float)));
@@ -2589,7 +2632,9 @@ struct Engine {
 
     void destroy_graphs() {
         if (core_graph) { cudaGraphExecDestroy(core_graph); core_graph = nullptr; }
-        if (verify_core_graph) { cudaGraphExecDestroy(verify_core_graph); verify_core_graph = nullptr; }
+        for (int t = 0; t < 9; ++t) {
+            if (verify_core_graph[t]) { cudaGraphExecDestroy(verify_core_graph[t]); verify_core_graph[t] = nullptr; }
+        }
         for (int t = 0; t < 9; ++t)
             for (int c = 0; c < 2; ++c)
                 for (int s = 0; s < 2; ++s)
@@ -2601,15 +2646,17 @@ struct Engine {
         for (auto& g : layer_pre_graph) {
             if (g) { cudaGraphExecDestroy(g); g = nullptr; }
         }
-        for (auto& g : verify_pre_graph) {
-            if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+        for (int t = 0; t < 9; ++t) {
+            for (auto& g : verify_pre_graph[t]) {
+                if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+            }
         }
         graph_oom = false;
     }
 
-    // Dynamic VRAM elasticity (--vram-elastic): shrink expert cache when free < target_free_bytes,
-    // or grow it back up toward full residency when free > target_free_bytes + safety headroom.
-    void resize_experts_vram(size_t target_free_bytes) {
+    // Dynamic VRAM elasticity (--vram-elastic & Prefill<->Decode phase split):
+    // shrink expert cache when free < target_free_bytes, or grow toward full residency when free > guard.
+    void resize_experts_vram(size_t target_free_bytes, size_t guard_override = 0) {
         const auto t0 = Clock::now();
         const auto& hp = m->hp;
         const int ne = (int) hp.n_expert;
@@ -2621,9 +2668,11 @@ struct Engine {
         sync_d_hits(false);
 
         const bool core_res_hy = (profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
-        const size_t base_guard = core_res_hy
-            ? (verify_max_t > 1 ? ((size_t) 288 << 20) : ((size_t) 160 << 20))
-            : ((size_t) 256 << 20);
+        const size_t base_guard = (guard_override > 0)
+            ? guard_override
+            : (core_res_hy
+                ? (verify_max_t > 1 ? ((size_t) 176 << 20) : ((size_t) 160 << 20))
+                : ((size_t) 256 << 20));
 
         auto demote_tier2_pin = [&](size_t need_bytes) {
             for (int j = (int) m->layers.size() - 1; j >= 0 && pinned_used + need_bytes > max_pin_bytes; --j) {
@@ -2866,6 +2915,74 @@ struct Engine {
                      (double) fr / (1 << 20), hybrid ? 1 : 0, ms_since(t0));
     }
 
+    /// Phase-split Decode transition: free Prefill-only scratch (chunk=2048 arena, norm_blk_buf, pp_stage -> ~650 MiB)
+    /// and immediately grow hot tier1/tier2 experts from pinned RAM before decoding.
+    void set_phase_decode() {
+        static const bool disable_ps = (std::getenv("STRATA_NO_PHASE_SPLIT") != nullptr);
+        if (disable_ps || !hybrid || in_decode_phase || tmax <= kDecodePhaseCap || tmax < 1024) return;
+        CK(cudaStreamSynchronize(st));
+        if (cst) CK(cudaStreamSynchronize(cst));
+        for (int i = 0; i < kMaxRebalLayers; ++i) layer_pending_rebal[i] = false;
+        destroy_graphs();
+
+        // Free pp_stage ring buffers (unused during decode)
+        saved_pp_stage_cnt = pp_stage_cnt;
+        saved_pp_stage_bytes = pp_stage_bytes;
+        for (int b = 0; b < pp_stage_cnt; ++b) {
+            if (pp_stage[b]) { cudaFree(pp_stage[b]); pp_stage[b] = nullptr; }
+        }
+        pp_stage_cnt = 0;
+        pp_stage_bytes = 0;
+
+        free_ephemeral_bufs();
+        decode_ephemeral_bytes = alloc_ephemeral_bufs(kDecodePhaseCap);
+        if (dspark) dspark->rebind_arena(layer_arena, layer_arena_bytes, kDecodePhaseCap);
+        in_decode_phase = true;
+
+        const size_t dec_guard = (verify_max_t > 1) ? ((size_t) 176 << 20) : ((size_t) 144 << 20);
+        resize_experts_vram(vram_reserve_bytes, dec_guard);
+    }
+
+    /// Phase-split Prefill transition: shrink temporary decode-bonus experts and restore full tmax prefill scratch + pp_stage.
+    void set_phase_prefill() {
+        if (!in_decode_phase) return;
+        CK(cudaStreamSynchronize(st));
+        if (cst) CK(cudaStreamSynchronize(cst));
+        for (int i = 0; i < kMaxRebalLayers; ++i) layer_pending_rebal[i] = false;
+        destroy_graphs();
+
+        const size_t extra_eph = (prefill_ephemeral_bytes > decode_ephemeral_bytes)
+            ? (prefill_ephemeral_bytes - decode_ephemeral_bytes) : 0;
+        const size_t stage_tot = (size_t) saved_pp_stage_cnt * saved_pp_stage_bytes;
+        const size_t need_free = vram_reserve_bytes + extra_eph + stage_tot + ((size_t) 128 << 20);
+        resize_experts_vram(need_free);
+
+        free_ephemeral_bufs();
+        prefill_ephemeral_bytes = alloc_ephemeral_bufs(tmax);
+        if (dspark) dspark->rebind_arena(layer_arena, layer_arena_bytes, tmax);
+
+        if (saved_pp_stage_cnt > 0 && saved_pp_stage_bytes > 0) {
+            int ok = 0;
+            for (int b = 0; b < saved_pp_stage_cnt; ++b) {
+                if (cudaMalloc(&pp_stage[b], saved_pp_stage_bytes) == cudaSuccess) {
+                    ++ok;
+                } else {
+                    (void) cudaGetLastError();
+                    break;
+                }
+            }
+            if (ok >= 2) {
+                pp_stage_cnt = ok;
+                pp_stage_bytes = saved_pp_stage_bytes;
+            } else {
+                for (int b = 0; b < ok; ++b) { cudaFree(pp_stage[b]); pp_stage[b] = nullptr; }
+                pp_stage_cnt = 0;
+                pp_stage_bytes = 0;
+            }
+        }
+        in_decode_phase = false;
+    }
+
     void ensure_kv_cap(int needed_pos) {
         if (needed_pos <= full_kv_cap || full_kv_cap >= ctx) return;
         const auto& hp = m->hp;
@@ -2891,10 +3008,11 @@ struct Engine {
         for (int il = 0; il < hp.n_layer; ++il) {
             if (!hp.is_swa(il)) ++n_full;
         }
+        const int n_dspark_full = dspark ? dspark->count_full_layers() : 0;
         const size_t per_tok = kv_q8
             ? ((size_t) hp.kv_dim * 2 + (size_t) hp.n_head_kv * sizeof(__half) * 2)
             : ((size_t) hp.kv_dim * sizeof(__half) * 2);
-        const size_t extra_total = (size_t) n_full * (size_t) (new_cap - full_kv_cap) * per_tok;
+        const size_t extra_total = (size_t) (n_full + n_dspark_full) * (size_t) (new_cap - full_kv_cap) * per_tok;
         // Host-staged per-layer KV growth needs ZERO extra full-layer temp headroom (saves ~520 MiB at 262K = +122 core experts!).
         const size_t need_free = extra_total + ((size_t) std::max(64, profile.kv_grow_reserve_mib) << 20);
 
@@ -3229,6 +3347,7 @@ struct Engine {
             }
             kv_cap[(size_t) il] = new_cap;
         }
+        if (dspark) dspark->grow_full_kv(new_cap, st);
         full_kv_cap = new_cap;
         int t1_min = ne, t1_max = 0, t2_min = ne, t2_max = 0, tot_slots = 0, t1_pin = 0, t2_pin = 0;
         size_t exp_bytes = 0;
@@ -3260,6 +3379,7 @@ struct Engine {
                     bool defer_logits_d2h = false,
                     const float* img_embs = nullptr, size_t img_embs_n = 0, int32_t img_pad_id = -1,
                     size_t* img_cursor = nullptr) {
+        if (in_decode_phase && T > kDecodePhaseCap) set_phase_prefill();
         ensure_kv_cap((int) (pos + T));
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
@@ -3847,9 +3967,13 @@ struct Engine {
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
                     const int sp_cap = std::max(1, attn_split_slots / std::max(1, T));
-                    if (is_swa && T >= 2 && T <= 4) {
+                    if (is_swa && T >= 2 && T <= 5) {
                         const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
-                        if (T == 4) {
+                        if (T == 5) {
+                            k_attn_q8_gqa3_verify4_swa_wmma_split<5><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else if (T == 4) {
                             k_attn_q8_gqa3_verify4_swa_wmma_split<4><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
                                 pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                                 (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
@@ -3865,15 +3989,19 @@ struct Engine {
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
-                    } else if (is_swa && T >= 5 && T <= 8) {
+                    } else if (is_swa && T >= 6 && T <= 8) {
                         k_attn_q8_gqa3_swa_1pass<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink,
                             pGate, att, xq, (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext,
                             kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale);
                         att_xq_ready = xq;
-                    } else if (T >= 2 && T <= 4 && !is_swa) {
+                    } else if (T >= 2 && T <= 5 && !is_swa) {
                         const int sp = std::min(sp_cap, std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
-                        if (T == 4) {
+                        if (T == 5) {
+                            k_attn_q8_gqa3_verify4_wmma_split<5><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else if (T == 4) {
                             k_attn_q8_gqa3_verify4_wmma_split<4><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
                                 pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                                 (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
@@ -4143,20 +4271,38 @@ struct Engine {
         if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
         for (int il = 0; il < hp.n_layer; ++il) {
             const bool use_t1_core = (!capturing_full_graph && !prof && T == 1 && !capture_dspark);
-            const bool use_vf_core = (!capturing_full_graph && !prof && verify_max_t > 1 && T == verify_max_t && save_conv_trace && capture_dspark);
+            const bool use_vf_core = (!capturing_full_graph && !prof && T >= 1 && T <= 8 && T <= verify_max_t &&
+                                      capture_dspark && ((T == 1 && !save_conv_trace) || (T >= 2 && save_conv_trace)));
             if ((use_t1_core || use_vf_core) && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
-                cudaGraphExec_t& cg = use_t1_core ? core_graph : verify_core_graph;
-                if (!cg) {
+                cudaGraphExec_t& cg = use_t1_core ? core_graph : verify_core_graph[T];
+                if (!cg && !graph_oom) {
+                    const auto saved_nb = norm_blocks;
+                    const int saved_next = next_blk_buf;
+                    const auto saved_pnb = prelude_norm_blocks;
+                    const auto saved_bank = norm_bank;
                     cudaGraph_t g = nullptr;
-                    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-                    for (int cl = il; cl < core_end_virt; ++cl) {
-                        run_layer_pre(cl, false);
-                        run_layer_post(cl, false);
+                    cudaError_t ce = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+                    if (ce == cudaSuccess) {
+                        for (int cl = il; cl < core_end_virt; ++cl) {
+                            run_layer_pre(cl, false);
+                            run_layer_post(cl, false);
+                        }
+                        ce = cudaStreamEndCapture(st, &g);
                     }
-                    CK(cudaStreamEndCapture(st, &g));
-                    CK(cudaGraphInstantiate(&cg, g, nullptr, nullptr, 0));
-                    CK(cudaGraphDestroy(g));
-                } else {
+                    cudaGraphExec_t ge = nullptr;
+                    if (ce == cudaSuccess && g) ce = cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0);
+                    if (g) cudaGraphDestroy(g);
+                    if (ce == cudaSuccess && ge) {
+                        cg = ge;
+                    } else {
+                        (void) cudaGetLastError();
+                        graph_oom = true;
+                        norm_blocks = saved_nb;
+                        next_blk_buf = saved_next;
+                        prelude_norm_blocks = saved_pnb;
+                        norm_bank = saved_bank;
+                    }
+                } else if (cg) {
                     if (norm_blk_cnt == 5) {
                         norm_blocks = {norm_blk_buf[0], norm_blk_buf[1], norm_blk_buf[2]};
                         next_blk_buf = 3;
@@ -4165,16 +4311,19 @@ struct Engine {
                         next_blk_buf = 7;
                     }
                 }
-                const auto tp_cg0 = Clock::now();
-                CK(cudaGraphLaunch(cg, st));
-                if (prof) { CK(cudaStreamSynchronize(st)); p_core_ms += ms_since(tp_cg0); }
-                il = core_end_virt - 1;
-                continue;
+                if (cg) {
+                    const auto tp_cg0 = Clock::now();
+                    CK(cudaGraphLaunch(cg, st));
+                    if (prof) { CK(cudaStreamSynchronize(st)); p_core_ms += ms_since(tp_cg0); }
+                    il = core_end_virt - 1;
+                    continue;
+                }
             }
             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
             const bool use_t1_pre_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming && !capture_dspark);
-            const bool use_vf_pre_graph = (verify_max_t > 1 && T == verify_max_t && hybrid && is_outer &&
-                                           !prof_detail && !pp_streaming && save_conv_trace && capture_dspark);
+            const bool use_vf_pre_graph = (T >= 1 && T <= 8 && T <= verify_max_t && hybrid &&
+                                           (is_outer || !core_all_gpu) && !prof_detail && !pp_streaming &&
+                                           capture_dspark && ((T == 1 && !save_conv_trace) || (T >= 2 && save_conv_trace)));
             const bool use_pre_graph = use_t1_pre_graph || use_vf_pre_graph;
             const int ip_cur = hp.loop_layer(il);
             const bool include_route_t1 = use_pre_graph && (m->layers[(size_t) ip_cur].n_slots < hp.n_expert);
@@ -4183,7 +4332,7 @@ struct Engine {
                 CK(cudaStreamWaitEvent(st, ev_rebal_layer[ip_cur], 0));
                 layer_pending_rebal[ip_cur] = false;
             }
-            auto& pre_vec = use_t1_pre_graph ? layer_pre_graph : verify_pre_graph;
+            auto& pre_vec = use_t1_pre_graph ? layer_pre_graph : verify_pre_graph[T];
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (pre_vec[(size_t) il] || !graph_oom)) {
                 if (!pre_vec[(size_t) il]) {
@@ -4360,7 +4509,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     const bool core_res_hy = (E.profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
     // DSpark adds dflare_graph + markov_graphs + verify_core_graph; keep 288 MiB headroom when enabled.
     const size_t base_reserve = core_res_hy
-        ? (E.verify_max_t > 1 ? ((size_t) 288 << 20) : ((size_t) 144 << 20))
+        ? (E.verify_max_t > 1 ? ((size_t) 176 << 20) : ((size_t) 144 << 20))
         : ((size_t) 256 << 20);
     const size_t reserve = base_reserve + E.vram_reserve_bytes;
     size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
@@ -5192,19 +5341,25 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
             alpha_num = 0.85f * alpha_num + (float) m;
             alpha_den = 0.85f * alpha_den + (float) trials;
             const float alpha = alpha_num / std::max(1e-3f, alpha_den);
+            // Hybrid mode pays incremental CPU DDR4 bandwidth per extra draft token, so raise K-promotion thresholds
+            // to match the exact mathematical break-even (keeps dm=4 for high-acceptance code, dm=2 for prose).
+            const float th_max = E.hybrid ? 0.76f : 0.55f;
+            const float th_3   = E.hybrid ? 0.56f : 0.38f;
+            const float th_2   = E.hybrid ? 0.38f : 0.24f;
+            const float th_1   = E.hybrid ? 0.22f : 0.16f;
             if (cur_dm == 0) {
                 if (m >= 1) {
                     cd_backoff = 12;
-                    cur_dm = (alpha >= 0.45f) ? std::min(draft_max, 3) : std::min(draft_max, 2);
+                    cur_dm = (alpha >= th_3) ? std::min(draft_max, 3) : std::min(draft_max, 2);
                 } else {
                     skip_cd = cd_backoff;
                     cd_backoff = std::min(48, cd_backoff * 2);
                 }
             } else {
-                if (alpha >= 0.55f) { cur_dm = draft_max; cd_backoff = 12; }
-                else if (alpha >= 0.38f) { cur_dm = std::min(draft_max, 3); cd_backoff = 12; }
-                else if (alpha >= 0.24f) { cur_dm = std::min(draft_max, 2); cd_backoff = 12; }
-                else if (alpha >= 0.16f) { cur_dm = 1; cd_backoff = 12; }
+                if (alpha >= th_max) { cur_dm = draft_max; cd_backoff = 12; }
+                else if (alpha >= th_3) { cur_dm = std::min(draft_max, 3); cd_backoff = 12; }
+                else if (alpha >= th_2) { cur_dm = std::min(draft_max, 2); cd_backoff = 12; }
+                else if (alpha >= th_1) { cur_dm = 1; cd_backoff = 12; }
                 else { cur_dm = 0; skip_cd = cd_backoff; cd_backoff = std::min(48, cd_backoff * 2); }
             }
         }
@@ -5347,7 +5502,7 @@ int run(int argc, char** argv) {
     }
     if (dm) {
         dspark = std::make_unique<DsparkEngine>();
-        dspark->init(*dm, max_ctx, chunk);
+        dspark->init(*dm, max_ctx, chunk, E.full_kv_cap, E.layer_arena, E.layer_arena_bytes);
         E.enable_dspark(dspark.get());
         E.reset_state();
     }
@@ -5643,8 +5798,9 @@ int run(int argc, char** argv) {
                 const bool use_gpu_topk_pp = sample_on && can_use_gpu_topk(smp, (int) m.hp.vocab_unpadded);
                 int32_t next_tok = 0;
                 const size_t fresh = prompt.size() - reuse;
-                for (size_t off = reuse; off < prompt.size() && !stop_req.load(std::memory_order_acquire); off += (size_t) chunk) {
-                    const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
+                const int eff_chunk = (E.in_decode_phase && fresh <= 64) ? Engine::kDecodePhaseCap : chunk;
+                for (size_t off = reuse; off < prompt.size() && !stop_req.load(std::memory_order_acquire); off += (size_t) eff_chunk) {
+                    const int tc = (int) std::min<size_t>((size_t) eff_chunk, prompt.size() - off);
                     const bool is_last = (off + (size_t) tc == prompt.size());
                     const int pos_pre = (int) E.pos;
                     const size_t img_cur_pre = img_cursor;
@@ -5707,6 +5863,7 @@ int run(int argc, char** argv) {
                 if (stop_req.load(std::memory_order_acquire)) {
                     finish = "cancel";
                 } else {
+                    if (E.hybrid && limit >= 16) E.set_phase_decode();
                     bool hit_eos = false;
                     decode_tokens_loop(
                         E, dspark.get(), draft_max, next_tok, limit, smp, rng, hist, live_tokens,
@@ -5812,6 +5969,7 @@ int run(int argc, char** argv) {
 
     const auto t_tg0 = Clock::now();
     if (max_new > 0) {
+        if (E.hybrid && max_new >= 16) E.set_phase_decode();
         decode_tokens_loop(
             E, dspark.get(), draft_max, next_tok, max_new, cli_smp, cli_rng, cli_hist, cli_live,
             [&](int32_t tok) -> bool {
