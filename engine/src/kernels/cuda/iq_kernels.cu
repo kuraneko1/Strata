@@ -46,6 +46,10 @@ void check(const char* what) {
 }
 
 // ---------------------------------------------------------------- llama.cpp helpers (vecdotq.cuh)
+__device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
+    const uint8_t* x8 = (const uint8_t*) x + 4 * i32;
+    return (int) ((uint32_t) x8[0] | ((uint32_t) x8[1] << 8) | ((uint32_t) x8[2] << 16) | ((uint32_t) x8[3] << 24));
+}
 __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     const uint16_t* x16 = (const uint16_t*) x;
     int x32 = x16[2 * i32 + 0] << 0;
@@ -286,6 +290,30 @@ __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
+__device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq1_s* bq1 = (const block_iq1_s*) vbq + kbx;
+    const int qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const uint16_t qh = bq1->qh[iqs];
+    int sumi = 0, sumy = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1s_grid_gpu[qs[l0 / 2] | (((qh >> (3 * (l0 / 2))) & 7) << 8)];
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+    }
+    const float dl = __half2float(bq1->d) * (2 * ((qh >> 12) & 7) + 1);
+    const float delta = (qh & 0x8000) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA);
+    return dl * __low2float(bq8_1[iqs].ds) * ((float) sumi + delta * (float) sumy);
+}
+
 __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                      const int& kbx, const int& iqs) {
     const block_iq4_nl* bq4 = (const block_iq4_nl*) vbq + kbx;
@@ -328,7 +356,32 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
 // Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down: llama.cpp's vec_dot_*_q8_1 (vecdotq.cuh, VDR 2 each), transcribed; the
 // Q5_1 min term is the one departure (below).  Via eddoursul/Strata 8029fa9 (iq_dot.cuh) and #255 (Q8_0,
 // gopinath87607), which agree with llama.cpp and with each other.
-constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q4_1 = 2, VDR_Q4_0 = 2, VDR_Q8_0 = 2, VDR_Q6_K = 1;
+constexpr int VDR_Q3_K = 1, VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q4_1 = 2, VDR_Q4_0 = 2, VDR_Q8_0 = 2, VDR_Q6_K = 1;
+
+__device__ __forceinline__ float vec_dot_q3_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q3_K* bq3 = (const block_q3_K*) vbq + kbx;
+    const int bq8_offset = 4 * (iqs / 8);
+    const int scale_offset = iqs - (iqs % 8) + (iqs % 8) / 4;
+    const float d = __half2float(bq3->d);
+    const int vl = get_int_b2(bq3->qs, iqs);
+    const int vh = ~get_int_b2(bq3->hmask, iqs % 8) >> bq8_offset;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int isc = scale_offset + 2 * i;
+        const int sc_low = (bq3->scales[isc % 8] >> (4 * (isc / 8))) & 0xf;
+        const int sc_high = ((bq3->scales[8 + (isc % 4)] >> (2 * (isc / 4))) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        const int vi = __vsubss4(vil, vih);
+        const int u = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % 8);
+        const float d8 = __low2float(bq8_1[bq8_offset + i].ds);
+        sumf += d8 * (ggml_cuda_dp4a(vi, u, 0) * sc);
+    }
+    return d * sumf;
+}
 
 __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restrict__ v, const int* __restrict__ u,
                                                              const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
@@ -618,6 +671,26 @@ __device__ __forceinline__ float vec_dot_nvfp4_q8_1(const void* __restrict__ vbq
     return sum;
 }
 
+__device__ __forceinline__ float e8m0_to_f32_half(uint8_t x) {
+    const uint32_t bits = x < 2 ? (0x00200000u << x) : ((uint32_t) (x - 1) << 23);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
+    const int* q8 = (const int*) bq8_1->qs + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_fp4);
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+    return e8m0_to_f32_half(bq4->e) * __low2float(bq8_1->ds) * (float) sumi;
+}
+
 // ---------------------------------------------------------------- APR trellis types (ggml 144 TQ2_T, 145 TQK6, 146 TQK7)
 // Transcribed from the agention llama.cpp fork's ggml-cuda/tq.cuh (6d3f2b1b8; format in ggml-common-tq.h).  A
 // 128-value block is 8 lanes of 4 trellis steps (16 values); the dot of lane l reads q8_1 block l/2, ints 4(l&1)..
@@ -811,10 +884,14 @@ template<> struct Fmt<23> { static constexpr int qk = 256, ipb = 8, step = 4;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_xs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<22> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_s_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<19> { static constexpr int qk = 256, ipb = 8, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K / VDR_Q3_K, step = VDR_Q3_K;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -849,18 +926,20 @@ STRATA_TQP_FMT(149)
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(11) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(11) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
 // Q4_K as well: heretic's down experts are Q4_K; without 12 here d_qk(12)=0 and STRATA_DOWN reaches its exit(1)
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(12) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(20) X(23) X(39) X(42) X(7) X(6) X(12) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(12) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(20) X(23) X(39) X(42) X(7) X(6) X(12) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(39) X(42) X(11) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+template<> struct Fmt<39> { static constexpr int qk = 32, ipb = 2, step = 2;     // MXFP4: 2 calls of 16 values
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -917,7 +996,7 @@ inline bool g_kq_split = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); re
 template<int TY> inline bool split_off() { return kq_type<TY> && !g_kq_split; }
 template<int TY> inline constexpr bool kTqType = (TY == 144 || TY == 145 || TY == 146);
 // the trellis types stage their int8 codebook (4 KB) too, but only where it pays: tq_stage_on() below (compute capability 6.0)
-template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29 || kTqType<TY>);
+template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 19 || TY == 21 || TY == 22 || TY == 29 || kTqType<TY>);
 
 // LDS-only barrier (#3259, bsorensen110): the staging barriers of the grid / activation tables need the shared-memory stores to be
 // visible, not a global-memory fence; on gfx12 __syncthreads() is s_wait_loadcnt_dscnt 0; s_barrier; global_inv scope:SCOPE_SE.
@@ -1151,6 +1230,102 @@ template<> struct Split<21> {   // IQ3_S
         sumi *= r.ls;
         const float d = r.dw * d8;
         return d * sumi;
+    }
+};
+template<> inline constexpr bool kSplit<19> = true;
+template<> struct Split<19> {   // IQ1_S
+    struct W { int g[8]; float dl, delta; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
+        const block_iq1_s* bq1 = (const block_iq1_s*) vbq + kbx;
+        const int qs_packed = get_int_b2(bq1->qs, iqs);
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const uint16_t qh = bq1->qh[iqs];
+        const uint32_t* grid_lut;
+        if constexpr (STAGE_GRID) grid_lut = s_grid;
+        else grid_lut = iq1s_grid_gpu;
+        W r;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int grid = grid_lut[qs[l0 / 2] | (((qh >> (3 * (l0 / 2))) & 7) << 8)];
+            r.g[l0 + 0] = (grid >> 0) & 0x0F0F0F0F;
+            r.g[l0 + 1] = (grid >> 4) & 0x0F0F0F0F;
+        }
+        r.dl = __half2float(bq1->d) * (2 * ((qh >> 12) & 7) + 1);
+        r.delta = (qh & 0x8000) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi = 0, sumy = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+            const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+            sumi = ggml_cuda_dp4a(r.g[l0 + 0], u0, sumi);
+            sumi = ggml_cuda_dp4a(r.g[l0 + 1], u1, sumi);
+            sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+            sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+        }
+        return r.dl * __low2float(bq8_1[iqs].ds) * ((float) sumi + r.delta * (float) sumy);
+    }
+};
+template<> inline constexpr bool kSplit<11> = true;
+template<> struct Split<11> {   // Q3_K
+    struct W { int vi[4]; int sc[4]; float d; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q3_K* bq3 = (const block_q3_K*) vbq + kbx;
+        const int bq8_offset = 4 * (iqs / 8);
+        const int scale_offset = iqs - (iqs % 8) + (iqs % 8) / 4;
+        const int vl = get_int_b2(bq3->qs, iqs);
+        const int vh = ~get_int_b2(bq3->hmask, iqs % 8) >> bq8_offset;
+        W r;
+        r.d = __half2float(bq3->d);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int isc = scale_offset + 2 * i;
+            const int sc_low = (bq3->scales[isc % 8] >> (4 * (isc / 8))) & 0xf;
+            const int sc_high = ((bq3->scales[8 + (isc % 4)] >> (2 * (isc / 4))) & 3) << 4;
+            r.sc[i] = (sc_low | sc_high) - 32;
+            const int vil = (vl >> (2 * i)) & 0x03030303;
+            const int vih = ((vh >> i) << 2) & 0x04040404;
+            r.vi[i] = __vsubss4(vil, vih);
+        }
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        const int bq8_offset = 4 * (iqs / 8);
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int u = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % 8);
+            const float d8 = __low2float(bq8_1[bq8_offset + i].ds);
+            sumf += d8 * (ggml_cuda_dp4a(r.vi[i], u, 0) * r.sc[i]);
+        }
+        return r.d * sumf;
+    }
+};
+template<> inline constexpr bool kSplit<39> = true;
+template<> struct Split<39> {   // MXFP4
+    struct W { int2 v[2]; float dw; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
+        W r;
+#pragma unroll
+        for (int l = 0; l < 2; ++l) r.v[l] = get_int_from_table_16(get_int_b1(bq4->qs, iqs + l), kvalues_fp4);
+        r.dw = e8m0_to_f32_half(bq4->e);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        const int* q8 = (const int*) bq8_1->qs + iqs;
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            sumi = ggml_cuda_dp4a(r.v[l].x, q8[l + 0], sumi);
+            sumi = ggml_cuda_dp4a(r.v[l].y, q8[l + 4], sumi);
+        }
+        return r.dw * __low2float(bq8_1->ds) * (float) sumi;
     }
 };
 template<> inline constexpr bool kSplit<29> = true;
@@ -2129,7 +2304,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
         for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i];
         iq_sync_lds();
         return s_buf;
-    } else if constexpr (TY == 29) {
+    } else if constexpr (TY == 19 || TY == 29) {
         uint2* dst = (uint2*) s_buf;
         const uint2* src = (const uint2*) iq1s_grid_gpu;
         for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i];
@@ -2167,7 +2342,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
 
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 struct IqGridWords {
-    static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29) ? 2048 : (TY == 17 || TY == 21 || kTqType<TY>) ? 1024 : (TY == 16 || TY == 18) ? 512 : 4;
+    static constexpr int value = !STAGE_GRID ? 4 : (TY == 19 || TY == 22 || TY == 29) ? 2048 : (TY == 17 || TY == 21 || kTqType<TY>) ? 1024 : (TY == 16 || TY == 18) ? 512 : 4;
 };
 
 // mmvq_kernel with the columns taken NC at a time.  After warp_sum every lane holds the same sum, so lane c stores
@@ -3357,6 +3532,33 @@ __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
 }
 template<typename dst_t>
+__device__ void dq_iq1_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_iq1_s* x = (const block_iq1_s*) vx + ibs;
+    const int il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 8 * il;
+    const uint16_t qh = x->qh[ib];
+    const float dl = __half2float(x->d) * (2 * ((qh >> 12) & 7) + 1);
+    const float delta = (qh & 0x8000) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA);
+    uint32_t grid32[2];
+    const int8_t* q = (const int8_t*) grid32;
+    grid32[0] = iq1s_grid_gpu[x->qs[4 * ib + il] | (((qh >> (3 * il)) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(dl * ((float) q[j] + delta));
+}
+template<typename dst_t>
+__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_mxfp4* x = (const block_mxfp4*) vx + ibs * (QK_K / QK_MXFP4);
+    const int il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 4 * il;
+    const uint8_t* q4 = x[ib].qs + 4 * il;
+    const float d = e8m0_to_f32_half(x[ib].e);
+    for (int j = 0; j < 4; ++j) {
+        y[j + 0] = cvt<dst_t>(d * (float) kvalues_fp4[q4[j] & 0xf]);
+        y[j + 16] = cvt<dst_t>(d * (float) kvalues_fp4[q4[j] >> 4]);
+    }
+}
+template<typename dst_t>
 __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_iq4_nl* x = (const block_iq4_nl*) vx + ibs * (QK_K / QK4_NL);
     const int64_t il = tid / 8, ib = tid % 8;
@@ -3639,11 +3841,13 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
         case 18: dq_iq3_xxs(vx, ibs, y, tid); break;
+        case 19: dq_iq1_s(vx, ibs, y, tid); break;
         case 20: dq_iq4_nl(vx, ibs, y, tid); break;
         case 21: dq_iq3_s(vx, ibs, y, tid); break;
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+        case 39: dq_mxfp4(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
@@ -3701,7 +3905,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+    return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 39 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149;
 #else
@@ -6078,11 +6282,13 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 16: return (size_t) (n / 256) * sizeof(block_iq2_xxs);
         case 17: return (size_t) (n / 256) * sizeof(block_iq2_xs);
         case 18: return (size_t) (n / 256) * sizeof(block_iq3_xxs);
+        case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);
         case 20: return (size_t) (n / 32) * sizeof(block_iq4_nl);
         case 21: return (size_t) (n / 256) * sizeof(block_iq3_s);
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+        case 39: return (size_t) (n / 32) * sizeof(block_mxfp4);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
@@ -8221,9 +8427,321 @@ __device__ __forceinline__ void i8x4_to_h2x2_scaled_iq(uint32_t packed_i8x4, __h
     out1 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&hi), bias), scale2);
 }
 
+__device__ __noinline__ void dq_sub16_k64_store_dyn(int wt, const uint8_t* row_ptr, int k0, int sb, __half* dst) {
+    __half2* d2 = reinterpret_cast<__half2*>(dst);
+    switch (wt) {
+        case 20: {  // IQ4_NL (32-elem)
+            const block_iq4_nl* x = reinterpret_cast<const block_iq4_nl*>(row_ptr) + (k0 >> 5) + (sb >> 1);
+            const float d = __half2float(x->d);
+            const int hi = sb & 1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t b0 = x->qs[2 * j], b1 = x->qs[2 * j + 1];
+                const int q0 = hi ? (b0 >> 4) : (b0 & 0xF);
+                const int q1 = hi ? (b1 >> 4) : (b1 & 0xF);
+                d2[j] = __floats2half2_rn(d * (float) kvalues_iq4nl[q0], d * (float) kvalues_iq4nl[q1]);
+            }
+            return;
+        }
+        case 39: {  // MXFP4 (32-elem, 1-byte aligned)
+            const block_mxfp4* x = reinterpret_cast<const block_mxfp4*>(row_ptr) + (k0 >> 5) + (sb >> 1);
+            const float d = e8m0_to_f32_half(x->e);
+            const int hi = sb & 1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t b0 = x->qs[2 * j], b1 = x->qs[2 * j + 1];
+                const int q0 = hi ? (b0 >> 4) : (b0 & 0xF);
+                const int q1 = hi ? (b1 >> 4) : (b1 & 0xF);
+                d2[j] = __floats2half2_rn(d * (float) kvalues_fp4[q0], d * (float) kvalues_fp4[q1]);
+            }
+            return;
+        }
+        case 42: {  // Q2_0 (64-elem)
+            const block_q2_0* x = reinterpret_cast<const block_q2_0*>(row_ptr) + (k0 >> 6);
+            const float d = __half2float(x->d);
+            const uint8_t* qp = x->qs + sb * 4;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t b = qp[j];
+                d2[2 * j + 0] = __floats2half2_rn(d * (float) ((int) ((b >> 0) & 3) - 1), d * (float) ((int) ((b >> 2) & 3) - 1));
+                d2[2 * j + 1] = __floats2half2_rn(d * (float) ((int) ((b >> 4) & 3) - 1), d * (float) ((int) ((b >> 6) & 3) - 1));
+            }
+            return;
+        }
+        case 6: {   // Q5_0 (32-elem)
+            const block_q5_0* x = reinterpret_cast<const block_q5_0*>(row_ptr) + (k0 >> 5) + (sb >> 1);
+            const float d = __half2float(x->d);
+            const uint32_t qh = (uint32_t) get_int_b2(x->qh, 0);
+            const int hi = sb & 1;
+            const int hb = hi * 16;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int i0 = 2 * j, i1 = 2 * j + 1;
+                const int q0 = (hi ? (x->qs[i0] >> 4) : (x->qs[i0] & 0xF)) | (int) (((qh >> (hb + i0)) & 1u) << 4);
+                const int q1 = (hi ? (x->qs[i1] >> 4) : (x->qs[i1] & 0xF)) | (int) (((qh >> (hb + i1)) & 1u) << 4);
+                d2[j] = __floats2half2_rn(((float) q0 - 16.0f) * d, ((float) q1 - 16.0f) * d);
+            }
+            return;
+        }
+        case 7: {   // Q5_1 (32-elem)
+            const block_q5_1* x = reinterpret_cast<const block_q5_1*>(row_ptr) + (k0 >> 5) + (sb >> 1);
+            const float2 dm = __half22float2(x->dm);
+            const uint32_t qh = (uint32_t) get_int_b4(x->qh, 0);
+            const int hi = sb & 1;
+            const int hb = hi * 16;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int i0 = 2 * j, i1 = 2 * j + 1;
+                const int q0 = (hi ? (x->qs[i0] >> 4) : (x->qs[i0] & 0xF)) | (int) (((qh >> (hb + i0)) & 1u) << 4);
+                const int q1 = (hi ? (x->qs[i1] >> 4) : (x->qs[i1] & 0xF)) | (int) (((qh >> (hb + i1)) & 1u) << 4);
+                d2[j] = __floats2half2_rn((float) q0 * dm.x + dm.y, (float) q1 * dm.x + dm.y);
+            }
+            return;
+        }
+        case 2: {   // Q4_0 (32-elem)
+            const block_q4_0* x = reinterpret_cast<const block_q4_0*>(row_ptr) + (k0 >> 5) + (sb >> 1);
+            const float d = __half2float(x->d);
+            const int hi = sb & 1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int q0 = hi ? (x->qs[2 * j] >> 4) : (x->qs[2 * j] & 0xF);
+                const int q1 = hi ? (x->qs[2 * j + 1] >> 4) : (x->qs[2 * j + 1] & 0xF);
+                d2[j] = __floats2half2_rn(((float) q0 - 8.0f) * d, ((float) q1 - 8.0f) * d);
+            }
+            return;
+        }
+        case 3: {   // Q4_1 (32-elem)
+            const block_q4_1* x = reinterpret_cast<const block_q4_1*>(row_ptr) + (k0 >> 5) + (sb >> 1);
+            const float2 dm = __half22float2(x->dm);
+            const int hi = sb & 1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int q0 = hi ? (x->qs[2 * j] >> 4) : (x->qs[2 * j] & 0xF);
+                const int q1 = hi ? (x->qs[2 * j + 1] >> 4) : (x->qs[2 * j + 1] & 0xF);
+                d2[j] = __floats2half2_rn((float) q0 * dm.x + dm.y, (float) q1 * dm.x + dm.y);
+            }
+            return;
+        }
+        case 11: {  // Q3_K (256-elem)
+            const block_q3_K* x = reinterpret_cast<const block_q3_K*>(row_ptr) + (k0 >> 8);
+            const int is = ((k0 & 255) >> 4) + sb;
+            const int n = is >> 3, jg = (is >> 1) & 3, is0 = is & 1;
+            const int8_t us = is < 4  ? (int8_t) ((x->scales[is] & 0xF) | (((x->scales[is + 8] >> 0) & 3) << 4)) :
+                              is < 8  ? (int8_t) ((x->scales[is] & 0xF) | (((x->scales[is + 4] >> 2) & 3) << 4)) :
+                              is < 12 ? (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is] >> 4) & 3) << 4)) :
+                                        (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is - 4] >> 6) & 3) << 4));
+            const float dl = __half2float(x->d) * (float) (us - 32);
+            const uint8_t m = (uint8_t) (1u << (4 * n + jg));
+            const int shift = 2 * jg;
+            const uint8_t* q = x->qs + 32 * n + 16 * is0;
+            const uint8_t* hm = x->hmask + 16 * is0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int l0 = 2 * j, l1 = 2 * j + 1;
+                const float v0 = dl * (float) ((int8_t) ((q[l0] >> shift) & 3) - ((hm[l0] & m) ? 0 : 4));
+                const float v1 = dl * (float) ((int8_t) ((q[l1] >> shift) & 3) - ((hm[l1] & m) ? 0 : 4));
+                d2[j] = __floats2half2_rn(v0, v1);
+            }
+            return;
+        }
+        case 14: {  // Q6_K (256-elem)
+            const block_q6_K* x = reinterpret_cast<const block_q6_K*>(row_ptr) + (k0 >> 8);
+            const int is = ((k0 & 255) >> 4) + sb;
+            const int ip = is >> 3, q32 = (is >> 1) & 3, h16 = is & 1;
+            const float dl = __half2float(x->d) * (float) x->scales[is];
+            const uint8_t* ql = x->ql + 64 * ip + (q32 & 1) * 32 + 16 * h16;
+            const uint8_t* qh = x->qh + 32 * ip + 16 * h16;
+            const int hi_n = q32 >> 1;
+            const int qh_sh = 2 * q32;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int l0 = 2 * j, l1 = 2 * j + 1;
+                const int v0 = (int) ((hi_n ? (ql[l0] >> 4) : (ql[l0] & 0xF)) | (((qh[l0] >> qh_sh) & 3) << 4)) - 32;
+                const int v1 = (int) ((hi_n ? (ql[l1] >> 4) : (ql[l1] & 0xF)) | (((qh[l1] >> qh_sh) & 3) << 4)) - 32;
+                d2[j] = __floats2half2_rn(dl * (float) v0, dl * (float) v1);
+            }
+            return;
+        }
+        case 23: {  // IQ4_XS (256-elem)
+            const block_iq4_xs* x = reinterpret_cast<const block_iq4_xs*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int hi = sb & 1;
+            const float d = __half2float(x->d) * (float) ((((x->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                                                           (((x->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+            const uint8_t* q4 = x->qs + 16 * ib;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t b0 = q4[2 * j], b1 = q4[2 * j + 1];
+                const int q0 = hi ? (b0 >> 4) : (b0 & 0xF);
+                const int q1 = hi ? (b1 >> 4) : (b1 & 0xF);
+                d2[j] = __floats2half2_rn(d * (float) kvalues_iq4nl[q0], d * (float) kvalues_iq4nl[q1]);
+            }
+            return;
+        }
+        case 19: {  // IQ1_S (256-elem)
+            const block_iq1_s* x = reinterpret_cast<const block_iq1_s*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int il0 = (sb & 1) * 2;
+            const uint16_t qh = x->qh[ib];
+            const float dl = __half2float(x->d) * (float) (2 * ((qh >> 12) & 7) + 1);
+            const float delta = (qh & 0x8000) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA);
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int il = il0 + g;
+                const uint32_t gw = iq1s_grid_gpu[x->qs[4 * ib + il] | (((qh >> (3 * il)) & 7) << 8)];
+                const uint32_t g0 = gw & 0x0f0f0f0fu;
+                const uint32_t g1 = (gw >> 4) & 0x0f0f0f0fu;
+                d2[g * 4 + 0] = __floats2half2_rn(dl * ((float) (int) (g0 & 0xFF) + delta), dl * ((float) (int) ((g0 >> 8) & 0xFF) + delta));
+                d2[g * 4 + 1] = __floats2half2_rn(dl * ((float) (int) ((g0 >> 16) & 0xFF) + delta), dl * ((float) (int) ((g0 >> 24) & 0xFF) + delta));
+                d2[g * 4 + 2] = __floats2half2_rn(dl * ((float) (int) (g1 & 0xFF) + delta), dl * ((float) (int) ((g1 >> 8) & 0xFF) + delta));
+                d2[g * 4 + 3] = __floats2half2_rn(dl * ((float) (int) ((g1 >> 16) & 0xFF) + delta), dl * ((float) (int) ((g1 >> 24) & 0xFF) + delta));
+            }
+            return;
+        }
+        case 29: {  // IQ1_M (256-elem)
+            const block_iq1_m* x = reinterpret_cast<const block_iq1_m*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int hi = sb & 1;
+            const uint16_t* sc = reinterpret_cast<const uint16_t*>(x->scales);
+            iq1m_scale_t scale;
+            scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            const int ib16 = 2 * ib + hi;
+            const float dl = __half2float(scale.f16) * (float) (2 * ((sc[ib16 / 4] >> (3 * (ib16 % 4))) & 7) + 1);
+            const uint8_t qhb_full = x->qh[2 * ib + hi];
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int il = hi * 2 + g;
+                const int qhb = (qhb_full >> (4 * g)) & 0xF;
+                const float delta = (qhb & 8) ? (-1.0f - IQ1M_DELTA) : (-1.0f + IQ1M_DELTA);
+                const uint32_t gw = iq1s_grid_gpu[x->qs[4 * ib + il] | ((qhb & 7) << 8)];
+                const uint32_t g0 = gw & 0x0f0f0f0fu;
+                const uint32_t g1 = (gw >> 4) & 0x0f0f0f0fu;
+                d2[g * 4 + 0] = __floats2half2_rn(dl * ((float) (int) (g0 & 0xFF) + delta), dl * ((float) (int) ((g0 >> 8) & 0xFF) + delta));
+                d2[g * 4 + 1] = __floats2half2_rn(dl * ((float) (int) ((g0 >> 16) & 0xFF) + delta), dl * ((float) (int) ((g0 >> 24) & 0xFF) + delta));
+                d2[g * 4 + 2] = __floats2half2_rn(dl * ((float) (int) (g1 & 0xFF) + delta), dl * ((float) (int) ((g1 >> 8) & 0xFF) + delta));
+                d2[g * 4 + 3] = __floats2half2_rn(dl * ((float) (int) ((g1 >> 16) & 0xFF) + delta), dl * ((float) (int) ((g1 >> 24) & 0xFF) + delta));
+            }
+            return;
+        }
+        case 16: {  // IQ2_XXS (256-elem)
+            const block_iq2_xxs* x = reinterpret_cast<const block_iq2_xxs*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int il0 = (sb & 1) * 2;
+            const uint16_t* q2 = x->qs + 4 * ib;
+            const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(q2);
+            const uint32_t aux32 = (uint32_t) q2[2] | ((uint32_t) q2[3] << 16);
+            const float d = __half2float(x->d) * (0.5f + (float) (aux32 >> 28)) * 0.25f;
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int il = il0 + g;
+                const uint8_t* grid = reinterpret_cast<const uint8_t*>(iq2xxs_grid + aux8[il]);
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float v0 = d * (float) grid[2 * j + 0] * ((signs & kmask_iq2xs[2 * j + 0]) ? -1.0f : 1.0f);
+                    const float v1 = d * (float) grid[2 * j + 1] * ((signs & kmask_iq2xs[2 * j + 1]) ? -1.0f : 1.0f);
+                    d2[g * 4 + j] = __floats2half2_rn(v0, v1);
+                }
+            }
+            return;
+        }
+        case 17: {  // IQ2_XS (256-elem)
+            const block_iq2_xs* x = reinterpret_cast<const block_iq2_xs*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int hi = sb & 1;
+            const uint16_t* q2 = x->qs + 4 * ib;
+            const float d = __half2float(x->d) * (0.5f + (float) ((x->scales[ib] >> (4 * hi)) & 0xf)) * 0.25f;
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int il = hi * 2 + g;
+                const uint8_t* grid = reinterpret_cast<const uint8_t*>(iq2xs_grid + (q2[il] & 511));
+                const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float v0 = d * (float) grid[2 * j + 0] * ((signs & kmask_iq2xs[2 * j + 0]) ? -1.0f : 1.0f);
+                    const float v1 = d * (float) grid[2 * j + 1] * ((signs & kmask_iq2xs[2 * j + 1]) ? -1.0f : 1.0f);
+                    d2[g * 4 + j] = __floats2half2_rn(v0, v1);
+                }
+            }
+            return;
+        }
+        case 22: {  // IQ2_S (256-elem)
+            const block_iq2_s* x = reinterpret_cast<const block_iq2_s*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int hi = sb & 1;
+            const float d = __half2float(x->d) * (0.5f + (float) ((x->scales[ib] >> (4 * hi)) & 0xf)) * 0.25f;
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int il = hi * 2 + g;
+                const uint8_t* grid = reinterpret_cast<const uint8_t*>(iq2s_grid + (x->qs[4 * ib + il] | ((x->qh[ib] << (8 - 2 * il)) & 0x300)));
+                const uint8_t signs = x->qs[QK_K / 8 + 4 * ib + il];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float v0 = d * (float) grid[2 * j + 0] * ((signs & kmask_iq2xs[2 * j + 0]) ? -1.0f : 1.0f);
+                    const float v1 = d * (float) grid[2 * j + 1] * ((signs & kmask_iq2xs[2 * j + 1]) ? -1.0f : 1.0f);
+                    d2[g * 4 + j] = __floats2half2_rn(v0, v1);
+                }
+            }
+            return;
+        }
+        case 18: {  // IQ3_XXS (256-elem)
+            const block_iq3_xxs* x = reinterpret_cast<const block_iq3_xxs*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int il0 = (sb & 1) * 2;
+            const uint8_t* q3 = x->qs + 8 * ib;
+            const uint16_t* gas = reinterpret_cast<const uint16_t*>(x->qs + QK_K / 4) + 2 * ib;
+            const uint32_t aux32 = (uint32_t) gas[0] | ((uint32_t) gas[1] << 16);
+            const float d = __half2float(x->d) * (0.5f + (float) (aux32 >> 28)) * 0.5f;
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int il = il0 + g;
+                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(iq3xxs_grid + q3[2 * il + 0]);
+                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(iq3xxs_grid + q3[2 * il + 1]);
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+                d2[g * 4 + 0] = __floats2half2_rn(d * (float) grid1[0] * ((signs & kmask_iq2xs[0]) ? -1.0f : 1.0f),
+                                                  d * (float) grid1[1] * ((signs & kmask_iq2xs[1]) ? -1.0f : 1.0f));
+                d2[g * 4 + 1] = __floats2half2_rn(d * (float) grid1[2] * ((signs & kmask_iq2xs[2]) ? -1.0f : 1.0f),
+                                                  d * (float) grid1[3] * ((signs & kmask_iq2xs[3]) ? -1.0f : 1.0f));
+                d2[g * 4 + 2] = __floats2half2_rn(d * (float) grid2[0] * ((signs & kmask_iq2xs[4]) ? -1.0f : 1.0f),
+                                                  d * (float) grid2[1] * ((signs & kmask_iq2xs[5]) ? -1.0f : 1.0f));
+                d2[g * 4 + 3] = __floats2half2_rn(d * (float) grid2[2] * ((signs & kmask_iq2xs[6]) ? -1.0f : 1.0f),
+                                                  d * (float) grid2[3] * ((signs & kmask_iq2xs[7]) ? -1.0f : 1.0f));
+            }
+            return;
+        }
+        case 21: {  // IQ3_S (256-elem)
+            const block_iq3_s* x = reinterpret_cast<const block_iq3_s*>(row_ptr) + (k0 >> 8);
+            const int ib = ((k0 & 255) >> 5) + (sb >> 1);
+            const int il0 = (sb & 1) * 2;
+            const uint8_t* qs = x->qs + 8 * ib;
+            const float d = __half2float(x->d) * (float) (1 + 2 * ((x->scales[ib / 2] >> (4 * (ib % 2))) & 0xf));
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int il = il0 + g;
+                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(iq3s_grid + (qs[2 * il + 0] | ((x->qh[ib] << (8 - 2 * il)) & 256)));
+                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(iq3s_grid + (qs[2 * il + 1] | ((x->qh[ib] << (7 - 2 * il)) & 256)));
+                const uint8_t signs = x->signs[4 * ib + il];
+                d2[g * 4 + 0] = __floats2half2_rn(d * (float) grid1[0] * ((signs & kmask_iq2xs[0]) ? -1.0f : 1.0f),
+                                                  d * (float) grid1[1] * ((signs & kmask_iq2xs[1]) ? -1.0f : 1.0f));
+                d2[g * 4 + 1] = __floats2half2_rn(d * (float) grid1[2] * ((signs & kmask_iq2xs[2]) ? -1.0f : 1.0f),
+                                                  d * (float) grid1[3] * ((signs & kmask_iq2xs[3]) ? -1.0f : 1.0f));
+                d2[g * 4 + 2] = __floats2half2_rn(d * (float) grid2[0] * ((signs & kmask_iq2xs[4]) ? -1.0f : 1.0f),
+                                                  d * (float) grid2[1] * ((signs & kmask_iq2xs[5]) ? -1.0f : 1.0f));
+                d2[g * 4 + 3] = __floats2half2_rn(d * (float) grid2[2] * ((signs & kmask_iq2xs[6]) ? -1.0f : 1.0f),
+                                                  d * (float) grid2[3] * ((signs & kmask_iq2xs[7]) ? -1.0f : 1.0f));
+            }
+            return;
+        }
+        default: break;
+    }
+}
+
 template <int WT>
-__device__ __forceinline__ void dq_sub16_k64_store(const uint8_t* row_ptr, int k0, int sb, __half* dst) {
-    if constexpr (WT == 40) {
+__device__ __forceinline__ void dq_sub16_k64_store(const uint8_t* row_ptr, int k0, int sb, __half* dst, int wt_dyn = WT) {
+    if constexpr (WT == -1) {
+        dq_sub16_k64_store_dyn(wt_dyn, row_ptr, k0, sb, dst);
+        return;
+    } else if constexpr (WT == 40) {
         const uint8_t* bp = row_ptr + (size_t) (k0 >> 6) * 36;
         const uint32_t w0 = *reinterpret_cast<const uint32_t*>(bp + 4 + sb * 8);
         const uint32_t w1 = *reinterpret_cast<const uint32_t*>(bp + 8 + sb * 8);
@@ -8534,8 +9052,8 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_64_kernel(
             const __half* cxp = xp + k0;
             *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x_ok ? *reinterpret_cast<const uint4*>(cxp)     : make_uint4(0, 0, 0, 0);
             *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x_ok ? *reinterpret_cast<const uint4*>(cxp + 8) : make_uint4(0, 0, 0, 0);
-            dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16);
-            dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16);
+            dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16, L.gu_type);
+            dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16, L.gu_type);
             __syncthreads();
 #if __CUDA_ARCH__ < 750
 #pragma unroll
@@ -8877,8 +9395,8 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8)        = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc)     = x1_ok ? *reinterpret_cast<const uint4*>(cxp1)     : make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc + 8) = x1_ok ? *reinterpret_cast<const uint4*>(cxp1 + 8) : make_uint4(0, 0, 0, 0);
-                dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16);
-                dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16);
+                dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16, L.gu_type);
+                dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16, L.gu_type);
                 __syncthreads();
 #if __CUDA_ARCH__ < 750
 #pragma unroll 1
@@ -8919,8 +9437,8 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                 const __half* cxp0 = xp0 + k0;
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
-                dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16);
-                dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16);
+                dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16, L.gu_type);
+                dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16, L.gu_type);
                 __syncthreads();
 #if __CUDA_ARCH__ < 750
 #pragma unroll 1
@@ -9025,7 +9543,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
 /// On Volta sm_70 (__CUDA_ARCH__ < 750): uses native PTX HMMA.884 (mma.sync.aligned.m8n8k4.row.col) + LDS.128 +
 /// register-direct float2 epilogue + 3-blk/SM occupancy.
 template <int WT, bool IS_DOWN, int BN, bool USE_TILES = false>
-__global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kernel(
+__global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_grouped_64_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_idx,
     const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1,
@@ -9209,7 +9727,7 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
                     *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x1;
 #pragma unroll
                     for (int rb = 0; rb < BN; rb += 64) {
-                        dq_sub16_k64_store<WT>(we_t + (size_t) rb * row_stride, k0, sb, sw + (rb + wr) * LD + sb * 16);
+                        dq_sub16_k64_store<WT>(we_t + (size_t) rb * row_stride, k0, sb, sw + (rb + wr) * LD + sb * 16, IS_DOWN ? L.d_type : L.gu_type);
                     }
                     __syncthreads();
 #if __CUDA_ARCH__ < 750
@@ -9571,7 +10089,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                         *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc + 8) = x1_ok ? *reinterpret_cast<const uint4*>(cxp1 + 8) : make_uint4(0, 0, 0, 0);
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
-                            dq_sub16_k64_store<WT>(we_t + (size_t) (b * 64) * row_stride, k0, sb, sw + (b * 64 + wr) * LD + sb * 16);
+                            dq_sub16_k64_store<WT>(we_t + (size_t) (b * 64) * row_stride, k0, sb, sw + (b * 64 + wr) * LD + sb * 16, IS_DOWN ? L.d_type : L.gu_type);
                         }
                         __syncthreads();
 #if __CUDA_ARCH__ < 750
@@ -9615,7 +10133,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                         *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
-                            dq_sub16_k64_store<WT>(we_t + (size_t) (b * 64) * row_stride, k0, sb, sw + (b * 64 + wr) * LD + sb * 16);
+                            dq_sub16_k64_store<WT>(we_t + (size_t) (b * 64) * row_stride, k0, sb, sw + (b * 64 + wr) * LD + sb * 16, IS_DOWN ? L.d_type : L.gu_type);
                         }
                         __syncthreads();
 #if __CUDA_ARCH__ < 750
@@ -9891,14 +10409,30 @@ void native_expert_grouped_bf16_f32(const NativeExpertLayout& L, const unsigned 
     check("native_expert_grouped_bf16_f32/down");
 }
 
+namespace {
+bool wmma_type_ok(int t, int64_t K) noexcept {
+    switch (t) {
+        case 40: case 42: return (K % 64) == 0;
+        case 2: case 3: case 6: case 7: case 8: case 20: case 39: return (K % 32) == 0;
+        case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 22: case 23: case 29:
+            return (K % 256) == 0;
+        case 30: return (K % 16) == 0;
+        default: return false;
+    }
+}
+}  // namespace
+
+bool native_expert_wmma_supported(const NativeExpertLayout& L) noexcept {
+    if (L.had_block > 0 || L.gu_nib) return false;
+    if (L.n_embd % 256 != 0 || L.n_ff % 128 != 0) return false;
+    return wmma_type_ok(L.gu_type, L.n_embd) && wmma_type_ok(L.d_type, L.n_ff);
+}
+
 bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                                 const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
                                 int64_t cap_groups, int64_t cap_entries, const void* x_f16, void* scratch, float* out,
                                 void* stream, int64_t expected_entries) {
-    if (cap_groups <= 0 || cap_entries <= 0 || L.had_block > 0 || L.gu_nib) return false;
-    if (L.n_embd % 256 != 0 || L.n_ff % 128 != 0) return false;
-    if (L.gu_type != 40 && L.gu_type != 12 && L.gu_type != 13 && L.gu_type != 8 && L.gu_type != 30) return false;
-    if (L.d_type != 40 && L.d_type != 8 && L.d_type != 30) return false;
+    if (cap_groups <= 0 || cap_entries <= 0 || !native_expert_wmma_supported(L)) return false;
 
     static int cc_ok[64];
     static int cc_volta[64];
@@ -9922,6 +10456,8 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             cudaFuncSetAttribute(wmma_grouped_64_kernel<8, true, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_64_kernel<30, false, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_64_kernel<30, true, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_64_kernel<-1, false, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_64_kernel<-1, true, 64>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<40, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<40, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<13, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
@@ -9930,19 +10466,24 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             cudaFuncSetAttribute(wmma_grouped_128_kernel<8, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<30, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<30, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_128_kernel<-1, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_128_kernel<-1, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<40, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<8, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<30, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_128_kernel<-1, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<40>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<13>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<12>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<8>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<30>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_64_kernel<-1>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<40>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<13>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<12>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<8>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<30>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(wmma_grouped_gu_situ_128_kernel<-1>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         }
     }
     if (cc_ok[dev] != 2) return false;
@@ -9995,8 +10536,11 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             } else if (L.gu_type == 30) {
                 wmma_grouped_gu_situ_128_kernel<30><<<ggu_f, 256, 0, s>>>(
                     grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
-            } else {
+            } else if (L.gu_type == 8) {
                 wmma_grouped_gu_situ_128_kernel<8><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else {
+                wmma_grouped_gu_situ_128_kernel<-1><<<ggu_f, 256, 0, s>>>(
                     grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
             }
         } else {
@@ -10014,8 +10558,11 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             } else if (L.gu_type == 30) {
                 wmma_grouped_gu_situ_64_kernel<30><<<ggu_f, 256, 0, s>>>(
                     grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
-            } else {
+            } else if (L.gu_type == 8) {
                 wmma_grouped_gu_situ_64_kernel<8><<<ggu_f, 256, 0, s>>>(
+                    grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
+            } else {
+                wmma_grouped_gu_situ_64_kernel<-1><<<ggu_f, 256, 0, s>>>(
                     grp_ptr, grp_start, tile_g, tile_c0, n_tiles, ent_tok, (const __half*) x_f16, L, L.situ_beta, L.situ_linear_beta, h16);
             }
         }
@@ -10035,8 +10582,11 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             } else if (L.gu_type == 30) {
                 wmma_grouped_128_kernel<30, false, false><<<ggu128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
-            } else {
+            } else if (L.gu_type == 8) {
                 wmma_grouped_128_kernel<8, false, false><<<ggu128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            } else {
+                wmma_grouped_128_kernel<-1, false, false><<<ggu128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
             }
         } else {
@@ -10059,8 +10609,11 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             } else if (L.gu_type == 30) {
                 wmma_grouped_64_kernel<30, false, 64, false><<<ggu64, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
-            } else {
+            } else if (L.gu_type == 8) {
                 wmma_grouped_64_kernel<8, false, 64, false><<<ggu64, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
+            } else {
+                wmma_grouped_64_kernel<-1, false, 64, false><<<ggu64, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
             }
         }
@@ -10085,8 +10638,11 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             } else if (L.d_type == 30) {
                 wmma_grouped_128_kernel<30, true, true><<<gd128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr, tile_g, tile_c0, n_tiles);
-            } else {
+            } else if (L.d_type == 8) {
                 wmma_grouped_128_kernel<8, true, true><<<gd128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr, tile_g, tile_c0, n_tiles);
+            } else {
+                wmma_grouped_128_kernel<-1, true, true><<<gd128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr, tile_g, tile_c0, n_tiles);
             }
         } else {
@@ -10097,8 +10653,11 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             } else if (L.d_type == 30) {
                 wmma_grouped_128_kernel<30, true, false><<<gd128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
-            } else {
+            } else if (L.d_type == 8) {
                 wmma_grouped_128_kernel<8, true, false><<<gd128, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+            } else {
+                wmma_grouped_128_kernel<-1, true, false><<<gd128, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
             }
         }
@@ -10122,8 +10681,11 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             } else if (L.d_type == 30) {
                 wmma_grouped_64_kernel<30, true, 64, false><<<gd64, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
-            } else {
+            } else if (L.d_type == 8) {
                 wmma_grouped_64_kernel<8, true, 64, false><<<gd64, 256, 0, s>>>(
+                    grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
+            } else {
+                wmma_grouped_64_kernel<-1, true, 64, false><<<gd64, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_dst, h16, L, out, nullptr);
             }
         }

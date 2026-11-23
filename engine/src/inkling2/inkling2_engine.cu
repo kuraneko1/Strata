@@ -175,6 +175,29 @@ struct GpuWeightStore {
         float* d = gpu_alloc<float>((size_t) ne);
         if (t->type == 0) {
             CK(cudaMemcpy(d, raw, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice));
+        } else if (t->type == 1) {
+            std::vector<float> tmp((size_t) ne);
+            const uint16_t* h = (const uint16_t*) raw;
+            for (int64_t i = 0; i < ne; ++i) {
+                const uint16_t bits = h[i];
+                const uint32_t s = (uint32_t) (bits & 0x8000u) << 16;
+                const uint32_t e = (bits >> 10) & 0x1Fu;
+                const uint32_t m = bits & 0x03FFu;
+                uint32_t u = s;
+                if (e == 0) {
+                    if (m != 0) {
+                        float v = std::ldexp((float) m, -24);
+                        std::memcpy(&u, &v, 4);
+                        u |= s;
+                    }
+                } else if (e == 31) {
+                    u |= 0x7F800000u | (m << 13);
+                } else {
+                    u |= ((e + 112u) << 23) | (m << 13);
+                }
+                std::memcpy(&tmp[(size_t) i], &u, 4);
+            }
+            CK(cudaMemcpy(d, tmp.data(), (size_t) ne * sizeof(float), cudaMemcpyHostToDevice));
         } else if (t->type == 30) {
             std::vector<float> tmp((size_t) ne);
             const uint16_t* b = (const uint16_t*) raw;
@@ -339,6 +362,27 @@ struct Model : GpuWeightStore {
                 uint32_t u = (uint32_t) bf[i] << 16;
                 std::memcpy(&dst[i], &u, 4);
             }
+        } else if (tok_embd_type == 1) {
+            const uint16_t* h = (const uint16_t*) row;
+            for (int i = 0; i < N; ++i) {
+                const uint16_t bits = h[i];
+                const uint32_t s = (uint32_t) (bits & 0x8000u) << 16;
+                const uint32_t e = (bits >> 10) & 0x1Fu;
+                const uint32_t m = bits & 0x03FFu;
+                uint32_t u = s;
+                if (e == 0) {
+                    if (m != 0) {
+                        float v = std::ldexp((float) m, -24);
+                        std::memcpy(&u, &v, 4);
+                        u |= s;
+                    }
+                } else if (e == 31) {
+                    u |= 0x7F800000u | (m << 13);
+                } else {
+                    u |= ((e + 112u) << 23) | (m << 13);
+                }
+                std::memcpy(&dst[i], &u, 4);
+            }
         } else if (tok_embd_type == 0) {
             std::memcpy(dst, row, (size_t) N * sizeof(float));
         } else {
@@ -459,7 +503,7 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
         return false;
     }
     m.tok_embd_type = (int) te_info->type;
-    if (m.tok_embd_type == 30) m.tok_embd_row_bytes = (size_t) hp.n_embd * sizeof(uint16_t);
+    if (m.tok_embd_type == 30 || m.tok_embd_type == 1) m.tok_embd_row_bytes = (size_t) hp.n_embd * sizeof(uint16_t);
     else if (m.tok_embd_type == 0) m.tok_embd_row_bytes = (size_t) hp.n_embd * sizeof(float);
     else if (strata::quant::can_dequant((strata::quant::Type) m.tok_embd_type)) {
         m.tok_embd_row_bytes = strata::quant::row_bytes(m.tok_embd_type, hp.n_embd);
@@ -1344,7 +1388,7 @@ struct Engine {
         eparts_bytes = a256((size_t) max_ent * (size_t) N * sizeof(float));
         bool all_situ_fused = (hp.n_ff % 64 == 0 && hp.n_expert <= 256);
         for (const auto& L : m->layers) {
-            if (L.gu_type != 30 && !L.L.situ) { all_situ_fused = false; break; }
+            if (!L.L.situ || !K::native_expert_wmma_supported(L.L)) { all_situ_fused = false; break; }
         }
         if (all_situ_fused) {
             const size_t escr_wmma = K::native_expert_wmma_fused_scratch_bytes(max_ent, hp.n_expert, hp.n_ff);
@@ -4107,17 +4151,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             size_t sum_tier2_stride = 0;
             for (int ip : tier2) sum_tier2_stride += m.layers[(size_t) ip].stride;
             size_t tier2_resv = (size_t) t2_floor * sum_tier2_stride;
-            const size_t per_layer_stride = m.layers[(size_t) tier1[0]].stride;
-            const size_t min_tier1_bytes = (size_t) std::max(1, ne / 2) * tier1.size() * per_layer_stride;
+            size_t sum_tier1_stride = 0;
+            for (int ip : tier1) sum_tier1_stride += m.layers[(size_t) ip].stride;
+            const size_t min_tier1_bytes = (size_t) std::max(1, ne / 2) * sum_tier1_stride;
             if (tier2.empty() || budget <= used + min_tier1_bytes) {
                 tier2_resv = 0;
             } else if (budget - used - min_tier1_bytes < tier2_resv) {
                 tier2_resv = budget - used - min_tier1_bytes;
             }
             const size_t t1_budget = (budget > used + tier2_resv) ? (budget - used - tier2_resv) : (budget - used);
-            const int s = (int) std::min<size_t>((size_t) ne, t1_budget / (tier1.size() * per_layer_stride));
+            const int s = sum_tier1_stride > 0 ? (int) std::min<size_t>((size_t) ne, t1_budget / sum_tier1_stride) : 0;
             for (int ip : tier1) slots[(size_t) ip] = s;
-            used += (size_t) s * tier1.size() * per_layer_stride;
+            used += (size_t) s * sum_tier1_stride;
         }
     }
 
