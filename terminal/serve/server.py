@@ -2901,6 +2901,7 @@ class Vision:
         self.elastic = cfg.get("elastic") is True
         self.elastic_mib = self.elastic_ask_mib(cfg, self.max_tokens)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
+        self.release_after_encode = cfg.get("release_after_encode") is True
         if not lazy and not self.elastic:
             self._start()
 
@@ -4310,6 +4311,21 @@ class Service:
         elif note:
             print(f"[strata] images: the expert cache did not make room for the image encoder{note}; starting it anyway", flush=True)
 
+    def _vision_down_locked(self, reason: str) -> str:
+        """Stop an elastic encoder and give its VRAM back to the expert cache (caller holds self.fifo)."""
+        v = self.vision
+        if not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
+            return "nothing"
+        v.unload()
+        back = ""
+        if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+            out = self.engine.vram(self._engine_reserve())
+            back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
+                    f"{out.get('expert_cache_full_mib')} MiB)")
+        print(f"[strata] images: the image encoder stopped {reason}{back}", flush=True)
+        self.vision_held = False
+        return "down"
+
     def _vision_idle_down(self, force: bool = False) -> str:
         """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
         "down", "busy" (a request holds the turn, or a picture came more recently) or "nothing" (not elastic or not
@@ -4322,17 +4338,7 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            v.unload()
-            back = ""
-            if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
-                out = self.engine.vram(self._engine_reserve())
-                back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
-                        f"{out.get('expert_cache_full_mib')} MiB)")
-            # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
-            print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
-                  flush=True)
-            self.vision_held = False
-            return "down"
+            return self._vision_down_locked(f"after {v.elastic_idle_s:g} s without a picture")
         finally:
             self.fifo.release()
 
@@ -5084,6 +5090,8 @@ class Service:
                                else [self.vision.encode(src) for src in images])
                 finally:
                     self.last_image_at = time.time()
+                    if getattr(self.vision, "release_after_encode", False):
+                        self._vision_down_locked("right after encoding (release_after_encode)")
             # one <|image_pad|> (or <|unused_200054|>) per image -> one per image token.  Only the markers the template
             # writes for an image (right after <|vision_start|> or <|content_image|>) are images: the same text inside a
             # message (an agent reading these docs, #150) is kept as plain text, or it took an image's place and the

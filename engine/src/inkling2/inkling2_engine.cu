@@ -799,6 +799,8 @@ struct Engine {
     uint8_t* h_is_img_pin = nullptr; // pinned [tmax] flag (1 = vision embedding, skip tok_embd_norm)
     uint8_t* d_is_img = nullptr;     // device [tmax] flag for k_rms_norm_masked
     size_t vram_reserve_bytes = 0;   // --vram-reserve-mib headroom (e.g. for GPU strata-vision)
+    bool vram_elastic = false;       // --vram-elastic: dynamic expert cache shrink/grow via VRAM command
+    size_t full_cache_bytes = 0;     // full expert cache size (for VRAM command reporting)
     uint8_t* ckpt_pin = nullptr;     // reusable pinned staging buffer for fast SWA/conv checkpoint D2H
     size_t ckpt_pin_cap = 0;
     uint16_t* act_bf16 = nullptr;    // FP16 scratch [max(tmax*2*N, 16*4*N)]
@@ -2585,21 +2587,7 @@ struct Engine {
         }
     }
 
-    void ensure_kv_cap(int needed_pos) {
-        if (needed_pos <= full_kv_cap || full_kv_cap >= ctx) return;
-        const auto& hp = m->hp;
-        const int step_cap = (profile.regime == strata::inkling2::VramRegime::TightHybrid && full_kv_cap < 65536)
-                           ? (full_kv_cap + 16384)
-                           : (full_kv_cap * 2);
-        const int new_cap = std::min(ctx, std::max(needed_pos, step_cap));
-        if (new_cap <= full_kv_cap) return;
-
-        CK(cudaStreamSynchronize(st));
-        if (cst) CK(cudaStreamSynchronize(cst));
-        for (int i = 0; i < kMaxRebalLayers; ++i) layer_pending_rebal[i] = false;
-
-        // Full-attention KV buffers are reallocated below; invalidate all captured decode/verify graphs
-        // and reset graph_oom so graphs cleanly re-capture at the new capacity.
+    void destroy_graphs() {
         if (core_graph) { cudaGraphExecDestroy(core_graph); core_graph = nullptr; }
         if (verify_core_graph) { cudaGraphExecDestroy(verify_core_graph); verify_core_graph = nullptr; }
         for (int t = 0; t < 9; ++t)
@@ -2617,6 +2605,283 @@ struct Engine {
             if (g) { cudaGraphExecDestroy(g); g = nullptr; }
         }
         graph_oom = false;
+    }
+
+    // Dynamic VRAM elasticity (--vram-elastic): shrink expert cache when free < target_free_bytes,
+    // or grow it back up toward full residency when free > target_free_bytes + safety headroom.
+    void resize_experts_vram(size_t target_free_bytes) {
+        const auto t0 = Clock::now();
+        const auto& hp = m->hp;
+        const int ne = (int) hp.n_expert;
+
+        CK(cudaStreamSynchronize(st));
+        if (cst) CK(cudaStreamSynchronize(cst));
+        for (int i = 0; i < kMaxRebalLayers; ++i) layer_pending_rebal[i] = false;
+        destroy_graphs();
+        sync_d_hits(false);
+
+        const bool core_res_hy = (profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
+        const size_t base_guard = core_res_hy
+            ? (verify_max_t > 1 ? ((size_t) 288 << 20) : ((size_t) 160 << 20))
+            : ((size_t) 256 << 20);
+
+        auto demote_tier2_pin = [&](size_t need_bytes) {
+            for (int j = (int) m->layers.size() - 1; j >= 0 && pinned_used + need_bytes > max_pin_bytes; --j) {
+                if (j >= hp.core_start && j < hp.core_end) continue;
+                PhysLayer& T2 = m->layers[(size_t) j];
+                if (!T2.hblobs || !T2.hblobs_pinned) continue;
+                const size_t tb = (size_t) ne * T2.stride;
+                uint8_t* pag = (uint8_t*) std::malloc(tb);
+                if (!pag) continue;
+                std::memcpy(pag, T2.hblobs, tb);
+                auto it = std::find(m->host_pinned_allocs.begin(), m->host_pinned_allocs.end(), (void*) T2.hblobs);
+                if (it != m->host_pinned_allocs.end()) m->host_pinned_allocs.erase(it);
+                cudaFreeHost(T2.hblobs);
+                T2.hblobs = pag;
+                T2.hblobs_pinned = false;
+                m->host_allocs.push_back(pag);
+                pinned_used = (pinned_used >= tb) ? (pinned_used - tb) : 0;
+            }
+        };
+
+        auto ensure_hblobs = [&](PhysLayer& L, bool is_tier1) {
+            if (L.hblobs) return;
+            const size_t hb_bytes = (size_t) ne * L.stride;
+            const bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr);
+            if (want_pin && pinned_used + hb_bytes > max_pin_bytes && is_tier1) demote_tier2_pin(hb_bytes);
+            if (want_pin && pinned_used + hb_bytes <= max_pin_bytes &&
+                cudaHostAlloc(&L.hblobs, hb_bytes, cudaHostAllocDefault) == cudaSuccess) {
+                m->host_pinned_allocs.push_back(L.hblobs);
+                L.hblobs_pinned = true;
+                pinned_used += hb_bytes;
+            } else {
+                (void) cudaGetLastError();
+                L.hblobs = (uint8_t*) std::malloc(hb_bytes);
+                if (!L.hblobs) { std::fprintf(stderr, "strata-inkling2: host malloc failed during VRAM resize\n"); std::exit(1); }
+                L.hblobs_pinned = false;
+                m->host_allocs.push_back(L.hblobs);
+            }
+            bool can_d2h = (L.n_slots == ne && L.d_blobs != nullptr);
+            if (can_d2h) {
+                for (int e = 0; e < ne; ++e) if (L.slot_of[(size_t) e] != e) { can_d2h = false; break; }
+            }
+            if (can_d2h) {
+                CK(cudaMemcpyAsync(L.hblobs, L.d_blobs, hb_bytes, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+            } else {
+                build_all_expert_blobs(L, ne, L.hblobs);
+            }
+        };
+
+        auto set_layer_slots = [&](int ip, int target_slots) -> bool {
+            PhysLayer& L = m->layers[(size_t) ip];
+            target_slots = std::clamp(target_slots, 0, ne);
+            if (target_slots == L.n_slots) return false;
+            const bool is_tier1 = (ip >= hp.core_start && ip < hp.core_end);
+            ensure_hblobs(L, is_tier1);
+
+            std::vector<int> keep;
+            if (target_slots > 0) {
+                std::vector<int> order((size_t) ne);
+                for (int e = 0; e < ne; ++e) order[(size_t) e] = e;
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                    if (L.score[(size_t) a] != L.score[(size_t) b]) return L.score[(size_t) a] > L.score[(size_t) b];
+                    return (L.slot_of[(size_t) a] >= 0) > (L.slot_of[(size_t) b] >= 0);
+                });
+                keep.assign(order.begin(), order.begin() + target_slots);
+            }
+
+            if (L.d_blobs) {
+                auto it = std::find(m->gpu_allocs.begin(), m->gpu_allocs.end(), (void*) L.d_blobs);
+                if (it != m->gpu_allocs.end()) m->gpu_allocs.erase(it);
+                CK(cudaFree(L.d_blobs));
+                L.d_blobs = nullptr;
+            }
+            L.n_slots = 0;
+            std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
+            L.exp_in_slot.clear();
+
+            if (target_slots > 0) {
+                void* ndb = nullptr;
+                int s = target_slots;
+                while (s > 0 && cudaMalloc(&ndb, (size_t) s * L.stride) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    --s;
+                }
+                if (s > 0 && ndb) {
+                    L.d_blobs = (uint8_t*) ndb;
+                    m->gpu_allocs.push_back(L.d_blobs);
+                    if (!L.d_slot_of) {
+                        CK(cudaMalloc(&L.d_slot_of, (size_t) ne * sizeof(int32_t)));
+                        m->gpu_allocs.push_back(L.d_slot_of);
+                    }
+                    L.n_slots = s;
+                    L.exp_in_slot.assign((size_t) s, -1);
+                    for (int k = 0; k < s; ++k) {
+                        const int e = keep[(size_t) k];
+                        CK(cudaMemcpyAsync(L.d_blobs + (size_t) k * L.stride, L.hblobs + (size_t) e * L.stride,
+                                           L.L.bytes, cudaMemcpyHostToDevice, st));
+                        L.slot_of[(size_t) e] = k;
+                        L.exp_in_slot[(size_t) k] = e;
+                    }
+                    CK(cudaStreamSynchronize(st));
+                }
+            }
+            if (L.d_slot_of) {
+                CK(cudaMemcpy(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice));
+            }
+            rebal_burst = 2;
+            return true;
+        };
+
+        std::vector<int> tier1, tier2, tier3;
+        for (int ip = 0; ip < hp.n_phys; ++ip) {
+            if (m->layers[(size_t) ip].gu_type == 30) tier3.push_back(ip);
+            else if (ip >= hp.core_start && ip < hp.core_end) tier1.push_back(ip);
+            else tier2.push_back(ip);
+        }
+
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+
+        if (fr < target_free_bytes) {
+            // SHRINK: evict Tier 3 -> Tier 2 -> Tier 1 (fast: full-layer cudaFree first, minimal re-upload)
+            auto shrink_tier = [&](const std::vector<int>& tier) {
+                for (int idx = (int) tier.size() - 1; idx >= 0 && fr < target_free_bytes; --idx) {
+                    const int ip = tier[(size_t) idx];
+                    const PhysLayer& L = m->layers[(size_t) ip];
+                    if (L.n_slots <= 0) continue;
+                    const size_t deficit = target_free_bytes - fr;
+                    const int drop = (L.stride > 0) ? (int) ((deficit + L.stride - 1) / L.stride) : L.n_slots;
+                    const int tgt = (drop >= L.n_slots) ? 0 : (L.n_slots - drop);
+                    set_layer_slots(ip, tgt);
+                    CK(cudaMemGetInfo(&fr, &tot));
+                }
+            };
+            shrink_tier(tier3);
+            shrink_tier(tier2);
+            shrink_tier(tier1);
+        } else {
+            // GROW: restore Tier 1 -> Tier 2 -> Tier 3 back toward full residency while keeping (target_free + base_guard) free
+            const size_t keep_free = std::max(target_free_bytes, base_guard);
+            auto grow_tier = [&](const std::vector<int>& tier) {
+                if (tier.empty()) return;
+                CK(cudaMemGetInfo(&fr, &tot));
+                if (fr <= keep_free) return;
+                size_t avail = fr - keep_free;
+                size_t need_full = 0;
+                for (int ip : tier) {
+                    const PhysLayer& L = m->layers[(size_t) ip];
+                    if (L.n_slots < ne) need_full += (size_t) (ne - L.n_slots) * L.stride;
+                }
+                if (need_full == 0) return;
+                if (avail >= need_full) {
+                    for (int ip : tier) {
+                        if (m->layers[(size_t) ip].n_slots < ne) set_layer_slots(ip, ne);
+                    }
+                    return;
+                }
+                // Distribute available VRAM evenly across layers in this tier that are below full
+                std::vector<int> targets(tier.size());
+                size_t sum_cur_bytes = 0, sum_stride = 0;
+                for (size_t i = 0; i < tier.size(); ++i) {
+                    const PhysLayer& L = m->layers[(size_t) tier[i]];
+                    targets[i] = L.n_slots;
+                    sum_cur_bytes += (size_t) L.n_slots * L.stride;
+                    sum_stride += L.stride;
+                }
+                const size_t total_b = sum_cur_bytes + avail;
+                const int uniform_s = sum_stride > 0 ? (int) std::min<size_t>((size_t) ne, total_b / sum_stride) : 0;
+                size_t used_b = 0;
+                for (size_t i = 0; i < tier.size(); ++i) {
+                    const int cur_s = m->layers[(size_t) tier[i]].n_slots;
+                    const int ns = std::max(cur_s, uniform_s);
+                    targets[i] = std::min(ne, ns);
+                    if (targets[i] > cur_s) used_b += (size_t) (targets[i] - cur_s) * m->layers[(size_t) tier[i]].stride;
+                }
+                bool added = true;
+                while (added && used_b < avail) {
+                    added = false;
+                    for (size_t i = 0; i < tier.size(); ++i) {
+                        const size_t sb = m->layers[(size_t) tier[i]].stride;
+                        if (targets[i] < ne && used_b + sb <= avail) {
+                            targets[i] += 1;
+                            used_b += sb;
+                            added = true;
+                        }
+                    }
+                }
+                for (size_t i = 0; i < tier.size(); ++i) {
+                    const int ip = tier[i];
+                    if (targets[i] > m->layers[(size_t) ip].n_slots) {
+                        CK(cudaMemGetInfo(&fr, &tot));
+                        const size_t cur_b = (size_t) m->layers[(size_t) ip].n_slots * m->layers[(size_t) ip].stride;
+                        const size_t max_b = (fr + cur_b > keep_free) ? (fr + cur_b - keep_free) : 0;
+                        const int max_s = m->layers[(size_t) ip].stride > 0
+                            ? (int) std::min<size_t>((size_t) ne, max_b / m->layers[(size_t) ip].stride) : 0;
+                        const int ns = std::min(targets[i], max_s);
+                        if (ns > m->layers[(size_t) ip].n_slots) set_layer_slots(ip, ns);
+                    }
+                }
+            };
+            grow_tier(tier1);
+            grow_tier(tier2);
+            grow_tier(tier3);
+        }
+
+        // Recompute residency state & lazily initialize CPU pool/buffers if transitioning from Full-VRAM -> Hybrid
+        int tot_slots = 0;
+        size_t exp_bytes = 0;
+        bool any_missing = false;
+        bool all_core = !tier1.empty();
+        for (int ip = 0; ip < hp.n_phys; ++ip) {
+            const PhysLayer& L = m->layers[(size_t) ip];
+            tot_slots += L.n_slots;
+            exp_bytes += (size_t) L.n_slots * L.stride;
+            if (L.n_slots < ne) any_missing = true;
+            if (ip >= hp.core_start && ip < hp.core_end && L.n_slots < ne) all_core = false;
+        }
+        hybrid = any_missing;
+        core_all_gpu = all_core;
+#if defined(STRATA_INKLING2_CPU_POOL)
+        if (hybrid && !pool) {
+            int nw = cpu_threads_req > 0 ? cpu_threads_req : 0;
+            pool = std::make_unique<strata::kernels::cpu::ExpertPool>(nw, true, true);
+            pool_workers = pool->workers();
+            pin_host_for_pool();
+        }
+#endif
+        if (hybrid && !h_h) {
+            const int cpu_t = (pp_stage[0] && pp_stream_t > 1) ? std::min(tmax, pp_stream_t - 1) : tmax;
+            init_cpu_bufs(cpu_t);
+        }
+        placed_slots = tot_slots;
+        placed_bytes = exp_bytes;
+        if (exp_bytes > full_cache_bytes) full_cache_bytes = exp_bytes;
+        CK(cudaMemGetInfo(&fr, &tot));
+        vram_free_after_place = fr;
+        std::fprintf(stderr, "strata-inkling2: VRAM resize(target=%.0f MiB) -> slots=%d/%lld (%.0f/%.0f MiB, free=%.0f MiB, hybrid=%d) in %.1f ms\n",
+                     (double) target_free_bytes / (1 << 20), tot_slots, (long long) hp.n_phys * ne,
+                     (double) exp_bytes / (1 << 20), (double) full_cache_bytes / (1 << 20),
+                     (double) fr / (1 << 20), hybrid ? 1 : 0, ms_since(t0));
+    }
+
+    void ensure_kv_cap(int needed_pos) {
+        if (needed_pos <= full_kv_cap || full_kv_cap >= ctx) return;
+        const auto& hp = m->hp;
+        const int step_cap = (profile.regime == strata::inkling2::VramRegime::TightHybrid && full_kv_cap < 65536)
+                           ? (full_kv_cap + 16384)
+                           : (full_kv_cap * 2);
+        const int new_cap = std::min(ctx, std::max(needed_pos, step_cap));
+        if (new_cap <= full_kv_cap) return;
+
+        CK(cudaStreamSynchronize(st));
+        if (cst) CK(cudaStreamSynchronize(cst));
+        for (int i = 0; i < kMaxRebalLayers; ++i) layer_pending_rebal[i] = false;
+
+        // Full-attention KV buffers are reallocated below; invalidate all captured decode/verify graphs
+        // and reset graph_oom so graphs cleanly re-capture at the new capacity.
+        destroy_graphs();
 
         const int ne = (int) hp.n_expert;
         // Pull GPU routing hit counts into L.score for ALL layers so shrinking keeps the true hottest experts!
@@ -4462,6 +4727,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     CK(cudaMemGetInfo(&fr_after, &tot_after));
     E.placed_slots = total_vram_experts;
     E.placed_bytes = used;
+    E.full_cache_bytes = used;
     E.vram_free_after_place = fr_after;
 
     int tier2_min = ne, tier2_max = 0;
@@ -4968,6 +5234,7 @@ int run(int argc, char** argv) {
     bool bench = false;
     bool kv_q8 = true;
     bool vision_enabled = false;
+    bool vram_elastic = false;
     int vram_reserve_mib = 0;
     int32_t img_pad_id = 200054;
     bool profile = false;
@@ -4995,6 +5262,8 @@ int run(int argc, char** argv) {
         else if (a == "--kv-f16") kv_q8 = false;
         else if (a == "--kv-q8") kv_q8 = true;
         else if (a == "--vision") vision_enabled = true;
+        else if (a == "--vram-elastic") vram_elastic = true;
+        else if (a == "--vram-segment-mib") (void) next_arg();
         else if (a == "--vram-reserve-mib") vram_reserve_mib = std::max(0, std::atoi(next_arg()));
         else if (a == "--image-pad-id") img_pad_id = std::atoi(next_arg());
         else if (a == "--serve") serve = true;
@@ -5071,6 +5340,7 @@ int run(int argc, char** argv) {
 
     Engine E;
     E.vram_reserve_bytes = (size_t) vram_reserve_mib << 20;
+    E.vram_elastic = vram_elastic;
     if (!E.init(m, max_ctx, chunk, kv_q8, err, dm && dm->has_quant_dense, dm ? (draft_max + 1) : 1, &prof_cfg)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
@@ -5123,12 +5393,12 @@ int run(int argc, char** argv) {
             q_cv.notify_one();
         });
 
-        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d dspark=%s draft_max=%d vision=%s\n",
+        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d dspark=%s draft_max=%d vision=%s vram_elastic=%d\n",
                     max_ctx, kv_q8 ? "int8" : "fp16", max_ctx,
                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
                     (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
                     E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0,
-                    vision_enabled ? "on" : "off");
+                    vision_enabled ? "on" : "off", E.vram_elastic ? 1 : 0);
         E.prealloc_ckpt_pin();
         std::printf("READY %d stop\n", max_ctx);
         std::fflush(stdout);
@@ -5197,6 +5467,25 @@ int run(int argc, char** argv) {
                 q_lines.pop_front();
             }
             if (line == "QUIT" || line == "EXIT") { got_quit = true; break; }
+            if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
+                if (!E.vram_elastic) {
+                    std::printf("ERR this engine was started without --vram-elastic\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                size_t req_resv = E.vram_reserve_bytes;
+                if (line.size() > 5) {
+                    const long long mib = std::atoll(line.c_str() + 5);
+                    req_resv = (mib > 0) ? ((size_t) mib << 20) : 0;
+                }
+                E.resize_experts_vram(req_resv);
+                std::printf("VRAM expert_slots=%d experts=%lld expert_cache_mib=%lld expert_cache_full_mib=%lld vram_free_mib=%lld\n",
+                            E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
+                            (long long) (E.placed_bytes >> 20), (long long) (E.full_cache_bytes >> 20),
+                            (long long) (E.vram_free_after_place >> 20));
+                std::fflush(stdout);
+                continue;
+            }
             const bool is_geni = (line.rfind("GENI ", 0) == 0);
             const bool is_gen = (!is_geni && (line.rfind("GEN ", 0) == 0 || line == "GEN"));
             if (is_gen || is_geni) {
