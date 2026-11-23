@@ -38,7 +38,9 @@ struct ArchProfile {
     int kv_grow_reserve_mib = 112;        // Extra VRAM headroom during dynamic KV growth
     bool allow_tight_chunk_2048 = false;  // Measured win on sm_89 12GB TightHybrid (halves PCIe streaming bytes/tok)
     bool allow_core_chunk_2048 = false;   // Measured win on sm_89 12GB CoreResidentHybrid when tier1 still fits 128/128
+    bool allow_core_chunk_4096 = false;   // EX-4: Measured win on sm_89 12GB with SWA compaction + dynamic KV init
     bool allow_full_vram_chunk_2048 = false; // Measured +21-23% prefill win on sm_70 32GB FullVram (fills BM=128 tiles)
+    int core_hybrid_kv_init = 0;          // Optional initial Full-KV cap on CoreResidentHybrid (0 = max_ctx upfront)
 };
 
 inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
@@ -75,7 +77,9 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.kv_grow_reserve_mib = 112;
         p.allow_tight_chunk_2048 = true;
         p.allow_core_chunk_2048 = true;
+        p.allow_core_chunk_4096 = true;
         p.allow_full_vram_chunk_2048 = true;
+        p.core_hybrid_kv_init = 16384;
         return p;
     }
     ArchProfile p;
@@ -177,38 +181,54 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     }
 
     // 1. Initial full-attention KV capacity:
-    //    - FullVram & CoreResidentHybrid allocate max_ctx upfront (zero mid-run KV expansion pauses!).
+    //    - FullVram allocates max_ctx upfront (zero mid-run KV expansion pauses).
+    //    - CoreResidentHybrid on sm_89 starts at min(max_ctx, 16384) (frees +780 MiB @ 65K / +1.8 GiB @ 131K for
+    //      chunk=4096 + 4x128MiB staging + blk.0 100% resident on short/medium prompts; grows cleanly on 62K/126K).
     //    - TightHybrid starts at min(max_ctx, 36864) (32K + 4K decode headroom) so a 32K prompt never hits
     //      a mid-decode KV growth cliff on token #1 while still keeping maximum VRAM experts for short prompts.
     if (out.regime == VramRegime::TightHybrid && in.max_ctx > 36864) {
         out.full_kv_init = 36864;
+    } else if (out.regime == VramRegime::CoreResidentHybrid && out.arch.core_hybrid_kv_init > 0 &&
+               in.max_ctx > out.arch.core_hybrid_kv_init) {
+        out.full_kv_init = out.arch.core_hybrid_kv_init;
     } else {
         out.full_kv_init = std::max(1, in.max_ctx);
     }
 
     // 2. Prefill chunk size (user --chunk always wins):
-    //    - FullVram keeps 1024 (no PCIe expert streaming to amortize).
-    //    - CoreResidentHybrid on measured sm_89 Q8KV (no draft) promotes to 2048 when tier1 still fits 128/128
-    //      with upfront full_kv_init + SWA-3072 ring + 2x64MiB staging, boosting prefill +25-35% without losing core_graph.
-    //    - TightHybrid on measured sm_89 Q8KV (no draft) uses 2048 (SWA-3072 ring halves PCIe streaming bytes/tok).
+    //    - FullVram promotes to 2048 when all experts + full KV fit with margin (V100 32GB).
+    //    - CoreResidentHybrid on sm_89 Q8KV promotes to 4096 (EX-4: SWA compaction reclaims +323 MiB for Decode)
+    //      when tier1 fits 128/128 with initial KV + SWA-5120 ring, else falls back cleanly to 2048 -> 1024.
+    //    - TightHybrid on sm_89 Q8KV uses 2048 (SWA-3072 ring halves PCIe streaming bytes/tok).
+    const size_t init_kv_bytes = (size_t) std::max(0, in.n_full_layers) * (size_t) out.full_kv_init * in.kv_bytes_per_tok;
     const size_t swa_kv_2048 = (size_t) std::max(0, in.n_swa_layers) * (size_t) (std::max(1, in.n_swa) + 2048) * in.kv_bytes_per_tok;
+    const size_t swa_kv_4096 = (size_t) std::max(0, in.n_swa_layers) * (size_t) (std::max(1, in.n_swa) + 4096) * in.kv_bytes_per_tok;
     const size_t engine_overhead_2048 = 576 * MiB;
+    const size_t engine_overhead_4096 = 832 * MiB;
     const size_t dspark_kv_2048_need = in.has_draft
                                      ? ((size_t) std::max(1, in.max_ctx) * in.kv_bytes_per_tok + 128 * MiB)
                                      : 0;
+    // Note: With EX-4A DSpark decode-weight phase offload, 358 MiB is evicted during Prefill,
+    // so only DSpark KV (~130 MiB @ 65K) + ~32 MiB inject weights are active during Prefill!
+    const size_t dspark_kv_4096_need = in.has_draft
+                                     ? ((size_t) std::max(1, out.full_kv_init) * in.kv_bytes_per_tok + 64 * MiB)
+                                     : 0;
+    const size_t core_hybrid_4096_need = init_kv_bytes + swa_kv_4096 + engine_overhead_4096 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_4096_need + 160 * MiB;
     const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_2048_need + 160 * MiB;
     const size_t full_vram_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + in.all_experts_bytes + dspark_kv_need + 256 * MiB;
 
     if (in.requested_chunk > 0) {
         out.chunk = std::clamp(in.requested_chunk, 1, 4096);
     } else {
-        const size_t init_kv_bytes = (size_t) std::max(0, in.n_full_layers) * (size_t) out.full_kv_init * in.kv_bytes_per_tok;
         if (out.regime == VramRegime::FullVram && out.arch.allow_full_vram_chunk_2048 &&
             in.kv_q8 && in.vram_free_bytes >= full_vram_2048_need) {
             out.chunk = 2048;
         } else if (out.regime == VramRegime::TightHybrid && out.arch.allow_tight_chunk_2048 &&
             in.kv_q8 && in.vram_free_bytes > init_kv_bytes + ((size_t) 4 << 30)) {
             out.chunk = 2048;
+        } else if (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_4096 &&
+                   in.kv_q8 && in.vram_free_bytes >= core_hybrid_4096_need) {
+            out.chunk = 4096;
         } else if (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_2048 &&
                    in.kv_q8 && in.vram_free_bytes >= core_hybrid_2048_need) {
             out.chunk = 2048;

@@ -1526,7 +1526,55 @@ struct DsparkModel : GpuWeightStore {
     float* hidden_out_b = nullptr;      // [N]
     std::vector<DsparkLayer> layers;
 
-    ~DsparkModel() { free_store(); }
+    // EX-4A: Contiguous Decode-only weight arena (evicted to pinned RAM during Prefill on Hybrid GPUs -> +358 MiB!)
+    struct DecodeWeightRef {
+        void** ptr_slot = nullptr;
+        size_t offset = 0;
+    };
+    uint8_t* decode_w_gpu = nullptr;
+    uint8_t* decode_w_pin = nullptr;
+    bool decode_w_pin_cuda = false;
+    size_t decode_w_bytes = 0;
+    bool decode_w_offloadable = false;
+    bool decode_w_resident = true;
+    std::vector<DecodeWeightRef> decode_w_refs;
+
+    void bind_decode_weight_ptrs(uint8_t* base) {
+        for (const auto& r : decode_w_refs) {
+            *r.ptr_slot = base ? (void*) (base + r.offset) : nullptr;
+        }
+    }
+
+    void evict_decode_weights() {
+        if (!decode_w_offloadable || !decode_w_resident) return;
+        if (decode_w_gpu) {
+            cudaFree(decode_w_gpu);
+            decode_w_gpu = nullptr;
+        }
+        bind_decode_weight_ptrs(nullptr);
+        decode_w_resident = false;
+    }
+
+    void restore_decode_weights(cudaStream_t st) {
+        if (!decode_w_offloadable || decode_w_resident) return;
+        const auto t0 = Clock::now();
+        CK(cudaMalloc(&decode_w_gpu, decode_w_bytes));
+        CK(cudaMemcpyAsync(decode_w_gpu, decode_w_pin, decode_w_bytes, cudaMemcpyHostToDevice, st));
+        bind_decode_weight_ptrs(decode_w_gpu);
+        decode_w_resident = true;
+        std::fprintf(stderr, "strata-inkling2: dspark decode weights restored (%.1f MiB) queued in %.1f ms\n",
+                     (double) decode_w_bytes / (1 << 20), ms_since(t0));
+    }
+
+    ~DsparkModel() {
+        if (decode_w_gpu) { cudaFree(decode_w_gpu); decode_w_gpu = nullptr; }
+        if (decode_w_pin) {
+            if (decode_w_pin_cuda) cudaFreeHost(decode_w_pin);
+            else std::free(decode_w_pin);
+            decode_w_pin = nullptr;
+        }
+        free_store();
+    }
 
     const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const override {
         size_t shard = 0;
@@ -1603,6 +1651,49 @@ inline bool load_dspark_model(const std::string& path, const Hparams& target_hp,
     dm.dspark_norm = dm.upload_f32("dspark_norm.weight", (size_t) N);
     dm.mask_embd = dm.upload_f32("mask_embd.weight", (size_t) N);
     dm.output_norm = dm.upload_f32("output_norm.weight", (size_t) N);
+    dm.joint_proj_b = dm.upload_f32("joint_proj.bias", (size_t) (3 * rank));
+    dm.hidden_out_b = dm.upload_f32("dspark_hidden_out.bias", (size_t) N);
+
+    size_t fr_vram = 0, tot_vram = 0;
+    const bool pack_dspark_q8 = (cudaMemGetInfo(&fr_vram, &tot_vram) == cudaSuccess && tot_vram >= (20ull << 30));
+    const bool use_decode_arena = !pack_dspark_q8 && (std::getenv("STRATA_NO_PHASE_SPLIT") == nullptr);
+
+    struct StagedDecodeEntry {
+        const uint8_t* raw = nullptr;
+        size_t bytes = 0;
+        size_t offset = 0;
+        void** ptr_slot = nullptr;
+    };
+    std::vector<StagedDecodeEntry> staged;
+    size_t staged_bytes = 0;
+    auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
+
+    auto stage_dense = [&](const char* name, size_t rows_override, size_t cols_expected, DenseMat& dst) {
+        if (!use_decode_arena) {
+            dst = dm.upload_dense(name, rows_override, cols_expected, false, pack_dspark_q8);
+            return;
+        }
+        const strata::TensorInfo* t = nullptr;
+        const uint8_t* raw = dm.find_tensor(name, &t);
+        if (!raw || !t || (t->type != 0 && t->type != 1 && t->type != 30 && !K::native_mmvq_supported((int) t->type))) {
+            std::fprintf(stderr, "strata-inkling2: missing/unsupported dspark dense tensor %s (type=%u)\n", name, t ? t->type : 999u);
+            std::exit(1);
+        }
+        const int64_t ne0 = (int64_t) t->shape[0];
+        const int64_t ne1 = rows_override ? (int64_t) rows_override : (t->shape.size() > 1 ? (int64_t) t->shape[1] : 1);
+        if (cols_expected && (size_t) ne0 != cols_expected) {
+            std::fprintf(stderr, "strata-inkling2: %s ne0 expected %zu got %lld\n", name, cols_expected, (long long) ne0);
+            std::exit(1);
+        }
+        const size_t rb = (t->type == 0) ? (size_t) ne0 * sizeof(float)
+                        : (t->type == 1 || t->type == 30) ? (size_t) ne0 * sizeof(uint16_t)
+                        : strata::quant::row_bytes((int) t->type, ne0);
+        const size_t bytes = rb * (size_t) ne1;
+        if (t->type != 30 && t->type != 0 && t->type != 1) dm.has_quant_dense = true;
+        dst = DenseMat{(int) t->type, ne0, ne1, nullptr, bytes, false};
+        staged.push_back(StagedDecodeEntry{raw, bytes, staged_bytes, &dst.d});
+        staged_bytes += align256(bytes);
+    };
 
     {
         const strata::TensorInfo* wt = nullptr;
@@ -1614,18 +1705,19 @@ inline bool load_dspark_model(const std::string& path, const Hparams& target_hp,
         dm.markov_w1_type = (int) wt->type;
         const size_t elem_sz = (wt->type == 0) ? sizeof(float) : sizeof(uint16_t);
         const size_t bytes = (size_t) wt->elements() * elem_sz;
-        void* d = dm.gpu_alloc<uint8_t>(bytes);
-        CK(cudaMemcpy(d, raw, bytes, cudaMemcpyHostToDevice));
-        dm.markov_w1 = d;
+        if (use_decode_arena) {
+            staged.push_back(StagedDecodeEntry{raw, bytes, staged_bytes, &dm.markov_w1});
+            staged_bytes += align256(bytes);
+        } else {
+            void* d = dm.gpu_alloc<uint8_t>(bytes);
+            CK(cudaMemcpy(d, raw, bytes, cudaMemcpyHostToDevice));
+            dm.markov_w1 = d;
+        }
     }
 
-    dm.joint_proj = dm.upload_dense("joint_proj.weight", (size_t) (3 * rank), (size_t) (2 * rank + 2 * N));
-    dm.joint_proj_b = dm.upload_f32("joint_proj.bias", (size_t) (3 * rank));
-    dm.hidden_out = dm.upload_dense("dspark_hidden_out.weight", (size_t) N, (size_t) rank);
-    dm.hidden_out_b = dm.upload_f32("dspark_hidden_out.bias", (size_t) N);
+    stage_dense("joint_proj.weight", (size_t) (3 * rank), (size_t) (2 * rank + 2 * N), dm.joint_proj);
+    stage_dense("dspark_hidden_out.weight", (size_t) N, (size_t) rank, dm.hidden_out);
 
-    size_t fr_vram = 0, tot_vram = 0;
-    const bool pack_dspark_q8 = (cudaMemGetInfo(&fr_vram, &tot_vram) == cudaSuccess && tot_vram >= (20ull << 30));
     dm.layers.resize((size_t) hp.n_layer);
     char nm[128];
     for (int il = 0; il < hp.n_layer; ++il) {
@@ -1642,24 +1734,51 @@ inline bool load_dspark_model(const std::string& path, const Hparams& target_hp,
         L.attn_k_norm = dm.upload_f32(tn("attn_k_norm.weight"), (size_t) hp.head_dim);
         L.attn_k_ctx_norm = dm.upload_f32(tn("attn_k_ctx_norm.weight"), (size_t) hp.head_dim);
 
+        // inject()-required context projections stay ALWAYS resident on GPU (~14-27 MiB)
         L.attn_k_ctx = dm.upload_dense(tn("attn_k_ctx.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
         L.attn_v_ctx = dm.upload_dense(tn("attn_v_ctx.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
-        L.attn_q = dm.upload_dense(tn("attn_q.weight"), (size_t) hp.q_dim, (size_t) N, false, pack_dspark_q8);
-        L.attn_k = dm.upload_dense(tn("attn_k.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
-        L.attn_v = dm.upload_dense(tn("attn_v.weight"), (size_t) hp.kv_dim, (size_t) N, false, pack_dspark_q8);
-        L.attn_output = dm.upload_dense(tn("attn_output.weight"), (size_t) N, (size_t) hp.q_dim, false, pack_dspark_q8);
-        L.ffn_gate = dm.upload_dense(tn("ffn_gate.weight"), (size_t) hp.n_ff, (size_t) N, false, pack_dspark_q8);
-        L.ffn_up = dm.upload_dense(tn("ffn_up.weight"), (size_t) hp.n_ff, (size_t) N, false, pack_dspark_q8);
-        L.ffn_down = dm.upload_dense(tn("ffn_down.weight"), (size_t) N, (size_t) hp.n_ff, false, pack_dspark_q8);
+
+        // Decode-only DFlare weights -> packed into offloadable arena on Hybrid GPUs
+        stage_dense(tn("attn_q.weight"), (size_t) hp.q_dim, (size_t) N, L.attn_q);
+        stage_dense(tn("attn_k.weight"), (size_t) hp.kv_dim, (size_t) N, L.attn_k);
+        stage_dense(tn("attn_v.weight"), (size_t) hp.kv_dim, (size_t) N, L.attn_v);
+        stage_dense(tn("attn_output.weight"), (size_t) N, (size_t) hp.q_dim, L.attn_output);
+        stage_dense(tn("ffn_gate.weight"), (size_t) hp.n_ff, (size_t) N, L.ffn_gate);
+        stage_dense(tn("ffn_up.weight"), (size_t) hp.n_ff, (size_t) N, L.ffn_up);
+        stage_dense(tn("ffn_down.weight"), (size_t) N, (size_t) hp.n_ff, L.ffn_down);
     }
 
-    std::fprintf(stderr, "strata-inkling2: loaded dspark draft (%d layers, block=%d, rank=%d) in %.2f s\n",
-                 hp.n_layer, hp.block_size, hp.markov_rank, ms_since(t0) / 1000.0);
+    if (use_decode_arena && staged_bytes > 0) {
+        dm.decode_w_bytes = staged_bytes;
+        if (cudaMallocHost(&dm.decode_w_pin, staged_bytes) == cudaSuccess) {
+            dm.decode_w_pin_cuda = true;
+        } else {
+            (void) cudaGetLastError();
+            dm.decode_w_pin = (uint8_t*) std::malloc(staged_bytes);
+            dm.decode_w_pin_cuda = false;
+        }
+        dm.decode_w_refs.reserve(staged.size());
+        for (const auto& e : staged) {
+            std::memcpy(dm.decode_w_pin + e.offset, e.raw, e.bytes);
+            dm.decode_w_refs.push_back(DsparkModel::DecodeWeightRef{e.ptr_slot, e.offset});
+        }
+        // Upload initially so resolve_inkling2_profile() sees truthful Decode VRAM headroom;
+        // Hybrid mode evicts before place_experts() and restores in set_phase_decode().
+        CK(cudaMalloc(&dm.decode_w_gpu, staged_bytes));
+        CK(cudaMemcpy(dm.decode_w_gpu, dm.decode_w_pin, staged_bytes, cudaMemcpyHostToDevice));
+        dm.bind_decode_weight_ptrs(dm.decode_w_gpu);
+        dm.decode_w_offloadable = true;
+        dm.decode_w_resident = true;
+    }
+
+    std::fprintf(stderr, "strata-inkling2: loaded dspark draft (%d layers, block=%d, rank=%d, decode_arena=%.1f MiB) in %.2f s\n",
+                 hp.n_layer, hp.block_size, hp.markov_rank,
+                 (double) dm.decode_w_bytes / (1 << 20), ms_since(t0) / 1000.0);
     return true;
 }
 
 struct DsparkEngine {
-    const DsparkModel* dm = nullptr;
+    DsparkModel* dm = nullptr;
     int ctx = 0;
     int tmax = 0;
     int pos = 0;
@@ -1725,13 +1844,31 @@ struct DsparkEngine {
         }
     }
 
-    /// Rebind aliased arena buffers (ctx_norm/k/v and split_out) when Engine switches Prefill <-> Decode arena.
-    void rebind_arena(uint8_t* ext_arena, size_t ext_arena_bytes, int cur_tmax) {
-        destroy_kv_graphs();
+    void destroy_decode_graphs() {
+        if (dflare_graph_short) { cudaGraphExecDestroy(dflare_graph_short); dflare_graph_short = nullptr; }
+        if (dflare_graph_split) { cudaGraphExecDestroy(dflare_graph_split); dflare_graph_split = nullptr; }
         for (int i = 0; i < 8; ++i) {
             if (markov_graphs[i]) { cudaGraphExecDestroy(markov_graphs[i]); markov_graphs[i] = nullptr; }
             markov_graph_oom[i] = false;
         }
+    }
+
+    void evict_decode_weights() {
+        if (!dm || !dm->decode_w_offloadable || !dm->decode_w_resident) return;
+        destroy_decode_graphs();
+        dm->evict_decode_weights();
+    }
+
+    void ensure_decode_weights_resident(cudaStream_t st) {
+        if (!dm || !dm->decode_w_offloadable || dm->decode_w_resident) return;
+        destroy_decode_graphs();
+        dm->restore_decode_weights(st);
+    }
+
+    /// Rebind aliased arena buffers (ctx_norm/k/v and split_out) when Engine switches Prefill <-> Decode arena.
+    void rebind_arena(uint8_t* ext_arena, size_t ext_arena_bytes, int cur_tmax) {
+        destroy_kv_graphs();
+        destroy_decode_graphs();
         if (!ctx_aliased && !split_aliased) return;
         const auto& hp = dm->hp;
         auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
@@ -1800,7 +1937,7 @@ struct DsparkEngine {
         if (h_anchor_pin) cudaFreeHost(h_anchor_pin);
     }
 
-    void init(const DsparkModel& model, int max_ctx, int max_t,
+    void init(DsparkModel& model, int max_ctx, int max_t,
               int init_full_cap = 0, uint8_t* ext_arena = nullptr, size_t ext_arena_bytes = 0) {
         dm = &model;
         ctx = max_ctx;
@@ -2135,6 +2272,7 @@ struct DsparkEngine {
     template <typename EngineT, typename SampleFn>
     void draft(EngineT& E, int32_t anchor, int n_draft, std::vector<int32_t>& out_tokens,
                std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn, bool gpu_sampled = false) {
+        ensure_decode_weights_resident(E.st);
         const auto t0 = Clock::now();
         const auto& hp = dm->hp;
         const int block_n = hp.block_size;

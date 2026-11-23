@@ -8363,12 +8363,54 @@ __global__ void swiglu_f16_valid_kernel(const float* __restrict__ gate, const fl
     }
 }
 
+// EX-4B Wave 2: Zero-SMEM, 1-cycle constant-cache LUT for ue4m3_to_half_halved packed as __half2.
+// Must be declared outside #if defined(__CUDA_ARCH__) so host stub registration sees the symbol.
+__constant__ uint32_t k_ue4m3_h2[256] = {
+    0x00000000u, 0x14001400u, 0x18001800u, 0x1A001A00u, 0x1C001C00u, 0x1D001D00u, 0x1E001E00u, 0x1F001F00u,
+    0x20002000u, 0x20802080u, 0x21002100u, 0x21802180u, 0x22002200u, 0x22802280u, 0x23002300u, 0x23802380u,
+    0x24002400u, 0x24802480u, 0x25002500u, 0x25802580u, 0x26002600u, 0x26802680u, 0x27002700u, 0x27802780u,
+    0x28002800u, 0x28802880u, 0x29002900u, 0x29802980u, 0x2A002A00u, 0x2A802A80u, 0x2B002B00u, 0x2B802B80u,
+    0x2C002C00u, 0x2C802C80u, 0x2D002D00u, 0x2D802D80u, 0x2E002E00u, 0x2E802E80u, 0x2F002F00u, 0x2F802F80u,
+    0x30003000u, 0x30803080u, 0x31003100u, 0x31803180u, 0x32003200u, 0x32803280u, 0x33003300u, 0x33803380u,
+    0x34003400u, 0x34803480u, 0x35003500u, 0x35803580u, 0x36003600u, 0x36803680u, 0x37003700u, 0x37803780u,
+    0x38003800u, 0x38803880u, 0x39003900u, 0x39803980u, 0x3A003A00u, 0x3A803A80u, 0x3B003B00u, 0x3B803B80u,
+    0x3C003C00u, 0x3C803C80u, 0x3D003D00u, 0x3D803D80u, 0x3E003E00u, 0x3E803E80u, 0x3F003F00u, 0x3F803F80u,
+    0x40004000u, 0x40804080u, 0x41004100u, 0x41804180u, 0x42004200u, 0x42804280u, 0x43004300u, 0x43804380u,
+    0x44004400u, 0x44804480u, 0x45004500u, 0x45804580u, 0x46004600u, 0x46804680u, 0x47004700u, 0x47804780u,
+    0x48004800u, 0x48804880u, 0x49004900u, 0x49804980u, 0x4A004A00u, 0x4A804A80u, 0x4B004B00u, 0x4B804B80u,
+    0x4C004C00u, 0x4C804C80u, 0x4D004D00u, 0x4D804D80u, 0x4E004E00u, 0x4E804E80u, 0x4F004F00u, 0x4F804F80u,
+    0x50005000u, 0x50805080u, 0x51005100u, 0x51805180u, 0x52005200u, 0x52805280u, 0x53005300u, 0x53805380u,
+    0x54005400u, 0x54805480u, 0x55005500u, 0x55805580u, 0x56005600u, 0x56805680u, 0x57005700u, 0x57805780u,
+    0x58005800u, 0x58805880u, 0x59005900u, 0x59805980u, 0x5A005A00u, 0x5A805A80u, 0x5B005B00u, 0x00000000u,
+    0x00000000u, 0x14001400u, 0x18001800u, 0x1A001A00u, 0x1C001C00u, 0x1D001D00u, 0x1E001E00u, 0x1F001F00u,
+    0x20002000u, 0x20802080u, 0x21002100u, 0x21802180u, 0x22002200u, 0x22802280u, 0x23002300u, 0x23802380u,
+    0x24002400u, 0x24802480u, 0x25002500u, 0x25802580u, 0x26002600u, 0x26802680u, 0x27002700u, 0x27802780u,
+    0x28002800u, 0x28802880u, 0x29002900u, 0x29802980u, 0x2A002A00u, 0x2A802A80u, 0x2B002B00u, 0x2B802B80u,
+    0x2C002C00u, 0x2C802C80u, 0x2D002D00u, 0x2D802D80u, 0x2E002E00u, 0x2E802E80u, 0x2F002F00u, 0x2F802F80u,
+    0x30003000u, 0x30803080u, 0x31003100u, 0x31803180u, 0x32003200u, 0x32803280u, 0x33003300u, 0x33803380u,
+    0x34003400u, 0x34803480u, 0x35003500u, 0x35803580u, 0x36003600u, 0x36803680u, 0x37003700u, 0x37803780u,
+    0x38003800u, 0x38803880u, 0x39003900u, 0x39803980u, 0x3A003A00u, 0x3A803A80u, 0x3B003B00u, 0x3B803B80u,
+    0x3C003C00u, 0x3C803C80u, 0x3D003D00u, 0x3D803D80u, 0x3E003E00u, 0x3E803E80u, 0x3F003F00u, 0x3F803F80u,
+    0x40004000u, 0x40804080u, 0x41004100u, 0x41804180u, 0x42004200u, 0x42804280u, 0x43004300u, 0x43804380u,
+    0x44004400u, 0x44804480u, 0x45004500u, 0x45804580u, 0x46004600u, 0x46804680u, 0x47004700u, 0x47804780u,
+    0x48004800u, 0x48804880u, 0x49004900u, 0x49804980u, 0x4A004A00u, 0x4A804A80u, 0x4B004B00u, 0x4B804B80u,
+    0x4C004C00u, 0x4C804C80u, 0x4D004D00u, 0x4D804D80u, 0x4E004E00u, 0x4E804E80u, 0x4F004F00u, 0x4F804F80u,
+    0x50005000u, 0x50805080u, 0x51005100u, 0x51805180u, 0x52005200u, 0x52805280u, 0x53005300u, 0x53805380u,
+    0x54005400u, 0x54805480u, 0x55005500u, 0x55805580u, 0x56005600u, 0x56805680u, 0x57005700u, 0x57805780u,
+    0x58005800u, 0x58805880u, 0x59005900u, 0x59805980u, 0x5A005A00u, 0x5A805A80u, 0x5B005B00u, 0x5B805B80u,
+};
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
 __device__ __forceinline__ __half ue4m3_to_half_halved(uint8_t x) {
     if (x == 0 || x == 0x7F) return __ushort_as_half(0);
     const uint32_t exp = (x >> 3) & 0xFu, man = x & 0x7u;
     if (exp == 0) return __float2half((float) man * 0.0009765625f);
     return __ushort_as_half((uint16_t) (((exp + 7u) << 10) | (man << 7)));
+}
+__device__ __forceinline__ __half2 iq_ue4m3_h2(uint8_t x) {
+    const uint32_t v = k_ue4m3_h2[x];
+    __half2 r;
+    memcpy(&r, &v, sizeof(r));
+    return r;
 }
 
 __device__ __forceinline__ __half2 e2m1_pair_to_h2(uint32_t q0, uint32_t q1) {
@@ -8411,6 +8453,36 @@ __device__ __forceinline__ void iq_cp_async_commit() {
 }
 __device__ __forceinline__ void iq_cp_async_wait0() {
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+__device__ __forceinline__ void iq_ldmatrix_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* smem_ptr) {
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ int iq_swz64(int row, int col8) {
+    return (row << 6) + ((col8 ^ (row & 7)) << 3);
+}
+__device__ __forceinline__ void dq_nvfp4_sub16_store_sc2_swz64(
+    uint32_t w0, uint32_t w1, __half2 sc2, __half* base, int row, int sb) {
+    __align__(16) __half2 p[4];
+    p[0] = __hmul2(e2m1_pair_to_h2(w0,       w0 >> 8),  sc2);
+    p[1] = __hmul2(e2m1_pair_to_h2(w0 >> 16, w0 >> 24), sc2);
+    p[2] = __hmul2(e2m1_pair_to_h2(w1,       w1 >> 8),  sc2);
+    p[3] = __hmul2(e2m1_pair_to_h2(w1 >> 16, w1 >> 24), sc2);
+    *reinterpret_cast<uint4*>(base + iq_swz64(row, sb * 2)) = *reinterpret_cast<const uint4*>(p);
+    p[0] = __hmul2(e2m1_pair_to_h2(w0 >> 4,  w0 >> 12), sc2);
+    p[1] = __hmul2(e2m1_pair_to_h2(w0 >> 20, w0 >> 28), sc2);
+    p[2] = __hmul2(e2m1_pair_to_h2(w1 >> 4,  w1 >> 12), sc2);
+    p[3] = __hmul2(e2m1_pair_to_h2(w1 >> 20, w1 >> 28), sc2);
+    *reinterpret_cast<uint4*>(base + iq_swz64(row, sb * 2 + 1)) = *reinterpret_cast<const uint4*>(p);
+}
+__device__ __forceinline__ void iq_mma_m16n8k16_f32(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                     uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 #endif
 
@@ -9166,11 +9238,6 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
     constexpr int WK = (WT == 40) ? 32 : 64;
     constexpr int LD = (WT == 40) ? 40 : 72;
     constexpr int STAGES = (WT == 40) ? 2 : 1;
-#else
-    constexpr int WK = 64;
-    constexpr int LD = 72;
-    constexpr int STAGES = 1;
-#endif
     constexpr int STAGE_ELEMS = (BM + 128) * LD;
     __shared__ __align__(16) __half smem[STAGES * STAGE_ELEMS];
     __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
@@ -9179,6 +9246,26 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
         s_ue4m3[tid] = __half2half2(ue4m3_to_half_halved((uint8_t) tid));
         __syncthreads();
     }
+#elif __CUDA_ARCH__ >= 800
+    constexpr int WK = 64;
+    constexpr int LD = (WT == 40) ? 64 : 72;
+    // WT==40: 2x sx (2*128*64) + 1x sw (128*64) = 24,576 halfs = 49,152 B (48.0 KB exact -> 2 blk/SM on Ada!)
+    constexpr int SMEM_ELEMS = (WT == 40) ? (3 * BM * 64) : ((BM + 128) * LD);
+    __shared__ __align__(16) __half smem[SMEM_ELEMS];
+    const int tid = threadIdx.x, warp = tid >> 5;
+#else
+    constexpr int WK = 64;
+    constexpr int LD = 72;
+    constexpr int STAGES = 1;
+    constexpr int STAGE_ELEMS = (BM + 128) * LD;
+    __shared__ __align__(16) __half smem[STAGES * STAGE_ELEMS];
+    __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
+    const int tid = threadIdx.x, warp = tid >> 5;
+    if constexpr (WT == 40) {
+        s_ue4m3[tid] = __half2half2(ue4m3_to_half_halved((uint8_t) tid));
+        __syncthreads();
+    }
+#endif
 
     const int g = tile_g[blockIdx.y];
     const int c0 = tile_c0[blockIdx.y];
@@ -9211,6 +9298,18 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
             : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
             : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
     };
+    float acc[4][2][8];
+#pragma unroll
+    for (int mr = 0; mr < 4; ++mr) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+    }
+#elif __CUDA_ARCH__ >= 800
+    const int lane = tid & 31;
+    const int a_lane_row = lane & 15;
+    const int a_lane_col = (lane >> 4) << 3;
+    const int b_lane_row = ((lane >> 4) << 3) | (lane & 7);
+    const int b_lane_col = ((lane >> 3) & 1) << 3;
     float acc[4][2][8];
 #pragma unroll
     for (int mr = 0; mr < 4; ++mr) {
@@ -9301,6 +9400,101 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
         };
         if (has_hi) run_loop(std::integral_constant<int, 4>{});
         else run_loop(std::integral_constant<int, 2>{});
+#elif __CUDA_ARCH__ >= 800
+        // EX-4B v3 (Ampere/Ada sm_80+): Double-buffered XOR-swizzled sx (2x16KB) + sw (16KB) = 48.0 KB exact (2 blk/SM!)
+        // Zero bank conflicts, zero s_ue4m3 SMEM, BOTH sx cp.async DMA AND weight prefetch 100% overlapped behind 64 m16n8k16!
+        constexpr int SX_ELEMS = BM * 64;
+        __half* sx_base = smem;
+        __half* sw = smem + 2 * SX_ELEMS;
+        const int wr = tid >> 2, sb = tid & 3;
+        const int xr = wr, xc = sb * 16;
+        const uint8_t* we_g = blob + (size_t) (col0 + wr) * row_stride;
+        const uint8_t* we_u = blob + L.up_off + (size_t) (col0 + wr) * row_stride;
+        const bool x0_ok = (xr < rows);
+        const bool x1_ok = ((xr + 64) < rows);
+        const int in_row0 = x0_ok ? ent_idx[c0 + xr] : 0;
+        const int in_row1 = x1_ok ? ent_idx[c0 + xr + 64] : 0;
+        const __half* xp0 = X + (size_t) in_row0 * K + xc;
+        const __half* xp1 = X + (size_t) in_row1 * K + xc;
+        uint32_t pf_w0[2], pf_w1[2];
+        uint8_t pf_d[2];
+        pf_w0[0] = *reinterpret_cast<const uint32_t*>(we_g + 4 + sb * 8);
+        pf_w1[0] = *reinterpret_cast<const uint32_t*>(we_g + 8 + sb * 8);
+        pf_d[0] = we_g[sb];
+        pf_w0[1] = *reinterpret_cast<const uint32_t*>(we_u + 4 + sb * 8);
+        pf_w1[1] = *reinterpret_cast<const uint32_t*>(we_u + 8 + sb * 8);
+        pf_d[1] = we_u[sb];
+        const int b_r0 = wn * 16 + b_lane_row;
+        const int b_c8 = (lane >> 3) & 1;
+        const int a_c8 = lane >> 4;
+        auto run_ada_wk64 = [&](auto mr_tag) {
+            constexpr int MR_RUN = decltype(mr_tag)::value;
+            // Prologue: stage k0=0 into sx[0] and sw
+            iq_cp_async_cg_16(sx_base + iq_swz64(xr, sb * 2),     xp0,     x0_ok);
+            iq_cp_async_cg_16(sx_base + iq_swz64(xr, sb * 2 + 1), xp0 + 8, x0_ok);
+            if constexpr (MR_RUN == 4) {
+                iq_cp_async_cg_16(sx_base + iq_swz64(xr + 64, sb * 2),     xp1,     x1_ok);
+                iq_cp_async_cg_16(sx_base + iq_swz64(xr + 64, sb * 2 + 1), xp1 + 8, x1_ok);
+            }
+            iq_cp_async_commit();
+            dq_nvfp4_sub16_store_sc2_swz64(pf_w0[0], pf_w1[0], iq_ue4m3_h2(pf_d[0]), sw, wr, sb);
+            dq_nvfp4_sub16_store_sc2_swz64(pf_w0[1], pf_w1[1], iq_ue4m3_h2(pf_d[1]), sw, 64 + wr, sb);
+            iq_cp_async_wait0();
+            __syncthreads();
+
+            int sx_st = 0;
+            for (int k0 = 0; k0 < K; k0 += 64, sx_st ^= 1) {
+                const bool has_next = (k0 + 64 < K);
+                if (has_next) {
+                    const int nk = k0 + 64;
+                    __half* sx_nxt = sx_base + (sx_st ^ 1) * SX_ELEMS;
+                    const __half* cxp0 = xp0 + nk;
+                    iq_cp_async_cg_16(sx_nxt + iq_swz64(xr, sb * 2),     cxp0,     x0_ok);
+                    iq_cp_async_cg_16(sx_nxt + iq_swz64(xr, sb * 2 + 1), cxp0 + 8, x0_ok);
+                    if constexpr (MR_RUN == 4) {
+                        const __half* cxp1 = xp1 + nk;
+                        iq_cp_async_cg_16(sx_nxt + iq_swz64(xr + 64, sb * 2),     cxp1,     x1_ok);
+                        iq_cp_async_cg_16(sx_nxt + iq_swz64(xr + 64, sb * 2 + 1), cxp1 + 8, x1_ok);
+                    }
+                    iq_cp_async_commit();
+                    const size_t boff = (size_t) (nk >> 6) * 36;
+                    const uint8_t* wng = we_g + boff;
+                    const uint8_t* wnu = we_u + boff;
+                    pf_w0[0] = *reinterpret_cast<const uint32_t*>(wng + 4 + sb * 8);
+                    pf_w1[0] = *reinterpret_cast<const uint32_t*>(wng + 8 + sb * 8);
+                    pf_d[0] = wng[sb];
+                    pf_w0[1] = *reinterpret_cast<const uint32_t*>(wnu + 4 + sb * 8);
+                    pf_w1[1] = *reinterpret_cast<const uint32_t*>(wnu + 8 + sb * 8);
+                    pf_d[1] = wnu[sb];
+                }
+                const __half* sx_cur = sx_base + sx_st * SX_ELEMS;
+#pragma unroll
+                for (int kk8 = 0; kk8 < 8; kk8 += 2) {
+                    uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                    iq_ldmatrix_x4(b00, b01, b02, b03, sw + iq_swz64(b_r0,      kk8 + b_c8));
+                    iq_ldmatrix_x4(b10, b11, b12, b13, sw + iq_swz64(64 + b_r0, kk8 + b_c8));
+#pragma unroll
+                    for (int mr = 0; mr < MR_RUN; ++mr) {
+                        uint32_t a0, a1, a2, a3;
+                        const int ar = wm * (MR_RUN * 16) + mr * 16 + a_lane_row;
+                        iq_ldmatrix_x4(a0, a1, a2, a3, sx_cur + iq_swz64(ar, kk8 + a_c8));
+                        iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                        iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                        iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                        iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
+                    }
+                }
+                if (has_next) {
+                    __syncthreads();
+                    dq_nvfp4_sub16_store_sc2_swz64(pf_w0[0], pf_w1[0], iq_ue4m3_h2(pf_d[0]), sw, wr, sb);
+                    dq_nvfp4_sub16_store_sc2_swz64(pf_w0[1], pf_w1[1], iq_ue4m3_h2(pf_d[1]), sw, 64 + wr, sb);
+                    iq_cp_async_wait0();
+                    __syncthreads();
+                }
+            }
+        };
+        if (has_hi) run_ada_wk64(std::integral_constant<int, 4>{});
+        else run_ada_wk64(std::integral_constant<int, 2>{});
 #else
         // Turing/Ampere/Ada (sm_75+): 1-stage WK=64 (LD=72) halves __syncthreads() & loop iterations + E1 sc2 LUT!
         __half* sx = smem;
@@ -9383,20 +9577,36 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
 #if __CUDA_ARCH__ < 750
         const __half* sw_r0 = sw + (wn * 16 + kb_row) * LD;
         const __half* sw_r1 = sw + (64 + wn * 16 + kb_row) * LD;
+#elif __CUDA_ARCH__ >= 800
+        const __half* sw_b0 = sw + (wn * 16 + b_lane_row) * LD + b_lane_col;
+        const __half* sw_b1 = sw + (64 + wn * 16 + b_lane_row) * LD + b_lane_col;
 #endif
         if (has_hi) {
 #if __CUDA_ARCH__ < 750
             const __half* sx_hi = sx + (wm * 64 + qa_row) * LD;
+#elif __CUDA_ARCH__ >= 800
+            const __half* sx_hi_a = sx + (wm * 64 + a_lane_row) * LD + a_lane_col;
 #endif
             for (int k0 = 0; k0 < K; k0 += WK) {
                 const __half* cxp0 = xp0 + k0;
                 const __half* cxp1 = xp1 + k0;
+#if __CUDA_ARCH__ >= 800
+                iq_cp_async_cg_16(sx + xr * LD + xc,            cxp0,     x0_ok);
+                iq_cp_async_cg_16(sx + xr * LD + xc + 8,        cxp0 + 8, x0_ok);
+                iq_cp_async_cg_16(sx + (xr + 64) * LD + xc,     cxp1,     x1_ok);
+                iq_cp_async_cg_16(sx + (xr + 64) * LD + xc + 8, cxp1 + 8, x1_ok);
+                iq_cp_async_commit();
+#else
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc)            = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8)        = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc)     = x1_ok ? *reinterpret_cast<const uint4*>(cxp1)     : make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc + 8) = x1_ok ? *reinterpret_cast<const uint4*>(cxp1 + 8) : make_uint4(0, 0, 0, 0);
+#endif
                 dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16, L.gu_type);
                 dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16, L.gu_type);
+#if __CUDA_ARCH__ >= 800
+                iq_cp_async_wait0();
+#endif
                 __syncthreads();
 #if __CUDA_ARCH__ < 750
 #pragma unroll 1
@@ -9410,6 +9620,22 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                         hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
                         hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
                         hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                    }
+                }
+#elif __CUDA_ARCH__ >= 800
+#pragma unroll
+                for (int kk = 0; kk < WK; kk += 16) {
+                    uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                    iq_ldmatrix_x4(b00, b01, b02, b03, sw_b0 + kk);
+                    iq_ldmatrix_x4(b10, b11, b12, b13, sw_b1 + kk);
+#pragma unroll
+                    for (int mr = 0; mr < 4; ++mr) {
+                        uint32_t a0, a1, a2, a3;
+                        iq_ldmatrix_x4(a0, a1, a2, a3, sx_hi_a + mr * 16 * LD + kk);
+                        iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                        iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                        iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                        iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
                     }
                 }
 #else
@@ -9432,13 +9658,24 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
         } else {
 #if __CUDA_ARCH__ < 750
             const __half* sx_lo = sx + (wm * 32 + qa_row) * LD;
+#elif __CUDA_ARCH__ >= 800
+            const __half* sx_lo_a = sx + (wm * 32 + a_lane_row) * LD + a_lane_col;
 #endif
             for (int k0 = 0; k0 < K; k0 += WK) {
                 const __half* cxp0 = xp0 + k0;
+#if __CUDA_ARCH__ >= 800
+                iq_cp_async_cg_16(sx + xr * LD + xc,     cxp0,     x0_ok);
+                iq_cp_async_cg_16(sx + xr * LD + xc + 8, cxp0 + 8, x0_ok);
+                iq_cp_async_commit();
+#else
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
+#endif
                 dq_sub16_k64_store<WT>(we_g, k0, sb, sw + wr * LD + sb * 16, L.gu_type);
                 dq_sub16_k64_store<WT>(we_u, k0, sb, sw + (64 + wr) * LD + sb * 16, L.gu_type);
+#if __CUDA_ARCH__ >= 800
+                iq_cp_async_wait0();
+#endif
                 __syncthreads();
 #if __CUDA_ARCH__ < 750
 #pragma unroll 1
@@ -9452,6 +9689,22 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                         hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
                         hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
                         hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                    }
+                }
+#elif __CUDA_ARCH__ >= 800
+#pragma unroll
+                for (int kk = 0; kk < WK; kk += 16) {
+                    uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                    iq_ldmatrix_x4(b00, b01, b02, b03, sw_b0 + kk);
+                    iq_ldmatrix_x4(b10, b11, b12, b13, sw_b1 + kk);
+#pragma unroll
+                    for (int mr = 0; mr < 2; ++mr) {
+                        uint32_t a0, a1, a2, a3;
+                        iq_ldmatrix_x4(a0, a1, a2, a3, sx_lo_a + mr * 16 * LD + kk);
+                        iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                        iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                        iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                        iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
                     }
                 }
 #else
@@ -9476,7 +9729,11 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
 
     const float inv_b = __fdividef(1.0f, beta);
     const float inv_lb = lb > 0.0f ? __fdividef(1.0f, lb) : 0.0f;
-#if __CUDA_ARCH__ < 750
+#if __CUDA_ARCH__ < 750 || __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 800
+    const int acc_r0 = lane >> 2, acc_r1 = acc_r0 + 8;
+    const int acc_c0 = (lane & 3) * 2, acc_c1 = acc_c0 + 8;
+#endif
     const int mr_lim = has_hi ? 4 : 2;
     const int wm_base = has_hi ? (wm * 64) : (wm * 32);
 #pragma unroll
@@ -9562,15 +9819,21 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
     constexpr int BM = 64, WK = 64, LD = 72;
     constexpr int NW = (BN == 128) ? 4 : 2;
     constexpr int MR = (BN == 128) ? 2 : 1;
+    // Measured on Ada sm_89: 1-stage 27.6 KB SMEM + register prefetch (nx0/nx1, nw0/nw1) + native ldmatrix/m16n8k16
+    // beats 2-stage 48 KB SMEM by 13 ms (lower barrier/occupancy pressure); sm_80+ uses zero-SMEM __constant__ k_ue4m3_h2!
     __shared__ __align__(16) __half smem[(BM + BN) * LD];
-    __shared__ __half2 s_ue4m3[256];
+#if __CUDA_ARCH__ < 800
+    __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
+#endif
     __half* sx = smem;
     __half* sw = smem + BM * LD;
     const int tid = threadIdx.x, warp = tid >> 5;
+#if __CUDA_ARCH__ < 800
     if constexpr (WT == 40) {
         s_ue4m3[tid] = __half2half2(ue4m3_to_half_halved((uint8_t) tid));
         __syncthreads();
     }
+#endif
 
     const int col0_all = (int) blockIdx.x * BN;
     const bool is_up = !IS_DOWN && (col0_all >= (int) L.n_ff);
@@ -9606,6 +9869,17 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
             : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
             : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
     };
+#elif __CUDA_ARCH__ >= 800
+    const int lane = tid & 31;
+    const int a_lane_row = lane & 15;
+    const int a_lane_col = (lane >> 4) << 3;
+    const int b_lane_row = ((lane >> 4) << 3) | (lane & 7);
+    const int b_lane_col = ((lane >> 3) & 1) << 3;
+    const int acc_r0 = lane >> 2, acc_r1 = acc_r0 + 8;
+    const int acc_c0 = (lane & 3) * 2, acc_c1 = acc_c0 + 8;
+    const __half* sx_a0 = sx + (wm * MR * 16 + a_lane_row) * LD + a_lane_col;
+    const __half* sw_b0 = sw + (wn * 32 + b_lane_row) * LD + b_lane_col;
+    const __half* sw_b1 = sw + (wn * 32 + 16 + b_lane_row) * LD + b_lane_col;
 #endif
 
     for (int gi = USE_TILES ? 0 : (int) blockIdx.z; gi < (USE_TILES ? 1 : ng); gi += (USE_TILES ? 1 : (int) gridDim.z)) {
@@ -9623,7 +9897,7 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
             const int in_row = x_ok ? (IS_DOWN ? (c0 + xr) : ent_idx[c0 + xr]) : 0;
             const __half* xp = X + (size_t) in_row * K + xc;
 
-#if __CUDA_ARCH__ < 750
+#if __CUDA_ARCH__ < 750 || __CUDA_ARCH__ >= 800
             float acc[MR][2][8];
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
@@ -9658,7 +9932,11 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
                 *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = nx1;
 #pragma unroll
                 for (int b = 0; b < NB; ++b) {
+#if __CUDA_ARCH__ >= 800
+                    dq_nvfp4_sub16_store_sc2(nw0[b], nw1[b], iq_ue4m3_h2(ndb[b]), sw + (b * 64 + wr) * LD + sb * 16);
+#else
                     dq_nvfp4_sub16_store_sc2(nw0[b], nw1[b], s_ue4m3[ndb[b]], sw + (b * 64 + wr) * LD + sb * 16);
+#endif
                 }
                 __syncthreads();
 
@@ -9692,6 +9970,22 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
                             hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
                         }
                     }
+#elif __CUDA_ARCH__ >= 800
+#pragma unroll
+                    for (int kk = 0; kk < WK; kk += 16) {
+                        uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                        iq_ldmatrix_x4(b00, b01, b02, b03, sw_b0 + kk);
+                        iq_ldmatrix_x4(b10, b11, b12, b13, sw_b1 + kk);
+#pragma unroll
+                        for (int mr = 0; mr < MR; ++mr) {
+                            uint32_t a0, a1, a2, a3;
+                            iq_ldmatrix_x4(a0, a1, a2, a3, sx_a0 + mr * 16 * LD + kk);
+                            iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                            iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                            iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                            iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
+                        }
+                    }
 #else
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 16) {
@@ -9713,7 +10007,11 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
                         *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = nx1;
 #pragma unroll
                         for (int b = 0; b < NB; ++b) {
+#if __CUDA_ARCH__ >= 800
+                            dq_nvfp4_sub16_store_sc2(nw0[b], nw1[b], iq_ue4m3_h2(ndb[b]), sw + (b * 64 + wr) * LD + sb * 16);
+#else
                             dq_nvfp4_sub16_store_sc2(nw0[b], nw1[b], s_ue4m3[ndb[b]], sw + (b * 64 + wr) * LD + sb * 16);
+#endif
                         }
                         __syncthreads();
                     }
@@ -9744,6 +10042,22 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
                             hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
                         }
                     }
+#elif __CUDA_ARCH__ >= 800
+#pragma unroll
+                    for (int kk = 0; kk < WK; kk += 16) {
+                        uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                        iq_ldmatrix_x4(b00, b01, b02, b03, sw_b0 + kk);
+                        iq_ldmatrix_x4(b10, b11, b12, b13, sw_b1 + kk);
+#pragma unroll
+                        for (int mr = 0; mr < MR; ++mr) {
+                            uint32_t a0, a1, a2, a3;
+                            iq_ldmatrix_x4(a0, a1, a2, a3, sx_a0 + mr * 16 * LD + kk);
+                            iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                            iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                            iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                            iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
+                        }
+                    }
 #else
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 16) {
@@ -9766,7 +10080,7 @@ __global__ void __launch_bounds__(256, (BN == 128 || WT == -1) ? 2 : 3) wmma_gro
                 }
             }
 
-#if __CUDA_ARCH__ < 750
+#if __CUDA_ARCH__ < 750 || __CUDA_ARCH__ >= 800
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 const int r0 = wm * MR * 16 + mr * 16 + acc_r0;
@@ -9892,6 +10206,14 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
             : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
             : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
     };
+#elif __CUDA_ARCH__ >= 800
+    const int lane = tid & 31;
+    const int a_lane_row = lane & 15;
+    const int a_lane_col = (lane >> 4) << 3;
+    const int b_lane_row = ((lane >> 4) << 3) | (lane & 7);
+    const int b_lane_col = ((lane >> 3) & 1) << 3;
+    const int acc_r0 = lane >> 2, acc_r1 = acc_r0 + 8;
+    const int acc_c0 = (lane & 3) * 2, acc_c1 = acc_c0 + 8;
 #endif
 
     for (int gi = USE_TILES ? 0 : (int) blockIdx.z; gi < (USE_TILES ? 1 : ng); gi += (USE_TILES ? 1 : (int) gridDim.z)) {
@@ -9906,7 +10228,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
             const int rows = min(BM, e1 - c0);
             const bool has_hi = (rows > 64);
 
-#if __CUDA_ARCH__ < 750
+#if __CUDA_ARCH__ < 750 || __CUDA_ARCH__ >= 800
             float acc[4][2][8];
 #pragma unroll
             for (int mr = 0; mr < 4; ++mr) {
@@ -9994,6 +10316,79 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 };
                 if (has_hi) run_loop(std::integral_constant<int, 4>{});
                 else run_loop(std::integral_constant<int, 2>{});
+#elif __CUDA_ARCH__ >= 800
+                // EX-4B (Ampere/Ada sm_80+): 1-stage WK=64 (LD=72, 36,864 B -> 2 blk/SM, coalesced 36B NVFP4 blocks)
+                // + cp.async.cg.shared.global + ldmatrix.x4 + native mma.m16n8k16.f32 + overlapped weight prefetch!
+                __half* sx = smem;
+                __half* sw = smem + BM * LD;
+                const int wr = tid >> 2, sb = tid & 3;
+                const int xr = wr, xc = sb * 16;
+                const uint8_t* we_t = blob + role_off + (size_t) (col0 + wr) * row_stride;
+                const bool x0_ok = (xr < rows);
+                const bool x1_ok = ((xr + 64) < rows);
+                const int in_row0 = x0_ok ? (IS_DOWN ? (c0 + xr) : ent_idx[c0 + xr]) : 0;
+                const int in_row1 = x1_ok ? (IS_DOWN ? (c0 + xr + 64) : ent_idx[c0 + xr + 64]) : 0;
+                const __half* xp0 = X + (size_t) in_row0 * K + xc;
+                const __half* xp1 = X + (size_t) in_row1 * K + xc;
+                const uint8_t* we_t1 = we_t + (size_t) 64 * row_stride;
+                uint32_t pf_w0[2], pf_w1[2];
+                uint8_t pf_d[2];
+                pf_w0[0] = *reinterpret_cast<const uint32_t*>(we_t + 4 + sb * 8);
+                pf_w1[0] = *reinterpret_cast<const uint32_t*>(we_t + 8 + sb * 8);
+                pf_d[0] = we_t[sb];
+                pf_w0[1] = *reinterpret_cast<const uint32_t*>(we_t1 + 4 + sb * 8);
+                pf_w1[1] = *reinterpret_cast<const uint32_t*>(we_t1 + 8 + sb * 8);
+                pf_d[1] = we_t1[sb];
+                const __half* sw_b0 = sw + (wn * 32 + b_lane_row) * LD + b_lane_col;
+                const __half* sw_b1 = sw + (wn * 32 + 16 + b_lane_row) * LD + b_lane_col;
+                auto run_ada_wk64 = [&](auto mr_tag) {
+                    constexpr int MR_RUN = decltype(mr_tag)::value;
+                    const __half* sx_a = sx + (wm * (MR_RUN * 16) + a_lane_row) * LD + a_lane_col;
+                    for (int k0 = 0; k0 < K; k0 += 64) {
+                        const __half* cxp0 = xp0 + k0;
+                        iq_cp_async_cg_16(sx + xr * LD + xc,     cxp0,     x0_ok);
+                        iq_cp_async_cg_16(sx + xr * LD + xc + 8, cxp0 + 8, x0_ok);
+                        if constexpr (MR_RUN == 4) {
+                            const __half* cxp1 = xp1 + k0;
+                            iq_cp_async_cg_16(sx + (xr + 64) * LD + xc,     cxp1,     x1_ok);
+                            iq_cp_async_cg_16(sx + (xr + 64) * LD + xc + 8, cxp1 + 8, x1_ok);
+                        }
+                        iq_cp_async_commit();
+                        dq_nvfp4_sub16_store_sc2(pf_w0[0], pf_w1[0], s_ue4m3[pf_d[0]], sw + wr * LD + sb * 16);
+                        dq_nvfp4_sub16_store_sc2(pf_w0[1], pf_w1[1], s_ue4m3[pf_d[1]], sw + (64 + wr) * LD + sb * 16);
+                        iq_cp_async_wait0();
+                        __syncthreads();
+                        if (k0 + 64 < K) {
+                            const size_t boff = (size_t) ((k0 + 64) >> 6) * 36;
+                            const uint8_t* wpn0 = we_t + boff;
+                            const uint8_t* wpn1 = we_t1 + boff;
+                            pf_w0[0] = *reinterpret_cast<const uint32_t*>(wpn0 + 4 + sb * 8);
+                            pf_w1[0] = *reinterpret_cast<const uint32_t*>(wpn0 + 8 + sb * 8);
+                            pf_d[0] = wpn0[sb];
+                            pf_w0[1] = *reinterpret_cast<const uint32_t*>(wpn1 + 4 + sb * 8);
+                            pf_w1[1] = *reinterpret_cast<const uint32_t*>(wpn1 + 8 + sb * 8);
+                            pf_d[1] = wpn1[sb];
+                        }
+#pragma unroll
+                        for (int kk = 0; kk < 64; kk += 16) {
+                            uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                            iq_ldmatrix_x4(b00, b01, b02, b03, sw_b0 + kk);
+                            iq_ldmatrix_x4(b10, b11, b12, b13, sw_b1 + kk);
+#pragma unroll
+                            for (int mr = 0; mr < MR_RUN; ++mr) {
+                                uint32_t a0, a1, a2, a3;
+                                iq_ldmatrix_x4(a0, a1, a2, a3, sx_a + mr * 16 * LD + kk);
+                                iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                                iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                                iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                                iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
+                            }
+                        }
+                        if (k0 + 64 < K) __syncthreads();
+                    }
+                };
+                if (has_hi) run_ada_wk64(std::integral_constant<int, 4>{});
+                else run_ada_wk64(std::integral_constant<int, 2>{});
 #else
                 // Turing/Ampere/Ada (sm_75+): 1-stage WK=64 (LD=72) halves __syncthreads() & loop iterations + E1 sc2 LUT!
                 __half* sx = smem;
@@ -10075,22 +10470,38 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
 #if __CUDA_ARCH__ < 750
                 const __half* sw_r0 = sw + (wn * 32 + kb_row) * LD;
                 const __half* sw_r1 = sw + (wn * 32 + 16 + kb_row) * LD;
+#elif __CUDA_ARCH__ >= 800
+                const __half* sw_b0 = sw + (wn * 32 + b_lane_row) * LD + b_lane_col;
+                const __half* sw_b1 = sw + (wn * 32 + 16 + b_lane_row) * LD + b_lane_col;
 #endif
                 if (has_hi) {
 #if __CUDA_ARCH__ < 750
                     const __half* sx_hi = sx + (wm * 64 + qa_row) * LD;
+#elif __CUDA_ARCH__ >= 800
+                    const __half* sx_hi_a = sx + (wm * 64 + a_lane_row) * LD + a_lane_col;
 #endif
                     for (int k0 = 0; k0 < K; k0 += WK) {
                         const __half* cxp0 = xp0 + k0;
                         const __half* cxp1 = xp1 + k0;
+#if __CUDA_ARCH__ >= 800
+                        iq_cp_async_cg_16(sx + xr * LD + xc,            cxp0,     x0_ok);
+                        iq_cp_async_cg_16(sx + xr * LD + xc + 8,        cxp0 + 8, x0_ok);
+                        iq_cp_async_cg_16(sx + (xr + 64) * LD + xc,     cxp1,     x1_ok);
+                        iq_cp_async_cg_16(sx + (xr + 64) * LD + xc + 8, cxp1 + 8, x1_ok);
+                        iq_cp_async_commit();
+#else
                         *reinterpret_cast<uint4*>(sx + xr * LD + xc)            = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
                         *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8)        = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
                         *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc)     = x1_ok ? *reinterpret_cast<const uint4*>(cxp1)     : make_uint4(0, 0, 0, 0);
                         *reinterpret_cast<uint4*>(sx + (xr + 64) * LD + xc + 8) = x1_ok ? *reinterpret_cast<const uint4*>(cxp1 + 8) : make_uint4(0, 0, 0, 0);
+#endif
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
                             dq_sub16_k64_store<WT>(we_t + (size_t) (b * 64) * row_stride, k0, sb, sw + (b * 64 + wr) * LD + sb * 16, IS_DOWN ? L.d_type : L.gu_type);
                         }
+#if __CUDA_ARCH__ >= 800
+                        iq_cp_async_wait0();
+#endif
                         __syncthreads();
 #if __CUDA_ARCH__ < 750
 #pragma unroll 1
@@ -10104,6 +10515,22 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                                 hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
                                 hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
                                 hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                            }
+                        }
+#elif __CUDA_ARCH__ >= 800
+#pragma unroll
+                        for (int kk = 0; kk < WK; kk += 16) {
+                            uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                            iq_ldmatrix_x4(b00, b01, b02, b03, sw_b0 + kk);
+                            iq_ldmatrix_x4(b10, b11, b12, b13, sw_b1 + kk);
+#pragma unroll
+                            for (int mr = 0; mr < 4; ++mr) {
+                                uint32_t a0, a1, a2, a3;
+                                iq_ldmatrix_x4(a0, a1, a2, a3, sx_hi_a + mr * 16 * LD + kk);
+                                iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                                iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                                iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                                iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
                             }
                         }
 #else
@@ -10126,15 +10553,26 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 } else {
 #if __CUDA_ARCH__ < 750
                     const __half* sx_lo = sx + (wm * 32 + qa_row) * LD;
+#elif __CUDA_ARCH__ >= 800
+                    const __half* sx_lo_a = sx + (wm * 32 + a_lane_row) * LD + a_lane_col;
 #endif
                     for (int k0 = 0; k0 < K; k0 += WK) {
                         const __half* cxp0 = xp0 + k0;
+#if __CUDA_ARCH__ >= 800
+                        iq_cp_async_cg_16(sx + xr * LD + xc,     cxp0,     x0_ok);
+                        iq_cp_async_cg_16(sx + xr * LD + xc + 8, cxp0 + 8, x0_ok);
+                        iq_cp_async_commit();
+#else
                         *reinterpret_cast<uint4*>(sx + xr * LD + xc)     = x0_ok ? *reinterpret_cast<const uint4*>(cxp0)     : make_uint4(0, 0, 0, 0);
                         *reinterpret_cast<uint4*>(sx + xr * LD + xc + 8) = x0_ok ? *reinterpret_cast<const uint4*>(cxp0 + 8) : make_uint4(0, 0, 0, 0);
+#endif
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
                             dq_sub16_k64_store<WT>(we_t + (size_t) (b * 64) * row_stride, k0, sb, sw + (b * 64 + wr) * LD + sb * 16, IS_DOWN ? L.d_type : L.gu_type);
                         }
+#if __CUDA_ARCH__ >= 800
+                        iq_cp_async_wait0();
+#endif
                         __syncthreads();
 #if __CUDA_ARCH__ < 750
 #pragma unroll 1
@@ -10148,6 +10586,22 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                                 hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
                                 hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
                                 hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                            }
+                        }
+#elif __CUDA_ARCH__ >= 800
+#pragma unroll
+                        for (int kk = 0; kk < WK; kk += 16) {
+                            uint32_t b00, b01, b02, b03, b10, b11, b12, b13;
+                            iq_ldmatrix_x4(b00, b01, b02, b03, sw_b0 + kk);
+                            iq_ldmatrix_x4(b10, b11, b12, b13, sw_b1 + kk);
+#pragma unroll
+                            for (int mr = 0; mr < 2; ++mr) {
+                                uint32_t a0, a1, a2, a3;
+                                iq_ldmatrix_x4(a0, a1, a2, a3, sx_lo_a + mr * 16 * LD + kk);
+                                iq_mma_m16n8k16_f32(&acc[mr][0][0], a0, a1, a2, a3, b00, b01);
+                                iq_mma_m16n8k16_f32(&acc[mr][0][4], a0, a1, a2, a3, b02, b03);
+                                iq_mma_m16n8k16_f32(&acc[mr][1][0], a0, a1, a2, a3, b10, b11);
+                                iq_mma_m16n8k16_f32(&acc[mr][1][4], a0, a1, a2, a3, b12, b13);
                             }
                         }
 #else
@@ -10170,7 +10624,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 }
             }
 
-#if __CUDA_ARCH__ < 750
+#if __CUDA_ARCH__ < 750 || __CUDA_ARCH__ >= 800
             const int mr_lim = has_hi ? 4 : 2;
             const int wm_base = has_hi ? (wm * 64) : (wm * 32);
 #pragma unroll
@@ -10432,8 +10886,6 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
                                 const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
                                 int64_t cap_groups, int64_t cap_entries, const void* x_f16, void* scratch, float* out,
                                 void* stream, int64_t expected_entries) {
-    if (cap_groups <= 0 || cap_entries <= 0 || !native_expert_wmma_supported(L)) return false;
-
     static int cc_ok[64];
     static int cc_volta[64];
     int dev = 0;
@@ -10487,6 +10939,7 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
         }
     }
     if (cc_ok[dev] != 2) return false;
+    if (cap_groups <= 0 || cap_entries <= 0 || !native_expert_wmma_supported(L)) return false;
 
     cudaStream_t s = (cudaStream_t) stream;
     const int64_t est_ent = (expected_entries > 0) ? std::min(cap_entries, expected_entries) : cap_entries;
@@ -10505,7 +10958,8 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     // Volta: S1 2-stage BM=128 + HMMA.884; Ada: BM=128 GU+SiTU (WK=64 + E5) & BM=64 BN=128 Down (2x CTAs on 46 SMs + E5).
     const bool can_fused_gu_situ = L.situ && (L.n_ff % 64 == 0) && cap_groups <= 256;
     const bool gu_bm128 = use_bm128 && (can_fused_gu_situ || L.gu_type != 40 || is_volta);
-    const bool dn_bm128 = use_bm128 && (L.d_type != 40 || is_volta);
+    static const int env_dn128 = []() { const char* v = std::getenv("STRATA_DN_BM128"); return v ? std::atoi(v) : -1; }();
+    const bool dn_bm128 = use_bm128 && (env_dn128 == 1 || (env_dn128 != 0 && (L.d_type != 40 || is_volta)));
     const int gu_bm = gu_bm128 ? 128 : 64;
     const int64_t cap_tiles_gu = (cap_entries / gu_bm) + cap_groups;
     const bool use_fused_gu_situ = can_fused_gu_situ &&

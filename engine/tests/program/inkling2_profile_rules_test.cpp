@@ -89,38 +89,37 @@ int main() {
         check(p.use_d_hits, "V100 1M hybrid enables d_hits");
     }
 
-    // 3. RTX 4070 12GB @ 65,536 ctx: CoreResidentHybrid (core 128/128 resident, upfront 64K KV, chunk=2048 + 2x64MiB stage)
+    // 3. RTX 4070 12GB @ 65,536 ctx: CoreResidentHybrid (core 128/128 resident, dynamic 16K->65K KV, chunk=4096 + SWA compaction)
     {
         const auto in = rtx4070_12g(65536);
         const auto p = resolve_inkling2_profile(in);
         std::printf("%s\n", format_profile_line(in, p).c_str());
         check(p.arch.id == ArchId::Sm89Ada, "RTX 4070 selects Sm89Ada arch");
         check(p.regime == VramRegime::CoreResidentHybrid, "RTX 4070 65K selects CoreResidentHybrid");
-        check(p.chunk == 2048, "RTX 4070 65K promotes to chunk=2048 (+20% PP while keeping tier1=128/128)");
-        check(p.full_kv_init == 65536, "RTX 4070 65K allocates 65K KV upfront (zero mid-run expansion pause)");
-        check(p.want_sp == 4, "RTX 4070 65K reserves 4 splits at T=2048");
-        check(p.pp_stage_cnt_pref == 2 && p.pp_stage_mb == 64, "RTX 4070 65K uses 2x64 MiB staging");
+        check(p.chunk == 4096, "RTX 4070 65K promotes to chunk=4096 (EX-4: SWA compaction + dynamic 16K KV init)");
+        check(p.full_kv_init == 16384, "RTX 4070 65K starts KV at 16K (+780 MiB for staging & blk.0 residency on 4K-16K)");
+        check(p.want_sp == 4, "RTX 4070 65K reserves 4 splits at T>=2048");
+        check(p.pp_stage_cnt_pref == 2 && p.pp_stage_mb == 64, "RTX 4070 65K baseline stage config");
         check(p.use_d_hits, "RTX 4070 65K enables d_hits");
         check(!p.force_bf16_x_f16, "RTX 4070 uses native BF16 TC");
     }
 
-    // 4. RTX 4070 12GB @ 131,072 ctx: CoreResidentHybrid (promotes to chunk=2048 when free VRAM fits tier1=128/128,
-    //    and safely falls back to chunk=1024 when desktop eats extra VRAM)
+    // 4. RTX 4070 12GB @ 131,072 ctx: CoreResidentHybrid (promotes to chunk=4096 with dynamic 16K KV init!)
     {
         const auto in = rtx4070_12g(131072);
         const auto p = resolve_inkling2_profile(in);
         std::printf("%s\n", format_profile_line(in, p).c_str());
         check(p.regime == VramRegime::CoreResidentHybrid, "RTX 4070 131K selects CoreResidentHybrid");
-        check(p.chunk == 2048, "RTX 4070 131K promotes to chunk=2048 when tier1=128/128 fits");
-        check(p.full_kv_init == 131072, "RTX 4070 131K allocates 131K KV upfront (zero mid-run pause)");
-        check(p.want_sp == 4, "RTX 4070 131K reserves 4 splits at T=2048");
-        check(p.pp_stage_cnt_pref == 2, "RTX 4070 131K uses 2x64 MiB staging");
+        check(p.chunk == 4096, "RTX 4070 131K promotes to chunk=4096 with 16K initial KV");
+        check(p.full_kv_init == 16384, "RTX 4070 131K starts KV at 16K (+1.8 GiB free on short/medium prompts)");
+        check(p.want_sp == 4, "RTX 4070 131K reserves 4 splits at T>=2048");
+        check(p.pp_stage_cnt_pref == 2, "RTX 4070 131K baseline stage config");
 
         auto in_tight_desk = rtx4070_12g(131072);
         in_tight_desk.vram_free_bytes = (size_t) (9.50 * (double) GiB);
         const auto p_fb = resolve_inkling2_profile(in_tight_desk);
         check(p_fb.regime == VramRegime::CoreResidentHybrid, "RTX 4070 131K tight desktop stays CoreResidentHybrid");
-        check(p_fb.chunk == 1024 && p_fb.want_sp == 5, "RTX 4070 131K tight desktop falls back to chunk=1024 to protect tier1=128/128");
+        check(p_fb.chunk == 4096 && p_fb.want_sp == 4, "RTX 4070 131K tight desktop still fits chunk=4096 with 16K initial KV");
     }
 
     // 5. RTX 4070 12GB @ 262,144 ctx: TightHybrid (auto chunk=2048 halves PCIe streaming, dynamic 32K->262K KV)
@@ -198,8 +197,8 @@ int main() {
         in65.vram_free_bytes = (size_t) (9.50 * (double) GiB);
         const auto p65 = resolve_inkling2_profile(in65);
         check(p65.regime == VramRegime::CoreResidentHybrid, "RTX 4070 65K + DSpark keeps CoreResidentHybrid");
-        check(p65.chunk == 2048, "RTX 4070 65K + DSpark uses chunk=2048");
-        check(p65.pp_stage_mb == 64, "RTX 4070 65K + DSpark uses 64 MiB pp_stage");
+        check(p65.chunk == 4096, "RTX 4070 65K + DSpark promotes to chunk=4096 with SWA compaction + DSpark phase offload");
+        check(p65.pp_stage_mb == 64, "RTX 4070 65K + DSpark uses 64 MiB baseline pp_stage");
     }
 
     if (fails > 0) {
