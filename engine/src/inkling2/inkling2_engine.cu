@@ -2113,7 +2113,7 @@ struct Engine {
         for (int il = 0; il < hp.n_layer; ++il) {
             const int ip = hp.loop_layer(il);
             const PhysLayer& L = m->layers[(size_t) ip];
-            if (L.n_slots >= ne || L.n_slots == 0 || !L.hblobs) continue;
+            if (L.n_slots >= ne || !L.hblobs) continue;
             const int cap = (int) std::min<size_t>((size_t) ne, pp_stage_bytes / L.stride);
             if (cap <= 0) continue;
             int n_miss = 0;
@@ -2249,7 +2249,7 @@ struct Engine {
                                      cap_g, n_ent, xq, escr, eparts, st);
         };
 
-        if (pp_streaming && need_cpu && L.hblobs && pp_stage_bytes >= L.stride) {
+        if (pp_streaming && need_cpu && L.hblobs && pp_stage_bytes >= L.stride && pp_layer_cnt[(size_t) il] > 0) {
             // Zero host-GPU stalls across all 48 layers: k_route_inkling2 tracks exact routing counts in L.d_hits on GPU!
             const int ne = (int) hp.n_expert;
             const int n_chunks = pp_layer_cnt[(size_t) il];
