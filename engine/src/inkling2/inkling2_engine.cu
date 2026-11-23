@@ -4305,7 +4305,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             CK(cudaStreamSynchronize(E.st));
             total_vram_experts += s;
         }
-        if (s > 0 && s < ne) E.hybrid = true;
+        if (s < ne) E.hybrid = true;
     }
     if (has_place_pin) {
         cudaEventDestroy(ev_b[0]);
