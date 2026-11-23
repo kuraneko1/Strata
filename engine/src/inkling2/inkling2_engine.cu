@@ -1257,7 +1257,7 @@ struct Engine {
             }
         }
         attn_split_t1_full = std::clamp((sm_count * profile.t1_full_split_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
-        attn_split_t1_swa = std::clamp((sm_count * profile.t1_swa_split_mult) / std::max(1, (int) hp.n_head_kv), 8, 24);
+        attn_split_t1_swa = std::clamp((sm_count * profile.t1_swa_split_mult) / std::max(1, (int) hp.n_head_kv), 8, 32);
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
         // Gate high-SMEM FA2 kernels on cudaDevAttrMaxSharedMemoryPerBlockOptin so Turing (sm_75, 64 KB cap) cleanly falls back to pp_wmma (29 KB).
         auto try_set_smem = [&](const void* fn, int bytes) -> bool {
@@ -1962,7 +1962,7 @@ struct Engine {
         }
         if (hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
             if (T == 1) {
-                k_control_up_combine_t1<<<(unsigned) ((N + 31) / 32), 256, 0, st>>>(
+                k_control_up_combine_t1<<<(unsigned) ((N + 7) / 8), 128, 0, st>>>(
                     c, msg, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d,
                     ctrl64, out, (int) hp.loop_gate_rank, N);
                 return;
@@ -2115,7 +2115,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
             if (can_fused_router_t1) {
-                k_router_gemv_and_group_t1<<<(unsigned) hp.n_expert, 128, 0, st>>>(
+                k_router_gemv_and_group_t1<<<(unsigned) ((hp.n_expert + 1) / 2), 128, 0, st>>>(
                     L.ffn_gate_inp, x_norm, router_logits, L.exp_probs_b, ids, ewts,
                     has_gpu ? L.d_slot_of : nullptr, has_gpu ? L.d_blobs : nullptr, L.stride,
                     N, (int) hp.n_expert, Kp, hp.expert_weights_scale,
@@ -2322,7 +2322,7 @@ struct Engine {
                 else { p_miss_nv += n_miss; p_hit_nv += (n_ent - n_miss); }
             }
             if (n_miss > 0) {
-                static const int l2_pf_min = [] { const char* v = std::getenv("STRATA_L2_PF_MIN"); return v ? std::atoi(v) : 4; }();
+                static const int l2_pf_min = [] { const char* v = std::getenv("STRATA_L2_PF_MIN"); return v ? std::atoi(v) : 0; }();
                 if (l2_pf_min > 0 && n_miss >= l2_pf_min && hybrid && T <= 8 && il + 1 < hp.n_layer) {
                     // F2: Free L2 prefetch of the next layer's dense weights on GPU while CPU computes missed experts!
                     const int ip_next = hp.loop_layer(il + 1);
@@ -3681,7 +3681,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(h_h, in_ffn, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
                 if (T == 1 && hp.n_expert <= 128 && Kp <= 16 && (N & 3) == 0 && d_router_done != nullptr) {
                     const bool has_g = L.n_slots > 0;
-                    k_router_gemv_and_group_t1<<<(unsigned) hp.n_expert, 128, 0, st>>>(
+                    k_router_gemv_and_group_t1<<<(unsigned) ((hp.n_expert + 1) / 2), 128, 0, st>>>(
                         L.ffn_gate_inp, in_ffn, router_logits, L.exp_probs_b, ids, ewts,
                         has_g ? L.d_slot_of : nullptr, has_g ? L.d_blobs : nullptr, L.stride,
                         N, (int) hp.n_expert, Kp, hp.expert_weights_scale,

@@ -50,8 +50,8 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.full_vram_want_sp = 6;
         p.hybrid_want_sp_1024 = 7;
         p.hybrid_want_sp_2048 = 4;
-        p.t1_full_split_mult = 8;
-        p.t1_swa_split_mult = 2;
+        p.t1_full_split_mult = 6;
+        p.t1_swa_split_mult = 3;
         p.pp_stage_mb = 64;
         p.pp_stage_cnt_pref = 3;
         p.kv_grow_reserve_mib = 112;

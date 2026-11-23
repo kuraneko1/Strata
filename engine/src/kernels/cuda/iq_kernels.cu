@@ -1773,24 +1773,67 @@ __device__ __forceinline__ void row_dot_72_sub8(const uint8_t* row, const block_
     }
 }
 
-// Single-pass fused Gate+Up 8-lane sub-warp row dot for T == 1 (NC=1): sequentially applies Gate then Up per k-step
-// so wg and wu never overlap in registers (STACK: 0!), sharing L1-resident bx, bitwise identical to row_dot_72_sub8.
+// Single-pass fused Gate+Up 8-lane sub-warp row dot for T == 1 (NC=1):
+// Loads block_q8_1 ONCE in registers (bq8 = x + k) and issues BOTH raw row_g & row_u HBM loads upfront for 2x MLP,
+// decoding one row at a time so register pressure stays low (STACK: 0!) and FP32 sum order is 100% bit-exact.
 __device__ __forceinline__ void row_dot_72_gu_sub8_t1(const uint8_t* row_g, const uint8_t* row_u,
                                                       const block_q8_1* x, int t, float& sg_out, float& su_out,
                                                       const float* __restrict__ s_ue4m3) {
-    using S = Split<40>;
     float sg = 0.0f, su = 0.0f;
 #pragma unroll 1
     for (int k = t; k < 72; k += 8) {
-        const int kbx = k >> 1, iqs = (k & 1) << 2;
-        const block_q8_1* bx = x + kbx * 2;
+        const int kbx = k >> 1, iqs = (k & 1) << 2, is0 = iqs >> 1;
+        const block_nvfp4* bqg = (const block_nvfp4*) row_g + kbx;
+        const block_nvfp4* bqu = (const block_nvfp4*) row_u + kbx;
+        const block_q8_1* bq8 = x + k;
+        const int gq0 = __ldg((const int*) bqg->qs + iqs + 0);
+        const int gq1 = __ldg((const int*) bqg->qs + iqs + 1);
+        const int gq2 = __ldg((const int*) bqg->qs + iqs + 2);
+        const int gq3 = __ldg((const int*) bqg->qs + iqs + 3);
+        const uint16_t gd16 = __ldg((const uint16_t*) &bqg->d[is0]);
+        const int uq0 = __ldg((const int*) bqu->qs + iqs + 0);
+        const int uq1 = __ldg((const int*) bqu->qs + iqs + 1);
+        const int uq2 = __ldg((const int*) bqu->qs + iqs + 2);
+        const int uq3 = __ldg((const int*) bqu->qs + iqs + 3);
+        const uint16_t ud16 = __ldg((const uint16_t*) &bqu->d[is0]);
+        const float dx = __low2float(bq8->ds);
+        const int x0 = get_int_b4(bq8->qs, 0), x1 = get_int_b4(bq8->qs, 1);
+        const int x2 = get_int_b4(bq8->qs, 2), x3 = get_int_b4(bq8->qs, 3);
+        const int x4 = get_int_b4(bq8->qs, 4), x5 = get_int_b4(bq8->qs, 5);
+        const int x6 = get_int_b4(bq8->qs, 6), x7 = get_int_b4(bq8->qs, 7);
         {
-            const typename S::W wg = S::template load_lut<true>(row_g, kbx, iqs, s_ue4m3);
-            sg += S::apply(wg, bx, iqs);
+            const int2 v00 = get_int_from_table_16(gq0, kvalues_fp4);
+            const int2 v01 = get_int_from_table_16(gq1, kvalues_fp4);
+            int s0 = ggml_cuda_dp4a(v00.x, x0, 0);
+            s0 = ggml_cuda_dp4a(v00.y, x2, s0);
+            s0 = ggml_cuda_dp4a(v01.x, x1, s0);
+            s0 = ggml_cuda_dp4a(v01.y, x3, s0);
+            const int2 v10 = get_int_from_table_16(gq2, kvalues_fp4);
+            const int2 v11 = get_int_from_table_16(gq3, kvalues_fp4);
+            int s1 = ggml_cuda_dp4a(v10.x, x4, 0);
+            s1 = ggml_cuda_dp4a(v10.y, x6, s1);
+            s1 = ggml_cuda_dp4a(v11.x, x5, s1);
+            s1 = ggml_cuda_dp4a(v11.y, x7, s1);
+            float p = s_ue4m3[gd16 & 0xFFu] * dx * (float) s0;
+            p += s_ue4m3[gd16 >> 8] * dx * (float) s1;
+            sg += p;
         }
         {
-            const typename S::W wu = S::template load_lut<true>(row_u, kbx, iqs, s_ue4m3);
-            su += S::apply(wu, bx, iqs);
+            const int2 v00 = get_int_from_table_16(uq0, kvalues_fp4);
+            const int2 v01 = get_int_from_table_16(uq1, kvalues_fp4);
+            int s0 = ggml_cuda_dp4a(v00.x, x0, 0);
+            s0 = ggml_cuda_dp4a(v00.y, x2, s0);
+            s0 = ggml_cuda_dp4a(v01.x, x1, s0);
+            s0 = ggml_cuda_dp4a(v01.y, x3, s0);
+            const int2 v10 = get_int_from_table_16(uq2, kvalues_fp4);
+            const int2 v11 = get_int_from_table_16(uq3, kvalues_fp4);
+            int s1 = ggml_cuda_dp4a(v10.x, x4, 0);
+            s1 = ggml_cuda_dp4a(v10.y, x6, s1);
+            s1 = ggml_cuda_dp4a(v11.x, x5, s1);
+            s1 = ggml_cuda_dp4a(v11.y, x7, s1);
+            float p = s_ue4m3[ud16 & 0xFFu] * dx * (float) s0;
+            p += s_ue4m3[ud16 >> 8] * dx * (float) s1;
+            su += p;
         }
     }
 #pragma unroll
@@ -1800,6 +1843,80 @@ __device__ __forceinline__ void row_dot_72_gu_sub8_t1(const uint8_t* row_g, cons
     }
     sg_out = sg;
     su_out = su;
+}
+
+// 2-row 8-lane sub-warp NVFP4 Down dot for K = 36 (n_ff == 1152, T == 1):
+// Shares block_q8_1 across 2 consecutive rows and overlaps both rows' HBM loads (2x MLP, 100% bit-exact, STACK: 0!).
+__device__ __forceinline__ void row_dot_36_sub8_2rows_t1(const uint8_t* row0, const uint8_t* row1,
+                                                         const block_q8_1* x, int t, float& s0_out, float& s1_out,
+                                                         const float* __restrict__ s_ue4m3) {
+    float acc0 = 0.0f, acc1 = 0.0f;
+    auto do_step = [&](int k, bool first) {
+        const int kbx = k >> 1, iqs = (k & 1) << 2, is0 = iqs >> 1;
+        const block_nvfp4* bq0 = (const block_nvfp4*) row0 + kbx;
+        const block_nvfp4* bq1 = (const block_nvfp4*) row1 + kbx;
+        const block_q8_1* bq8 = x + k;
+        const int r0q0 = __ldg((const int*) bq0->qs + iqs + 0);
+        const int r0q1 = __ldg((const int*) bq0->qs + iqs + 1);
+        const int r0q2 = __ldg((const int*) bq0->qs + iqs + 2);
+        const int r0q3 = __ldg((const int*) bq0->qs + iqs + 3);
+        const uint16_t r0d16 = __ldg((const uint16_t*) &bq0->d[is0]);
+        const int r1q0 = __ldg((const int*) bq1->qs + iqs + 0);
+        const int r1q1 = __ldg((const int*) bq1->qs + iqs + 1);
+        const int r1q2 = __ldg((const int*) bq1->qs + iqs + 2);
+        const int r1q3 = __ldg((const int*) bq1->qs + iqs + 3);
+        const uint16_t r1d16 = __ldg((const uint16_t*) &bq1->d[is0]);
+        const float dx = __low2float(bq8->ds);
+        const int x0 = get_int_b4(bq8->qs, 0), x1 = get_int_b4(bq8->qs, 1);
+        const int x2 = get_int_b4(bq8->qs, 2), x3 = get_int_b4(bq8->qs, 3);
+        const int x4 = get_int_b4(bq8->qs, 4), x5 = get_int_b4(bq8->qs, 5);
+        const int x6 = get_int_b4(bq8->qs, 6), x7 = get_int_b4(bq8->qs, 7);
+        {
+            const int2 v00 = get_int_from_table_16(r0q0, kvalues_fp4);
+            const int2 v01 = get_int_from_table_16(r0q1, kvalues_fp4);
+            int s0 = ggml_cuda_dp4a(v00.x, x0, 0);
+            s0 = ggml_cuda_dp4a(v00.y, x2, s0);
+            s0 = ggml_cuda_dp4a(v01.x, x1, s0);
+            s0 = ggml_cuda_dp4a(v01.y, x3, s0);
+            const int2 v10 = get_int_from_table_16(r0q2, kvalues_fp4);
+            const int2 v11 = get_int_from_table_16(r0q3, kvalues_fp4);
+            int s1 = ggml_cuda_dp4a(v10.x, x4, 0);
+            s1 = ggml_cuda_dp4a(v10.y, x6, s1);
+            s1 = ggml_cuda_dp4a(v11.x, x5, s1);
+            s1 = ggml_cuda_dp4a(v11.y, x7, s1);
+            float p = s_ue4m3[r0d16 & 0xFFu] * dx * (float) s0;
+            p += s_ue4m3[r0d16 >> 8] * dx * (float) s1;
+            if (first) acc0 = p; else acc0 += p;
+        }
+        {
+            const int2 v00 = get_int_from_table_16(r1q0, kvalues_fp4);
+            const int2 v01 = get_int_from_table_16(r1q1, kvalues_fp4);
+            int s0 = ggml_cuda_dp4a(v00.x, x0, 0);
+            s0 = ggml_cuda_dp4a(v00.y, x2, s0);
+            s0 = ggml_cuda_dp4a(v01.x, x1, s0);
+            s0 = ggml_cuda_dp4a(v01.y, x3, s0);
+            const int2 v10 = get_int_from_table_16(r1q2, kvalues_fp4);
+            const int2 v11 = get_int_from_table_16(r1q3, kvalues_fp4);
+            int s1 = ggml_cuda_dp4a(v10.x, x4, 0);
+            s1 = ggml_cuda_dp4a(v10.y, x6, s1);
+            s1 = ggml_cuda_dp4a(v11.x, x5, s1);
+            s1 = ggml_cuda_dp4a(v11.y, x7, s1);
+            float p = s_ue4m3[r1d16 & 0xFFu] * dx * (float) s0;
+            p += s_ue4m3[r1d16 >> 8] * dx * (float) s1;
+            if (first) acc1 = p; else acc1 += p;
+        }
+    };
+    do_step(t, true);
+#pragma unroll 1
+    for (int step = 8; step <= 24; step += 8) do_step(t + step, false);
+    if (t < 4) do_step(t + 32, false);
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) {
+        acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
+        acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
+    }
+    s0_out = acc0;
+    s1_out = acc1;
 }
 
 // 16-lane sub-warp row dot for K = nb * ipb == 20 (TD == 42, Q2_0, and TD == 40, NVFP4, with n_ff == 640):
@@ -4600,8 +4717,8 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
     }
 }
 
-// Standalone T=1 (128-thr = 16 rows/CTA) L1-direct NVFP4 down kernel for n_ff == 1152:
-// Doubles CTA count (72 -> 144 per expert: fixes V100 1.80-wave tail), skips s_hq_buf SMEM staging & per-group barriers.
+// Standalone T=1 (128-thr = 16 subwarps x 2 rows = 32 rows/CTA -> 72x8 = 576 CTAs = 0.90 wave on V100!) L1-direct NVFP4 down:
+// Eliminates wave-2 tail (1152 -> 576 CTAs), halves s_ue4m3 init barriers, shares hq across 2 rows + 2x MLP, STACK: 0!
 __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
@@ -4612,19 +4729,26 @@ __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
     s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
     s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
     iq_sync_lds();
-    const int r = (int) blockIdx.x * 16 + (threadIdx.x >> 3);
+    const int r0 = (int) blockIdx.x * 32 + (threadIdx.x >> 3) * 2;
     const int t = threadIdx.x & 7;
-    if (r >= L.n_embd) return;
-    const size_t w_off = L.down_off + (size_t) r * L.d_row;
-    const int off1[1] = { 0 };
+    if (r0 >= L.n_embd) return;
+    const bool has_r1 = (r0 + 1 < L.n_embd);
+    const size_t w_off0 = L.down_off + (size_t) r0 * L.d_row;
+    const size_t w_off1 = has_r1 ? (w_off0 + L.d_row) : w_off0;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
-        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* wr0 = blob + w_off0;
+        const uint8_t* wr1 = blob + w_off1;
+        const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int e = e0; e < e1; ++e) {
-            float s1[1];
-            row_dot_36_sub8<1, true, true>(wr, hq + (size_t) e * 36, off1, 1, t, s1, s_ue4m3);
-            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+            float s0 = 0.0f, s1 = 0.0f;
+            row_dot_36_sub8_2rows_t1(wr0, wr1, hq + (size_t) e * 36, t, s0, s1, s_ue4m3);
+            if (t == 0) {
+                float* dst = out + (size_t) ent_dst[e] * L.n_embd + r0;
+                if (has_r1) *reinterpret_cast<float2*>(dst) = make_float2(s0 * sd, s1 * sd);
+                else dst[0] = s0 * sd;
+            }
         }
     }
 }
@@ -4906,8 +5030,8 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
     if constexpr (TD == 40) {
         if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 1152) {
             if (cap_entries > 0 && cap_entries <= 8) {
-                const dim3 g16((unsigned) ((L.n_embd + 15) / 16), grid.y);
-                native_down_nvfp4_36_t1_kernel<<<g16, 128, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                const dim3 g32((unsigned) ((L.n_embd + 31) / 32), grid.y);
+                native_down_nvfp4_36_t1_kernel<<<g32, 128, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
                 return;
             }
             native_down_nvfp4_36_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
