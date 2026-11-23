@@ -908,13 +908,43 @@ struct Engine {
     // Prefix cache checkpoint (stores conv_hist + LIVE circular SWA KV window <= n_swa in host RAM; full-attn KV stays append-only on GPU)
     struct StateCheckpoint {
         std::vector<int32_t> tokens;
-        std::vector<uint8_t> data;
-        std::vector<uint8_t> dspark_data;
+        std::unique_ptr<uint8_t[]> data;
+        size_t data_bytes = 0;
+        std::unique_ptr<uint8_t[]> dspark_data;
+        size_t dspark_bytes = 0;
         int swa_len = 0;
         int saved_pos = 0;
     };
+    std::thread ckpt_bg_thread;
 
-    StateCheckpoint save_checkpoint(const std::vector<int32_t>& tokens) {
+    void flush_ckpt_bg() {
+        if (ckpt_bg_thread.joinable()) ckpt_bg_thread.join();
+    }
+
+    void prealloc_ckpt_pin() {
+        const auto& hp = m->hp;
+        const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
+        size_t total = conv_bytes;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            if (!hp.is_swa(il)) continue;
+            const size_t n = (size_t) hp.n_swa;
+            if (kv_q8) total += n * (size_t) hp.kv_dim * 2 + n * (size_t) hp.n_head_kv * sizeof(__half) * 2;
+            else total += n * (size_t) hp.kv_dim * sizeof(__half) * 2;
+        }
+        const size_t ds_bytes = dspark ? dspark->checkpoint_bytes() : 0;
+        const size_t stage_bytes = total + ds_bytes;
+        if (stage_bytes > ckpt_pin_cap) {
+            flush_ckpt_bg();
+            if (ckpt_pin) { cudaFreeHost(ckpt_pin); ckpt_pin = nullptr; ckpt_pin_cap = 0; }
+            if (cudaMallocHost(&ckpt_pin, stage_bytes) == cudaSuccess) ckpt_pin_cap = stage_bytes;
+            else (void) cudaGetLastError();
+        }
+    }
+
+    // Async checkpoint save: D2H into pre-allocated pinned staging (~3.6 ms), then background CPU copy into
+    // uninitialized heap buffer while GPU immediately resumes the next prefill chunk / decode token!
+    void save_checkpoint_into(StateCheckpoint& cp, const std::vector<int32_t>& tokens) {
+        flush_ckpt_bg();
         const auto& hp = m->hp;
         const int cur_pos = (int) tokens.size();
         const int swa_len = std::min<int>(cur_pos, (int) hp.n_swa);
@@ -926,19 +956,23 @@ struct Engine {
             if (kv_q8) total += n * (size_t) hp.kv_dim * 2 + n * (size_t) hp.n_head_kv * sizeof(__half) * 2;
             else total += n * (size_t) hp.kv_dim * sizeof(__half) * 2;
         }
-        StateCheckpoint cp;
         cp.tokens = tokens;
         cp.swa_len = swa_len;
         cp.saved_pos = cur_pos;
-        cp.data.resize(total);
+        cp.data_bytes = total;
         const size_t ds_bytes = dspark ? dspark->checkpoint_bytes() : 0;
+        cp.dspark_bytes = ds_bytes;
         const size_t stage_bytes = total + ds_bytes;
         if (stage_bytes > ckpt_pin_cap) {
             if (ckpt_pin) { cudaFreeHost(ckpt_pin); ckpt_pin = nullptr; ckpt_pin_cap = 0; }
             if (cudaMallocHost(&ckpt_pin, stage_bytes) == cudaSuccess) ckpt_pin_cap = stage_bytes;
             else (void) cudaGetLastError();
         }
-        uint8_t* dst_base = ckpt_pin ? ckpt_pin : cp.data.data();
+        if (!ckpt_pin) {
+            cp.data.reset(new uint8_t[total]);
+            if (dspark && ds_bytes > 0) cp.dspark_data.reset(new uint8_t[ds_bytes]);
+        }
+        uint8_t* dst_base = ckpt_pin ? ckpt_pin : cp.data.get();
         size_t off = 0;
         auto pull = [&](const void* src, size_t n) {
             if (n == 0) return;
@@ -974,32 +1008,39 @@ struct Engine {
             }
         }
         if (dspark) {
-            cp.dspark_data.resize(ds_bytes);
-            dspark->save_checkpoint(ckpt_pin ? (ckpt_pin + total) : cp.dspark_data.data(), st);
+            dspark->save_checkpoint(ckpt_pin ? (ckpt_pin + total) : cp.dspark_data.get(), st);
         }
         CK(cudaStreamSynchronize(st));
         if (ckpt_pin) {
-            std::memcpy(cp.data.data(), ckpt_pin, total);
-            if (dspark && ds_bytes > 0) std::memcpy(cp.dspark_data.data(), ckpt_pin + total, ds_bytes);
+            const uint8_t* pin = ckpt_pin;
+            const bool has_ds = (dspark != nullptr && ds_bytes > 0);
+            ckpt_bg_thread = std::thread([&cp, pin, total, ds_bytes, has_ds]() {
+                cp.data.reset(new uint8_t[total]);
+                std::memcpy(cp.data.get(), pin, total);
+                if (has_ds) {
+                    cp.dspark_data.reset(new uint8_t[ds_bytes]);
+                    std::memcpy(cp.dspark_data.get(), pin + total, ds_bytes);
+                }
+            });
         }
-        return cp;
     }
 
     void restore_checkpoint(const StateCheckpoint& cp) {
+        flush_ckpt_bg();
         const auto& hp = m->hp;
         const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
-        const size_t total = cp.data.size();
-        const size_t ds_bytes = (dspark && !cp.dspark_data.empty()) ? cp.dspark_data.size() : 0;
+        const size_t total = cp.data_bytes;
+        const size_t ds_bytes = (dspark && cp.dspark_data && cp.dspark_bytes > 0) ? cp.dspark_bytes : 0;
         const size_t stage_bytes = total + ds_bytes;
         if (stage_bytes > ckpt_pin_cap) {
             if (ckpt_pin) { cudaFreeHost(ckpt_pin); ckpt_pin = nullptr; ckpt_pin_cap = 0; }
             if (cudaMallocHost(&ckpt_pin, stage_bytes) == cudaSuccess) ckpt_pin_cap = stage_bytes;
             else (void) cudaGetLastError();
         }
-        const uint8_t* src_base = cp.data.data();
+        const uint8_t* src_base = cp.data.get();
         if (ckpt_pin && total > 0) {
-            std::memcpy(ckpt_pin, cp.data.data(), total);
-            if (ds_bytes > 0) std::memcpy(ckpt_pin + total, cp.dspark_data.data(), ds_bytes);
+            std::memcpy(ckpt_pin, cp.data.get(), total);
+            if (ds_bytes > 0) std::memcpy(ckpt_pin + total, cp.dspark_data.get(), ds_bytes);
             src_base = ckpt_pin;
         }
         size_t off = 0;
@@ -1039,13 +1080,14 @@ struct Engine {
             }
         }
         pos = (int64_t) cp.tokens.size();
-        if (dspark && !cp.dspark_data.empty()) {
-            dspark->restore_checkpoint(ckpt_pin ? (ckpt_pin + total) : cp.dspark_data.data(), (int) cp.tokens.size(), st);
+        if (dspark && ds_bytes > 0) {
+            dspark->restore_checkpoint(ckpt_pin ? (ckpt_pin + total) : cp.dspark_data.get(), (int) cp.tokens.size(), st);
         }
         if (ckpt_pin) CK(cudaStreamSynchronize(st));
     }
 
     ~Engine() {
+        flush_ckpt_bg();
         if (core_graph) cudaGraphExecDestroy(core_graph);
         if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
         for (int t = 0; t < 9; ++t)
@@ -2170,9 +2212,9 @@ struct Engine {
                     pp_kick_next();
                 }
             };
-            // On il > 0 with both resident & staged experts where all staged chunks fit in the ring, drain staged
-            // buffers FIRST so cst immediately starts prefetching the next layer during has_gpu + next_attn.
-            if (il > 0 && has_gpu && n_chunks > 0 && n_chunks <= pp_stage_cnt) {
+            // On il > 0 with both resident & staged experts, drain staged buffers FIRST so pp_stage[0] is released
+            // immediately for cst to keep streaming while run_gpu_res() overlaps with next layer's PCIe H2D!
+            if (il > 0 && has_gpu && n_chunks > 0) {
                 run_staged();
                 run_gpu_res();
             } else {
@@ -4240,12 +4282,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         cudaFreeHost(pbuf[0]);
         cudaFreeHost(pbuf[1]);
     }
-    // F5: Warm up cuBLAS AFTER place_experts so zero VRAM is taken from Tier-2 experts while eliminating chunk-0 cold start!
+    // F5: Warm up cuBLAS (f16, bf16, sgemm) AFTER place_experts so zero VRAM is taken from Tier-2 experts while eliminating chunk-0 cold start!
     if (E.act_bf16 && E.cur) {
         CK(cudaMemsetAsync(E.act_bf16, 0, 16 * 64 * sizeof(uint16_t), E.st));
         E.gemm.f16(E.act_bf16, E.act_bf16, E.cur, 16, 64, 64);
+        if (!E.bf16_x_f16) E.gemm.bf16(E.act_bf16, E.act_bf16, E.cur, 16, 64, 64);
+        if (E.in_q) {
+            CK(cudaMemsetAsync(E.in_q, 0, 16 * 64 * sizeof(float), E.st));
+            E.gemm.sgemm(E.in_q, E.in_q, E.cur, 16, 64, 64);
+        }
         CK(cudaStreamSynchronize(E.st));
     }
+    if (!E.hybrid && m.has_quant_dense) strata::prefill::Gemm::set_w16_auto_default(true);
     E.pinned_used = pinned_used;
     used = actual_used;
 
@@ -4931,13 +4979,14 @@ int run(int argc, char** argv) {
                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
                     (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
                     E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0);
+        E.prealloc_ckpt_pin();
         std::printf("READY %d stop\n", max_ctx);
         std::fflush(stdout);
 
         std::vector<float> lg;
         std::vector<int32_t> hist;
         std::vector<int32_t> live_tokens;
-        std::vector<Engine::StateCheckpoint> snaps;
+        std::deque<Engine::StateCheckpoint> snaps;
         constexpr size_t kMaxSnaps = 8;
         std::mt19937_64 rng(0x9e3779b97f4a7c15ULL);
         bool got_quit = false;
@@ -5015,6 +5064,7 @@ int run(int argc, char** argv) {
                         snaps.resize((size_t) best_idx + 1);
                         reuse = live_tokens.size();
                     } else {
+                        E.flush_ckpt_bg();
                         E.reset_state();
                         live_tokens.clear();
                         snaps.clear();
@@ -5059,8 +5109,10 @@ int run(int argc, char** argv) {
                     if (!is_last && !stop_req.load(std::memory_order_acquire)) {
                         const size_t last_cp = snaps.empty() ? 0 : snaps.back().tokens.size();
                         if (live_tokens.size() - last_cp >= 8192) {
-                            snaps.push_back(E.save_checkpoint(live_tokens));
-                            if (snaps.size() > kMaxSnaps) snaps.erase(snaps.begin());
+                            E.flush_ckpt_bg();
+                            if (snaps.size() >= kMaxSnaps) snaps.pop_front();
+                            snaps.emplace_back();
+                            E.save_checkpoint_into(snaps.back(), live_tokens);
                         }
                     }
                 }
@@ -5073,8 +5125,10 @@ int run(int argc, char** argv) {
                 auto maybe_save_prompt_cp = [&]() {
                     if (saved_prompt_cp) return;
                     saved_prompt_cp = true;
-                    snaps.push_back(E.save_checkpoint(live_tokens));
-                    if (snaps.size() > kMaxSnaps) snaps.erase(snaps.begin());
+                    E.flush_ckpt_bg();
+                    if (snaps.size() >= kMaxSnaps) snaps.pop_front();
+                    snaps.emplace_back();
+                    E.save_checkpoint_into(snaps.back(), live_tokens);
                 };
 
                 const auto t_tg0 = Clock::now();
@@ -5112,6 +5166,7 @@ int run(int argc, char** argv) {
                 std::fflush(stdout);
             }
         }
+        E.flush_ckpt_bg();
         if (reader.joinable()) {
             if (got_quit) reader.detach();
             else reader.join();

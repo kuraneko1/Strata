@@ -38,6 +38,7 @@ struct ArchProfile {
     int kv_grow_reserve_mib = 112;        // Extra VRAM headroom during dynamic KV growth
     bool allow_tight_chunk_2048 = false;  // Measured win on sm_89 12GB TightHybrid (halves PCIe streaming bytes/tok)
     bool allow_core_chunk_2048 = false;   // Measured win on sm_89 12GB CoreResidentHybrid when tier1 still fits 128/128
+    bool allow_full_vram_chunk_2048 = false; // Measured +21-23% prefill win on sm_70 32GB FullVram (fills BM=128 tiles)
 };
 
 inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
@@ -55,6 +56,7 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.pp_stage_cnt_pref = 3;
         p.kv_grow_reserve_mib = 112;
         p.allow_tight_chunk_2048 = false;
+        p.allow_full_vram_chunk_2048 = true;
         return p;
     }
     if (cc_major == 8 && cc_minor == 9) {
@@ -73,6 +75,7 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.kv_grow_reserve_mib = 112;
         p.allow_tight_chunk_2048 = true;
         p.allow_core_chunk_2048 = true;
+        p.allow_full_vram_chunk_2048 = true;
         return p;
     }
     ArchProfile p;
@@ -191,12 +194,16 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     const size_t swa_kv_2048 = (size_t) std::max(0, in.n_swa_layers) * (size_t) (std::max(1, in.n_swa) + 2048) * in.kv_bytes_per_tok;
     const size_t engine_overhead_2048 = 576 * MiB;
     const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + 160 * MiB;
+    const size_t full_vram_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + in.all_experts_bytes + dspark_kv_need + 256 * MiB;
 
     if (in.requested_chunk > 0) {
         out.chunk = std::clamp(in.requested_chunk, 1, 4096);
     } else {
         const size_t init_kv_bytes = (size_t) std::max(0, in.n_full_layers) * (size_t) out.full_kv_init * in.kv_bytes_per_tok;
-        if (out.regime == VramRegime::TightHybrid && out.arch.allow_tight_chunk_2048 &&
+        if (out.regime == VramRegime::FullVram && out.arch.allow_full_vram_chunk_2048 &&
+            in.kv_q8 && in.vram_free_bytes >= full_vram_2048_need) {
+            out.chunk = 2048;
+        } else if (out.regime == VramRegime::TightHybrid && out.arch.allow_tight_chunk_2048 &&
             in.kv_q8 && !in.has_draft && in.vram_free_bytes > init_kv_bytes + ((size_t) 4 << 30)) {
             out.chunk = 2048;
         } else if (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_2048 &&

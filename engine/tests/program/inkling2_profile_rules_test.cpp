@@ -55,19 +55,27 @@ strata::inkling2::ProfileInput rtx4070_12g(int max_ctx, bool draft = false) {
 int main() {
     using namespace strata::inkling2;
 
-    // 1. V100 32GB @ 819,200 ctx (DSpark ON): must stay sm70 + full_vram with want_sp=7 (6 exact waves on 80 SMs) & d_hits=off!
+    // 1. V100 32GB @ 819,200 ctx (DSpark ON): measured real V100 (29.7 GiB free) promotes to chunk=2048 (+21-24% PP,
+    //    want_sp=4, ~558 MiB free after placement), while tighter headroom (29.1 GiB) falls back safely to chunk=1024 / want_sp=6!
     {
-        const auto in = v100_32g(819200, true);
+        auto in = v100_32g(819200, true);
+        in.vram_free_bytes = (size_t) (29.7 * (double) GiB);
         const auto p = resolve_inkling2_profile(in);
         std::printf("%s\n", format_profile_line(in, p).c_str());
         check(p.arch.id == ArchId::Sm70Volta, "V100 selects Sm70Volta arch");
         check(p.regime == VramRegime::FullVram, "V100 819K selects FullVram");
-        check(p.chunk == 1024, "V100 819K keeps chunk=1024");
+        check(p.chunk == 2048, "V100 819K measured 29.7 GiB promotes to chunk=2048");
         check(p.full_kv_init == 819200, "V100 819K allocates full 819K KV upfront");
-        check(p.want_sp == 6, "V100 819K uses exact want_sp=6 (best_sp=5 + 1 tail on 80 SMs)");
+        check(p.want_sp == 4, "V100 819K chunk=2048 uses want_sp=4");
         check(!p.use_d_hits, "V100 FullVram skips d_hits atomics");
         check(p.pp_stage_cnt_pref == 0, "V100 FullVram allocates no pp_stage");
         check(p.force_bf16_x_f16, "V100 enables force_bf16_x_f16");
+
+        const auto in_tight = v100_32g(819200, true);
+        const auto p_tight = resolve_inkling2_profile(in_tight);
+        check(p_tight.regime == VramRegime::FullVram, "V100 819K tight stays FullVram");
+        check(p_tight.chunk == 1024, "V100 819K tight falls back cleanly to chunk=1024");
+        check(p_tight.want_sp == 6, "V100 819K chunk=1024 uses exact want_sp=6 (best_sp=5 + 1 tail on 80 SMs)");
     }
 
     // 2. V100 32GB @ 1,048,576 ctx (1M, DSpark OFF): overflows FullVram -> drops cleanly to CoreResidentHybrid
