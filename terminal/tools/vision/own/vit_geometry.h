@@ -34,7 +34,13 @@ struct VitGeometry {
     bool gated_ffn = false;           // an ffn_gate tensor
     bool fused_qkv = true;            // attn_qkv (else attn_q / attn_k / attn_v)
     int patch_taps = 2;               // v.patch_embd.weight and .1 (the two temporal taps of the 3D patch embed, summed for a still image)
+    bool has_patch_bias = true;       // v.patch_embd.bias (false for inkling2v)
+    bool has_cls = false;             // v.class_embd + v.class_position_embd.weight (inkling2v)
+    bool has_layer_scale = false;     // v.blk.<i>.ls1.weight / ls2.weight (inkling2v)
     bool pre_ln = false;              // a v.pre_ln.* norm before the first layer
+    bool has_post_ln = true;          // v.post_ln.* norm after the last layer (false for inkling2v)
+    bool has_mm0_bias = true;         // bias on first projector linear (mm.0 or mm.1)
+    bool has_mm2_bias = true;         // bias on second projector linear (mm.2)
     int window_pattern = 0;           // clip.vision.n_wa_pattern (0: every layer attends globally)
     std::vector<int> deepstack;       // layer indices that feed an extra output (clip.vision.is_deepstack_layers)
     float rope_theta = 10000.0f;
@@ -43,8 +49,9 @@ struct VitGeometry {
     int min_tokens = 8;               // the image's token limits (Qwen's preprocessor_config; --min-tokens / --max-tokens override)
     int max_tokens = 4096;
     int merger_in = 0;                // width * merge^2
-    int merger_hidden = 0;            // mm.0's output width
+    int merger_hidden = 0;            // mm.0 / mm.1's output width
 
+    bool is_inkling2v() const { return projector == "inkling2v"; }
     // tokens a patch grid gives: (w / merge) * (h / merge) for a w x h patch grid
     int align() const { return patch * merge; }   // image sides are multiples of this
 };

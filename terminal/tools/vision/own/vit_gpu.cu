@@ -82,6 +82,7 @@ struct DevW {            // a weight matrix [rows = out][cols = in] on the devic
 
 struct DevLayer {
     float *ln1_w = nullptr, *ln1_b = nullptr, *ln2_w = nullptr, *ln2_b = nullptr, *qkv_b = nullptr, *o_b = nullptr, *up_b = nullptr, *down_b = nullptr;
+    float *ls1_w = nullptr, *ls2_w = nullptr;
     DevW qkv, o, up, down;
 };
 
@@ -138,6 +139,36 @@ __global__ void k_patch_post(float* __restrict__ x, const float* __restrict__ bi
         xr[i] += bias[i] + (a[i] * (1 - dx) * (1 - dy) + bb[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy);
 }
 
+// inkling2v: token 0 = cls_embd + cls_pos; tokens 1..pw*ph (row-major) += bilinear pos table (pixel_offset=0.5, no align_corners)
+__global__ void k_inkling2v_patch_pos(float* __restrict__ x, const float* __restrict__ cls_embd, const float* __restrict__ cls_pos,
+                                      const float* __restrict__ pos, int G, int pw, int ph, int D) {
+    const int t = blockIdx.x;
+    float* xr = x + (size_t) t * D;
+    if (t == 0) {
+        for (int i = threadIdx.x; i < D; i += blockDim.x) xr[i] = cls_embd[i] + cls_pos[i];
+        return;
+    }
+    const int p = t - 1, px = p % pw, py = p / pw;
+    if (pw == G && ph == G) {
+        const float* pr = pos + ((size_t) py * G + px) * D;
+        for (int i = threadIdx.x; i < D; i += blockDim.x) xr[i] += pr[i];
+        return;
+    }
+    const float sfx = (float) pw / (float) G, sfy = (float) ph / (float) G;
+    const float fy = ((float) py + 0.5f) / sfy - 0.5f;
+    const float fx = ((float) px + 0.5f) / sfx - 0.5f;
+    int y0 = (int) floorf(fy), x0 = (int) floorf(fx), y1 = y0 + 1, x1 = x0 + 1;
+    y0 = max(0, min(y0, G - 1)); y1 = max(0, min(y1, G - 1));
+    x0 = max(0, min(x0, G - 1)); x1 = max(0, min(x1, G - 1));
+    const float dy = fmaxf(0.0f, fminf(fy - (float) y0, 1.0f)), dx = fmaxf(0.0f, fminf(fx - (float) x0, 1.0f));
+    const float* a = pos + ((size_t) y0 * G + x0) * D;
+    const float* bb = pos + ((size_t) y0 * G + x1) * D;
+    const float* c = pos + ((size_t) y1 * G + x0) * D;
+    const float* d = pos + ((size_t) y1 * G + x1) * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x)
+        xr[i] += a[i] * (1 - dx) * (1 - dy) + bb[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy;
+}
+
 // out = LayerNorm(x) * w + b, into `kind`
 __global__ void k_layernorm(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b, float eps, int D, void* out, int kind) {
     const float* xr = x + (size_t) blockIdx.x * D;
@@ -169,6 +200,32 @@ __global__ void k_qkv_rope(const float* __restrict__ y, const float* __restrict_
         const float sc = part == 0 ? qscale : 1.0f;        // the attention's 1/sqrt(head size) goes into q: the scores are then smaller, and an F16 score keeps more digits
         dst[j] = f_to_f16bits((a * cs - c * sn) * sc);
         dst[j + half] = f_to_f16bits((a * sn + c * cs) * sc);
+    }
+    for (int e = threadIdx.x; e < D; e += blockDim.x) v[(size_t) t * D + e] = f_to_f16bits(yr[2 * D + e] + bias[2 * D + e]);
+}
+
+// inkling2v: 2D RoPE mode=0 (interleaved pairs (2j, 2j+1)); dims [0..hd/2) rotate with pos_x, [hd/2..hd) with pos_y.
+// CLS (t == 0) has (0, 0); row-major patches (t >= 1) have ((t-1)%pw + 1, (t-1)/pw + 1).
+__global__ void k_inkling2v_qkv_rope(const float* __restrict__ y, const float* __restrict__ bias, int row0, int pw, int heads, int hd, float theta_scale, float qscale,
+                                     uint16_t* __restrict__ q, uint16_t* __restrict__ k, uint16_t* __restrict__ v) {
+    const int t = row0 + blockIdx.x, D = heads * hd, half = hd / 2, quarter = hd / 4;
+    const int pos_x = (t == 0) ? 0 : (((t - 1) % pw) + 1);
+    const int pos_y = (t == 0) ? 0 : (((t - 1) / pw) + 1);
+    const float* yr = y + (size_t) blockIdx.x * 3 * D;
+    for (int i = threadIdx.x; i < 2 * heads * half; i += blockDim.x) {
+        const int part = i / (heads * half), rem = i % (heads * half), h = rem / half, j = rem % half;
+        const int base = part * D + h * hd;
+        const float a = yr[base + 2 * j] + bias[base + 2 * j];
+        const float c = yr[base + 2 * j + 1] + bias[base + 2 * j + 1];
+        const int jl = j < quarter ? j : (j - quarter);
+        const int coord = j < quarter ? pos_x : pos_y;
+        const float freq = powf(theta_scale, (float) jl);
+        float sn, cs;
+        sincosf((float) coord * freq, &sn, &cs);
+        uint16_t* dst = (part == 0 ? q : k) + (size_t) t * D + h * hd;
+        const float sc = part == 0 ? qscale : 1.0f;
+        dst[2 * j] = f_to_f16bits((a * cs - c * sn) * sc);
+        dst[2 * j + 1] = f_to_f16bits((a * sn + c * cs) * sc);
     }
     for (int e = threadIdx.x; e < D; e += blockDim.x) v[(size_t) t * D + e] = f_to_f16bits(yr[2 * D + e] + bias[2 * D + e]);
 }
@@ -402,13 +459,44 @@ __global__ void k_add_bias_res(float* __restrict__ x, const float* __restrict__ 
     for (int i = threadIdx.x; i < D; i += blockDim.x) x[base + i] += y[base + i] + bias[i];
 }
 
+// x[r] += (y[r] + bias) * ls  (inkling2v LayerScale)
+__global__ void k_add_bias_ls_res(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ bias, const float* __restrict__ ls, int D) {
+    const size_t base = (size_t) blockIdx.x * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) x[base + i] += (y[base + i] + bias[i]) * ls[i];
+}
+
 // out = gelu_tanh(y + bias) into `kind`
 __global__ void k_bias_gelu_cast(const float* __restrict__ y, const float* __restrict__ bias, int n, void* out, int kind) {
     const size_t base = (size_t) blockIdx.x * n;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const float x = y[base + i] + bias[i];
+        const float x = y[base + i] + (bias ? bias[i] : 0.0f);
         const float g = 0.5f * x * (1.0f + tanhf(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
         store_kind(out, base + i, g, kind);
+    }
+}
+
+// out = gelu_erf(y + bias) into `kind` (inkling2v FFN & projector)
+__global__ void k_bias_gelu_erf_cast(const float* __restrict__ y, const float* __restrict__ bias, int n, void* out, int kind) {
+    const size_t base = (size_t) blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float x = y[base + i] + (bias ? bias[i] : 0.0f);
+        const float g = 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
+        store_kind(out, base + i, g, kind);
+    }
+}
+
+// inkling2v: drop CLS (row 0) and gather 2x2 spatial patches for merged rows r0 .. r0+gridDim.x-1 into `kind` [rows][4*D]
+__global__ void k_inkling2v_merge_2x2_cast(const float* __restrict__ x, int r0, int pw, int nx, int D, void* out, int kind) {
+    const int r = blockIdx.x, m = r0 + r, my = m / nx, mx = m % nx;
+    const int s0 = 1 + (2 * my) * pw + (2 * mx);
+    const int s1 = 1 + (2 * my) * pw + (2 * mx + 1);
+    const int s2 = 1 + (2 * my + 1) * pw + (2 * mx);
+    const int s3 = 1 + (2 * my + 1) * pw + (2 * mx + 1);
+    const int src[4] = {s0, s1, s2, s3};
+    const size_t dst_base = (size_t) r * 4 * D;
+    for (int i = threadIdx.x; i < 4 * D; i += blockDim.x) {
+        const int sub = i / D, d = i % D;
+        store_kind(out, dst_base + i, x[(size_t) src[sub] * D + d], kind);
     }
 }
 
@@ -446,6 +534,7 @@ struct VitGpuImpl {
     size_t n_weight_allocs = 0;
 
     float *patch_w = nullptr, *patch_b = nullptr, *pos = nullptr, *post_w = nullptr, *post_b = nullptr, *mm0_b = nullptr, *mm2_b = nullptr;
+    float *cls_embd = nullptr, *cls_pos = nullptr, *pre_w = nullptr, *pre_b = nullptr;
     DevW mm0, mm2;
     std::vector<DevLayer> layers;
 
@@ -741,6 +830,66 @@ struct VitGpuImpl {
         }
         return true;
     }
+    bool upload_f32_cat3(float*& dst, const Gguf& gg, const std::string& n0, const std::string& n1, const std::string& n2, std::string& err) {
+        const std::string names[3] = {n0, n1, n2};
+        std::vector<float> h;
+        for (int k = 0; k < 3; ++k) {
+            const GgufTensorInfo* t = gg.tensor(names[k]);
+            if (!t) { err = "the mmproj file lacks the tensor " + names[k]; return false; }
+            const size_t off = h.size(), cnt = (size_t) t->nelem();
+            h.resize(off + cnt);
+            if (!gg.read_f32(*t, h.data() + off, err)) return false;
+        }
+        if (!alloc(dst, h.size(), err, true)) return false;
+        return cudaMemcpy(dst, h.data(), h.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess || (err = "GPU copy failed", false);
+    }
+    bool upload_matrix_cat3(DevW& w, const Gguf& gg, const std::string& n0, const std::string& n1, const std::string& n2, std::string& err) {
+        const std::string names[3] = {n0, n1, n2};
+        const GgufTensorInfo* ts[3] = {gg.tensor(n0), gg.tensor(n1), gg.tensor(n2)};
+        for (int k = 0; k < 3; ++k)
+            if (!ts[k] || ts[k]->ne.size() != 2) { err = "the mmproj file lacks the matrix " + names[k]; return false; }
+        w.cols = (int) ts[0]->ne[0];
+        w.rows = (int) (ts[0]->ne[1] + ts[1]->ne[1] + ts[2]->ne[1]);
+        const size_t n_part = (size_t) ts[0]->nelem();
+        const size_t n_tot = n_part * 3;
+        std::vector<unsigned char> raw;
+        const bool all_same = ts[0]->type == ts[1]->type && ts[0]->type == ts[2]->type && ts[1]->nelem() == ts[0]->nelem() && ts[2]->nelem() == ts[0]->nelem();
+        if (all_same && ts[0]->type == GT_BF16 && bf16_mode == BF16_TO_F16) {
+            raw.resize(n_tot * 2);
+            for (int k = 0; k < 3; ++k)
+                if (!gg.read_raw(*ts[k], raw.data() + k * n_part * 2, err)) return false;
+            Bf16F16Count c;
+            if (trace) c = bf16_count_f16((const uint16_t*) raw.data(), (long long) n_tot);
+            else c.overflow = bf16_count_beyond_f16((const uint16_t*) raw.data(), (long long) n_tot);
+            w.kind = bf16_matrix_fits_f16(c.overflow) ? K_HF : K_BF16;
+            f16_notes.push_back({n0 + "+k+v", w.kind, c, (long long) n_tot});
+        } else if (all_same && (ts[0]->type == GT_F16 || (ts[0]->type == GT_BF16 && bf16_mode != BF16_ROUNDED))) {
+            raw.resize(n_tot * 2);
+            for (int k = 0; k < 3; ++k)
+                if (!gg.read_raw(*ts[k], raw.data() + k * n_part * 2, err)) return false;
+            w.kind = ts[0]->type == GT_F16 ? K_F16 : K_BF16;
+        } else {
+            raw.resize(n_tot * 2);
+            w.kind = (all_same && ts[0]->type == GT_BF16 && bf16_mode == BF16_ROUNDED) ? K_BH : K_F16;
+            std::vector<float> f(n_part);
+            for (int k = 0; k < 3; ++k) {
+                if (!gg.read_f32(*ts[k], f.data(), err)) return false;
+                for (size_t i = 0; i < n_part; ++i) {
+                    const uint16_t u = host_f32_to_f16(f[i]);
+                    std::memcpy(&raw[(k * n_part + i) * 2], &u, 2);
+                }
+            }
+        }
+        uint16_t* dev = nullptr;
+        if (!alloc(dev, n_tot, err, true)) return false;
+        w.p = dev;
+        if (cudaMemcpy(w.p, raw.data(), n_tot * 2, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
+        if (w.kind == K_HF) {
+            k_bf16_to_f16<<<blocks_for(n_tot), 256>>>(dev, n_tot);
+            if (cudaGetLastError() != cudaSuccess) { err = "the BF16 to F16 conversion failed on the GPU"; return false; }
+        }
+        return true;
+    }
     bool trace = false;               // STRATA_TRACE: the per-matrix F16 counts
     static cudaDataType_t dtype(Kind k) { return k == K_F32 ? CUDA_R_32F : (k == K_F16 || k == K_BH || k == K_HF) ? CUDA_R_16F : CUDA_R_16BF; }
 
@@ -802,8 +951,9 @@ struct VitGpuImpl {
         const size_t R = std::min<size_t>(N, (size_t) kRows);
         // d_ctx holds, one after the other: the patch matrix, the attention context, and at the end the projector's output rows (d_out)
         const size_t ctx_elems = std::max({N * D, N * K0, (N / 4) * (size_t) g.out_dim});
+        const size_t a_elems = std::max<size_t>(R, 4) * D;
         bool ok = alloc(d_x, N * D, err, false) && alloc(d_ctx, ctx_elems, err, false) && alloc(d_y, R * std::max<size_t>(3 * D, F), err, false) &&
-                  alloc(d_a, R * D, err, false) && alloc(d_f16, R * F, err, false) &&
+                  alloc(d_a, a_elems, err, false) && alloc(d_f16, R * F, err, false) &&
                   alloc(d_q16, N * D, err, false) && alloc(d_k16, N * D, err, false) && alloc(d_v16, N * D, err, false);
 #if defined(STRATA_VIT_HIP)
         d_y16 = d_pv16 = nullptr;
@@ -953,19 +1103,46 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         if (!m.alloc(m.patch_w, w0.size(), err, true)) return false;
         if (cudaMemcpy(m.patch_w, w0.data(), w0.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
     }
-    if (!m.upload_f32(m.patch_b, gg, "v.patch_embd.bias", err) || !m.upload_f32(m.pos, gg, "v.position_embd.weight", err) ||
-        !m.upload_f32(m.post_w, gg, "v.post_ln.weight", err) || !m.upload_f32(m.post_b, gg, "v.post_ln.bias", err) ||
-        !m.upload_matrix(m.mm0, gg, "mm.0.weight", err) || !m.upload_f32(m.mm0_b, gg, "mm.0.bias", err) ||
-        !m.upload_matrix(m.mm2, gg, "mm.2.weight", err) || !m.upload_f32(m.mm2_b, gg, "mm.2.bias", err))
-        return false;
+    if (g.has_patch_bias && !m.upload_f32(m.patch_b, gg, "v.patch_embd.bias", err)) return false;
+    if (!m.upload_f32(m.pos, gg, "v.position_embd.weight", err)) return false;
+    if (g.has_cls) {
+        if (!m.upload_f32(m.cls_embd, gg, "v.class_embd", err) ||
+            !m.upload_f32(m.cls_pos, gg, "v.class_position_embd.weight", err))
+            return false;
+    }
+    if (g.pre_ln) {
+        if (!m.upload_f32(m.pre_w, gg, "v.pre_ln.weight", err) || !m.upload_f32(m.pre_b, gg, "v.pre_ln.bias", err))
+            return false;
+    }
+    if (g.has_post_ln) {
+        if (!m.upload_f32(m.post_w, gg, "v.post_ln.weight", err) || !m.upload_f32(m.post_b, gg, "v.post_ln.bias", err))
+            return false;
+    }
+    const std::string mm0_prefix = g.is_inkling2v() ? "mm.1" : "mm.0";
+    if (!m.upload_matrix(m.mm0, gg, mm0_prefix + ".weight", err)) return false;
+    if (g.has_mm0_bias && !m.upload_f32(m.mm0_b, gg, mm0_prefix + ".bias", err)) return false;
+    if (!m.upload_matrix(m.mm2, gg, "mm.2.weight", err)) return false;
+    if (g.has_mm2_bias && !m.upload_f32(m.mm2_b, gg, "mm.2.bias", err)) return false;
     m.layers.assign((size_t) g.layers, DevLayer{});
     for (int il = 0; il < g.layers; ++il) {
         DevLayer& L = m.layers[(size_t) il];
         const std::string p = "v.blk." + std::to_string(il) + ".";
         if (!m.upload_f32(L.ln1_w, gg, p + "ln1.weight", err) || !m.upload_f32(L.ln1_b, gg, p + "ln1.bias", err) ||
-            !m.upload_f32(L.ln2_w, gg, p + "ln2.weight", err) || !m.upload_f32(L.ln2_b, gg, p + "ln2.bias", err) ||
-            !m.upload_matrix(L.qkv, gg, p + "attn_qkv.weight", err) || !m.upload_f32(L.qkv_b, gg, p + "attn_qkv.bias", err) ||
-            !m.upload_matrix(L.o, gg, p + "attn_out.weight", err) || !m.upload_f32(L.o_b, gg, p + "attn_out.bias", err) ||
+            !m.upload_f32(L.ln2_w, gg, p + "ln2.weight", err) || !m.upload_f32(L.ln2_b, gg, p + "ln2.bias", err))
+            return false;
+        if (g.fused_qkv) {
+            if (!m.upload_matrix(L.qkv, gg, p + "attn_qkv.weight", err) || !m.upload_f32(L.qkv_b, gg, p + "attn_qkv.bias", err))
+                return false;
+        } else {
+            if (!m.upload_matrix_cat3(L.qkv, gg, p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight", err) ||
+                !m.upload_f32_cat3(L.qkv_b, gg, p + "attn_q.bias", p + "attn_k.bias", p + "attn_v.bias", err))
+                return false;
+        }
+        if (g.has_layer_scale) {
+            if (!m.upload_f32(L.ls1_w, gg, p + "ls1.weight", err) || !m.upload_f32(L.ls2_w, gg, p + "ls2.weight", err))
+                return false;
+        }
+        if (!m.upload_matrix(L.o, gg, p + "attn_out.weight", err) || !m.upload_f32(L.o_b, gg, p + "attn_out.bias", err) ||
             !m.upload_matrix(L.up, gg, p + "ffn_up.weight", err) || !m.upload_f32(L.up_b, gg, p + "ffn_up.bias", err) ||
             !m.upload_matrix(L.down, gg, p + "ffn_down.weight", err) || !m.upload_f32(L.down_b, gg, p + "ffn_down.bias", err))
             return false;
@@ -990,7 +1167,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (const char* e = std::getenv("STRATA_VIT_SCORES_LARGE")) { const long v = std::atol(e); if (v >= 1) m.kScoreElemsLarge = (size_t) v << 20; }
     if (const char* e = std::getenv("STRATA_VIT_NPAD")) { const int v = std::atoi(e); if (v >= 8 && v % 8 == 0) m.n_pad = v; }
     if (const char* e = std::getenv("STRATA_VIT_QALIGN")) { const int v = std::atoi(e); if (v >= 1) m.q_align = v; }
-    return m.size_buffers(std::max(max_patches, 16), err);
+    return m.size_buffers(std::max(max_patches + (g.has_cls ? 1 : 0), 16), err);
 }
 
 bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx, int& ny, std::string& err) {
@@ -999,8 +1176,10 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
     if (m.layers.empty()) { err = "the tower is not loaded"; return false; }
     if (img.w <= 0 || img.h <= 0 || img.w % g.align() != 0 || img.h % g.align() != 0) { err = "the picture size is not a multiple of patch * merge"; return false; }
     if (g.head_dim > 96 || g.head_dim % 4 != 0) { err = "this head size is not handled by the GPU attention kernel"; return false; }
+    const bool ink2 = g.is_inkling2v();
+    const bool use_gelu_erf = (g.act == ActKind::GeluErf);
     const int P = g.patch, D = g.width, H = g.heads, HD = g.head_dim, F = g.ffn;
-    const int pw = img.w / P, ph = img.h / P, N = pw * ph, nbx = pw / 2;
+    const int pw = img.w / P, ph = img.h / P, Np_img = pw * ph, N = Np_img + (g.has_cls ? 1 : 0), nbx = pw / 2;
     nx = pw / 2;
     ny = ph / 2;
     if (cudaSetDevice(m.device) != cudaSuccess) { err = "cannot use the GPU"; return false; }
@@ -1023,11 +1202,12 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         pmark = now;
     };
     const int K0 = 3 * P * P;
-    {   // the patch matrix [N][K0], channel-major per patch, tokens in 2x2-merge order, built on the host; it lives in the context buffer (free until the first attention)
-        std::vector<float> pm((size_t) N * K0);
+    {   // the patch matrix [Np_img][K0], channel-major per patch, row-major for inkling2v or 2x2-merge order for Qwen3-VL
+        std::vector<float> pm((size_t) Np_img * K0);
         const size_t plane = (size_t) img.w * img.h;
-        for (int t = 0; t < N; ++t) {
-            const int b = t / 4, r = t % 4, py = 2 * (b / nbx) + r / 2, px = 2 * (b % nbx) + r % 2;
+        for (int t = 0; t < Np_img; ++t) {
+            const int py = ink2 ? (t / pw) : (2 * ((t / 4) / nbx) + (t % 4) / 2);
+            const int px = ink2 ? (t % pw) : (2 * ((t / 4) % nbx) + (t % 4) % 2);
             float* a = &pm[(size_t) t * K0];
             for (int c = 0; c < 3; ++c)
                 for (int ky = 0; ky < P; ++ky)
@@ -1036,11 +1216,22 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         if (cudaMemcpy(m.d_ctx, pm.data(), pm.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
     }
     stage(0);
-    // patch embedding (float32 GEMM), then bias + position
+    // patch embedding (float32 GEMM), then bias + position (+ CLS & pre_ln for inkling2v)
     DevW pw_w;
     pw_w.p = m.patch_w; pw_w.kind = K_F32; pw_w.rows = D; pw_w.cols = K0;
-    if (!m.gemm(pw_w, m.d_ctx, N, m.d_x, CUDA_R_32F, err)) return false;
-    k_patch_post<<<N, 256>>>(m.d_x, m.patch_b, m.pos, g.pos_grid, pw, ph, nbx, D);
+    float* patch_dst = ink2 ? (m.d_x + D) : m.d_x;
+    if (!m.gemm(pw_w, m.d_ctx, Np_img, patch_dst, CUDA_R_32F, err)) return false;
+    if (ink2) {
+        k_inkling2v_patch_pos<<<N, 256>>>(m.d_x, m.cls_embd, m.cls_pos, m.pos, g.pos_grid, pw, ph, D);
+        if (g.pre_ln) {
+            k_layernorm<<<N, 256>>>(m.d_x, m.pre_w, m.pre_b, g.eps, D, m.d_ctx, (int) K_F32);
+            if (cudaMemcpy(m.d_x, m.d_ctx, (size_t) N * D * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) {
+                err = "GPU copy failed"; return false;
+            }
+        }
+    } else {
+        k_patch_post<<<N, 256>>>(m.d_x, m.patch_b, m.pos, g.pos_grid, pw, ph, nbx, D);
+    }
     if (!sync_err("patch embedding")) return false;
     stage(1);
 
@@ -1053,7 +1244,8 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
             const int rows = std::min(R, N - r0);
             k_layernorm<<<rows, 256>>>(m.d_x + (size_t) r0 * D, L.ln1_w, L.ln1_b, g.eps, D, a16, (int) L.qkv.kind);
             if (!m.gemm(L.qkv, a16, rows, m.d_y, VitGpuImpl::dtype(L.qkv.kind), err)) return false;
-            k_qkv_rope<<<rows, 256>>>(m.d_y, L.qkv_b, r0, nbx, H, HD, theta_scale, kq_scale, m.d_q16, m.d_k16, m.d_v16);
+            if (ink2) k_inkling2v_qkv_rope<<<rows, 256>>>(m.d_y, L.qkv_b, r0, pw, H, HD, theta_scale, kq_scale, m.d_q16, m.d_k16, m.d_v16);
+            else k_qkv_rope<<<rows, 256>>>(m.d_y, L.qkv_b, r0, nbx, H, HD, theta_scale, kq_scale, m.d_q16, m.d_k16, m.d_v16);
         }
         stage(2);
         // per chunk of queries: S = K Q^T (one batched product over the heads), softmax, O = V P (a head's matrix is a column slice of the [N][D] arrays:
@@ -1105,29 +1297,37 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
             const int rows = std::min(R, N - r0);
             k_cast<<<VitGpuImpl::blocks_for((size_t) rows * D), 256>>>(m.d_ctx + (size_t) r0 * D, (size_t) rows * D, a16, (int) L.o.kind);
             if (!m.gemm(L.o, a16, rows, m.d_y, VitGpuImpl::dtype(L.o.kind), err)) return false;
-            k_add_bias_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.o_b, D);
+            if (g.has_layer_scale) k_add_bias_ls_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.o_b, L.ls1_w, D);
+            else k_add_bias_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.o_b, D);
         }
         stage(4);
         for (int r0 = 0; r0 < N; r0 += R) {      // the feed-forward block in chunks: norm, up, GELU, down, added to the residual
             const int rows = std::min(R, N - r0);
             k_layernorm<<<rows, 256>>>(m.d_x + (size_t) r0 * D, L.ln2_w, L.ln2_b, g.eps, D, a16, (int) L.up.kind);
             if (!m.gemm(L.up, a16, rows, m.d_y, VitGpuImpl::dtype(L.up.kind), err)) return false;
-            k_bias_gelu_cast<<<rows, 256>>>(m.d_y, L.up_b, F, m.d_f16, (int) L.down.kind);
+            if (use_gelu_erf) k_bias_gelu_erf_cast<<<rows, 256>>>(m.d_y, L.up_b, F, m.d_f16, (int) L.down.kind);
+            else k_bias_gelu_cast<<<rows, 256>>>(m.d_y, L.up_b, F, m.d_f16, (int) L.down.kind);
             if (!m.gemm(L.down, m.d_f16, rows, m.d_y, VitGpuImpl::dtype(L.down.kind), err)) return false;
-            k_add_bias_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.down_b, D);
+            if (g.has_layer_scale) k_add_bias_ls_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.down_b, L.ls2_w, D);
+            else k_add_bias_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.down_b, D);
         }
         stage(5);
     }
     if (!sync_err("the layers")) return false;
-    // post norm (into the merger's input kind), then the merger on 4-patch rows, in chunks
-    const int M = N / 4, RM = std::max(1, R / 4);      // a chunk of RM merged rows is 4 * RM tokens: R rows of the 16-bit input
+    // projector / merger on 4-patch rows, in chunks
+    const int M = Np_img / 4, RM = std::max(1, R / 4);      // a chunk of RM merged rows is 4 * RM tokens: R rows of the 16-bit input
     for (int r0 = 0; r0 < M; r0 += RM) {
         const int rows = std::min(RM, M - r0);
-        k_layernorm<<<rows * 4, 256>>>(m.d_x + (size_t) r0 * 4 * D, m.post_w, m.post_b, g.eps, D, a16, (int) m.mm0.kind);
+        if (ink2) {
+            k_inkling2v_merge_2x2_cast<<<rows, 256>>>(m.d_x, r0, pw, nx, D, a16, (int) m.mm0.kind);
+        } else {
+            k_layernorm<<<rows * 4, 256>>>(m.d_x + (size_t) r0 * 4 * D, m.post_w, m.post_b, g.eps, D, a16, (int) m.mm0.kind);
+        }
         if (!m.gemm(m.mm0, a16, rows, m.d_y, VitGpuImpl::dtype(m.mm0.kind), err)) return false;
-        k_bias_gelu_cast<<<rows, 256>>>(m.d_y, m.mm0_b, g.merger_hidden, m.d_f16, (int) m.mm2.kind);
+        if (use_gelu_erf) k_bias_gelu_erf_cast<<<rows, 256>>>(m.d_y, m.mm0_b, g.merger_hidden, m.d_f16, (int) m.mm2.kind);
+        else k_bias_gelu_cast<<<rows, 256>>>(m.d_y, m.mm0_b, g.merger_hidden, m.d_f16, (int) m.mm2.kind);
         if (!m.gemm(m.mm2, m.d_f16, rows, m.d_out + (size_t) r0 * g.out_dim, VitGpuImpl::dtype(m.mm2.kind), err)) return false;
-        k_add_bias<<<rows, 256>>>(m.d_out + (size_t) r0 * g.out_dim, m.mm2_b, g.out_dim);
+        if (m.mm2_b) k_add_bias<<<rows, 256>>>(m.d_out + (size_t) r0 * g.out_dim, m.mm2_b, g.out_dim);
     }
     if (!sync_err("the projector")) return false;
     stage(6);

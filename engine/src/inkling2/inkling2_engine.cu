@@ -796,6 +796,9 @@ struct Engine {
     size_t eparts_bytes = 0;
     float *logits = nullptr;
     float* h_tok_buf = nullptr;      // pinned [tmax * N] FP32 for token embedding upload
+    uint8_t* h_is_img_pin = nullptr; // pinned [tmax] flag (1 = vision embedding, skip tok_embd_norm)
+    uint8_t* d_is_img = nullptr;     // device [tmax] flag for k_rms_norm_masked
+    size_t vram_reserve_bytes = 0;   // --vram-reserve-mib headroom (e.g. for GPU strata-vision)
     uint8_t* ckpt_pin = nullptr;     // reusable pinned staging buffer for fast SWA/conv checkpoint D2H
     size_t ckpt_pin_cap = 0;
     uint16_t* act_bf16 = nullptr;    // FP16 scratch [max(tmax*2*N, 16*4*N)]
@@ -955,6 +958,7 @@ struct Engine {
     // Prefix cache checkpoint (stores conv_hist + LIVE circular SWA KV window <= n_swa in host RAM; full-attn KV stays append-only on GPU)
     struct StateCheckpoint {
         std::vector<int32_t> tokens;
+        std::vector<uint64_t> img_sigs;
         std::unique_ptr<uint8_t[]> data;
         size_t data_bytes = 0;
         std::unique_ptr<uint8_t[]> dspark_data;
@@ -990,7 +994,8 @@ struct Engine {
 
     // Async checkpoint save: D2H into pre-allocated pinned staging (~3.6 ms), then background CPU copy into
     // uninitialized heap buffer while GPU immediately resumes the next prefill chunk / decode token!
-    void save_checkpoint_into(StateCheckpoint& cp, const std::vector<int32_t>& tokens) {
+    void save_checkpoint_into(StateCheckpoint& cp, const std::vector<int32_t>& tokens,
+                              const std::vector<uint64_t>& img_sigs = {}) {
         flush_ckpt_bg();
         const auto& hp = m->hp;
         const int cur_pos = (int) tokens.size();
@@ -1004,6 +1009,7 @@ struct Engine {
             else total += n * (size_t) hp.kv_dim * sizeof(__half) * 2;
         }
         cp.tokens = tokens;
+        cp.img_sigs = img_sigs;
         cp.swa_len = swa_len;
         cp.saved_pos = cur_pos;
         cp.data_bytes = total;
@@ -1176,6 +1182,8 @@ struct Engine {
         cudaFree(d_pen_toks); cudaFree(d_pen_cnts);
         cudaFree(d_miss); cudaFree(ecpu);
         cudaFreeHost(h_tok_buf);
+        cudaFreeHost(h_is_img_pin);
+        cudaFree(d_is_img);
         if (ckpt_pin) cudaFreeHost(ckpt_pin);
         if (h_topk_val_pin) cudaFreeHost(h_topk_val_pin);
         if (h_topk_idx_pin) cudaFreeHost(h_topk_idx_pin);
@@ -1345,6 +1353,8 @@ struct Engine {
         d_f32(&ewts, (size_t) max_ent);
 
         CK(cudaMallocHost(&h_tok_buf, (size_t) tmax * N * sizeof(float)));
+        CK(cudaMallocHost(&h_is_img_pin, (size_t) tmax * sizeof(uint8_t)));
+        CK(cudaMalloc(&d_is_img, (size_t) tmax * sizeof(uint8_t)));
         // Minimum sizing accommodates DSpark draft FFN down (block_n=8, K_in=4*N) and joint_proj even with small --chunk.
         const size_t act_elems = std::max<size_t>((size_t) tmax * 2 * (size_t) N, (size_t) 16 * 4 * (size_t) N);
         CK(cudaMalloc(&act_bf16, act_elems * sizeof(uint16_t)));
@@ -2982,7 +2992,9 @@ struct Engine {
     int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr,
                     bool all_row_logits = false, bool capture_dspark = false, int verify_k_save = 0,
                     std::vector<int32_t>* out_picks = nullptr, bool need_logits = true,
-                    bool defer_logits_d2h = false) {
+                    bool defer_logits_d2h = false,
+                    const float* img_embs = nullptr, size_t img_embs_n = 0, int32_t img_pad_id = -1,
+                    size_t* img_cursor = nullptr) {
         ensure_kv_cap((int) (pos + T));
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
@@ -2994,6 +3006,7 @@ struct Engine {
         const bool want_softcap = (copy_logits && hp.softcap > 0.0f);
         const bool want_argmax = !copy_logits || (out_picks != nullptr);
         const bool can_full_graph = (!hybrid && core_all_gpu && full_kv_cap == ctx && !prof && !prof_detail && !graph_oom &&
+                                     img_embs == nullptr &&
                                      T >= 1 && T <= 8 && T <= verify_max_t && compute_logits && rows == T &&
                                      h_tok_buf != nullptr && h_pos_pin != nullptr && h_pick_pin != nullptr &&
                                      (!copy_logits || defer_logits_d2h) &&
@@ -3026,10 +3039,32 @@ struct Engine {
         const bool save_conv_trace = (verify_k_save > 0 && d_conv_trace != nullptr);
         const size_t total_conv_floats = (size_t) hp.n_layer * layer_conv_floats;
 
-        // 1. Token embedding from host mmap + tok_embd_norm (multi-threaded for prefill chunks)
+        // 1. Token embedding from host mmap (+ injected vision embeddings) + masked tok_embd_norm
         if (prof) ++p_calls;
         const auto tp_e0 = Clock::now();
+        bool chunk_has_img = false;
+        std::vector<int64_t> img_slot;
         if (!can_full_graph) {
+            if (img_embs != nullptr && img_cursor != nullptr && img_pad_id >= 0) {
+                img_slot.assign((size_t) T, -1);
+                for (int t = 0; t < T; ++t) {
+                    if (tokens[t] == img_pad_id && *img_cursor < img_embs_n) {
+                        img_slot[(size_t) t] = (int64_t) (*img_cursor)++;
+                        h_is_img_pin[t] = 1;
+                        chunk_has_img = true;
+                    } else {
+                        h_is_img_pin[t] = 0;
+                    }
+                }
+            }
+            auto fill_row = [&](int t) {
+                if (chunk_has_img && img_slot[(size_t) t] >= 0) {
+                    std::memcpy(h_tok_buf + (size_t) t * N, img_embs + (size_t) img_slot[(size_t) t] * N,
+                                (size_t) N * sizeof(float));
+                } else {
+                    m->dequant_tok(tokens[t], h_tok_buf + (size_t) t * N);
+                }
+            };
             if (T >= 128) {
 #if defined(STRATA_INKLING2_CPU_POOL)
                 const bool unpinned_for_embd = host_pinned;
@@ -3048,22 +3083,23 @@ struct Engine {
                     const int t1 = std::min(T, t0 + per);
                     if (t0 >= t1) break;
                     ths.emplace_back([&, t0, t1]() {
-                        for (int t = t0; t < t1; ++t) m->dequant_tok(tokens[t], h_tok_buf + (size_t) t * N);
+                        for (int t = t0; t < t1; ++t) fill_row(t);
                     });
                 }
                 const int t1_0 = std::min(T, per);
-                for (int t = 0; t < t1_0; ++t) m->dequant_tok(tokens[t], h_tok_buf + (size_t) t * N);
+                for (int t = 0; t < t1_0; ++t) fill_row(t);
                 for (auto& th : ths) th.join();
 #if defined(STRATA_INKLING2_CPU_POOL)
                 if (unpinned_for_embd) pin_host_for_pool();
 #endif
             } else {
-                for (int t = 0; t < T; ++t) {
-                    m->dequant_tok(tokens[t], h_tok_buf + (size_t) t * N);
-                }
+                for (int t = 0; t < T; ++t) fill_row(t);
             }
         }
         CK(cudaMemcpyAsync(ffn_inp, h_tok_buf, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, st));
+        if (chunk_has_img) {
+            CK(cudaMemcpyAsync(d_is_img, h_is_img_pin, (size_t) T * sizeof(uint8_t), cudaMemcpyHostToDevice, st));
+        }
         const int32_t pos32 = (int32_t) pos;
         if (h_pos_pin) {
             if (!can_full_graph) *h_pos_pin = pos32;
@@ -3082,7 +3118,11 @@ struct Engine {
                     pos0_d, 1, 0, verify_k_save, 0);
             }
         }
-        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(ffn_inp, m->tok_embd_norm, cur, N, hp.rms_eps);
+        if (chunk_has_img) {
+            k_rms_norm_masked<<<(unsigned) T, kThreads, 0, st>>>(ffn_inp, m->tok_embd_norm, d_is_img, cur, N, hp.rms_eps);
+        } else {
+            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(ffn_inp, m->tok_embd_norm, cur, N, hp.rms_eps);
+        }
         if (prof) { CK(cudaStreamSynchronize(st)); p_embd_ms += ms_since(tp_e0); }
 
         std::vector<float*> norm_blocks;
@@ -4054,9 +4094,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     CK(cudaMemGetInfo(&fr, &tot));
     const bool core_res_hy = (E.profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
     // DSpark adds dflare_graph + markov_graphs + verify_core_graph; keep 288 MiB headroom when enabled.
-    const size_t reserve = core_res_hy
+    const size_t base_reserve = core_res_hy
         ? (E.verify_max_t > 1 ? ((size_t) 288 << 20) : ((size_t) 144 << 20))
         : ((size_t) 256 << 20);
+    const size_t reserve = base_reserve + E.vram_reserve_bytes;
     size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                     : (fr > reserve ? fr - reserve : 0);
 
@@ -4926,6 +4967,9 @@ int run(int argc, char** argv) {
     bool serve = false;
     bool bench = false;
     bool kv_q8 = true;
+    bool vision_enabled = false;
+    int vram_reserve_mib = 0;
+    int32_t img_pad_id = 200054;
     bool profile = false;
     bool profile_detail = false;
 
@@ -4950,6 +4994,9 @@ int run(int argc, char** argv) {
         else if (a == "--dump-logits") dump_logits_path = next_arg();
         else if (a == "--kv-f16") kv_q8 = false;
         else if (a == "--kv-q8") kv_q8 = true;
+        else if (a == "--vision") vision_enabled = true;
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::max(0, std::atoi(next_arg()));
+        else if (a == "--image-pad-id") img_pad_id = std::atoi(next_arg());
         else if (a == "--serve") serve = true;
         else if (a == "--bench") bench = true;
         else if (a == "--profile") profile = true;
@@ -4992,7 +5039,8 @@ int run(int argc, char** argv) {
         pin.cc_minor = strata::cc_minor_of(raw_min);
         pin.sm_count = sm_cnt;
         pin.vram_total_bytes = vtot;
-        pin.vram_free_bytes = vfree;
+        const size_t vram_res_b = (size_t) vram_reserve_mib << 20;
+        pin.vram_free_bytes = (vfree > vram_res_b) ? (vfree - vram_res_b) : 0;
         pin.max_ctx = max_ctx;
         pin.requested_chunk = chunk;
         pin.kv_q8 = kv_q8;
@@ -5022,6 +5070,7 @@ int run(int argc, char** argv) {
     std::fprintf(stderr, "strata-inkling2: %s\n", strata::inkling2::format_profile_line(pin, prof_cfg).c_str());
 
     Engine E;
+    E.vram_reserve_bytes = (size_t) vram_reserve_mib << 20;
     if (!E.init(m, max_ctx, chunk, kv_q8, err, dm && dm->has_quant_dense, dm ? (draft_max + 1) : 1, &prof_cfg)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
@@ -5074,18 +5123,65 @@ int run(int argc, char** argv) {
             q_cv.notify_one();
         });
 
-        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d dspark=%s draft_max=%d\n",
+        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d dspark=%s draft_max=%d vision=%s\n",
                     max_ctx, kv_q8 ? "int8" : "fp16", max_ctx,
                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
                     (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
-                    E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0);
+                    E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0,
+                    vision_enabled ? "on" : "off");
         E.prealloc_ckpt_pin();
         std::printf("READY %d stop\n", max_ctx);
         std::fflush(stdout);
 
+        auto fnv1a_bytes = [](const void* data, size_t n) -> uint64_t {
+            uint64_t h = 14695981039346656037ULL;
+            const auto* p = (const uint8_t*) data;
+            for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+            return h ? h : 1ULL;
+        };
+        auto read_sve1_file = [&](const std::string& path, int expected_embd,
+                                  std::vector<float>& out_embs,
+                                  std::vector<int>& rec_ntok,
+                                  std::vector<uint64_t>& rec_hashes,
+                                  std::string& rerr) -> bool {
+            out_embs.clear();
+            rec_ntok.clear();
+            rec_hashes.clear();
+            FILE* f = std::fopen(path.c_str(), "rb");
+            if (!f) { rerr = "cannot open embeddings file: " + path; return false; }
+            int32_t hdr[5];
+            while (true) {
+                const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+                if (got == 0 && std::feof(f)) break;
+                if (got != 5) { std::fclose(f); rerr = "truncated SVE1 header"; return false; }
+                if ((uint32_t) hdr[0] != 0x31455653u) { std::fclose(f); rerr = "bad SVE1 magic"; return false; }
+                const int n_tok = hdr[1], n_embd = hdr[4];
+                if (n_tok <= 0 || n_embd != expected_embd) {
+                    std::fclose(f);
+                    rerr = "SVE1 shape mismatch (n_tok=" + std::to_string(n_tok) +
+                           ", n_embd=" + std::to_string(n_embd) + ", expected=" + std::to_string(expected_embd) + ")";
+                    return false;
+                }
+                const size_t off = out_embs.size();
+                const size_t cnt = (size_t) n_tok * (size_t) n_embd;
+                out_embs.resize(off + cnt);
+                if (std::fread(out_embs.data() + off, sizeof(float), cnt, f) != cnt) {
+                    std::fclose(f);
+                    rerr = "truncated SVE1 float payload";
+                    return false;
+                }
+                rec_ntok.push_back(n_tok);
+                rec_hashes.push_back(fnv1a_bytes(out_embs.data() + off, cnt * sizeof(float)));
+            }
+            std::fclose(f);
+            if (rec_ntok.empty()) { rerr = "empty SVE1 embeddings file"; return false; }
+            return true;
+        };
+
         std::vector<float> lg;
         std::vector<int32_t> hist;
         std::vector<int32_t> live_tokens;
+        std::vector<uint64_t> live_img_sigs;
         std::deque<Engine::StateCheckpoint> snaps;
         constexpr size_t kMaxSnaps = 8;
         std::mt19937_64 rng(0x9e3779b97f4a7c15ULL);
@@ -5101,13 +5197,18 @@ int run(int argc, char** argv) {
                 q_lines.pop_front();
             }
             if (line == "QUIT" || line == "EXIT") { got_quit = true; break; }
-            if (line.rfind("GEN ", 0) == 0 || line == "GEN") {
+            const bool is_geni = (line.rfind("GENI ", 0) == 0);
+            const bool is_gen = (!is_geni && (line.rfind("GEN ", 0) == 0 || line == "GEN"));
+            if (is_gen || is_geni) {
                 stop_req.store(false, std::memory_order_release);
-                std::istringstream iss(line.size() > 4 ? line.substr(4) : "");
+                const size_t skip = is_geni ? 5 : (line.size() > 4 ? 4 : line.size());
+                std::istringstream iss(line.substr(skip));
                 int req_new = 0;
                 iss >> req_new;
                 SamplingParams smp;
                 std::vector<int32_t> prompt;
+                std::vector<std::string> pos_args;
+                std::vector<std::string> img_keys;
                 std::string tok;
                 while (iss >> tok) {
                     const size_t eq = tok.find('=');
@@ -5123,9 +5224,57 @@ int run(int argc, char** argv) {
                         else if (k == "penalty_present") smp.pres_pen = std::strtof(v.c_str(), nullptr);
                         else if (k == "penalty_last_n") smp.pen_last_n = std::atoi(v.c_str());
                         else if (k == "seed") smp.seed = (uint64_t) std::strtoull(v.c_str(), nullptr, 10);
+                        else if (k == "img_keys") {
+                            std::stringstream ks(v);
+                            std::string item;
+                            while (std::getline(ks, item, ',')) {
+                                if (!item.empty()) img_keys.push_back(item);
+                            }
+                        }
                         continue;
                     }
-                    for (int32_t id : parse_id_list(tok)) prompt.push_back(id);
+                    pos_args.push_back(tok);
+                }
+                std::vector<float> img_embs;
+                std::vector<uint64_t> prompt_img_sigs;
+                size_t img_embs_n = 0;
+                if (is_geni) {
+                    if (pos_args.size() < 2) {
+                        std::printf("ERR GENI requires embeddings path and token ids\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    std::vector<int> rec_ntok;
+                    std::vector<uint64_t> rec_hashes;
+                    std::string rerr;
+                    if (!read_sve1_file(pos_args[0], (int) m.hp.n_embd, img_embs, rec_ntok, rec_hashes, rerr)) {
+                        std::printf("ERR %s\n", rerr.c_str());
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    for (size_t ai = 1; ai < pos_args.size(); ++ai) {
+                        for (int32_t id : parse_id_list(pos_args[ai])) prompt.push_back(id);
+                    }
+                    const bool use_keys = (img_keys.size() == rec_ntok.size());
+                    for (size_t r = 0; r < rec_ntok.size(); ++r) {
+                        const uint64_t sig = use_keys
+                            ? fnv1a_bytes(img_keys[r].data(), img_keys[r].size())
+                            : rec_hashes[r];
+                        prompt_img_sigs.insert(prompt_img_sigs.end(), (size_t) rec_ntok[r], sig);
+                    }
+                    img_embs_n = prompt_img_sigs.size();
+                    size_t n_pads = 0;
+                    for (int32_t id : prompt) if (id == img_pad_id) ++n_pads;
+                    if (n_pads != img_embs_n) {
+                        std::printf("ERR image token count mismatch: prompt has %zu pad tokens (id=%d), embeddings has %zu\n",
+                                    n_pads, (int) img_pad_id, img_embs_n);
+                        std::fflush(stdout);
+                        continue;
+                    }
+                } else {
+                    for (const auto& pa : pos_args) {
+                        for (int32_t id : parse_id_list(pa)) prompt.push_back(id);
+                    }
                 }
                 if (smp.seed > 0) rng.seed(smp.seed);
                 if (prompt.empty()) {
@@ -5139,11 +5288,21 @@ int run(int argc, char** argv) {
                     continue;
                 }
 
-                // Prefix / KV cache reuse along live_tokens & saved SWA/conv checkpoints
+                // Prefix / KV cache reuse along live_tokens & saved SWA/conv checkpoints (image-signature aware)
                 const size_t max_possible = prompt.size() - 1;
                 size_t lcp_live = 0;
+                size_t pad_seen = 0;
                 const size_t lim_live = std::min(live_tokens.size(), max_possible);
-                while (lcp_live < lim_live && live_tokens[lcp_live] == prompt[lcp_live]) ++lcp_live;
+                while (lcp_live < lim_live && live_tokens[lcp_live] == prompt[lcp_live]) {
+                    if (prompt[lcp_live] == img_pad_id) {
+                        if (pad_seen >= live_img_sigs.size() || pad_seen >= prompt_img_sigs.size() ||
+                            live_img_sigs[pad_seen] != prompt_img_sigs[pad_seen]) {
+                            break;
+                        }
+                        ++pad_seen;
+                    }
+                    ++lcp_live;
+                }
 
                 size_t reuse = 0;
                 if (lcp_live == live_tokens.size()) {
@@ -5152,8 +5311,11 @@ int run(int argc, char** argv) {
                     int best_idx = -1;
                     for (int si = (int) snaps.size() - 1; si >= 0; --si) {
                         const auto& stoks = snaps[(size_t) si].tokens;
+                        const auto& ssigs = snaps[(size_t) si].img_sigs;
                         if (stoks.size() <= lcp_live &&
-                            std::equal(stoks.begin(), stoks.end(), prompt.begin())) {
+                            std::equal(stoks.begin(), stoks.end(), prompt.begin()) &&
+                            ssigs.size() <= prompt_img_sigs.size() &&
+                            std::equal(ssigs.begin(), ssigs.end(), prompt_img_sigs.begin())) {
                             best_idx = si;
                             break;
                         }
@@ -5161,18 +5323,27 @@ int run(int argc, char** argv) {
                     if (best_idx >= 0) {
                         E.restore_checkpoint(snaps[(size_t) best_idx]);
                         live_tokens = snaps[(size_t) best_idx].tokens;
+                        live_img_sigs = snaps[(size_t) best_idx].img_sigs;
                         snaps.resize((size_t) best_idx + 1);
                         reuse = live_tokens.size();
                     } else {
                         E.flush_ckpt_bg();
                         E.reset_state();
                         live_tokens.clear();
+                        live_img_sigs.clear();
                         snaps.clear();
                         reuse = 0;
                     }
                 }
                 std::printf("RESUME %zu\n", reuse);
                 std::fflush(stdout);
+
+                size_t img_cursor = 0;
+                if (is_geni) {
+                    for (size_t i = 0; i < reuse; ++i) {
+                        if (prompt[i] == img_pad_id) ++img_cursor;
+                    }
+                }
 
                 const auto t_pp0 = Clock::now();
                 E.hy_gpu = 0;
@@ -5187,9 +5358,12 @@ int run(int argc, char** argv) {
                     const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
                     const bool is_last = (off + (size_t) tc == prompt.size());
                     const int pos_pre = (int) E.pos;
+                    const size_t img_cur_pre = img_cursor;
                     next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on,
                                          (is_last && use_gpu_topk_pp) ? nullptr : &lg, false, dspark != nullptr, 0, nullptr,
-                                         is_last, is_last && use_gpu_topk_pp);
+                                         is_last, is_last && use_gpu_topk_pp,
+                                         is_geni ? img_embs.data() : nullptr, img_embs_n,
+                                         is_geni ? img_pad_id : -1, is_geni ? &img_cursor : nullptr);
                     if (is_last && use_gpu_topk_pp) {
                         std::vector<SamplingDist> d0;
                         build_sampling_dists_gpu(E, 1, hist, nullptr, 0, smp, d0);
@@ -5197,6 +5371,11 @@ int run(int argc, char** argv) {
                     }
                     if (dspark) dspark->inject(E, pos_pre, tc);
                     live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
+                    if (is_geni && img_cursor > img_cur_pre) {
+                        live_img_sigs.insert(live_img_sigs.end(),
+                                             prompt_img_sigs.begin() + (ptrdiff_t) img_cur_pre,
+                                             prompt_img_sigs.begin() + (ptrdiff_t) img_cursor);
+                    }
                     if (E.hybrid) {
                         if (E.rebal_burst > 0) { E.rebalance(192, 16); --E.rebal_burst; }
                         else if ((++E.pp_chunk_cnt & 3) == 0) E.rebalance(16, 2);
@@ -5212,7 +5391,7 @@ int run(int argc, char** argv) {
                             E.flush_ckpt_bg();
                             if (snaps.size() >= kMaxSnaps) snaps.pop_front();
                             snaps.emplace_back();
-                            E.save_checkpoint_into(snaps.back(), live_tokens);
+                            E.save_checkpoint_into(snaps.back(), live_tokens, live_img_sigs);
                         }
                     }
                 }
@@ -5228,7 +5407,7 @@ int run(int argc, char** argv) {
                     E.flush_ckpt_bg();
                     if (snaps.size() >= kMaxSnaps) snaps.pop_front();
                     snaps.emplace_back();
-                    E.save_checkpoint_into(snaps.back(), live_tokens);
+                    E.save_checkpoint_into(snaps.back(), live_tokens, live_img_sigs);
                 };
 
                 const auto t_tg0 = Clock::now();

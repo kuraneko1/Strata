@@ -40,7 +40,11 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
     if (!gg.get_str("general.architecture", arch) || arch != "clip") { err = "not an mmproj file (general.architecture is not clip)"; return false; }
     bool has_v = false;
     if (!gg.get_bool("clip.has_vision_encoder", has_v) || !has_v) { err = "the mmproj file has no vision encoder"; return false; }
-    if (!gg.get_str("clip.projector_type", g.projector) || g.projector.empty()) { err = "the mmproj file names no projector type"; return false; }
+    if ((!gg.get_str("clip.projector_type", g.projector) || g.projector.empty()) &&
+        (!gg.get_str("clip.vision.projector_type", g.projector) || g.projector.empty())) {
+        err = "the mmproj file names no projector type";
+        return false;
+    }
     if (!need_u32(gg, "clip.vision.block_count", g.layers, err) || !need_u32(gg, "clip.vision.embedding_length", g.width, err) ||
         !need_u32(gg, "clip.vision.attention.head_count", g.heads, err) || !need_u32(gg, "clip.vision.feed_forward_length", g.ffn, err) ||
         !need_u32(gg, "clip.vision.patch_size", g.patch, err) || !need_u32(gg, "clip.vision.projection_dim", g.out_dim, err))
@@ -59,14 +63,24 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
     bool use_gelu = false, use_silu = false;
     gg.get_bool("clip.use_gelu", use_gelu);
     gg.get_bool("clip.use_silu", use_silu);
-    g.act = use_gelu ? ActKind::GeluTanh : use_silu ? ActKind::Silu : ActKind::GeluQuick;   // llama.cpp's own default when neither is set
+    g.act = g.is_inkling2v() ? ActKind::GeluErf
+          : use_gelu ? ActKind::GeluTanh : use_silu ? ActKind::Silu : ActKind::GeluQuick;   // llama.cpp's own default when neither is set
     g.norm = g.projector == "qwen2.5vl_merger" ? NormKind::RMSNorm : NormKind::LayerNorm;
 
     // the layer layout, from which tensors exist
     g.fused_qkv = gg.tensor(blk(0, "attn_qkv", "weight")) != nullptr;
     g.gated_ffn = gg.tensor(blk(0, "ffn_gate", "weight")) != nullptr;
     g.patch_taps = gg.tensor("v.patch_embd.weight.1") != nullptr ? 2 : 1;
+    g.has_patch_bias = gg.tensor("v.patch_embd.bias") != nullptr;
+    g.has_cls = gg.tensor("v.class_embd") != nullptr;
+    g.has_layer_scale = gg.tensor(blk(0, "ls1", "weight")) != nullptr;
     g.pre_ln = gg.tensor("v.pre_ln.weight") != nullptr;
+    g.has_post_ln = gg.tensor("v.post_ln.weight") != nullptr;
+    if (g.is_inkling2v()) {
+        g.min_tokens = 1;
+        g.max_tokens = 4096;
+        g.rope_theta = 10000.0f;
+    }
     std::vector<int64_t> ds;
     if (gg.get_int_array("clip.vision.is_deepstack_layers", ds))
         for (size_t i = 0; i < ds.size(); ++i) if (ds[i]) g.deepstack.push_back((int) i);
@@ -76,8 +90,13 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
     }
 
     const int64_t W = g.width, F = g.ffn;
-    if (!shape_is(gg, "v.patch_embd.weight", {g.patch, g.patch, 3, W}, err) || !shape_is(gg, "v.patch_embd.bias", {W}, err)) return false;
+    if (!shape_is(gg, "v.patch_embd.weight", {g.patch, g.patch, 3, W}, err)) return false;
+    if (g.has_patch_bias && !shape_is(gg, "v.patch_embd.bias", {W}, err)) return false;
     if (g.patch_taps == 2 && !shape_is(gg, "v.patch_embd.weight.1", {g.patch, g.patch, 3, W}, err)) return false;
+    if (g.has_cls) {
+        if (!shape_is(gg, "v.class_embd", {W}, err) || !shape_is(gg, "v.class_position_embd.weight", {W}, err)) return false;
+    }
+    if (g.pre_ln && (!shape_is(gg, "v.pre_ln.weight", {W}, err) || !shape_is(gg, "v.pre_ln.bias", {W}, err))) return false;
     const GgufTensorInfo* pos = gg.tensor("v.position_embd.weight");
     if (!pos || pos->ne.size() != 2 || pos->ne[0] != W) { err = "the vision projector's position table is missing or not [width, rows]"; return false; }
     g.pos_grid = (int) std::lround(std::sqrt((double) pos->ne[1]));
@@ -89,25 +108,51 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
             if (!shape_is(gg, blk(il, "attn_qkv", "weight"), {W, 3 * W}, err) || !shape_is(gg, blk(il, "attn_qkv", "bias"), {3 * W}, err)) return false;
         } else {
             for (const char* n : {"attn_q", "attn_k", "attn_v"})
-                if (!shape_is(gg, blk(il, n, "weight"), {W, W}, err)) return false;
+                if (!shape_is(gg, blk(il, n, "weight"), {W, W}, err) || !shape_is(gg, blk(il, n, "bias"), {W}, err)) return false;
         }
         if (!shape_is(gg, blk(il, "attn_out", "weight"), {W, W}, err) || !shape_is(gg, blk(il, "attn_out", "bias"), {W}, err)) return false;
         if (!shape_is(gg, blk(il, "ffn_up", "weight"), {W, F}, err) || !shape_is(gg, blk(il, "ffn_up", "bias"), {F}, err)) return false;
         if (!shape_is(gg, blk(il, "ffn_down", "weight"), {F, W}, err) || !shape_is(gg, blk(il, "ffn_down", "bias"), {W}, err)) return false;
         if (g.gated_ffn && !shape_is(gg, blk(il, "ffn_gate", "weight"), {W, F}, err)) return false;
+        if (g.has_layer_scale) {
+            if (!shape_is(gg, blk(il, "ls1", "weight"), {W}, err) || !shape_is(gg, blk(il, "ls2", "weight"), {W}, err)) return false;
+        }
     }
-    if (!shape_is(gg, "v.post_ln.weight", {W}, err) || !shape_is(gg, "v.post_ln.bias", {W}, err)) return false;
+    if (g.has_post_ln && (!shape_is(gg, "v.post_ln.weight", {W}, err) || !shape_is(gg, "v.post_ln.bias", {W}, err))) return false;
     g.merger_in = (int) (W * g.merge * g.merge);
-    const GgufTensorInfo* m0 = gg.tensor("mm.0.weight");
-    if (!m0 || m0->ne.size() != 2 || m0->ne[0] != g.merger_in) { err = "the vision projector's mm.0.weight is missing or not [width * merge^2, hidden]"; return false; }
-    g.merger_hidden = (int) m0->ne[1];
-    if (!shape_is(gg, "mm.0.bias", {g.merger_hidden}, err) || !shape_is(gg, "mm.2.weight", {g.merger_hidden, g.out_dim}, err) ||
-        !shape_is(gg, "mm.2.bias", {g.out_dim}, err))
-        return false;
+    if (g.is_inkling2v()) {
+        const GgufTensorInfo* m1 = gg.tensor("mm.1.weight");
+        if (!m1 || m1->ne.size() != 2 || m1->ne[0] != g.merger_in) { err = "the vision projector's mm.1.weight is missing or not [width * merge^2, hidden]"; return false; }
+        g.merger_hidden = (int) m1->ne[1];
+        g.has_mm0_bias = gg.tensor("mm.1.bias") != nullptr;
+        g.has_mm2_bias = gg.tensor("mm.2.bias") != nullptr;
+        if (g.has_mm0_bias && !shape_is(gg, "mm.1.bias", {g.merger_hidden}, err)) return false;
+        if (!shape_is(gg, "mm.2.weight", {g.merger_hidden, g.out_dim}, err)) return false;
+        if (g.has_mm2_bias && !shape_is(gg, "mm.2.bias", {g.out_dim}, err)) return false;
+    } else {
+        const GgufTensorInfo* m0 = gg.tensor("mm.0.weight");
+        if (!m0 || m0->ne.size() != 2 || m0->ne[0] != g.merger_in) { err = "the vision projector's mm.0.weight is missing or not [width * merge^2, hidden]"; return false; }
+        g.merger_hidden = (int) m0->ne[1];
+        g.has_mm0_bias = true;
+        g.has_mm2_bias = true;
+        if (!shape_is(gg, "mm.0.bias", {g.merger_hidden}, err) || !shape_is(gg, "mm.2.weight", {g.merger_hidden, g.out_dim}, err) ||
+            !shape_is(gg, "mm.2.bias", {g.out_dim}, err))
+            return false;
+    }
     return true;
 }
 
 bool vit_geometry_supported(const VitGeometry& g, std::string& why) {
+    if (g.is_inkling2v()) {
+        if (g.norm != NormKind::LayerNorm) { why = "RMS norm"; return false; }
+        if (g.act != ActKind::GeluErf) { why = "unexpected activation for inkling2v"; return false; }
+        if (g.gated_ffn) { why = "a gated FFN"; return false; }
+        if (g.fused_qkv) { why = "fused qkv not expected for inkling2v"; return false; }
+        if (!g.has_cls || !g.pre_ln || !g.has_layer_scale) { why = "missing cls, pre_ln or layer_scale"; return false; }
+        if (g.head_dim % 4 != 0) { why = "head size not a multiple of 4"; return false; }
+        if (g.merge != 2) { why = "a merge size other than 2"; return false; }
+        return true;
+    }
     if (g.projector != "qwen3vl_merger") { why = "projector type " + g.projector + " is not one of this tower's families"; return false; }
     if (g.norm != NormKind::LayerNorm) { why = "RMS norm"; return false; }
     if (g.act != ActKind::GeluTanh) { why = "an activation other than the tanh GELU"; return false; }

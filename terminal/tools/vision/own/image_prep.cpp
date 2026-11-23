@@ -203,14 +203,67 @@ void resize_pad_ceil(const ImageU8& src, ImageU8& dst, Size2 target) {
 }
 
 Size2 prepared_size(int w, int h, const VitGeometry& g, int min_tokens, int max_tokens) {
-    const int patch_area = g.patch * g.patch * g.merge * g.merge;
+    const int align = g.align();
+    const int patch_area = align * align;
+    if (g.is_inkling2v()) {
+        const int64_t max_px = (int64_t) (max_tokens > 0 ? max_tokens : g.max_tokens) * patch_area;
+        const int aw = ((w + align - 1) / align) * align;
+        const int ah = ((h + align - 1) / align) * align;
+        if (max_px > 0 && (int64_t) aw * ah > max_px) {
+            return smart_resize(w, h, align, 0, (int) std::min<int64_t>(max_px, 0x7FFFFFFFLL));
+        }
+        return {aw, ah};
+    }
     const int min_px = (min_tokens > 0 ? min_tokens : g.min_tokens) * patch_area;
     const int max_px = (max_tokens > 0 ? max_tokens : g.max_tokens) * patch_area;
-    return smart_resize(w, h, g.align(), min_px, max_px);
+    return smart_resize(w, h, align, min_px, max_px);
 }
 
 bool prepare_image(const ImageU8& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err, ImageU8* resized) {
     if (src.w <= 0 || src.h <= 0 || src.rgb.size() != (size_t) src.w * src.h * 3) { err = "the picture is empty"; return false; }
+    if (g.is_inkling2v()) {
+        // Exact port of llama.cpp mtmd_image_preprocessor_inkling2v::preprocess:
+        // do not resize unless ALIGN(w,align)*ALIGN(h,align) > max_pixels; pad right/bottom with -1.0f;
+        // normalize ALL pixels (including -1.0f padding) by (p - mean*255) / (std*255).
+        const int align = g.align();
+        const int64_t max_px = (int64_t) (max_tokens > 0 ? max_tokens : g.max_tokens) * align * align;
+        const int aw0 = ((src.w + align - 1) / align) * align;
+        const int ah0 = ((src.h + align - 1) / align) * align;
+        ImageU8 r_buf;
+        const ImageU8* cur = &src;
+        if (max_px > 0 && (int64_t) aw0 * ah0 > max_px) {
+            const Size2 sz = smart_resize(src.w, src.h, align, 0, (int) std::min<int64_t>(max_px, 0x7FFFFFFFLL));
+            if (sz.w <= 0 || sz.h <= 0) { err = "the picture has no usable size"; return false; }
+            resize_bicubic(src, r_buf, sz.w, sz.h);
+            cur = &r_buf;
+        }
+        const int width = ((cur->w + align - 1) / align) * align;
+        const int height = ((cur->h + align - 1) / align) * align;
+        out.w = width;
+        out.h = height;
+        const size_t plane = (size_t) width * height;
+        out.chw.resize(3 * plane);
+        float mean255[3], inv_std255[3], pad_val[3];
+        for (int c = 0; c < 3; ++c) {
+            mean255[c] = g.mean[c] * 255.0f;
+            inv_std255[c] = 1.0f / (g.stdv[c] * 255.0f);
+            pad_val[c] = (-1.0f - mean255[c]) * inv_std255[c];
+        }
+        for (int c = 0; c < 3; ++c) {
+            std::fill_n(&out.chw[c * plane], plane, pad_val[c]);
+        }
+        for (int y = 0; y < cur->h; ++y) {
+            const uint8_t* srow = &cur->rgb[(size_t) y * cur->w * 3];
+            const size_t dst_row = (size_t) y * width;
+            for (int x = 0; x < cur->w; ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    out.chw[c * plane + dst_row + x] = ((float) srow[x * 3 + c] - mean255[c]) * inv_std255[c];
+                }
+            }
+        }
+        if (resized) *resized = *cur;
+        return true;
+    }
     const Size2 t = prepared_size(src.w, src.h, g, min_tokens, max_tokens);
     if (t.w <= 0 || t.h <= 0) { err = "the picture has no usable size"; return false; }
     ImageU8 r;

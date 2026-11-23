@@ -261,7 +261,7 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # item; the same strings in a message's text (an agent reading chat_template.jinja, a tool result quoting it) became
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
-               "<|video_pad|>": "\U000F0E06"}
+               "<|video_pad|>": "\U000F0E06", "<|content_image|>": "\U000F0E0B", "<|unused_200054|>": "\U000F0E0C"}
 # #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
 # (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
 # message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.

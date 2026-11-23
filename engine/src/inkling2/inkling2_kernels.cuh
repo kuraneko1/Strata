@@ -212,6 +212,59 @@ __global__ void k_rms_norm(const float* __restrict__ x, const float* __restrict_
     }
 }
 
+/// Masked RMSNorm: applies token_embd_norm ONLY when !is_img[t]; passes image embeddings straight through.
+__global__ void k_rms_norm_masked(const float* __restrict__ x, const float* __restrict__ w,
+                                  const uint8_t* __restrict__ is_img, float* __restrict__ y,
+                                  int n, float eps) {
+    __shared__ float sh[32];
+    const int t = blockIdx.x;
+    const float* xr = x + (size_t) t * n;
+    float* yr = y + (size_t) t * n;
+    if (is_img && is_img[t]) {
+        if ((n & 3) == 0) {
+            const int n4 = n >> 2;
+            const float4* x4 = (const float4*) xr;
+            float4* y4 = (float4*) yr;
+            for (int i = threadIdx.x; i < n4; i += blockDim.x) y4[i] = x4[i];
+        } else {
+            for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i];
+        }
+        return;
+    }
+    float s = 0.0f;
+    if ((n & 3) == 0) {
+        const int n4 = n >> 2;
+        const float4* x4 = (const float4*) xr;
+        float4* y4 = (float4*) yr;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 v = x4[i];
+            s += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        s = block_sum(s, sh);
+        const float r = rsqrtf(s / (float) n + eps);
+        const float4* w4 = w ? (const float4*) w : nullptr;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 v = x4[i];
+            if (w4) {
+                const float4 ww = w4[i];
+                y4[i] = make_float4(v.x * r * ww.x, v.y * r * ww.y, v.z * r * ww.z, v.w * r * ww.w);
+            } else {
+                y4[i] = make_float4(v.x * r, v.y * r, v.z * r, v.w * r);
+            }
+        }
+        return;
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        s += v * v;
+    }
+    s = block_sum(s, sh);
+    const float r = rsqrtf(s / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        yr[i] = xr[i] * r * (w ? w[i] : 1.0f);
+    }
+}
+
 /// Normalize 3 independent vectors (q, k, v) with shared weight w in a single grid(3, T) launch.
 __global__ void k_rms_norm_3(float* __restrict__ q, float* __restrict__ k, float* __restrict__ v,
                              const float* __restrict__ w, int n, float eps) {

@@ -107,11 +107,19 @@ inline float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + std::tanh(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
 }
 
-void gelu_inplace(float* x, size_t n, int nth) {
+inline float gelu_erf(float x) {
+    return 0.5f * x * (1.0f + std::erff(x * 0.70710678118654752440f));
+}
+
+void gelu_inplace(float* x, size_t n, int nth, bool use_erf = false) {
     const int blocks = (int) ((n + 4095) / 4096);
     parallel_for(blocks, nth, [&](int bi) {
         const size_t i0 = (size_t) bi * 4096, i1 = std::min(n, i0 + 4096);
-        for (size_t i = i0; i < i1; ++i) x[i] = gelu_tanh(x[i]);
+        if (use_erf) {
+            for (size_t i = i0; i < i1; ++i) x[i] = gelu_erf(x[i]);
+        } else {
+            for (size_t i = i0; i < i1; ++i) x[i] = gelu_tanh(x[i]);
+        }
     });
 }
 
@@ -189,14 +197,28 @@ bool VitRef::load(const Gguf& gg, const VitGeometry& g, std::string& err) {
         for (size_t i = 0; i < w0.size(); ++i) w0[i] += w1[i];
     }
     patch_w_ = std::move(w0);
-    if (!read_t(gg, "v.patch_embd.bias", patch_b_, err) || !read_t(gg, "v.position_embd.weight", pos_, err) ||
-        !read_t(gg, "v.post_ln.weight", post_w_, err) || !read_t(gg, "v.post_ln.bias", post_b_, err) ||
-        !read_t(gg, "mm.0.weight", mm0_w_, err) || !read_t(gg, "mm.0.bias", mm0_b_, err) ||
-        !read_t(gg, "mm.2.weight", mm2_w_, err) || !read_t(gg, "mm.2.bias", mm2_b_, err))
-        return false;
+    if (g.has_patch_bias) {
+        if (!read_t(gg, "v.patch_embd.bias", patch_b_, err)) return false;
+    } else {
+        patch_b_.clear();
+    }
+    if (g.has_cls) {
+        if (!read_t(gg, "v.class_embd", cls_embd_, err) || !read_t(gg, "v.class_position_embd.weight", cls_pos_, err)) return false;
+    }
+    if (g.pre_ln) {
+        if (!read_t(gg, "v.pre_ln.weight", pre_w_, err) || !read_t(gg, "v.pre_ln.bias", pre_b_, err)) return false;
+    }
+    if (!read_t(gg, "v.position_embd.weight", pos_, err)) return false;
+    if (g.has_post_ln) {
+        if (!read_t(gg, "v.post_ln.weight", post_w_, err) || !read_t(gg, "v.post_ln.bias", post_b_, err)) return false;
+    }
+    const std::string mm0_name = g.is_inkling2v() ? "mm.1" : "mm.0";
+    if (!read_t(gg, mm0_name + ".weight", mm0_w_, err) || !read_t(gg, "mm.2.weight", mm2_w_, err)) return false;
+    if (g.has_mm0_bias) { if (!read_t(gg, mm0_name + ".bias", mm0_b_, err)) return false; } else mm0_b_.clear();
+    if (g.has_mm2_bias) { if (!read_t(gg, "mm.2.bias", mm2_b_, err)) return false; } else mm2_b_.clear();
     act_round_ = 0;
     if (const char* e = std::getenv("STRATA_VIT_REF_ROUND"); e && std::atoi(e) != 0) {
-        const GgufTensorInfo* t = gg.tensor("v.blk.0.attn_qkv.weight");
+        const GgufTensorInfo* t = gg.tensor(g.fused_qkv ? "v.blk.0.attn_qkv.weight" : "v.blk.0.attn_q.weight");
         act_round_ = t && t->type == GT_BF16 ? 1 : t && t->type == GT_F16 ? 2 : 0;
     }
     layers_.assign((size_t) g.layers, Layer{});
@@ -204,12 +226,31 @@ bool VitRef::load(const Gguf& gg, const VitGeometry& g, std::string& err) {
         Layer& L = layers_[(size_t) il];
         const std::string p = "v.blk." + std::to_string(il) + ".";
         if (!read_t(gg, p + "ln1.weight", L.ln1_w, err) || !read_t(gg, p + "ln1.bias", L.ln1_b, err) ||
-            !read_t(gg, p + "ln2.weight", L.ln2_w, err) || !read_t(gg, p + "ln2.bias", L.ln2_b, err) ||
-            !read_t(gg, p + "attn_qkv.weight", L.qkv_w, err) || !read_t(gg, p + "attn_qkv.bias", L.qkv_b, err) ||
-            !read_t(gg, p + "attn_out.weight", L.o_w, err) || !read_t(gg, p + "attn_out.bias", L.o_b, err) ||
+            !read_t(gg, p + "ln2.weight", L.ln2_w, err) || !read_t(gg, p + "ln2.bias", L.ln2_b, err))
+            return false;
+        if (g.fused_qkv) {
+            if (!read_t(gg, p + "attn_qkv.weight", L.qkv_w, err) || !read_t(gg, p + "attn_qkv.bias", L.qkv_b, err)) return false;
+        } else {
+            std::vector<float> qw, kw, vw, qb, kb, vb;
+            if (!read_t(gg, p + "attn_q.weight", qw, err) || !read_t(gg, p + "attn_k.weight", kw, err) || !read_t(gg, p + "attn_v.weight", vw, err) ||
+                !read_t(gg, p + "attn_q.bias", qb, err) || !read_t(gg, p + "attn_k.bias", kb, err) || !read_t(gg, p + "attn_v.bias", vb, err))
+                return false;
+            L.qkv_w.reserve(qw.size() + kw.size() + vw.size());
+            L.qkv_w.insert(L.qkv_w.end(), qw.begin(), qw.end());
+            L.qkv_w.insert(L.qkv_w.end(), kw.begin(), kw.end());
+            L.qkv_w.insert(L.qkv_w.end(), vw.begin(), vw.end());
+            L.qkv_b.reserve(qb.size() + kb.size() + vb.size());
+            L.qkv_b.insert(L.qkv_b.end(), qb.begin(), qb.end());
+            L.qkv_b.insert(L.qkv_b.end(), kb.begin(), kb.end());
+            L.qkv_b.insert(L.qkv_b.end(), vb.begin(), vb.end());
+        }
+        if (!read_t(gg, p + "attn_out.weight", L.o_w, err) || !read_t(gg, p + "attn_out.bias", L.o_b, err) ||
             !read_t(gg, p + "ffn_up.weight", L.up_w, err) || !read_t(gg, p + "ffn_up.bias", L.up_b, err) ||
             !read_t(gg, p + "ffn_down.weight", L.down_w, err) || !read_t(gg, p + "ffn_down.bias", L.down_b, err))
             return false;
+        if (g.has_layer_scale) {
+            if (!read_t(gg, p + "ls1.weight", L.ls1_w, err) || !read_t(gg, p + "ls2.weight", L.ls2_w, err)) return false;
+        }
     }
     return true;
 }
@@ -221,57 +262,104 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
     if (HD > 128) { err = "head size above 128 is not handled by the reference"; return false; }
     if (img.w <= 0 || img.h <= 0 || img.w % g.align() != 0 || img.h % g.align() != 0) { err = "the picture size is not a multiple of patch * merge"; return false; }
     const int nth = threads > 0 ? threads : (int) std::max(1u, std::thread::hardware_concurrency());
-    const int pw = img.w / P, ph = img.h / P, N = pw * ph, nbx = pw / 2;
+    const int pw = img.w / P, ph = img.h / P, Np = pw * ph, nbx = pw / 2;
+    const bool ink2 = g.is_inkling2v();
+    const int N = ink2 ? (Np + 1) : Np;
     nx = pw / 2;
     ny = ph / 2;
 
-    // ---- positions of the tokens (merge order: 2x2 blocks row by row, inside a block dy outer, dx inner) ----
-    std::vector<int> ty((size_t) N), tx((size_t) N);
-    for (int t = 0; t < N; ++t) {
-        const int b = t / 4, r = t % 4;
-        ty[(size_t) t] = 2 * (b / nbx) + r / 2;
-        tx[(size_t) t] = 2 * (b % nbx) + r % 2;
+    // ---- positions of the tokens ----
+    std::vector<int> ty((size_t) N, 0), tx((size_t) N, 0);
+    if (ink2) {
+        // token 0 = CLS (pos_w=0, pos_h=0); token 1..Np = row-major patches (1-indexed for RoPE)
+        for (int t = 0; t < Np; ++t) {
+            ty[(size_t) t + 1] = t / pw;
+            tx[(size_t) t + 1] = t % pw;
+        }
+    } else {
+        // Qwen merge order: 2x2 blocks row by row, inside a block dy outer, dx inner
+        for (int t = 0; t < Np; ++t) {
+            const int b = t / 4, r = t % 4;
+            ty[(size_t) t] = 2 * (b / nbx) + r / 2;
+            tx[(size_t) t] = 2 * (b % nbx) + r % 2;
+        }
     }
 
-    // ---- patch embedding: im2col in merge order, one GEMM ----
+    // ---- patch embedding: im2col, one GEMM ----
     const int K0 = 3 * P * P;
-    std::vector<float> A((size_t) N * K0);
+    std::vector<float> A((size_t) Np * K0);
     const size_t plane = (size_t) img.w * img.h;
-    parallel_for(N, nth, [&](int t) {
+    parallel_for(Np, nth, [&](int t) {
         float* a = &A[(size_t) t * K0];
-        const int py = ty[(size_t) t], px = tx[(size_t) t];
+        const int py = ink2 ? (t / pw) : ty[(size_t) t];
+        const int px = ink2 ? (t % pw) : tx[(size_t) t];
         for (int c = 0; c < 3; ++c)
             for (int ky = 0; ky < P; ++ky)
                 std::memcpy(a + (size_t) c * P * P + (size_t) ky * P, &img.chw[c * plane + (size_t) (py * P + ky) * img.w + (size_t) px * P], (size_t) P * sizeof(float));
     });
     std::vector<float> x((size_t) N * D);
-    gemm(A.data(), (size_t) K0, N, K0, patch_w_.data(), D, patch_b_.data(), x.data(), (size_t) D, nth);
+    float* x_patches = ink2 ? (x.data() + D) : x.data();
+    gemm(A.data(), (size_t) K0, Np, K0, patch_w_.data(), D, patch_b_.empty() ? nullptr : patch_b_.data(), x_patches, (size_t) D, nth);
     A.clear();
     A.shrink_to_fit();
 
-    // ---- the position table resized to the patch grid (bilinear, align corners: ggml's upscale with the same float maths), added ----
+    // ---- position table resized to the patch grid, added (+ CLS for inkling2v) ----
     {
         const int G = g.pos_grid;
-        float sfx = (float) pw / G, sfy = (float) ph / G;
-        if (pw > 1 && G > 1) sfx = (float) (pw - 1) / (G - 1);
-        if (ph > 1 && G > 1) sfy = (float) (ph - 1) / (G - 1);
-        parallel_for(N, nth, [&](int t) {
-            const float fy = (float) ty[(size_t) t] / sfy, fx = (float) tx[(size_t) t] / sfx;
-            int y0 = (int) std::floor(fy), x0 = (int) std::floor(fx);
-            int y1 = y0 + 1, x1 = x0 + 1;
-            y0 = std::max(0, std::min(y0, G - 1)); y1 = std::max(0, std::min(y1, G - 1));
-            x0 = std::max(0, std::min(x0, G - 1)); x1 = std::max(0, std::min(x1, G - 1));
-            const float dy = std::max(0.0f, std::min(fy - (float) y0, 1.0f)), dx = std::max(0.0f, std::min(fx - (float) x0, 1.0f));
-            const float* a = &pos_[((size_t) y0 * G + x0) * D];
-            const float* b = &pos_[((size_t) y0 * G + x1) * D];
-            const float* c = &pos_[((size_t) y1 * G + x0) * D];
-            const float* d = &pos_[((size_t) y1 * G + x1) * D];
-            float* xr = &x[(size_t) t * D];
-            for (int i = 0; i < D; ++i) xr[i] += a[i] * (1 - dx) * (1 - dy) + b[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy;
-        });
+        if (ink2) {
+            for (int i = 0; i < D; ++i) x[(size_t) i] = cls_embd_[(size_t) i] + cls_pos_[(size_t) i];
+            const float sfx = (float) pw / G, sfy = (float) ph / G;
+            parallel_for(Np, nth, [&](int t) {
+                const int px = t % pw, py = t / pw;
+                float* xr = x_patches + (size_t) t * D;
+                if (pw == G && ph == G) {
+                    const float* pr = &pos_[((size_t) py * G + px) * D];
+                    for (int i = 0; i < D; ++i) xr[i] += pr[i];
+                    return;
+                }
+                const float fy = ((float) py + 0.5f) / sfy - 0.5f;
+                const float fx = ((float) px + 0.5f) / sfx - 0.5f;
+                int y0 = (int) std::floor(fy), x0 = (int) std::floor(fx);
+                int y1 = y0 + 1, x1 = x0 + 1;
+                y0 = std::max(0, std::min(y0, G - 1)); y1 = std::max(0, std::min(y1, G - 1));
+                x0 = std::max(0, std::min(x0, G - 1)); x1 = std::max(0, std::min(x1, G - 1));
+                const float dy = std::max(0.0f, std::min(fy - (float) y0, 1.0f));
+                const float dx = std::max(0.0f, std::min(fx - (float) x0, 1.0f));
+                const float* a = &pos_[((size_t) y0 * G + x0) * D];
+                const float* b = &pos_[((size_t) y0 * G + x1) * D];
+                const float* c = &pos_[((size_t) y1 * G + x0) * D];
+                const float* d = &pos_[((size_t) y1 * G + x1) * D];
+                for (int i = 0; i < D; ++i) xr[i] += a[i] * (1 - dx) * (1 - dy) + b[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy;
+            });
+        } else {
+            float sfx = (float) pw / G, sfy = (float) ph / G;
+            if (pw > 1 && G > 1) sfx = (float) (pw - 1) / (G - 1);
+            if (ph > 1 && G > 1) sfy = (float) (ph - 1) / (G - 1);
+            parallel_for(N, nth, [&](int t) {
+                const float fy = (float) ty[(size_t) t] / sfy, fx = (float) tx[(size_t) t] / sfx;
+                int y0 = (int) std::floor(fy), x0 = (int) std::floor(fx);
+                int y1 = y0 + 1, x1 = x0 + 1;
+                y0 = std::max(0, std::min(y0, G - 1)); y1 = std::max(0, std::min(y1, G - 1));
+                x0 = std::max(0, std::min(x0, G - 1)); x1 = std::max(0, std::min(x1, G - 1));
+                const float dy = std::max(0.0f, std::min(fy - (float) y0, 1.0f)), dx = std::max(0.0f, std::min(fx - (float) x0, 1.0f));
+                const float* a = &pos_[((size_t) y0 * G + x0) * D];
+                const float* b = &pos_[((size_t) y0 * G + x1) * D];
+                const float* c = &pos_[((size_t) y1 * G + x0) * D];
+                const float* d = &pos_[((size_t) y1 * G + x1) * D];
+                float* xr = &x[(size_t) t * D];
+                for (int i = 0; i < D; ++i) xr[i] += a[i] * (1 - dx) * (1 - dy) + b[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy;
+            });
+        }
     }
 
-    // ---- rotary tables: pair j of a head (elements j and j + HD/2), j < HD/4 turns with the row, the rest with the column ----
+    // ---- pre-layernorm (inkling2v) ----
+    if (g.pre_ln) {
+        std::vector<float> tmp_pre((size_t) N * D);
+        layer_norm(x.data(), tmp_pre.data(), N, D, pre_w_.data(), pre_b_.data(), g.eps, nth);
+        x.swap(tmp_pre);
+    }
+
+    // ---- rotary tables ----
     const int half = HD / 2, quarter = HD / 4;
     std::vector<float> inv_freq((size_t) quarter);
     {
@@ -282,7 +370,12 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
     std::vector<float> rcos((size_t) N * half), rsin((size_t) N * half);
     parallel_for(N, nth, [&](int t) {
         for (int j = 0; j < half; ++j) {
-            const float pos = (float) (j < quarter ? ty[(size_t) t] : tx[(size_t) t]);
+            float pos = 0.0f;
+            if (ink2) {
+                pos = (t == 0) ? 0.0f : (float) (j < quarter ? (tx[(size_t) t] + 1) : (ty[(size_t) t] + 1));
+            } else {
+                pos = (float) (j < quarter ? ty[(size_t) t] : tx[(size_t) t]);
+            }
             const float ang = pos * inv_freq[(size_t) (j % quarter)];
             rcos[(size_t) t * half + j] = std::cos(ang);
             rsin[(size_t) t * half + j] = std::sin(ang);
@@ -292,6 +385,7 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
     // ---- the layers ----
     std::vector<float> h((size_t) N * D), qkv((size_t) N * 3 * D), ctx((size_t) N * D), tmp((size_t) N * D), up((size_t) N * F);
     const float kq_scale = 1.0f / std::sqrt((float) HD);
+    const bool use_erf = (g.act == ActKind::GeluErf);
     for (const Layer& L : layers_) {
         layer_norm(x.data(), h.data(), N, D, L.ln1_w.data(), L.ln1_b.data(), g.eps, nth);
         round_inplace(h.data(), h.size(), act_round_, nth);
@@ -304,10 +398,22 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
             for (int part = 0; part < 2; ++part)
                 for (int hh = 0; hh < H; ++hh) {
                     float* v = row + (size_t) part * D + (size_t) hh * HD;
-                    for (int j = 0; j < half; ++j) {
-                        const float a = v[j], b = v[j + half];
-                        v[j] = a * cs[j] - b * sn[j];
-                        v[j + half] = a * sn[j] + b * cs[j];
+                    if (ink2) {
+                        // GGML mode 0 (interleaved pairs): [0..half) uses pos_w, [half..HD) uses pos_h
+                        for (int j = 0; j < quarter; ++j) {
+                            const float a0 = v[2 * j], b0 = v[2 * j + 1];
+                            v[2 * j] = a0 * cs[j] - b0 * sn[j];
+                            v[2 * j + 1] = a0 * sn[j] + b0 * cs[j];
+                            const float a1 = v[half + 2 * j], b1 = v[half + 2 * j + 1];
+                            v[half + 2 * j] = a1 * cs[quarter + j] - b1 * sn[quarter + j];
+                            v[half + 2 * j + 1] = a1 * sn[quarter + j] + b1 * cs[quarter + j];
+                        }
+                    } else {
+                        for (int j = 0; j < half; ++j) {
+                            const float a = v[j], b = v[j + half];
+                            v[j] = a * cs[j] - b * sn[j];
+                            v[j + half] = a * sn[j] + b * cs[j];
+                        }
                     }
                 }
         });
@@ -348,26 +454,60 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
         });
         round_inplace(ctx.data(), ctx.size(), act_round_, nth);
         gemm(ctx.data(), (size_t) D, N, D, L.o_w.data(), D, L.o_b.data(), tmp.data(), (size_t) D, nth);
-        for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
+        if (g.has_layer_scale) {
+            for (int t = 0; t < N; ++t)
+                for (int i = 0; i < D; ++i) x[(size_t) t * D + i] += tmp[(size_t) t * D + i] * L.ls1_w[(size_t) i];
+        } else {
+            for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
+        }
         layer_norm(x.data(), h.data(), N, D, L.ln2_w.data(), L.ln2_b.data(), g.eps, nth);
         round_inplace(h.data(), h.size(), act_round_, nth);
         gemm(h.data(), (size_t) D, N, D, L.up_w.data(), F, L.up_b.data(), up.data(), (size_t) F, nth);
-        gelu_inplace(up.data(), up.size(), nth);
+        gelu_inplace(up.data(), up.size(), nth, use_erf);
         round_inplace(up.data(), up.size(), act_round_, nth);
         gemm(up.data(), (size_t) F, N, F, L.down_w.data(), D, L.down_b.data(), tmp.data(), (size_t) D, nth);
-        for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
+        if (g.has_layer_scale) {
+            for (int t = 0; t < N; ++t)
+                for (int i = 0; i < D; ++i) x[(size_t) t * D + i] += tmp[(size_t) t * D + i] * L.ls2_w[(size_t) i];
+        } else {
+            for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
+        }
     }
 
-    // ---- post norm and the merger ----
-    layer_norm(x.data(), h.data(), N, D, post_w_.data(), post_b_.data(), g.eps, nth);
-    const int M = N / 4, Kin = 4 * D, Hid = g.merger_hidden, O = g.out_dim;
+    // ---- post norm / merge and the projector ----
+    const int M = Np / 4, Kin = 4 * D, Hid = g.merger_hidden, O = g.out_dim;
+    std::vector<float> m_in;
+    const float* m_src = nullptr;
+    if (ink2) {
+        // drop CLS (row 0), gather 2x2 spatial patches in row-major order into [M, 4*D]
+        m_in.resize((size_t) M * Kin);
+        const float* xp = x.data() + D;
+        for (int my = 0; my < ny; ++my) {
+            for (int mx = 0; mx < nx; ++mx) {
+                float* dst = m_in.data() + (size_t) (my * nx + mx) * Kin;
+                const int p00 = (2 * my + 0) * pw + (2 * mx + 0);
+                const int p01 = (2 * my + 0) * pw + (2 * mx + 1);
+                const int p10 = (2 * my + 1) * pw + (2 * mx + 0);
+                const int p11 = (2 * my + 1) * pw + (2 * mx + 1);
+                std::memcpy(dst + 0 * D, xp + (size_t) p00 * D, (size_t) D * sizeof(float));
+                std::memcpy(dst + 1 * D, xp + (size_t) p01 * D, (size_t) D * sizeof(float));
+                std::memcpy(dst + 2 * D, xp + (size_t) p10 * D, (size_t) D * sizeof(float));
+                std::memcpy(dst + 3 * D, xp + (size_t) p11 * D, (size_t) D * sizeof(float));
+            }
+        }
+        round_inplace(m_in.data(), m_in.size(), act_round_, nth);
+        m_src = m_in.data();
+    } else {
+        layer_norm(x.data(), h.data(), N, D, post_w_.data(), post_b_.data(), g.eps, nth);
+        round_inplace(h.data(), h.size(), act_round_, nth);
+        m_src = h.data();
+    }
     std::vector<float> m1((size_t) M * Hid);
-    round_inplace(h.data(), h.size(), act_round_, nth);
-    gemm(h.data(), (size_t) Kin, M, Kin, mm0_w_.data(), Hid, mm0_b_.data(), m1.data(), (size_t) Hid, nth);
-    gelu_inplace(m1.data(), m1.size(), nth);
+    gemm(m_src, (size_t) Kin, M, Kin, mm0_w_.data(), Hid, mm0_b_.empty() ? nullptr : mm0_b_.data(), m1.data(), (size_t) Hid, nth);
+    gelu_inplace(m1.data(), m1.size(), nth, use_erf);
     rows.assign((size_t) M * O, 0.0f);
     round_inplace(m1.data(), m1.size(), act_round_, nth);
-    gemm(m1.data(), (size_t) Hid, M, Hid, mm2_w_.data(), O, mm2_b_.data(), rows.data(), (size_t) O, nth);
+    gemm(m1.data(), (size_t) Hid, M, Hid, mm2_w_.data(), O, mm2_b_.empty() ? nullptr : mm2_b_.data(), rows.data(), (size_t) O, nth);
     return true;
 }
 

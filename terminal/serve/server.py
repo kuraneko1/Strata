@@ -5061,8 +5061,17 @@ class Service:
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
         if images:
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            v_start_s, v_pad_s = VISION_START, IMAGE_PAD
+            pad_ids = self.tok.encode(v_pad_s, parse_special=True)
+            start_ids = self.tok.encode(v_start_s, parse_special=True)
+            if len(pad_ids) != 1 or len(start_ids) != 1:
+                alt_pad = self.tok.encode("<|unused_200054|>", parse_special=True)
+                alt_start = self.tok.encode("<|content_image|>", parse_special=True)
+                if len(alt_pad) == 1 and len(alt_start) == 1:
+                    v_start_s, v_pad_s = "<|content_image|>", "<|unused_200054|>"
+                    pad_ids, start_ids = alt_pad, alt_start
+            pad = pad_ids[0]
+            start = start_ids[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -5075,10 +5084,11 @@ class Service:
                                else [self.vision.encode(src) for src in images])
                 finally:
                     self.last_image_at = time.time()
-            # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
-            # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
-            # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            # one <|image_pad|> (or <|unused_200054|>) per image -> one per image token.  Only the markers the template
+            # writes for an image (right after <|vision_start|> or <|content_image|>) are images: the same text inside a
+            # message (an agent reading these docs, #150) is kept as plain text, or it took an image's place and the
+            # counts no longer matched.
+            literal = self.tok.encode(v_pad_s, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
