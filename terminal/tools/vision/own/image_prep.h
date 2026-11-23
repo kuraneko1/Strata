@@ -26,7 +26,10 @@ struct ImageU8 {
 
 struct PreparedImage {
     int w = 0, h = 0;               // the size the tower sees (multiples of patch * merge)
-    std::vector<float> chw;         // 3 * h * w, normalised, channel planes
+    std::vector<float> chw;         // 3 * h * w, normalised, channel planes (CPU path / tests)
+    // Optional fast GPU path: raw uint8 RGB before normalise/pad/im2col (4x smaller H2D, fused on GPU)
+    int raw_w = 0, raw_h = 0;       // active RGB pixels (top-left of w x h; right/bottom padded on GPU for inkling2v)
+    std::vector<uint8_t> rgb;       // raw_h * raw_w * 3 bytes when non-empty
 };
 
 struct Size2 {
@@ -51,6 +54,9 @@ void resize_pad_ceil(const ImageU8& src, ImageU8& dst, Size2 target);
 // The resized picture (before the normalisation) is returned in `resized` when it is not null (for tests).
 bool prepare_image(const ImageU8& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err,
                    ImageU8* resized = nullptr);
+
+// GPU fast path: resizes only if needed and fills out.rgb / out.raw_w / out.raw_h (skips CPU float chw & normalise/pad).
+bool prepare_image_u8(const ImageU8& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err);
 
 // the size prepare_image would give (no pixels touched)
 Size2 prepared_size(int w, int h, const VitGeometry& g, int min_tokens, int max_tokens);

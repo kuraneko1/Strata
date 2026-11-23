@@ -58,6 +58,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #define VIT_COMPUTE_32F CUBLAS_COMPUTE_32F
 #define VIT_GEMM_DEFAULT CUBLAS_GEMM_DEFAULT
 #define VIT_SHFL_XOR(v, m) __shfl_xor_sync(0xffffffffu, (v), (m))
@@ -169,9 +170,85 @@ __global__ void k_inkling2v_patch_pos(float* __restrict__ x, const float* __rest
         xr[i] += a[i] * (1 - dx) * (1 - dy) + bb[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy;
 }
 
-// out = LayerNorm(x) * w + b, into `kind`
+// GPU-fused uint8 RGB -> normalised, padded, im2col patch matrix [Np_img][3*P*P]
+__global__ void k_rgb_to_patches(const uint8_t* __restrict__ rgb, int raw_w, int raw_h, int P, int pw, int nbx, int ink2,
+                                 float m0, float m1, float m2, float is0, float is1, float is2, float p0, float p1, float p2,
+                                 float* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int py = ink2 ? (t / pw) : (2 * ((t / 4) / nbx) + (t % 4) / 2);
+    const int px = ink2 ? (t % pw) : (2 * ((t / 4) % nbx) + (t % 4) % 2);
+    const int PP = P * P, K0 = 3 * PP;
+    const float mean255[3] = {m0, m1, m2};
+    const float inv_std[3] = {is0, is1, is2};
+    const float pad_val[3] = {p0, p1, p2};
+    float* dst = out + (size_t) t * K0;
+    for (int i = threadIdx.x; i < K0; i += blockDim.x) {
+        const int c = i / PP, rem = i - c * PP, ky = rem / P, kx = rem - ky * P;
+        const int iy = py * P + ky, ix = px * P + kx;
+        float v;
+        if (ix < raw_w && iy < raw_h) {
+            const uint8_t u = rgb[((size_t) iy * raw_w + ix) * 3 + c];
+            v = ((float) u - mean255[c]) * inv_std[c];
+        } else {
+            v = pad_val[c];
+        }
+        dst[i] = v;
+    }
+}
+
+// out = LayerNorm(x) * w + b, into `kind` (float4-vectorized when D % 4 == 0)
 __global__ void k_layernorm(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b, float eps, int D, void* out, int kind) {
     const float* xr = x + (size_t) blockIdx.x * D;
+    if ((D & 3) == 0) {
+        const int D4 = D >> 2;
+        const float4* x4 = (const float4*) xr;
+        float s = 0.0f;
+        for (int i = threadIdx.x; i < D4; i += blockDim.x) {
+            const float4 q = x4[i];
+            s += q.x + q.y + q.z + q.w;
+        }
+        const float mean = block_sum(s) / (float) D;
+        float v = 0.0f;
+        for (int i = threadIdx.x; i < D4; i += blockDim.x) {
+            const float4 q = x4[i];
+            const float d0 = q.x - mean, d1 = q.y - mean, d2 = q.z - mean, d3 = q.w - mean;
+            v += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+        }
+        const float scale = rsqrtf(block_sum(v) / (float) D + eps);
+        const float4* w4 = (const float4*) w;
+        const float4* b4 = (const float4*) b;
+        const size_t base = (size_t) blockIdx.x * D;
+        if (kind == K_F16) {
+            uint2* out4 = (uint2*) ((uint16_t*) out + base);
+            for (int i = threadIdx.x; i < D4; i += blockDim.x) {
+                const float4 q = x4[i], ww = w4[i], bb = b4[i];
+                const __half2 h01 = __halves2half2(__float2half_rn((q.x - mean) * scale * ww.x + bb.x),
+                                                   __float2half_rn((q.y - mean) * scale * ww.y + bb.y));
+                const __half2 h23 = __halves2half2(__float2half_rn((q.z - mean) * scale * ww.z + bb.z),
+                                                   __float2half_rn((q.w - mean) * scale * ww.w + bb.w));
+                uint2 p;
+                p.x = *(const uint32_t*) &h01;
+                p.y = *(const uint32_t*) &h23;
+                out4[i] = p;
+            }
+        } else if (kind == K_F32) {
+            float4* out4 = (float4*) ((float*) out + base);
+            for (int i = threadIdx.x; i < D4; i += blockDim.x) {
+                const float4 q = x4[i], ww = w4[i], bb = b4[i];
+                out4[i] = make_float4((q.x - mean) * scale * ww.x + bb.x, (q.y - mean) * scale * ww.y + bb.y,
+                                      (q.z - mean) * scale * ww.z + bb.z, (q.w - mean) * scale * ww.w + bb.w);
+            }
+        } else {
+            for (int i = threadIdx.x; i < D4; i += blockDim.x) {
+                const float4 q = x4[i], ww = w4[i], bb = b4[i];
+                store_kind(out, base + (size_t) i * 4 + 0, (q.x - mean) * scale * ww.x + bb.x, kind);
+                store_kind(out, base + (size_t) i * 4 + 1, (q.y - mean) * scale * ww.y + bb.y, kind);
+                store_kind(out, base + (size_t) i * 4 + 2, (q.z - mean) * scale * ww.z + bb.z, kind);
+                store_kind(out, base + (size_t) i * 4 + 3, (q.w - mean) * scale * ww.w + bb.w, kind);
+            }
+        }
+        return;
+    }
     float s = 0.0f;
     for (int i = threadIdx.x; i < D; i += blockDim.x) s += xr[i];
     const float mean = block_sum(s) / (float) D;
@@ -206,22 +283,29 @@ __global__ void k_qkv_rope(const float* __restrict__ y, const float* __restrict_
 
 // inkling2v: 2D RoPE mode=0 (interleaved pairs (2j, 2j+1)); dims [0..hd/2) rotate with pos_x, [hd/2..hd) with pos_y.
 // CLS (t == 0) has (0, 0); row-major patches (t >= 1) have ((t-1)%pw + 1, (t-1)/pw + 1).
+// Precomputes quarter inv_freq + sincos values once per block in shared memory (eliminates millions of powf/sincosf calls).
 __global__ void k_inkling2v_qkv_rope(const float* __restrict__ y, const float* __restrict__ bias, int row0, int pw, int heads, int hd, float theta_scale, float qscale,
                                      uint16_t* __restrict__ q, uint16_t* __restrict__ k, uint16_t* __restrict__ v) {
+    __shared__ float sh_sn[64];
+    __shared__ float sh_cs[64];
     const int t = row0 + blockIdx.x, D = heads * hd, half = hd / 2, quarter = hd / 4;
     const int pos_x = (t == 0) ? 0 : (((t - 1) % pw) + 1);
     const int pos_y = (t == 0) ? 0 : (((t - 1) / pw) + 1);
+    if (threadIdx.x < half) {
+        const int j = threadIdx.x;
+        const int jl = j < quarter ? j : (j - quarter);
+        const int coord = j < quarter ? pos_x : pos_y;
+        const float freq = powf(theta_scale, (float) jl);
+        sincosf((float) coord * freq, &sh_sn[j], &sh_cs[j]);
+    }
+    __syncthreads();
     const float* yr = y + (size_t) blockIdx.x * 3 * D;
     for (int i = threadIdx.x; i < 2 * heads * half; i += blockDim.x) {
         const int part = i / (heads * half), rem = i % (heads * half), h = rem / half, j = rem % half;
         const int base = part * D + h * hd;
         const float a = yr[base + 2 * j] + bias[base + 2 * j];
         const float c = yr[base + 2 * j + 1] + bias[base + 2 * j + 1];
-        const int jl = j < quarter ? j : (j - quarter);
-        const int coord = j < quarter ? pos_x : pos_y;
-        const float freq = powf(theta_scale, (float) jl);
-        float sn, cs;
-        sincosf((float) coord * freq, &sn, &cs);
+        const float sn = sh_sn[j], cs = sh_cs[j];
         uint16_t* dst = (part == 0 ? q : k) + (size_t) t * D + h * hd;
         const float sc = part == 0 ? qscale : 1.0f;
         dst[2 * j] = f_to_f16bits((a * cs - c * sn) * sc);
@@ -280,6 +364,7 @@ static void softmax_rows(uint16_t* S, int n, int ld, int rows) {
     else if (n <= 512) k_softmax_rows<64, 8><<<rows, 64>>>(S, n, ld);
     else if (n <= 1024) k_softmax_rows<128, 8><<<rows, 128>>>(S, n, ld);
     else if (n <= 4096) k_softmax_rows<256, 16><<<rows, 256>>>(S, n, ld);
+    else if (n <= 4608) k_softmax_rows<256, 18><<<rows, 256>>>(S, n, ld);
     else k_softmax_rows<256, 64><<<rows, 256>>>(S, n, ld);
 }
 
@@ -453,15 +538,297 @@ __global__ void __launch_bounds__(128) k_attn_fa_gfx11(const uint16_t* __restric
 }
 #endif
 
+#if !defined(STRATA_VIT_HIP)
+// In-register WMMA 16x16x16 helpers (exact on Volta sm_70 AND Turing/Ampere/Ada sm_75+, zero SMEM for S/P/O)
+__device__ __forceinline__ float vit_exp2f_hw(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ void vit_wmma_acc_layout(int lane, int& r0, int& r1, int& c0, int& c1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    r0 = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 1);
+    r1 = r0 + 2;
+    c0 = (lane & 8) + (lane & 2);
+    c1 = c0 + 4;
+#else
+    r0 = lane >> 2;
+    r1 = r0 + 8;
+    c0 = (lane & 3) * 2;
+    c1 = c0 + 8;
+#endif
+}
+
+__device__ __forceinline__ float vit_wmma_row_max(float v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 8));
+#else
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
+#endif
+    return v;
+}
+
+__device__ __forceinline__ float vit_wmma_row_sum(float v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 8);
+#else
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+#endif
+    return v;
+}
+
+__device__ __forceinline__ void vit_wmma_rescale(nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>& fc,
+                                                 float a0, float a1) {
+    fc.x[0] *= a0; fc.x[1] *= a0; fc.x[4] *= a0; fc.x[5] *= a0;
+    fc.x[2] *= a1; fc.x[3] *= a1; fc.x[6] *= a1; fc.x[7] *= a1;
+}
+
+__device__ __forceinline__ uint32_t vit_f2_to_h2u(float a, float b) {
+    const __half2 h = __float22half2_rn(make_float2(a, b));
+    uint32_t u;
+    memcpy(&u, &h, 4);
+    return u;
+}
+
+template <bool MASKED>
+__device__ __forceinline__ void vit_wmma_acc_to_matA(
+    const nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>& fc,
+    float m_new0, float m_new1, float& ps0, float& ps1,
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major>& fa, int lane) {
+    const float p00 = (!MASKED || fc.x[0] > -1e20f) ? vit_exp2f_hw(fc.x[0] - m_new0) : 0.0f;
+    const float p01 = (!MASKED || fc.x[1] > -1e20f) ? vit_exp2f_hw(fc.x[1] - m_new0) : 0.0f;
+    const float p04 = (!MASKED || fc.x[4] > -1e20f) ? vit_exp2f_hw(fc.x[4] - m_new0) : 0.0f;
+    const float p05 = (!MASKED || fc.x[5] > -1e20f) ? vit_exp2f_hw(fc.x[5] - m_new0) : 0.0f;
+    ps0 += (p00 + p01) + (p04 + p05);
+    const float p12 = (!MASKED || fc.x[2] > -1e20f) ? vit_exp2f_hw(fc.x[2] - m_new1) : 0.0f;
+    const float p13 = (!MASKED || fc.x[3] > -1e20f) ? vit_exp2f_hw(fc.x[3] - m_new1) : 0.0f;
+    const float p16 = (!MASKED || fc.x[6] > -1e20f) ? vit_exp2f_hw(fc.x[6] - m_new1) : 0.0f;
+    const float p17 = (!MASKED || fc.x[7] > -1e20f) ? vit_exp2f_hw(fc.x[7] - m_new1) : 0.0f;
+    ps1 += (p12 + p13) + (p16 + p17);
+
+    const uint32_t a0 = vit_f2_to_h2u(p00, p01), a1 = vit_f2_to_h2u(p04, p05);
+    const uint32_t b0 = vit_f2_to_h2u(p12, p13), b1 = vit_f2_to_h2u(p16, p17);
+    uint32_t* fa_u = reinterpret_cast<uint32_t*>(fa.x);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    const bool want_r1 = (lane & 2) != 0;
+    const uint32_t recv0 = __shfl_xor_sync(0xffffffffu, want_r1 ? a0 : b0, 2);
+    const uint32_t recv1 = __shfl_xor_sync(0xffffffffu, want_r1 ? a1 : b1, 2);
+    const uint32_t h0 = want_r1 ? recv0 : a0, h1 = want_r1 ? b0 : recv0;
+    const uint32_t h2 = want_r1 ? recv1 : a1, h3 = want_r1 ? b1 : recv1;
+    const uint32_t o0 = __shfl_xor_sync(0xffffffffu, h0, 8), o1 = __shfl_xor_sync(0xffffffffu, h1, 8);
+    const uint32_t o2 = __shfl_xor_sync(0xffffffffu, h2, 8), o3 = __shfl_xor_sync(0xffffffffu, h3, 8);
+    const bool hi8 = (lane & 8) != 0;
+    fa_u[0] = hi8 ? o0 : h0; fa_u[1] = hi8 ? o1 : h1;
+    fa_u[2] = hi8 ? o2 : h2; fa_u[3] = hi8 ? o3 : h3;
+    fa_u[4] = hi8 ? h0 : o0; fa_u[5] = hi8 ? h1 : o1;
+    fa_u[6] = hi8 ? h2 : o2; fa_u[7] = hi8 ? h3 : o3;
+#else
+    (void) lane;
+    fa_u[0] = fa_u[4] = a0;
+    fa_u[1] = fa_u[5] = b0;
+    fa_u[2] = fa_u[6] = a1;
+    fa_u[3] = fa_u[7] = b1;
+#endif
+}
+
+// 100% In-Register WMMA FlashAttention-2 for CUDA sm_70+ (Volta / Turing / Ampere / Ada / Hopper), head_dim == 64:
+//   - 1 CTA = 8 warps (256 threads) = BQ = 128 queries of 1 head, BK = 32 key/value tile
+//   - ZERO sS / sP / sO shared memory (only sK[32][72] + sV[32][72] = 9,216 B total SMEM!)
+//   - S = QK^T, online FP32 softmax, P->matrix_a conversion, O rescaling & PV accumulation stay 100% in registers (STACK: 0)
+__global__ void __launch_bounds__(256, 2) k_attn_fa_cuda_hd64(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    float* __restrict__ ctx, int N, int D) {
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    constexpr int BQ = 128, BK = 32, HD = 64, KV_LD = 72;
+    constexpr float kLog2e = 1.4426950408889634f;
+    __shared__ __align__(16) __half sK[BK][KV_LD];  // 4,608 B
+    __shared__ __align__(16) __half sV[BK][KV_LD];  // 4,608 B
+
+    const int h = blockIdx.y;
+    const int q_blk = blockIdx.x * BQ;
+    const int tid = threadIdx.x;
+    const int w = tid >> 5, lane = tid & 31;
+    const size_t hoff = (size_t) h * HD;
+
+    int r0, r1, c0, c1;
+    vit_wmma_acc_layout(lane, r0, r1, c0, c1);
+
+    // 1. Load Q[q_blk..q_blk+127, 0..63] into persistent q_frag[4] in two 64-row waves reusing sK+sV (zero extra SMEM)
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> q_frag[4];
+    {
+        const int row = tid >> 3, col = (tid & 7) << 3;
+        const int qi0 = q_blk + row;
+        const int qi1 = q_blk + 32 + row;
+        *(uint4*) &sK[row][col] = (qi0 < N) ? *(const uint4*) (q + (size_t) qi0 * D + hoff + col) : make_uint4(0, 0, 0, 0);
+        *(uint4*) &sV[row][col] = (qi1 < N) ? *(const uint4*) (q + (size_t) qi1 * D + hoff + col) : make_uint4(0, 0, 0, 0);
+        __syncthreads();
+        if (w < 4) {
+            const __half* qs = (w < 2) ? &sK[w * 16][0] : &sV[(w - 2) * 16][0];
+#pragma unroll
+            for (int dt = 0; dt < 4; ++dt) wmma::load_matrix_sync(q_frag[dt], qs + dt * 16, KV_LD);
+        }
+        __syncthreads();
+        const int qi2 = q_blk + 64 + row;
+        const int qi3 = q_blk + 96 + row;
+        *(uint4*) &sK[row][col] = (qi2 < N) ? *(const uint4*) (q + (size_t) qi2 * D + hoff + col) : make_uint4(0, 0, 0, 0);
+        *(uint4*) &sV[row][col] = (qi3 < N) ? *(const uint4*) (q + (size_t) qi3 * D + hoff + col) : make_uint4(0, 0, 0, 0);
+        __syncthreads();
+        if (w >= 4) {
+            const __half* qs = (w < 6) ? &sK[(w - 4) * 16][0] : &sV[(w - 6) * 16][0];
+#pragma unroll
+            for (int dt = 0; dt < 4; ++dt) wmma::load_matrix_sync(q_frag[dt], qs + dt * 16, KV_LD);
+        }
+        __syncthreads();
+    }
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_acc[4];
+#pragma unroll
+    for (int dt = 0; dt < 4; ++dt) wmma::fill_fragment(o_acc[dt], 0.0f);
+
+    float m0 = -1e30f, m1 = -1e30f;
+    float l0 = 0.0f, l1 = 0.0f;
+
+    auto process_tile = [&](int k0, bool is_tail) {
+        // 2. Cooperatively load K and V for keys [k0 .. k0 + 31] (1 uint4 per thread each!)
+        const int row = tid >> 3, col = (tid & 7) << 3;
+        const int ki = k0 + row;
+        if (!is_tail || ki < N) {
+            *(uint4*) &sK[row][col] = *(const uint4*) (k + (size_t) ki * D + hoff + col);
+            *(uint4*) &sV[row][col] = *(const uint4*) (v + (size_t) ki * D + hoff + col);
+        } else {
+            *(uint4*) &sK[row][col] = make_uint4(0, 0, 0, 0);
+            *(uint4*) &sV[row][col] = make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+
+        // 3. S = Q * K^T (16x64 x 64x32 -> 2 x 16x16 FP32 fragments in registers)
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_fc[2];
+        float tmx0 = -1e30f, tmx1 = -1e30f;
+#pragma unroll
+        for (int kt = 0; kt < 2; ++kt) {
+            wmma::fill_fragment(s_fc[kt], 0.0f);
+#pragma unroll
+            for (int dt = 0; dt < 4; ++dt) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> k_f;
+                wmma::load_matrix_sync(k_f, &sK[kt * 16][dt * 16], KV_LD);
+                wmma::mma_sync(s_fc[kt], q_frag[dt], k_f, s_fc[kt]);
+            }
+            const int kc0 = k0 + kt * 16 + c0;
+            const int kc1 = k0 + kt * 16 + c1;
+            if (is_tail) {
+                s_fc[kt].x[0] = (kc0 < N) ? (s_fc[kt].x[0] * kLog2e) : -1e30f;
+                s_fc[kt].x[1] = (kc0 + 1 < N) ? (s_fc[kt].x[1] * kLog2e) : -1e30f;
+                s_fc[kt].x[2] = (kc0 < N) ? (s_fc[kt].x[2] * kLog2e) : -1e30f;
+                s_fc[kt].x[3] = (kc0 + 1 < N) ? (s_fc[kt].x[3] * kLog2e) : -1e30f;
+                s_fc[kt].x[4] = (kc1 < N) ? (s_fc[kt].x[4] * kLog2e) : -1e30f;
+                s_fc[kt].x[5] = (kc1 + 1 < N) ? (s_fc[kt].x[5] * kLog2e) : -1e30f;
+                s_fc[kt].x[6] = (kc1 < N) ? (s_fc[kt].x[6] * kLog2e) : -1e30f;
+                s_fc[kt].x[7] = (kc1 + 1 < N) ? (s_fc[kt].x[7] * kLog2e) : -1e30f;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) s_fc[kt].x[i] *= kLog2e;
+            }
+            tmx0 = fmaxf(tmx0, fmaxf(fmaxf(s_fc[kt].x[0], s_fc[kt].x[1]), fmaxf(s_fc[kt].x[4], s_fc[kt].x[5])));
+            tmx1 = fmaxf(tmx1, fmaxf(fmaxf(s_fc[kt].x[2], s_fc[kt].x[3]), fmaxf(s_fc[kt].x[6], s_fc[kt].x[7])));
+        }
+
+        // 4. Online FP32 softmax + in-register rescale of o_acc
+        const float rmx0 = vit_wmma_row_max(tmx0);
+        const float rmx1 = vit_wmma_row_max(tmx1);
+        const float m_new0 = fmaxf(m0, rmx0);
+        const float m_new1 = fmaxf(m1, rmx1);
+        const float corr0 = vit_exp2f_hw(m0 - m_new0);
+        const float corr1 = vit_exp2f_hw(m1 - m_new1);
+#pragma unroll
+        for (int dt = 0; dt < 4; ++dt) vit_wmma_rescale(o_acc[dt], corr0, corr1);
+
+        // 5. In-register P -> matrix_a + O += P * V (zero SMEM for P or O!)
+        float ps0 = 0.0f, ps1 = 0.0f;
+#pragma unroll
+        for (int kt = 0; kt < 2; ++kt) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> p_f;
+            if (is_tail) vit_wmma_acc_to_matA<true>(s_fc[kt], m_new0, m_new1, ps0, ps1, p_f, lane);
+            else vit_wmma_acc_to_matA<false>(s_fc[kt], m_new0, m_new1, ps0, ps1, p_f, lane);
+#pragma unroll
+            for (int dt = 0; dt < 4; ++dt) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> v_f;
+                wmma::load_matrix_sync(v_f, &sV[kt * 16][dt * 16], KV_LD);
+                wmma::mma_sync(o_acc[dt], p_f, v_f, o_acc[dt]);
+            }
+        }
+        l0 = l0 * corr0 + vit_wmma_row_sum(ps0);
+        l1 = l1 * corr1 + vit_wmma_row_sum(ps1);
+        m0 = m_new0;
+        m1 = m_new1;
+        __syncthreads();
+    };
+
+    const int n_full = (N / BK) * BK;
+    for (int k0 = 0; k0 < n_full; k0 += BK) process_tile(k0, false);
+    if (n_full < N) process_tile(n_full, true);
+
+    // 6. Final normalize O / l and write directly from registers to ctx
+    const float inv_l0 = 1.0f / l0;
+    const float inv_l1 = 1.0f / l1;
+    const int qi0 = q_blk + w * 16 + r0;
+    const int qi1 = q_blk + w * 16 + r1;
+#pragma unroll
+    for (int dt = 0; dt < 4; ++dt) {
+        vit_wmma_rescale(o_acc[dt], inv_l0, inv_l1);
+        const int d0 = dt * 16 + c0, d1 = dt * 16 + c1;
+        if (qi0 < N) {
+            float* row0 = ctx + (size_t) qi0 * D + hoff;
+            row0[d0] = o_acc[dt].x[0];
+            row0[d0 + 1] = o_acc[dt].x[1];
+            row0[d1] = o_acc[dt].x[4];
+            row0[d1 + 1] = o_acc[dt].x[5];
+        }
+        if (qi1 < N) {
+            float* row1 = ctx + (size_t) qi1 * D + hoff;
+            row1[d0] = o_acc[dt].x[2];
+            row1[d0 + 1] = o_acc[dt].x[3];
+            row1[d1] = o_acc[dt].x[6];
+            row1[d1 + 1] = o_acc[dt].x[7];
+        }
+    }
+#else
+    (void) q; (void) k; (void) v; (void) ctx; (void) N; (void) D;
+#endif
+}
+#endif
+
 // x[r] += y[r] + bias
 __global__ void k_add_bias_res(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ bias, int D) {
     const size_t base = (size_t) blockIdx.x * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x) x[base + i] += y[base + i] + bias[i];
 }
 
-// x[r] += (y[r] + bias) * ls  (inkling2v LayerScale)
+// x[r] += (y[r] + bias) * ls  (inkling2v LayerScale, float4-vectorized when D % 4 == 0)
 __global__ void k_add_bias_ls_res(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ bias, const float* __restrict__ ls, int D) {
     const size_t base = (size_t) blockIdx.x * D;
+    if ((D & 3) == 0) {
+        const int D4 = D >> 2;
+        float4* x4 = (float4*) (x + base);
+        const float4* y4 = (const float4*) (y + base);
+        const float4* b4 = (const float4*) bias;
+        const float4* l4 = (const float4*) ls;
+        for (int i = threadIdx.x; i < D4; i += blockDim.x) {
+            float4 xv = x4[i];
+            const float4 yv = y4[i], bv = b4[i], lv = l4[i];
+            xv.x += (yv.x + bv.x) * lv.x;
+            xv.y += (yv.y + bv.y) * lv.y;
+            xv.z += (yv.z + bv.z) * lv.z;
+            xv.w += (yv.w + bv.w) * lv.w;
+            x4[i] = xv;
+        }
+        return;
+    }
     for (int i = threadIdx.x; i < D; i += blockDim.x) x[base + i] += (y[base + i] + bias[i]) * ls[i];
 }
 
@@ -475,9 +842,34 @@ __global__ void k_bias_gelu_cast(const float* __restrict__ y, const float* __res
     }
 }
 
-// out = gelu_erf(y + bias) into `kind` (inkling2v FFN & projector)
+// out = gelu_erf(y + bias) into `kind` (inkling2v FFN & projector, float4-vectorized when n % 4 == 0 && K_F16)
 __global__ void k_bias_gelu_erf_cast(const float* __restrict__ y, const float* __restrict__ bias, int n, void* out, int kind) {
     const size_t base = (size_t) blockIdx.x * n;
+    if ((n & 3) == 0 && kind == K_F16) {
+        const int n4 = n >> 2;
+        const float4* y4 = (const float4*) (y + base);
+        const float4* b4 = bias ? (const float4*) bias : nullptr;
+        uint2* out4 = (uint2*) ((uint16_t*) out + base);
+        constexpr float kInvSqrt2 = 0.70710678118654752440f;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            float4 v = y4[i];
+            if (b4) {
+                const float4 bv = b4[i];
+                v.x += bv.x; v.y += bv.y; v.z += bv.z; v.w += bv.w;
+            }
+            const float g0 = 0.5f * v.x * (1.0f + erff(v.x * kInvSqrt2));
+            const float g1 = 0.5f * v.y * (1.0f + erff(v.y * kInvSqrt2));
+            const float g2 = 0.5f * v.z * (1.0f + erff(v.z * kInvSqrt2));
+            const float g3 = 0.5f * v.w * (1.0f + erff(v.w * kInvSqrt2));
+            const __half2 h01 = __halves2half2(__float2half_rn(g0), __float2half_rn(g1));
+            const __half2 h23 = __halves2half2(__float2half_rn(g2), __float2half_rn(g3));
+            uint2 p;
+            p.x = *(const uint32_t*) &h01;
+            p.y = *(const uint32_t*) &h23;
+            out4[i] = p;
+        }
+        return;
+    }
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float x = y[base + i] + (bias ? bias[i] : 0.0f);
         const float g = 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
@@ -547,6 +939,9 @@ struct VitGpuImpl {
     uint16_t *d_q16 = nullptr, *d_k16 = nullptr, *d_v16 = nullptr;   // q (scaled by 1/sqrt(head size)), k, v [N][D], F16
     uint16_t* d_S = nullptr;       // the scores of a chunk of queries for every head, F16; the softmax turns them into the probabilities in place
     size_t sp_elems = 0;
+    uint8_t* d_rgb = nullptr;      // reusable device buffer for raw uint8 RGB H2D upload
+    size_t rgb_cap = 0;
+    bool cuda_fa = false;          // CUDA sm_70+ WMMA FlashAttention-2 (hd == 64): no d_S needed!
     int kRows = 512;      // rows per chunk of the matrix products (STRATA_VIT_ROWS overrides: a diagnostic)
     size_t kScoreElems = (size_t) 8 << 20;     // scores per attention chunk, 8M: 16 MB of F16 (STRATA_VIT_SCORES, in M elements, overrides)
     size_t kScoreElemsLarge = (size_t) 512 << 20;   // the chunk above 16,384 patches: 512M scores, 1 GB of F16 (see size_buffers)
@@ -759,6 +1154,7 @@ struct VitGpuImpl {
         lt_close();
 #endif
         for (void* p : allocs) (void) cudaFree(p);
+        if (d_rgb) (void) cudaFree(d_rgb);
         if (blas) cublasDestroy(blas);
     }
     template <class T> bool alloc(T*& p, size_t n, std::string& err, bool weight) {
@@ -943,11 +1339,9 @@ struct VitGpuImpl {
         // a score row is padded to a multiple of 8 elements (the product's leading dimension): with an odd row length the BLAS cannot use its tensor-core
         // kernels (a 93-token picture spent half its time there)
         const size_t Np = padded(N);
-        // above 16,384 patches (pictures of more than 4,096 tokens) the chunk is 512M scores (1 GB): with the 16 MB chunk such a picture runs 64 queries per
-        // product and the attention is launch-bound (l620, 16,384 tokens: 33.4 s, 1.17 of mtmd-GPU; with 512M 24.8 s, 0.87, at 3,398 MiB against mtmd-GPU's
-        // 3,858; RESULTS-OWN-3V.md 12.11).  STRATA_VIT_SCORES sets both sizes.
-        const size_t budget = (N > 16384 && !scores_env) ? kScoreElemsLarge : kScoreElems;
-        sp_elems = std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(budget, (size_t) g.heads * Np * 64));
+        const size_t n_patches_only = N > (size_t) (g.has_cls ? 1 : 0) ? (N - (size_t) (g.has_cls ? 1 : 0)) : N;
+        const size_t budget = (n_patches_only > 16384 && !scores_env) ? kScoreElemsLarge : kScoreElems;
+        sp_elems = cuda_fa ? 0 : std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(budget, (size_t) g.heads * Np * 64));
         const size_t R = std::min<size_t>(N, (size_t) kRows);
         // d_ctx holds, one after the other: the patch matrix, the attention context, and at the end the projector's output rows (d_out)
         const size_t ctx_elems = std::max({N * D, N * K0, (N / 4) * (size_t) g.out_dim});
@@ -961,7 +1355,7 @@ struct VitGpuImpl {
         if (ok && hpa16) { y16_elems = R * std::max<size_t>(3 * D, F); ok = alloc(d_y16, y16_elems, err, false); }
         if (ok && hpa16_att) { pv16_elems = N * D; ok = alloc(d_pv16, pv16_elems, err, false); }
 #endif
-        if (ok && !alloc(d_S, sp_elems, err, false)) {
+        if (ok && sp_elems > 0 && !alloc(d_S, sp_elems, err, false)) {
             // no room for the large chunk (a small card, or the engine beside the reader): the 16 MB chunk instead, slower, never an error
             ok = false;
             if (budget != kScoreElems) {
@@ -1037,11 +1431,18 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
 #endif
 #if !defined(STRATA_VIT_HIP)
     bool pascal = false;
-    {   // Pascal (compute capability 6.x): the larger score chunk below; BF16 matrices take K_HF as on every other CUDA card (see bf16_mode)
+    {   // Pascal (compute capability 6.x): the larger score chunk below; Volta+ (sm_70+) with head_dim == 64 uses fused WMMA FlashAttention-2
         cudaDeviceProp p;
-        if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) pascal = true;
+        if (cudaGetDeviceProperties(&p, device) == cudaSuccess) {
+            if (p.major == 6) pascal = true;
+            if (p.major >= 7 && g.head_dim == 64) {
+                const char* e = std::getenv("STRATA_VIT_FA");
+                m.cuda_fa = (!e || std::atoi(e) != 0);
+            }
+        }
         (void) cudaGetLastError();
     }
+    if (g.is_inkling2v() || m.cuda_fa) m.kRows = 2048;
 #else
     {   // gfx1151 (Strix Halo): every product with a 16-bit result and float32 accumulation, BF16 matrices held as F16, so all of them run rocBLAS's tuned
         // HH_HPA kernels (F16 results, 10-bit mantissa).  Strix, 18 pictures at 1,024 tokens: Qwen3.8 0.54-0.83 of mtmd-HIP's time (median 0.66), Qwen3.6
@@ -1202,7 +1603,27 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         pmark = now;
     };
     const int K0 = 3 * P * P;
-    {   // the patch matrix [Np_img][K0], channel-major per patch, row-major for inkling2v or 2x2-merge order for Qwen3-VL
+    if (!img.rgb.empty()) {
+        // Fast GPU path: upload compact uint8 RGB (4x smaller H2D) and fuse normalise + pad + im2col on GPU
+        const size_t rgb_bytes = img.rgb.size();
+        if (rgb_bytes > m.rgb_cap) {
+            if (m.d_rgb) { (void) cudaFree(m.d_rgb); m.d_rgb = nullptr; m.bytes -= m.rgb_cap; m.rgb_cap = 0; }
+            if (cudaMalloc(&m.d_rgb, rgb_bytes) != cudaSuccess) { err = "GPU memory: RGB upload buffer"; (void) cudaGetLastError(); return false; }
+            m.rgb_cap = rgb_bytes;
+            m.bytes += rgb_bytes;
+        }
+        if (cudaMemcpy(m.d_rgb, img.rgb.data(), rgb_bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
+        float m255[3], is255[3], pv[3];
+        for (int c = 0; c < 3; ++c) {
+            m255[c] = g.mean[c] * 255.0f;
+            is255[c] = 1.0f / (g.stdv[c] * 255.0f);
+            pv[c] = ((ink2 ? -1.0f : 0.0f) - m255[c]) * is255[c];
+        }
+        k_rgb_to_patches<<<Np_img, 256>>>(m.d_rgb, img.raw_w, img.raw_h, P, pw, nbx, ink2 ? 1 : 0,
+                                          m255[0], m255[1], m255[2], is255[0], is255[1], is255[2], pv[0], pv[1], pv[2], m.d_ctx);
+        if (!sync_err("gpu patch prepare")) return false;
+    } else {
+        // Fallback CHW path (for unit tests calling encode() with PreparedImage::chw directly)
         std::vector<float> pm((size_t) Np_img * K0);
         const size_t plane = (size_t) img.w * img.h;
         for (int t = 0; t < Np_img; ++t) {
@@ -1237,7 +1658,9 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
 
     const float theta_scale = powf(g.rope_theta, -2.0f / (float) (HD / 2));
     const float kq_scale = 1.0f / sqrtf((float) HD);
-    const int R = m.kRows;
+    // Balanced chunking eliminates tiny 1-row tail chunks (e.g. N=4097 splits into 3x1366 instead of 2x2048 + 1)
+    const int n_chunks = std::max(1, (N + m.kRows - 1) / m.kRows);
+    const int R = (N + n_chunks - 1) / n_chunks;
     uint16_t* const a16 = m.d_a;
     for (const DevLayer& L : m.layers) {
         for (int r0 = 0; r0 < N; r0 += R) {      // the fused projection in chunks of rows (norm, product); q and k get their rotary, all three go to F16
@@ -1248,6 +1671,14 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
             else k_qkv_rope<<<rows, 256>>>(m.d_y, L.qkv_b, r0, nbx, H, HD, theta_scale, kq_scale, m.d_q16, m.d_k16, m.d_v16);
         }
         stage(2);
+#if !defined(STRATA_VIT_HIP)
+        if (m.cuda_fa) {
+            const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) H);
+            k_attn_fa_cuda_hd64<<<grid, 256>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, D);
+            if (!sync_err("fused WMMA attention")) return false;
+        } else
+#endif
+        {
         // per chunk of queries: S = K Q^T (one batched product over the heads), softmax, O = V P (a head's matrix is a column slice of the [N][D] arrays:
         // leading dimension D, batch stride HD)
         const int Np = (int) m.padded((size_t) N);      // the score rows' leading dimension (see size_buffers)
@@ -1291,6 +1722,7 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
             if (!m.bgemm(false, false, HD, qc, N, m.d_v16, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, Np, (long long) qc * Np, m.d_ctx + (size_t) q0 * D,
                          CUDA_R_32F, D, HD, H, err))
                 return false;
+        }
         }
         stage(3);
         for (int r0 = 0; r0 < N; r0 += R) {      // the output projection in chunks: the context rows to the 16-bit input, the product, added to the residual

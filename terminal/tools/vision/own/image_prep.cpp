@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #define STBI_NO_STDIO
 #define STB_IMAGE_STATIC            // private to this file: the mtmd build of strata-vision has its own copy of stb_image
@@ -115,24 +116,41 @@ int precompute_weights(int in_size, int out_size, std::vector<int>& bounds, std:
 std::vector<uint8_t> resample_horizontal(const uint8_t* src, int in_nx, int in_ny, int out_nx, int ksize, const std::vector<int>& bounds,
                                          const std::vector<int32_t>& weights) {
     std::vector<uint8_t> out((size_t) out_nx * in_ny * 3);
-    for (int yy = 0; yy < in_ny; ++yy) {
-        const uint8_t* src_row = src + (size_t) yy * in_nx * 3;
-        uint8_t* dst_row = out.data() + (size_t) yy * out_nx * 3;
-        for (int xx = 0; xx < out_nx; ++xx) {
-            const int xmin = bounds[(size_t) xx * 2 + 0], xcnt = bounds[(size_t) xx * 2 + 1];
-            const int32_t* k = &weights[(size_t) xx * ksize];
-            const uint8_t* p = src_row + (size_t) xmin * 3;
-            int32_t ss0 = 1 << (PRECISION_BITS - 1), ss1 = ss0, ss2 = ss0;
-            for (int x = 0; x < xcnt; ++x) {
-                ss0 += p[0] * k[x];
-                ss1 += p[1] * k[x];
-                ss2 += p[2] * k[x];
-                p += 3;
+    auto run_rows = [&](int y0, int y1) {
+        for (int yy = y0; yy < y1; ++yy) {
+            const uint8_t* src_row = src + (size_t) yy * in_nx * 3;
+            uint8_t* dst_row = out.data() + (size_t) yy * out_nx * 3;
+            for (int xx = 0; xx < out_nx; ++xx) {
+                const int xmin = bounds[(size_t) xx * 2 + 0], xcnt = bounds[(size_t) xx * 2 + 1];
+                const int32_t* k = &weights[(size_t) xx * ksize];
+                const uint8_t* p = src_row + (size_t) xmin * 3;
+                int32_t ss0 = 1 << (PRECISION_BITS - 1), ss1 = ss0, ss2 = ss0;
+                for (int x = 0; x < xcnt; ++x) {
+                    ss0 += p[0] * k[x];
+                    ss1 += p[1] * k[x];
+                    ss2 += p[2] * k[x];
+                    p += 3;
+                }
+                dst_row[xx * 3 + 0] = clip8(ss0 >> PRECISION_BITS);
+                dst_row[xx * 3 + 1] = clip8(ss1 >> PRECISION_BITS);
+                dst_row[xx * 3 + 2] = clip8(ss2 >> PRECISION_BITS);
             }
-            dst_row[xx * 3 + 0] = clip8(ss0 >> PRECISION_BITS);
-            dst_row[xx * 3 + 1] = clip8(ss1 >> PRECISION_BITS);
-            dst_row[xx * 3 + 2] = clip8(ss2 >> PRECISION_BITS);
         }
+    };
+    const int hw = (int) std::thread::hardware_concurrency();
+    const int nt = ((size_t) in_ny * (size_t) out_nx >= 262144u) ? std::max(1, std::min({hw > 0 ? hw : 4, 8, in_ny / 32})) : 1;
+    if (nt <= 1) {
+        run_rows(0, in_ny);
+    } else {
+        std::vector<std::thread> ths;
+        ths.reserve((size_t) (nt - 1));
+        const int per = (in_ny + nt - 1) / nt;
+        for (int wi = 1; wi < nt; ++wi) {
+            const int y0 = wi * per, y1 = std::min(in_ny, y0 + per);
+            if (y0 < y1) ths.emplace_back(run_rows, y0, y1);
+        }
+        run_rows(0, std::min(in_ny, per));
+        for (auto& th : ths) th.join();
     }
     return out;
 }
@@ -141,18 +159,35 @@ std::vector<uint8_t> resample_vertical(const uint8_t* src, int in_nx, int out_ny
                                        const std::vector<int32_t>& weight) {
     const size_t row_elems = (size_t) in_nx * 3;
     std::vector<uint8_t> out(row_elems * out_ny);
-    std::vector<int32_t> acc(row_elems);
-    for (int yy = 0; yy < out_ny; ++yy) {
-        const int ymin = bounds[(size_t) yy * 2 + 0], ycnt = bounds[(size_t) yy * 2 + 1];
-        const int32_t* k = &weight[(size_t) yy * ksize];
-        std::fill(acc.begin(), acc.end(), 1 << (PRECISION_BITS - 1));
-        for (int y = 0; y < ycnt; ++y) {
-            const uint8_t* src_row = src + (size_t) (ymin + y) * row_elems;
-            const int32_t w = k[y];
-            for (size_t i = 0; i < row_elems; ++i) acc[i] += src_row[i] * w;
+    auto run_rows = [&](int y0, int y1) {
+        std::vector<int32_t> acc(row_elems);
+        for (int yy = y0; yy < y1; ++yy) {
+            const int ymin = bounds[(size_t) yy * 2 + 0], ycnt = bounds[(size_t) yy * 2 + 1];
+            const int32_t* k = &weight[(size_t) yy * ksize];
+            std::fill(acc.begin(), acc.end(), 1 << (PRECISION_BITS - 1));
+            for (int y = 0; y < ycnt; ++y) {
+                const uint8_t* src_row = src + (size_t) (ymin + y) * row_elems;
+                const int32_t w = k[y];
+                for (size_t i = 0; i < row_elems; ++i) acc[i] += src_row[i] * w;
+            }
+            uint8_t* dst_row = out.data() + (size_t) yy * row_elems;
+            for (size_t i = 0; i < row_elems; ++i) dst_row[i] = clip8(acc[i] >> PRECISION_BITS);
         }
-        uint8_t* dst_row = out.data() + (size_t) yy * row_elems;
-        for (size_t i = 0; i < row_elems; ++i) dst_row[i] = clip8(acc[i] >> PRECISION_BITS);
+    };
+    const int hw = (int) std::thread::hardware_concurrency();
+    const int nt = ((size_t) out_ny * (size_t) in_nx >= 262144u) ? std::max(1, std::min({hw > 0 ? hw : 4, 8, out_ny / 32})) : 1;
+    if (nt <= 1) {
+        run_rows(0, out_ny);
+    } else {
+        std::vector<std::thread> ths;
+        ths.reserve((size_t) (nt - 1));
+        const int per = (out_ny + nt - 1) / nt;
+        for (int wi = 1; wi < nt; ++wi) {
+            const int y0 = wi * per, y1 = std::min(out_ny, y0 + per);
+            if (y0 < y1) ths.emplace_back(run_rows, y0, y1);
+        }
+        run_rows(0, std::min(out_ny, per));
+        for (auto& th : ths) th.join();
     }
     return out;
 }
@@ -275,6 +310,43 @@ bool prepare_image(const ImageU8& src, const VitGeometry& g, int min_tokens, int
     for (size_t i = 0; i < n; ++i)
         for (int c = 0; c < 3; ++c) out.chw[c * n + i] = ((float) r.rgb[i * 3 + c] / 255.0f - g.mean[c]) / g.stdv[c];
     if (resized) *resized = std::move(r);
+    return true;
+}
+
+bool prepare_image_u8(const ImageU8& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err) {
+    if (src.w <= 0 || src.h <= 0 || src.rgb.size() != (size_t) src.w * src.h * 3) { err = "the picture is empty"; return false; }
+    out.chw.clear();
+    if (g.is_inkling2v()) {
+        const int align = g.align();
+        const int64_t max_px = (int64_t) (max_tokens > 0 ? max_tokens : g.max_tokens) * align * align;
+        const int aw0 = ((src.w + align - 1) / align) * align;
+        const int ah0 = ((src.h + align - 1) / align) * align;
+        if (max_px > 0 && (int64_t) aw0 * ah0 > max_px) {
+            const Size2 sz = smart_resize(src.w, src.h, align, 0, (int) std::min<int64_t>(max_px, 0x7FFFFFFFLL));
+            if (sz.w <= 0 || sz.h <= 0) { err = "the picture has no usable size"; return false; }
+            ImageU8 r_buf;
+            resize_bicubic(src, r_buf, sz.w, sz.h);
+            out.raw_w = r_buf.w;
+            out.raw_h = r_buf.h;
+            out.w = ((r_buf.w + align - 1) / align) * align;
+            out.h = ((r_buf.h + align - 1) / align) * align;
+            out.rgb = std::move(r_buf.rgb);
+        } else {
+            out.raw_w = src.w;
+            out.raw_h = src.h;
+            out.w = aw0;
+            out.h = ah0;
+            out.rgb = src.rgb;
+        }
+        return true;
+    }
+    const Size2 t = prepared_size(src.w, src.h, g, min_tokens, max_tokens);
+    if (t.w <= 0 || t.h <= 0) { err = "the picture has no usable size"; return false; }
+    ImageU8 r;
+    resize_pad_ceil(src, r, t);
+    out.w = out.raw_w = t.w;
+    out.h = out.raw_h = t.h;
+    out.rgb = std::move(r.rgb);
     return true;
 }
 
