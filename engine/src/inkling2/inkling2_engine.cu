@@ -2057,7 +2057,7 @@ struct Engine {
         for (int il = 0; il < hp.n_layer; ++il) {
             const int ip = hp.loop_layer(il);
             const PhysLayer& L = m->layers[(size_t) ip];
-            if (L.n_slots >= ne || L.gu_type == 30 || !L.hblobs) continue;
+            if (L.n_slots >= ne || L.n_slots == 0 || !L.hblobs) continue;
             const int cap = (int) std::min<size_t>((size_t) ne, pp_stage_bytes / L.stride);
             if (cap <= 0) continue;
             int n_miss = 0;
@@ -2183,12 +2183,17 @@ struct Engine {
                     return;
                 }
             }
+            if (L.gu_type == 30 && L.d_type == 30) {
+                K::native_expert_grouped_bf16_f32(L.L, gptr, grp_start, n_groups, ent_dst, ent_tok,
+                                                  cap_g, n_ent, x_norm, escr, eparts, st);
+                return;
+            }
             ensure_q8();
             K::native_expert_grouped(L.L, gptr, grp_start, n_groups, ent_dst, ent_tok,
                                      cap_g, n_ent, xq, escr, eparts, st);
         };
 
-        if (pp_streaming && need_cpu && L.gu_type != 30 && L.hblobs && pp_stage_bytes >= L.stride) {
+        if (pp_streaming && need_cpu && L.hblobs && pp_stage_bytes >= L.stride) {
             // Zero host-GPU stalls across all 48 layers: k_route_inkling2 tracks exact routing counts in L.d_hits on GPU!
             const int ne = (int) hp.n_expert;
             const int n_chunks = pp_layer_cnt[(size_t) il];
@@ -2595,7 +2600,7 @@ struct Engine {
         };
 
         auto ensure_hblobs = [&](PhysLayer& L, bool is_tier1) {
-            if (L.hblobs || L.gu_type == 30) return;
+            if (L.hblobs) return;
             const size_t hb_bytes = (size_t) ne * L.stride;
             bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr);
             if (want_pin && pinned_used + hb_bytes > max_pin_bytes && is_tier1) {
@@ -4016,7 +4021,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t max_exp_stride = 0;
     size_t all_exps_bytes = 0;
     for (int ip = 0; ip < hp.n_phys; ++ip) {
-        if (m.layers[(size_t) ip].gu_type == 30) continue;
         max_exp_stride = std::max(max_exp_stride, m.layers[(size_t) ip].stride);
         all_exps_bytes += (size_t) ne * m.layers[(size_t) ip].stride;
     }
@@ -4062,13 +4066,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             }
         }
     }
-    bool has_bf16_experts = false;
-    for (int ip = 0; ip < hp.n_phys; ++ip) {
-        if (m.layers[(size_t) ip].gu_type == 30) { has_bf16_experts = true; break; }
-    }
-    const int cpu_t = (!has_bf16_experts && E.pp_stage[0] && E.pp_stream_t > 1) ? std::min(E.tmax, E.pp_stream_t - 1) : E.tmax;
+    const int cpu_t = (E.pp_stage[0] && E.pp_stream_t > 1) ? std::min(E.tmax, E.pp_stream_t - 1) : E.tmax;
     // Defer init_cpu_bufs() until hybrid/CPU experts are actually needed (saves 72 MiB VRAM + 81 MiB pinned RAM on V100 Full-VRAM!).
-    const bool will_need_cpu = has_bf16_experts || (budget < all_exps_bytes);
+    const bool will_need_cpu = (budget < all_exps_bytes);
     if (will_need_cpu) {
         size_t fr_before_cpu = 0;
         CK(cudaMemGetInfo(&fr_before_cpu, &tot));
@@ -4084,10 +4084,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     std::vector<int> slots(m.layers.size(), 0);
 
     // Priority 1: Looped core NVFP4 layers (blk.6..17, executed 3x/token!)
-    std::vector<int> tier1, tier2;
+    // Priority 2: Compact quantized outer layers (NVFP4/Q5_K)
+    // Priority 3: BF16 outer layers (gu_type == 30, e.g. blk.20..23 in UD-Q8_K_XL) placed in remaining VRAM
+    std::vector<int> tier1, tier2, tier3;
     for (int ip = 0; ip < hp.n_phys; ++ip) {
-        if (m.layers[(size_t) ip].gu_type == 30) continue;   // BF16 stays CPU-resident
-        if (ip >= hp.core_start && ip < hp.core_end) tier1.push_back(ip);
+        if (m.layers[(size_t) ip].gu_type == 30) tier3.push_back(ip);
+        else if (ip >= hp.core_start && ip < hp.core_end) tier1.push_back(ip);
         else tier2.push_back(ip);
     }
 
@@ -4132,6 +4134,29 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         while (added && used < budget) {
             added = false;
             for (int ip : tier2) {
+                const size_t st_b = m.layers[(size_t) ip].stride;
+                if (slots[(size_t) ip] < ne && used + st_b <= budget) {
+                    slots[(size_t) ip] += 1;
+                    used += st_b;
+                    added = true;
+                }
+            }
+        }
+    }
+
+    // Priority 3: Distribute remaining VRAM across BF16 outer layers (e.g. blk.20..23 in UD-Q8_K_XL)
+    if (!tier3.empty() && budget > used) {
+        size_t sum_tier3_stride = 0;
+        for (int ip : tier3) sum_tier3_stride += m.layers[(size_t) ip].stride;
+        const int s = sum_tier3_stride > 0 ? (int) std::min<size_t>((size_t) ne, (budget - used) / sum_tier3_stride) : 0;
+        if (s > 0) {
+            for (int ip : tier3) slots[(size_t) ip] = s;
+            used += (size_t) s * sum_tier3_stride;
+        }
+        bool added = true;
+        while (added && used < budget) {
+            added = false;
+            for (int ip : tier3) {
                 const size_t st_b = m.layers[(size_t) ip].stride;
                 if (slots[(size_t) ip] < ne && used + st_b <= budget) {
                     slots[(size_t) ip] += 1;
@@ -4938,7 +4963,6 @@ int run(int argc, char** argv) {
             ? ((size_t) m.hp.kv_dim * 2 + (size_t) m.hp.n_head_kv * sizeof(__half) * 2)
             : ((size_t) m.hp.kv_dim * sizeof(__half) * 2);
         for (int ip = 0; ip < m.hp.n_phys; ++ip) {
-            if (m.layers[(size_t) ip].gu_type == 30) continue;
             const size_t lb = (size_t) m.hp.n_expert * m.layers[(size_t) ip].stride;
             pin.all_experts_bytes += lb;
             if (ip >= m.hp.core_start && ip < m.hp.core_end) pin.tier1_experts_bytes += lb;
