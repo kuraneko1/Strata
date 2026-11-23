@@ -304,21 +304,27 @@ bool dequant_wide_on() {
 }
 
 // Q8_0 with four threads per block, 8 values each: the warp reads 8 consecutive blocks and writes 512 consecutive
-// bytes (a thread per block wrote 2-byte values 64 bytes apart: ~110 GB/s, a quarter of a prompt projection's time)
+// bytes (a thread per block wrote 2-byte values 64 bytes apart: ~110 GB/s, a quarter of a prompt projection's time).
+// Zero 64-bit div/mod when contiguous (row_bytes == groups_per_row * 34) + __shfl_sync scale sharing + __ldg.
 template <typename T>
 __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                                     int64_t groups_per_row, T* __restrict__ out) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * groups_per_row * 4) return;
-    const int64_t g = i >> 2, r = g / groups_per_row, gi = g % groups_per_row;
+    const int64_t total_threads = rows * groups_per_row * 4;
+    if (i >= total_threads) return;
+    const int64_t g = i >> 2;
     const int piece = (int) (i & 3);
-    const uint8_t* b = blocks + (row0 + r) * row_bytes + gi * 34;
-    const float d = h2f(b);
+    const uint8_t* b = (row_bytes == groups_per_row * 34)
+        ? (blocks + (row0 * groups_per_row + g) * 34)
+        : (blocks + (row0 + g / groups_per_row) * row_bytes + (g % groups_per_row) * 34);
+    float d = 0.0f;
+    if (piece == 0) d = __half2float(__ldg((const __half*) b));
+    d = __shfl_sync(__activemask(), d, (threadIdx.x & 31) & ~3);
     const uint16_t* q = (const uint16_t*) (b + 2 + 8 * piece);   // blocks are 2-byte aligned
     __align__(16) T v[8];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const uint16_t w = q[k];
+        const uint16_t w = __ldg(q + k);
         put(v, 2 * k, (float) (int8_t) (w & 0xFF) * d);
         put(v, 2 * k + 1, (float) (int8_t) (w >> 8) * d);
     }
