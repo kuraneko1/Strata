@@ -650,6 +650,8 @@ class Assembler:
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item = None                             # the open output item
+        self._item_chunks = []                       # O(1) delta chunks for active item (avoids O(N^2) += after snapshot)
+        self._item_field = None                      # "text" (content[0]["text"]) or "arguments" (item["arguments"])
         self.json_text = []                          # structured output: the answer, held until it is checked
         self.called = False                          # a tool call was made: this turn is not the final answer
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
@@ -672,7 +674,18 @@ class Assembler:
         self.seq += 1
         return e
 
+    def _flush_item_text(self):
+        if not self._item_chunks or self.item is None:
+            return
+        chunk = "".join(self._item_chunks)
+        self._item_chunks.clear()
+        if self._item_field == "arguments":
+            self.item["arguments"] += chunk
+        elif self._item_field == "text":
+            self.item["content"][0]["text"] += chunk
+
     def snapshot(self) -> dict:
+        self._flush_item_text()
         return copy.deepcopy(self.response)
 
     def start(self) -> list[dict]:
@@ -686,6 +699,8 @@ class Assembler:
     def _open(self, item) -> list[dict]:
         self.response["output"].append(item)
         self.item = item
+        self._item_chunks.clear()
+        self._item_field = "arguments" if item["type"] == "function_call" else ("text" if item["type"] in ("message", "reasoning") else None)
         out = [self.event("response.output_item.added", output_index=self.index, item=copy.deepcopy(item))]
         if item["type"] == "message":
             part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
@@ -699,6 +714,8 @@ class Assembler:
         return len(self.response["output"]) - 1
 
     def close(self, status=None) -> list[dict]:
+        self._flush_item_text()
+        self._item_field = None
         item, self.item = self.item, None
         if item is None:
             return []
@@ -736,7 +753,7 @@ class Assembler:
                 out += self.close()
                 out += self._open({"id": new_id("rs"), "type": "reasoning", "status": "in_progress", "summary": [],
                                    "content": [{"type": "reasoning_text", "text": ""}]})
-            self.item["content"][0]["text"] += ev.text
+            self._item_chunks.append(ev.text)
             out.append(self.event("response.reasoning_text.delta", item_id=self.item["id"], output_index=self.index,
                                   content_index=0, delta=ev.text))
         elif kind == "content":
@@ -750,7 +767,7 @@ class Assembler:
                 out += self.close()
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
                                    "role": "assistant", "content": []})
-            self.item["content"][0]["text"] += ev.text
+            self._item_chunks.append(ev.text)
             out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
                                   content_index=0, delta=ev.text, logprobs=[]))
         elif kind == "tool_start":
@@ -762,7 +779,7 @@ class Assembler:
             if item is None or item.get("call_id") != ev.call.id:
                 return out
             if item["type"] == "function_call":         # a custom tool's input is sent whole, at its end
-                item["arguments"] += ev.text
+                self._item_chunks.append(ev.text)
                 out.append(self.event("response.function_call_arguments.delta", item_id=item["id"],
                                       output_index=self.index, delta=ev.text))
         elif kind == "tool_call":

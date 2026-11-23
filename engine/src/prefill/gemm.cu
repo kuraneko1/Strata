@@ -1290,6 +1290,21 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 
+void Gemm::sgemm(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K) {
+    if (T <= 0 || N <= 0 || K <= 0) return;
+    const float alpha = 1.0f, beta = 0.0f;
+#if defined(__HIPCC__)
+    ck(hipblasSgemm((hipblasHandle_t) handle_, HIPBLAS_OP_T, HIPBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                    (int) K, X, (int) K, &beta, Y, (int) N),
+       "hipblasSgemm");
+    STRATA_ABSORB_HIPBLAS_STICKY("hipblasSgemm");
+#else
+    ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                   (int) K, X, (int) K, &beta, Y, (int) N),
+       "cublasSgemm");
+#endif
+}
+
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
                       int64_t ldy) {

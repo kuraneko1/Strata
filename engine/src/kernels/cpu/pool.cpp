@@ -1367,7 +1367,7 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
     const int64_t dg_c = dg ? now_ns() : 0;
-    wait_parked("after a phase");
+    if (numa_phase() || dg) wait_parked("after a phase");
     if (dg) {
         const int64_t dg_d = now_ns();
         dg_wp_before_ns_ += dg_b - dg_a;
@@ -1495,7 +1495,6 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         }
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
-    mode_ = 0;
     const auto t_end = std::chrono::steady_clock::now();
     ms_drain_ += std::chrono::duration<double, std::milli>(t_end - t0).count();
     if (diag_pool_on()) {

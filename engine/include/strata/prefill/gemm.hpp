@@ -55,6 +55,9 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
+    /// Y[T, N] = X[T, K] . W[N, K]^T with both in FP32, reusing Gemm's cuBLAS handle & workspace.
+    void sgemm(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K);
+
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
     /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits

@@ -1008,6 +1008,9 @@ class StrataEngine:
         log = getattr(self, "log", None)                # retain this process's log across a restart
         line = None
         for line in proc.stdout:
+            if line.startswith("T "):
+                lines.put(line)
+                continue
             # stderr already reaches the log; native ERR diagnostics use the protocol pipe.
             if line.startswith("ERR ") and log not in (None, subprocess.DEVNULL):
                 try:
@@ -6345,6 +6348,7 @@ def body_limit() -> int:
 
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
+        disable_nagle_algorithm = True
         timeout = PEER_STALL_S
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 

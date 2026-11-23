@@ -46,7 +46,7 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.id = ArchId::Sm70Volta;
         p.name = "sm70";
         p.force_bf16_x_f16 = true;
-        p.full_vram_want_sp = 7;
+        p.full_vram_want_sp = 6;
         p.hybrid_want_sp_1024 = 7;
         p.hybrid_want_sp_2048 = 4;
         p.t1_full_split_mult = 8;
@@ -153,17 +153,17 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     const size_t full_kv_total = (size_t) std::max(0, in.n_full_layers) * (size_t) std::max(1, in.max_ctx) * in.kv_bytes_per_tok;
     const size_t swa_kv_1024 = (size_t) std::max(0, in.n_swa_layers) * (size_t) std::max(1, in.n_swa) * in.kv_bytes_per_tok;
     // Steady engine scratch + layer_arena + conv + driver slack at T=1024 (~380 MiB + 128 MiB safety margin).
-    const size_t engine_overhead_1024 = 512 * MiB;
-    const size_t stage_bytes_pref = (size_t) out.arch.pp_stage_cnt_pref * ((size_t) out.arch.pp_stage_mb * MiB);
+    const size_t engine_overhead_1024 = 448 * MiB;
+    const size_t stage_bytes_core = (size_t) out.arch.pp_stage_cnt_core * ((size_t) out.arch.pp_stage_mb * MiB);
 
     const bool cap_allows_full = !in.expert_vram_forced || (in.expert_vram_cap_bytes >= in.all_experts_bytes);
-    const bool cap_allows_core = !in.expert_vram_forced || (in.expert_vram_cap_bytes >= in.tier1_experts_bytes + stage_bytes_pref);
+    const bool cap_allows_core = !in.expert_vram_forced || (in.expert_vram_cap_bytes >= in.tier1_experts_bytes + stage_bytes_core);
 
     const size_t full_vram_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + in.all_experts_bytes + 128 * MiB;
     const size_t dspark_kv_need = in.has_draft
                                 ? ((size_t) std::max(1, in.max_ctx) * in.kv_bytes_per_tok + 256 * MiB)
                                 : 0;
-    const size_t core_hybrid_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + stage_bytes_pref + in.tier1_experts_bytes + dspark_kv_need + 128 * MiB;
+    const size_t core_hybrid_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_need + 128 * MiB;
 
     if (in.all_experts_bytes > 0 && cap_allows_full && in.vram_free_bytes >= full_vram_need) {
         out.regime = VramRegime::FullVram;
@@ -175,9 +175,10 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
 
     // 1. Initial full-attention KV capacity:
     //    - FullVram & CoreResidentHybrid allocate max_ctx upfront (zero mid-run KV expansion pauses!).
-    //    - TightHybrid starts at min(max_ctx, 32768) so short prompts keep maximum VRAM experts, then grows dynamically.
-    if (out.regime == VramRegime::TightHybrid && in.max_ctx > 32768) {
-        out.full_kv_init = 32768;
+    //    - TightHybrid starts at min(max_ctx, 36864) (32K + 4K decode headroom) so a 32K prompt never hits
+    //      a mid-decode KV growth cliff on token #1 while still keeping maximum VRAM experts for short prompts.
+    if (out.regime == VramRegime::TightHybrid && in.max_ctx > 36864) {
+        out.full_kv_init = 36864;
     } else {
         out.full_kv_init = std::max(1, in.max_ctx);
     }
@@ -188,8 +189,7 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     //      with upfront full_kv_init + SWA-3072 ring + 2x64MiB staging, boosting prefill +25-35% without losing core_graph.
     //    - TightHybrid on measured sm_89 Q8KV (no draft) uses 2048 (SWA-3072 ring halves PCIe streaming bytes/tok).
     const size_t swa_kv_2048 = (size_t) std::max(0, in.n_swa_layers) * (size_t) (std::max(1, in.n_swa) + 2048) * in.kv_bytes_per_tok;
-    const size_t stage_bytes_core = (size_t) out.arch.pp_stage_cnt_core * ((size_t) out.arch.pp_stage_mb * MiB);
-    const size_t engine_overhead_2048 = 704 * MiB;
+    const size_t engine_overhead_2048 = 576 * MiB;
     const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + 160 * MiB;
 
     if (in.requested_chunk > 0) {

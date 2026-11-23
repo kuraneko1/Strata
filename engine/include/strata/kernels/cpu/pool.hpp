@@ -279,7 +279,7 @@ public:
     /// between requests: with most experts in VRAM (a 24 GB card) many layers have no CPU work, so the workers
     /// also sleep mid-request - which the claim protocol above must survive (issue #29).
     /// `STRATA_POOL_SPIN_US` overrides it (a test knob: a short spin makes the workers sleep constantly).
-    static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
+    static constexpr std::chrono::milliseconds kSpinBeforeSleep{45};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again (issue #29).
     static constexpr std::chrono::seconds kStall{60};

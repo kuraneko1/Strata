@@ -64,7 +64,7 @@ int main() {
         check(p.regime == VramRegime::FullVram, "V100 819K selects FullVram");
         check(p.chunk == 1024, "V100 819K keeps chunk=1024");
         check(p.full_kv_init == 819200, "V100 819K allocates full 819K KV upfront");
-        check(p.want_sp == 7, "V100 819K preserves want_sp=7 (best_sp=5 on 80 SMs)");
+        check(p.want_sp == 6, "V100 819K uses exact want_sp=6 (best_sp=5 + 1 tail on 80 SMs)");
         check(!p.use_d_hits, "V100 FullVram skips d_hits atomics");
         check(p.pp_stage_cnt_pref == 0, "V100 FullVram allocates no pp_stage");
         check(p.force_bf16_x_f16, "V100 enables force_bf16_x_f16");
@@ -122,7 +122,7 @@ int main() {
         std::printf("%s\n", format_profile_line(in, p).c_str());
         check(p.regime == VramRegime::TightHybrid, "RTX 4070 262K selects TightHybrid");
         check(p.chunk == 2048, "RTX 4070 262K auto-selects chunk=2048");
-        check(p.full_kv_init == 32768, "RTX 4070 262K starts KV at 32K for fast short prompts");
+        check(p.full_kv_init == 36864, "RTX 4070 262K starts KV at 36K (32K+4K decode headroom) avoiding token-1 KV cliff");
         check(p.want_sp == 4, "RTX 4070 262K reserves 4 splits at T=2048");
         check(p.pp_stage_cnt_pref == 3 && p.pp_stage_mb == 64, "RTX 4070 262K uses 3x64 MiB ring");
     }

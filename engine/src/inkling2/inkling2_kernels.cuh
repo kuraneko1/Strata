@@ -115,10 +115,23 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
 }
 
 __global__ void k_f32_to_bf16(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+    if ((n & 3) == 0) {
+        const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+        const int64_t n4 = n >> 2;
+        if (i >= n4) return;
+        const float4 v = reinterpret_cast<const float4*>(x)[i];
+        const uint32_t u0 = __float_as_uint(v.x), u1 = __float_as_uint(v.y);
+        const uint32_t u2 = __float_as_uint(v.z), u3 = __float_as_uint(v.w);
+        const uint32_t b0 = (u0 + (0x7FFFu + ((u0 >> 16) & 1u))) >> 16;
+        const uint32_t b1 = (u1 + (0x7FFFu + ((u1 >> 16) & 1u))) >> 16;
+        const uint32_t b2 = (u2 + (0x7FFFu + ((u2 >> 16) & 1u))) >> 16;
+        const uint32_t b3 = (u3 + (0x7FFFu + ((u3 >> 16) & 1u))) >> 16;
+        reinterpret_cast<uint2*>(y)[i] = make_uint2(b0 | (b1 << 16), b2 | (b3 << 16));
+        return;
+    }
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    uint32_t u;
-    memcpy(&u, x + i, sizeof u);
+    const uint32_t u = __float_as_uint(x[i]);
     const uint32_t bias = 0x7FFFu + ((u >> 16) & 1u);
     y[i] = (uint16_t) ((u + bias) >> 16);
 }
@@ -129,8 +142,8 @@ __global__ void k_f32_to_f16(const float* __restrict__ x, uint16_t* __restrict__
         const int64_t n4 = n >> 2;
         if (i >= n4) return;
         const float4 v = reinterpret_cast<const float4*>(x)[i];
-        __half2 p0 = __halves2half2(__float2half_rn(v.x), __float2half_rn(v.y));
-        __half2 p1 = __halves2half2(__float2half_rn(v.z), __float2half_rn(v.w));
+        __half2 p0 = __floats2half2_rn(v.x, v.y);
+        __half2 p1 = __floats2half2_rn(v.z, v.w);
         uint2 out;
         memcpy(&out.x, &p0, 4);
         memcpy(&out.y, &p1, 4);
@@ -7604,63 +7617,65 @@ __global__ void k_mul_sigmoid(float* __restrict__ att, const float* __restrict__
     if (i < n) att[i] *= sigmf(gate[i]);
 }
 
-/// MoE router for Inkling2: sigmoid(logits) + exp_probs_b -> top-k -> normalize weights -> * scale.
-/// n_exp <= 128, top_k <= 16. 1 warp (32 threads) per token (grid T).
+/// Zero-spill MoE router for Inkling2: sigmoid(logits) + exp_probs_b -> top-k -> normalize weights -> * scale.
+/// n_exp <= 128, top_k <= 16. 8 warps (8 tokens) per CTA: grid((T + 7) / 8), block 256. STACK: 0!
 __global__ void k_route_inkling2(const float* __restrict__ logits, const float* __restrict__ bias,
                                  int32_t* __restrict__ ids, float* __restrict__ ewts,
-                                 int n_exp, int top_k, float scale,
+                                 int n_exp, int top_k, float scale, int T,
                                  uint32_t* __restrict__ d_hits = nullptr) {
-    const int t = blockIdx.x, lane = threadIdx.x;
-    float p[4], s[4];
+    __shared__ float s_wlocal[8][16];
+    __shared__ uint32_t s_hits[128];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int t = (int) blockIdx.x * 8 + warp;
+    if (d_hits && tid < 128) s_hits[tid] = 0u;
+    if (d_hits) __syncthreads();
+    if (t < T) {
+        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+        float s0 = -1e30f, s1 = -1e30f, s2 = -1e30f, s3 = -1e30f;
+        const float* lg = logits + (size_t) t * n_exp;
+        if (lane < n_exp) { p0 = sigmf(lg[lane]); s0 = p0 + (bias ? bias[lane] : 0.0f); }
+        if (32 + lane < n_exp) { p1 = sigmf(lg[32 + lane]); s1 = p1 + (bias ? bias[32 + lane] : 0.0f); }
+        if (64 + lane < n_exp) { p2 = sigmf(lg[64 + lane]); s2 = p2 + (bias ? bias[64 + lane] : 0.0f); }
+        if (96 + lane < n_exp) { p3 = sigmf(lg[96 + lane]); s3 = p3 + (bias ? bias[96 + lane] : 0.0f); }
+
+        float wsum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            float bv = s0; int be = lane; float bp = p0;
+            if (s1 > bv) { bv = s1; be = 32 + lane; bp = p1; }
+            if (s2 > bv) { bv = s2; be = 64 + lane; bp = p2; }
+            if (s3 > bv) { bv = s3; be = 96 + lane; bp = p3; }
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int e = j * 32 + lane;
-        if (e < n_exp) {
-            const float pr = sigmf(logits[(size_t) t * n_exp + e]);
-            p[j] = pr;
-            s[j] = pr + (bias ? bias[e] : 0.0f);
-        } else {
-            p[j] = 0.0f;
-            s[j] = -1e30f;
-        }
-    }
-    float wlocal[16];
-    float wsum = 0.0f;
-    for (int k = 0; k < top_k; ++k) {
-        float bv = s[0];
-        int be = lane;
-        float bp = p[0];
-#pragma unroll
-        for (int j = 1; j < 4; ++j) {
-            if (s[j] > bv) {
-                bv = s[j];
-                be = j * 32 + lane;
-                bp = p[j];
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+                const float op = __shfl_xor_sync(0xffffffffu, bp, o);
+                if (ov > bv || (ov == bv && oe < be)) { bv = ov; be = oe; bp = op; }
+            }
+            if (lane == 0) {
+                ids[(size_t) t * top_k + k] = be;
+                if (d_hits) atomicAdd(&s_hits[be], 1u);
+                s_wlocal[warp][k] = bp;
+                wsum += bp;
+            }
+            if ((be & 31) == lane) {
+                const int q = be >> 5;
+                if (q == 0) s0 = -1e30f;
+                else if (q == 1) s1 = -1e30f;
+                else if (q == 2) s2 = -1e30f;
+                else s3 = -1e30f;
             }
         }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oe = __shfl_xor_sync(0xffffffffu, be, o);
-            const float op = __shfl_xor_sync(0xffffffffu, bp, o);
-            if (ov > bv || (ov == bv && oe < be)) {
-                bv = ov;
-                be = oe;
-                bp = op;
-            }
+        const float wsum_b = __shfl_sync(0xffffffffu, wsum, 0);
+        const float fac = scale / fmaxf(wsum_b, 6.103515625e-5f);
+        if (lane < top_k) {
+            ewts[(size_t) t * top_k + lane] = s_wlocal[warp][lane] * fac;
         }
-        if (lane == 0) {
-            ids[(size_t) t * top_k + k] = be;
-            if (d_hits) atomicAdd(&d_hits[be], 1u);
-            wlocal[k] = bp;
-            wsum += bp;
-        }
-        if ((be & 31) == lane) s[be >> 5] = -1e30f;
     }
-    if (lane == 0) {
-        const float denom = fmaxf(wsum, 6.103515625e-5f);
-        const float fac = scale / denom;
-        for (int k = 0; k < top_k; ++k) ewts[(size_t) t * top_k + k] = wlocal[k] * fac;
+    if (d_hits) {
+        __syncthreads();
+        if (tid < n_exp && s_hits[tid] > 0u) atomicAdd(&d_hits[tid], s_hits[tid]);
     }
 }
 
@@ -8252,6 +8267,183 @@ __global__ void k_argmax_stage2(const float* __restrict__ p_val, const int32_t* 
         if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
     }
     if (lane == 0) pick[row_id] = mi;
+}
+
+/// Apply repetition / frequency / presence penalties in-place on GPU logits for `rows` rows (<= 64 unique tokens).
+/// Grid (1, rows), Block 64. 100% bit-exact to CPU `build_sampling_dist`.
+__global__ void k_apply_penalties(float* __restrict__ logits, int V,
+                                  const int32_t* __restrict__ pen_toks, const int32_t* __restrict__ pen_cnts,
+                                  int n_pen, float rep_pen, float freq_pen, float pres_pen) {
+    const int j = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_pen) return;
+    const int32_t tok = pen_toks[j];
+    if (tok < 0 || tok >= V) return;
+    float* row = logits + (size_t) blockIdx.y * V;
+    float l = row[tok];
+    if (rep_pen != 1.0f) l = (l <= 0.0f) ? (l * rep_pen) : (l / rep_pen);
+    l -= (float) pen_cnts[j] * freq_pen + pres_pen;
+    row[tok] = l;
+}
+
+__device__ __forceinline__ uint32_t f32_to_ordered_u32(float v) {
+    const uint32_t u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+/// Exact GPU Top-K (K <= 256) Stage 1: build 11-bit MSB histogram (2048 buckets) per row.
+/// Grid (n_blk, rows), Block 256 (8 KB SMEM, STACK: 0).
+__global__ void k_topk_hist(const float* __restrict__ logits, uint32_t* __restrict__ hist_out, int V) {
+    __shared__ uint32_t sh[2048];
+    const int tid = threadIdx.x;
+    const int b = blockIdx.x, row_id = blockIdx.y, n_blk = gridDim.x;
+#pragma unroll
+    for (int i = tid; i < 2048; i += 256) sh[i] = 0u;
+    __syncthreads();
+    const float* row = logits + (size_t) row_id * V;
+    const int stride = n_blk * 256;
+    for (int i = b * 256 + tid; i < V; i += stride) {
+        const uint32_t bucket = f32_to_ordered_u32(row[i]) >> 21;
+        atomicAdd(&sh[bucket], 1u);
+    }
+    __syncthreads();
+    uint32_t* dst = hist_out + (size_t) row_id * 2048;
+#pragma unroll
+    for (int i = tid; i < 2048; i += 256) {
+        const uint32_t c = sh[i];
+        if (c > 0u) atomicAdd(&dst[i], c);
+    }
+}
+
+/// Exact GPU Top-K Stage 2: find highest 11-bit bucket `thr_bucket` whose cumulative count >= K.
+/// Grid (rows), Block 256 (8 KB SMEM, STACK: 0). Also resets `cand_cnt[row] = 0`.
+__global__ void k_topk_select_thresh(const uint32_t* __restrict__ hist, int32_t* __restrict__ thr_bucket,
+                                     int32_t* __restrict__ cand_cnt, int K) {
+    __shared__ uint32_t sh[2048];
+    __shared__ uint32_t s_warp[8];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int row_id = blockIdx.x;
+    const uint32_t* h = hist + (size_t) row_id * 2048;
+    // Reverse order: idx 0 = bucket 2047 (largest floats), idx 2047 = bucket 0
+    for (int i = tid; i < 2048; i += 256) sh[i] = h[2047 - i];
+    __syncthreads();
+    // 256 threads each sum 8 consecutive buckets in descending order
+    uint32_t local_sum = 0u;
+    const int base = tid * 8;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) local_sum += sh[base + j];
+    // Inclusive warp scan on local_sum
+    uint32_t v = local_sum;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const uint32_t n = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += n;
+    }
+    if (lane == 31) s_warp[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        uint32_t wv = (lane < 8) ? s_warp[lane] : 0u;
+#pragma unroll
+        for (int o = 1; o < 8; o <<= 1) {
+            const uint32_t n = __shfl_up_sync(0xffffffffu, wv, o);
+            if (lane >= o) wv += n;
+        }
+        if (lane < 8) s_warp[lane] = wv;
+    }
+    __syncthreads();
+    const uint32_t warp_off = (warp > 0) ? s_warp[warp - 1] : 0u;
+    const uint32_t end_sum = warp_off + v;
+    const uint32_t start_sum = end_sum - local_sum;
+    if (start_sum < (uint32_t) K && end_sum >= (uint32_t) K) {
+        uint32_t acc = start_sum;
+        for (int j = 0; j < 8; ++j) {
+            acc += sh[base + j];
+            if (acc >= (uint32_t) K) {
+                thr_bucket[row_id] = 2047 - (base + j);
+                break;
+            }
+        }
+    }
+    if (tid == 0) cand_cnt[row_id] = 0;
+}
+
+/// Exact GPU Top-K Stage 3: collect all elements with `(key >> 21) >= thr_bucket` up to `kTopkMaxCand = 2048`.
+/// Grid (n_blk, rows), Block 256. Sets `cand_cnt[row] > 2048` on overflow (triggers exact host fallback).
+__global__ void k_topk_collect(const float* __restrict__ logits, const int32_t* __restrict__ thr_bucket,
+                               float* __restrict__ cand_val, int32_t* __restrict__ cand_idx,
+                               int32_t* __restrict__ cand_cnt, int V) {
+    constexpr int kMaxCand = 2048;
+    const int b = blockIdx.x, row_id = blockIdx.y, n_blk = gridDim.x;
+    const int tid = threadIdx.x;
+    const uint32_t thr = (uint32_t) thr_bucket[row_id];
+    const float* row = logits + (size_t) row_id * V;
+    float* cv = cand_val + (size_t) row_id * kMaxCand;
+    int32_t* ci = cand_idx + (size_t) row_id * kMaxCand;
+    const int stride = n_blk * 256;
+    for (int i = b * 256 + tid; i < V; i += stride) {
+        const float v = row[i];
+        if ((f32_to_ordered_u32(v) >> 21) >= thr) {
+            const int pos = atomicAdd(&cand_cnt[row_id], 1);
+            if (pos < kMaxCand) {
+                cv[pos] = v;
+                ci[pos] = i;
+            }
+        }
+    }
+}
+
+/// Exact GPU Top-K Stage 4: deterministic bitonic sort of `n_cand <= 2048` in SMEM -> exact top `K` pairs.
+/// Grid (rows), Block 256 (16 KB SMEM, STACK: 0). Writes `out_cnt[row] = K` on success or `-1` on overflow.
+__global__ void k_topk_finalize(const float* __restrict__ cand_val, const int32_t* __restrict__ cand_idx,
+                                const int32_t* __restrict__ cand_cnt,
+                                float* __restrict__ out_val, int32_t* __restrict__ out_idx,
+                                int32_t* __restrict__ out_cnt, int K) {
+    constexpr int kMaxCand = 2048;
+    __shared__ float sv[kMaxCand];
+    __shared__ int32_t si[kMaxCand];
+    const int row_id = blockIdx.x, tid = threadIdx.x;
+    const int n = cand_cnt[row_id];
+    if (n <= 0 || n > kMaxCand) {
+        if (tid == 0) out_cnt[row_id] = -1;
+        return;
+    }
+    int pow2 = 256;
+    while (pow2 < n) pow2 <<= 1;
+    const float* cv = cand_val + (size_t) row_id * kMaxCand;
+    const int32_t* ci = cand_idx + (size_t) row_id * kMaxCand;
+    for (int i = tid; i < pow2; i += 256) {
+        if (i < n) { sv[i] = cv[i]; si[i] = ci[i]; }
+        else { sv[i] = -3.402823466e+38f; si[i] = 0x7fffffff; }
+    }
+    __syncthreads();
+    // Bitonic sort descending by (val > other_val || (val == other_val && idx < other_idx))
+    for (int size = 2; size <= pow2; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int pair = tid; pair < (pow2 >> 1); pair += 256) {
+                const int blk = pair / stride;
+                const int off = pair - blk * stride;
+                const int i = blk * (stride << 1) + off;
+                const int j = i + stride;
+                const bool asc = ((i & size) != 0);
+                const float vi = sv[i], vj = sv[j];
+                const int32_t ii = si[i], ij = si[j];
+                const bool i_better = (vi > vj) || (vi == vj && ii < ij);
+                // If !asc (descending block): want i_better; swap if !i_better.
+                // If asc (ascending block): want !i_better; swap if i_better.
+                if (asc ? i_better : !i_better) {
+                    sv[i] = vj; si[i] = ij;
+                    sv[j] = vi; si[j] = ii;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    float* ov = out_val + (size_t) row_id * K;
+    int32_t* oi = out_idx + (size_t) row_id * K;
+    for (int i = tid; i < K; i += 256) {
+        ov[i] = sv[i];
+        oi[i] = si[i];
+    }
+    if (tid == 0) out_cnt[row_id] = K;
 }
 
 struct SwaLayerPtrs {

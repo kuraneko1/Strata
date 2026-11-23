@@ -56,20 +56,22 @@ inline int prefetch_distance() {
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
 
-// sub-blocks 2 h and 2 h + 1 (16 bytes of qs) as their 32 signed doubled E2M1 values, and magnitudes in parallel
-alignas(16) constexpr uint8_t kAbsFp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, 1, 2, 3, 4, 6, 8, 12};
-
-inline void values32_both(const uint8_t* qs, const __m128i kv, const __m128i ka, __m256i& v_out, __m256i& a_out) {
-    const __m128i q = _mm_loadu_si128((const __m128i*) qs);
-    const __m128i m4 = _mm_set1_epi8(0x0F);
-    const __m128i ql = _mm_and_si128(q, m4);
-    const __m128i qh = _mm_and_si128(_mm_srli_epi16(q, 4), m4);
-    const __m128i lo = _mm_shuffle_epi8(kv, ql);
-    const __m128i hi = _mm_shuffle_epi8(kv, qh);
-    const __m128i alo = _mm_shuffle_epi8(ka, ql);
-    const __m128i ahi = _mm_shuffle_epi8(ka, qh);
-    v_out = _mm256_set_m128i(_mm_unpackhi_epi64(lo, hi), _mm_unpacklo_epi64(lo, hi));
-    a_out = _mm256_set_m128i(_mm_unpackhi_epi64(alo, ahi), _mm_unpacklo_epi64(alo, ahi));
+// Decode all 4 sub-blocks (32 bytes of qs -> 64 signed doubled E2M1 values and magnitudes) in 256-bit AVX2 lanes.
+// Bit-identical to calling the 128-bit unpack + kAbsFp4 table twice, using vpabsb and half the shuffle/cross-lane ops.
+inline void values64_both(const uint8_t* qs, const __m256i kv,
+                          __m256i& v01, __m256i& a01, __m256i& v23, __m256i& a23) {
+    const __m256i q = _mm256_loadu_si256((const __m256i*) qs);
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    const __m256i ql = _mm256_and_si256(q, m4);
+    const __m256i qh = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+    const __m256i lo = _mm256_shuffle_epi8(kv, ql);
+    const __m256i hi = _mm256_shuffle_epi8(kv, qh);
+    const __m256i sb02 = _mm256_unpacklo_epi64(lo, hi);
+    const __m256i sb13 = _mm256_unpackhi_epi64(lo, hi);
+    v01 = _mm256_permute2x128_si256(sb02, sb13, 0x20);
+    v23 = _mm256_permute2x128_si256(sb02, sb13, 0x31);
+    a01 = _mm256_abs_epi8(v01);
+    a23 = _mm256_abs_epi8(v23);
 }
 
 inline float hsum8(const __m256 x) {   // ggml's hsum_float_8
@@ -99,8 +101,7 @@ struct Acts {   // per token and block, the two Q8_0 blocks' scales; built once 
 
 template <int NT>
 inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
-    const __m128i kv = _mm_loadu_si128((const __m128i*) kvalues_fp4);
-    const __m128i ka = _mm_loadu_si128((const __m128i*) kAbsFp4);
+    const __m256i kv = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) kvalues_fp4));
     const __m256i ones = _mm256_set1_epi16(1);
     __m256 acc[NT];
     for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
@@ -109,8 +110,7 @@ inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
     for (int ib = 0; ib < a.nb; ++ib) {
         if (prefetch_ahead > 0 && (ib & 1) == 0) _mm_prefetch((const char*) (x + ib) + prefetch_ahead, _MM_HINT_T0);
         __m256i v01, a01, v23, a23;
-        values32_both(x[ib].qs, kv, ka, v01, a01);
-        values32_both(x[ib].qs + 16, kv, ka, v23, a23);
+        values64_both(x[ib].qs, kv, v01, a01, v23, a23);
         const __m256 u01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x[ib].d[0]]));
         const __m256 u23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x[ib].d[2]]));
         for (int t = 0; t < NT; ++t) {
@@ -132,28 +132,63 @@ inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
 // Fused 2-row dot (gate+up or adjacent down rows): loads activations ONCE per block & doubles Zen3 FMA ILP, bit-exact.
 template <int NT>
 inline void row_dot_pair(const uint8_t* row0, const uint8_t* row1, const Acts& a, float* res0, float* res1) {
-    const __m128i kv = _mm_loadu_si128((const __m128i*) kvalues_fp4);
-    const __m128i ka = _mm_loadu_si128((const __m128i*) kAbsFp4);
+    const __m256i kv = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) kvalues_fp4));
     const __m256i ones = _mm256_set1_epi16(1);
     __m256 acc0[NT], acc1[NT];
     for (int t = 0; t < NT; ++t) { acc0[t] = _mm256_setzero_ps(); acc1[t] = _mm256_setzero_ps(); }
     const block_nvfp4* x0 = (const block_nvfp4*) row0;
     const block_nvfp4* x1 = (const block_nvfp4*) row1;
     const int prefetch_ahead = prefetch_distance();
+    if constexpr (NT == 1) {
+        // Sequential row0 -> row1 per block keeps peak live YMMs <= 13 (zero stack spills) while sharing q01/q23 loads!
+        for (int ib = 0; ib < a.nb; ++ib) {
+            if (prefetch_ahead > 0 && (ib & 1) == 0) {
+                _mm_prefetch((const char*) (x0 + ib) + prefetch_ahead, _MM_HINT_T0);
+                _mm_prefetch((const char*) (x1 + ib) + prefetch_ahead, _MM_HINT_T0);
+            }
+            const block_q8_0* yb = a.y[0] + 2 * ib;
+            const __m256i q01 = _mm256_loadu_si256((const __m256i*) yb[0].qs);
+            const __m256i q23 = _mm256_loadu_si256((const __m256i*) yb[1].qs);
+            const float* dy = a.dy + 2 * ib;
+            const __m256 dy0 = _mm256_broadcast_ss(dy);
+            const __m256 dy1 = _mm256_broadcast_ss(dy + 1);
+            {
+                __m256i v01, a01, v23, a23;
+                values64_both(x0[ib].qs, kv, v01, a01, v23, a23);
+                const __m256 u01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x0[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x0[ib].d[0]]));
+                const __m256 u23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x0[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x0[ib].d[2]]));
+                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(a01, _mm256_sign_epi8(q01, v01)), ones);
+                const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(a23, _mm256_sign_epi8(q23, v23)), ones);
+                acc0[0] = _mm256_fmadd_ps(_mm256_mul_ps(u01, dy0), _mm256_cvtepi32_ps(p1), acc0[0]);
+                acc0[0] = _mm256_fmadd_ps(_mm256_mul_ps(u23, dy1), _mm256_cvtepi32_ps(p2), acc0[0]);
+            }
+            {
+                __m256i v01, a01, v23, a23;
+                values64_both(x1[ib].qs, kv, v01, a01, v23, a23);
+                const __m256 u01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x1[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x1[ib].d[0]]));
+                const __m256 u23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x1[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x1[ib].d[2]]));
+                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(a01, _mm256_sign_epi8(q01, v01)), ones);
+                const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(a23, _mm256_sign_epi8(q23, v23)), ones);
+                acc1[0] = _mm256_fmadd_ps(_mm256_mul_ps(u01, dy0), _mm256_cvtepi32_ps(p1), acc1[0]);
+                acc1[0] = _mm256_fmadd_ps(_mm256_mul_ps(u23, dy1), _mm256_cvtepi32_ps(p2), acc1[0]);
+            }
+        }
+        res0[0] = hsum8(acc0[0]);
+        res1[0] = hsum8(acc1[0]);
+        return;
+    }
     for (int ib = 0; ib < a.nb; ++ib) {
         if (prefetch_ahead > 0 && (ib & 1) == 0) {
             _mm_prefetch((const char*) (x0 + ib) + prefetch_ahead, _MM_HINT_T0);
             _mm_prefetch((const char*) (x1 + ib) + prefetch_ahead, _MM_HINT_T0);
         }
         __m256i v0_01, a0_01, v0_23, a0_23;
-        values32_both(x0[ib].qs, kv, ka, v0_01, a0_01);
-        values32_both(x0[ib].qs + 16, kv, ka, v0_23, a0_23);
+        values64_both(x0[ib].qs, kv, v0_01, a0_01, v0_23, a0_23);
         const __m256 u0_01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x0[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x0[ib].d[0]]));
         const __m256 u0_23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x0[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x0[ib].d[2]]));
 
         __m256i v1_01, a1_01, v1_23, a1_23;
-        values32_both(x1[ib].qs, kv, ka, v1_01, a1_01);
-        values32_both(x1[ib].qs + 16, kv, ka, v1_23, a1_23);
+        values64_both(x1[ib].qs, kv, v1_01, a1_01, v1_23, a1_23);
         const __m256 u1_01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x1[ib].d[1]]), _mm_set1_ps(kUe4m3.v[x1[ib].d[0]]));
         const __m256 u1_23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[x1[ib].d[3]]), _mm_set1_ps(kUe4m3.v[x1[ib].d[2]]));
 
@@ -193,7 +228,7 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, const Acts& a, f
         for (int t = 0; t < NT; ++t) {   // native_gu_rows' ggml path, operation for operation
             const float gs = g[t] * sg, us = u[t] * su;
             if constexpr (SITU) {
-                const float tg = beta * std::tanh(gs / beta);
+                const float tg = beta * std::tanh((beta == 4.0f) ? (gs * 0.25f) : (gs / beta));
                 const float tu = lb > 0.f ? lb * std::tanh(us / lb) : us;
                 ff[t][r] = (tg / (1.f + std::exp(-gs))) * tu;
             } else {

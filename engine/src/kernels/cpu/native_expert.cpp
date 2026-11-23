@@ -742,7 +742,7 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         const char* v = std::getenv("STRATA_KQ256");
         return cpu_avx2_ok() && (v == nullptr || std::atoi(v) != 0);
     }();
-    if (kq_q5k && f.situ && f.gu_type == 13 && f.tail_off == 0 && nt >= 2 &&
+    if (kq_q5k && f.situ && f.gu_type == 13 && f.tail_off == 0 && nt >= 1 &&
         (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
         kq256_gu_rows_situ(f.gu_type, blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, f.situ_beta, f.situ_linear_beta);
         return;
@@ -866,7 +866,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (cpu_avx2_ok() && nt >= 2 && ((f.d_type == 7 && kq) || (f.d_type == 8 && kq_q80_def)) &&
+    if (cpu_avx2_ok() && ((nt >= 2 && f.d_type == 7 && kq) || (nt >= 1 && f.d_type == 8 && kq_q80_def)) &&
         (Arithmetic == NativeArithmetic::Default || (flavour_avx2()))) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

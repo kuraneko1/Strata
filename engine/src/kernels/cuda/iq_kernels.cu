@@ -6067,6 +6067,13 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
+size_t native_expert_wmma_fused_scratch_bytes(int64_t cap, int64_t cap_groups, int64_t n_ff) {
+    const int64_t cap_tiles = (cap / 64) + cap_groups;
+    const size_t tiles_bytes = (((size_t) (cap_tiles * 2 + 1) * sizeof(int32_t)) + 255u) & ~(size_t) 255u;
+    const size_t h16_bytes = (((size_t) cap * (size_t) n_ff * sizeof(__half)) + 255u) & ~(size_t) 255u;
+    return tiles_bytes + h16_bytes;
+}
+
 
 // The AMD layouts below (STRATA_EXP_MODE) also build for CUDA: Volta takes mode 8 by default (exp_mode), every
 // other CUDA card keeps mode 0, the CUDA layout above.
@@ -9321,6 +9328,8 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
         tile_g = (int32_t*) scratch;
         tile_c0 = tile_g + cap_tiles_gu;
         n_tiles = tile_c0 + cap_tiles_gu;
+        const size_t tiles_bytes = (((size_t) (cap_tiles_gu * 2 + 1) * sizeof(int32_t)) + 255u) & ~(size_t) 255u;
+        h16 = (__half*) ((uint8_t*) scratch + tiles_bytes);
         if (gu_bm128) {
             k_build_wmma_tiles<128><<<1, 256, 0, s>>>(grp_start, n_groups, tile_g, tile_c0, n_tiles);
             const dim3 ggu_f((unsigned) (L.n_ff / 64), (unsigned) cap_tiles_gu);

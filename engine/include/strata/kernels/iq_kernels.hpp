@@ -71,6 +71,8 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+/// Compact scratch for fused SiTU WMMA (`wmma_grouped_gu_situ_{64,128}`): only tile list + FP16 h16 (no FP32 gate/up).
+size_t native_expert_wmma_fused_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).

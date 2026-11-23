@@ -1883,7 +1883,7 @@ struct DsparkEngine {
     /// When `out_logits != nullptr` (`n_draft` rows of `vocab_unpadded`), uses `sample_fn(row_vec)` for each draft step.
     template <typename EngineT, typename SampleFn>
     void draft(EngineT& E, int32_t anchor, int n_draft, std::vector<int32_t>& out_tokens,
-               std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn) {
+               std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn, bool gpu_sampled = false) {
         const auto t0 = Clock::now();
         const auto& hp = dm->hp;
         const int block_n = hp.block_size;
@@ -1974,7 +1974,7 @@ struct DsparkEngine {
 
         // 3. Recurrent Markov chain for i = 1 .. n_draft
         const int joint_tot = 2 * rank + 2 * N;
-        if (!out_logits && n_draft >= 1 && n_draft <= 7 && d_draft_ids) {
+        if (!out_logits && !gpu_sampled && n_draft >= 1 && n_draft <= 7 && d_draft_ids) {
             // Zero-sync device-side greedy Markov chain (1 graph launch + 1 single D2H copy instead of n_draft syncs!)
             if (h_draft_ids_pin) {
                 h_draft_ids_pin[0] = anchor;
@@ -2055,7 +2055,14 @@ struct DsparkEngine {
                 dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
                     h_pred, hi, rnn_corr, dm->hidden_out_b, N);
                 E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
-                if (out_logits) {
+                if (gpu_sampled) {
+                    if (hp.softcap > 0.0f) {
+                        k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
+                            E.logits, hp.vocab_unpadded, hp.softcap);
+                    }
+                    std::vector<float> dummy_lg;
+                    prev_id = sample_fn(i, dummy_lg);
+                } else if (out_logits) {
                     k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
                         E.logits, hp.vocab_unpadded, hp.softcap);
                     auto& row_lg = (*out_logits)[(size_t) i];

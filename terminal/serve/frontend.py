@@ -3058,6 +3058,11 @@ class InklingOutputParser(OutputParser):
 
             if self._mode in ("thinking", "text"):
                 kind = "reasoning" if self._mode == "thinking" else "content"
+                if "<" not in self.buf:
+                    if self.buf:
+                        out.append(Event(kind, self.buf))
+                        self.buf = ""
+                    break
                 best_i, best_tag = -1, ""
                 for tag in _INK_TAGS:
                     p = self.buf.find(tag)
