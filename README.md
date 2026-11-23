@@ -80,6 +80,30 @@ Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/ben
 
 Full V100 800K progression, Roofline analysis & chart: [2026-11-22 V100 800K Report](docs/bench-results/2026-11-22-v100-inkling2-800k/README.md).
 
+### Practical & Coding Multimodal Benchmarks (`mmproj-F16` + `--vram-elastic`)
+
+End-to-end HTTP SSE practical benchmarks (`1,536` completion tokens, real 4-bug C++/Python debugging & Japanese cross-referencing, Text-only vs +1,024-token Image via native CUDA WMMA FA2 `strata-vision`):
+
+<p align="center">
+  <img src="docs/media/bench-rtx4070-v100-practical.png" width="960" alt="RTX 4070 and Tesla V100 Practical & Coding Multimodal Prefill and Decode vs Context Depth">
+</p>
+
+<p align="center">
+  <img src="docs/media/bench-multimodal-breakdown.png" width="960" alt="Multimodal Text-only vs +Vision Decode Overhead and Turn 1 vs Turn 2 KV Reuse TTFT">
+</p>
+
+| Hardware & Mode | Depth | Code PP / Dec (Text) | Code +Vision Dec | Practical JP PP / Dec (+Vision) | Turn 2 KV Reuse TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **RTX 4070 12 GB** (`65K`, Elastic Vision `965 MiB`) | `62K` | `2,864` / **`48.5 t/s`** | **`48.2 t/s`** | `2,832` / **`49.3 t/s`** (`Q=5/5`) | **`0.56 s`** |
+| **RTX 4070 12 GB** (`131K`, Elastic Vision `965 MiB`) | `126K` | `2,505` / **`37.3 t/s`** | **`36.7 t/s`** | `2,512` / **`37.0 t/s`** (`Q=5/5`) | **`0.69 s`** |
+| **RTX 4070 12 GB** (`262K`, Elastic Vision `965 MiB`) | `254K` | `2,059` / **`27.3 t/s`** | **`27.2 t/s`** | `2,126` / **`27.8 t/s`** (`Q=5/5`) | **`1.03 s`** |
+| **Tesla V100 32 GB** (`262K`, Resident Vision + DSpark) | `62K` | `2,981` / **`126.0 t/s`** | **`118.3 t/s`** | `2,952` / **`112.7 t/s`** (`Q=5/5`) | **`0.46 s`** |
+| **Tesla V100 32 GB** (`262K`, Resident Vision + DSpark) | `254K` | `2,144` / **`96.3 t/s`** | **`96.3 t/s`** | `2,144` / **`77.0 t/s`** (`Q=5/5`) | **`0.78 s`** |
+| **Tesla V100 32 GB** (`800K`, Elastic Vision + DSpark) | `520K` | `1,540` / **`76.9 t/s`** | **`70.1 t/s`** | `1,537` / **`57.0 t/s`** (`Q=5/5`) | **`1.31 s`** |
+| **Tesla V100 32 GB** (`800K`, Elastic Vision + DSpark) | `785K` | `1,203` / **`61.2 t/s`** | **`63.0 t/s`** | `1,205` / **`46.7 t/s`** (`Q=5/5`) | **`1.79 s`** |
+
+Full multimodal tables, methodology & raw CSV: [2026-11-23 Multimodal 262K–800K Report](docs/bench-results/2026-11-23-rtx4070-v100-multimodal-262k-800k/README.md).
+
 <a id="build-from-source"></a>
 
 ## Build from Source
