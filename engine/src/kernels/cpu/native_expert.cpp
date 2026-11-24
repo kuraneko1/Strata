@@ -21,6 +21,7 @@
 #include "strata/kernels/cpu/pool_quant.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -582,6 +583,141 @@ int native_gu_mt_min(int gu_type) {
     return iq3s_one && gu_type == 21 ? 1 : mt_min;
 }
 
+// GPU load repacks each byte b = (h3 h2 h1 h0 l3 l2 l1 l0) of nvfp4_ktile q0/q1 into
+// perm(b) = (l3 h2 h1 h0 l2 l1 l0 h3); invert it back to block_nvfp4 byte layout.
+constexpr std::array<uint8_t, 256> make_nvfp4_ktile_unperm_lut() {
+    std::array<uint8_t, 256> t{};
+    for (int p = 0; p < 256; ++p) {
+        t[(size_t) p] = (uint8_t) (
+            ((p & 0x01) << 7) | (p & 0x70) | ((p & 0x80) >> 4) | ((p & 0x0E) >> 1));
+    }
+    return t;
+}
+
+inline void unpack_nvfp4_ktile_block(uint8_t* dst, const uint8_t* d_base,
+                                     const uint8_t* q0_base, const uint8_t* q1_base, int w) {
+    static constexpr auto lut = make_nvfp4_ktile_unperm_lut();
+    std::memcpy(dst, d_base + (size_t) w * 4, 4);
+    const uint8_t* q0 = q0_base + (size_t) w * 16;
+    const uint8_t* q1 = q1_base + (size_t) w * 16;
+    for (int b = 0; b < 16; ++b) dst[4 + b] = lut[q0[b]];
+    for (int b = 0; b < 16; ++b) dst[20 + b] = lut[q1[b]];
+}
+
+// Unpack rows [c0, c1) within one NVFP4 GU N-tile (64 rows) from coalesced K-tile layout
+// ([n_ff/64, n_embd/64, 4608 B], wr 0..63 = gate, wr 64..127 = up) into contiguous block_nvfp4 rows.
+inline void unpack_nvfp4_ktile_gu(const uint8_t* blob, size_t row_bytes, int nb,
+                                  int c0, int c1, uint8_t* dst_gate, uint8_t* dst_up) {
+    constexpr size_t kTileBytes = 4608;
+    constexpr size_t kBlockBytes = 36;
+    const int n_tile = c0 / 64;
+    const int wr0 = c0 - n_tile * 64;
+    const int cnt = c1 - c0;
+    const uint8_t* tile_base = blob + (size_t) n_tile * (size_t) nb * kTileBytes;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        const uint8_t* kt = tile_base + (size_t) kbx * kTileBytes;
+        const uint8_t* d_base = kt;
+        const uint8_t* q0_base = kt + 512;
+        const uint8_t* q1_base = kt + 2560;
+        const size_t blk_off = (size_t) kbx * kBlockBytes;
+        for (int i = 0; i < cnt; ++i) {
+            const int wg = wr0 + i;
+            unpack_nvfp4_ktile_block(dst_gate + (size_t) i * row_bytes + blk_off, d_base, q0_base, q1_base, wg);
+            unpack_nvfp4_ktile_block(dst_up + (size_t) i * row_bytes + blk_off, d_base, q0_base, q1_base, wg + 64);
+        }
+    }
+}
+
+// Unpack rows [c0, c1) within one NVFP4 DOWN N-tile (128 rows) from coalesced K-tile layout
+// ([n_embd/128, n_ff/64, 4608 B], wr 0..127 = down) into contiguous block_nvfp4 rows.
+inline void unpack_nvfp4_ktile_down(const uint8_t* down_base, size_t row_bytes, int nb,
+                                    int c0, int c1, uint8_t* dst) {
+    constexpr size_t kTileBytes = 4608;
+    constexpr size_t kBlockBytes = 36;
+    const int n_tile = c0 / 128;
+    const int wr0 = c0 - n_tile * 128;
+    const int cnt = c1 - c0;
+    const uint8_t* tile_base = down_base + (size_t) n_tile * (size_t) nb * kTileBytes;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        const uint8_t* kt = tile_base + (size_t) kbx * kTileBytes;
+        const uint8_t* d_base = kt;
+        const uint8_t* q0_base = kt + 512;
+        const uint8_t* q1_base = kt + 2560;
+        const size_t blk_off = (size_t) kbx * kBlockBytes;
+        for (int i = 0; i < cnt; ++i) {
+            unpack_nvfp4_ktile_block(dst + (size_t) i * row_bytes + blk_off, d_base, q0_base, q1_base, wr0 + i);
+        }
+    }
+}
+
+// Unpack rows [c0, c1) within one Q5_K GU N-tile (64 rows) from coalesced K-tile layout
+// ([n_ff/64, n_embd/256, 22528 B], wr 0..63 = gate, wr 64..127 = up) into contiguous block_q5_K rows.
+inline void unpack_q5k_ktile_gu(const uint8_t* blob, size_t row_bytes, int k_sbs,
+                                int c0, int c1, uint8_t* dst_gate, uint8_t* dst_up) {
+    constexpr size_t kTileBytes = 22528;
+    constexpr size_t kBlockBytes = 176;
+    const int n_tile = c0 / 64;
+    const int wr0 = c0 - n_tile * 64;
+    const int cnt = c1 - c0;
+    const uint8_t* tile_base = blob + (size_t) n_tile * (size_t) k_sbs * kTileBytes;
+    for (int ksb = 0; ksb < k_sbs; ++ksb) {
+        const uint8_t* kt = tile_base + (size_t) ksb * kTileBytes;
+        const uint8_t* hdr_base = kt;
+        const uint8_t* qh_base = kt + 2048;
+        const uint8_t* qs0_base = kt + 6144;
+        const uint8_t* qs1_base = kt + 10240;
+        const uint8_t* qs2_base = kt + 14336;
+        const uint8_t* qs3_base = kt + 18432;
+        const size_t blk_off = (size_t) ksb * kBlockBytes;
+        for (int i = 0; i < cnt; ++i) {
+            const int wg = wr0 + i;
+            uint8_t* bg = dst_gate + (size_t) i * row_bytes + blk_off;
+            std::memcpy(bg, hdr_base + (size_t) wg * 16, 16);
+            std::memcpy(bg + 16, qh_base + (size_t) wg * 32, 32);
+            std::memcpy(bg + 48, qs0_base + (size_t) wg * 32, 32);
+            std::memcpy(bg + 80, qs1_base + (size_t) wg * 32, 32);
+            std::memcpy(bg + 112, qs2_base + (size_t) wg * 32, 32);
+            std::memcpy(bg + 144, qs3_base + (size_t) wg * 32, 32);
+            const int wu = wg + 64;
+            uint8_t* bu = dst_up + (size_t) i * row_bytes + blk_off;
+            std::memcpy(bu, hdr_base + (size_t) wu * 16, 16);
+            std::memcpy(bu + 16, qh_base + (size_t) wu * 32, 32);
+            std::memcpy(bu + 48, qs0_base + (size_t) wu * 32, 32);
+            std::memcpy(bu + 80, qs1_base + (size_t) wu * 32, 32);
+            std::memcpy(bu + 112, qs2_base + (size_t) wu * 32, 32);
+            std::memcpy(bu + 144, qs3_base + (size_t) wu * 32, 32);
+        }
+    }
+}
+
+// Unpack rows [c0, c1) within one Q8_0 DOWN N-tile (128 rows) from coalesced K-tile layout
+// ([n_embd/128, n_ff/64, 8704 B], wr 0..127 = down) into contiguous block_q8_0 rows.
+inline void unpack_q8_0_ktile_down(const uint8_t* down_base, size_t row_bytes, int k_64,
+                                   int c0, int c1, uint8_t* dst) {
+    constexpr size_t kTileBytes = 8704;
+    constexpr size_t kPairBytes = 68;
+    const int n_tile = c0 / 128;
+    const int wr0 = c0 - n_tile * 128;
+    const int cnt = c1 - c0;
+    const uint8_t* tile_base = down_base + (size_t) n_tile * (size_t) k_64 * kTileBytes;
+    for (int kb = 0; kb < k_64; ++kb) {
+        const uint8_t* kt = tile_base + (size_t) kb * kTileBytes;
+        const uint8_t* d2_base = kt;
+        const uint8_t* qs0_base = kt + 512;
+        const uint8_t* qs1_base = kt + 4608;
+        const size_t blk_off = (size_t) kb * kPairBytes;
+        for (int i = 0; i < cnt; ++i) {
+            const int wd = wr0 + i;
+            uint8_t* bd = dst + (size_t) i * row_bytes + blk_off;
+            const uint8_t* d2 = d2_base + (size_t) wd * 4;
+            std::memcpy(bd, d2, 2);
+            std::memcpy(bd + 2, qs0_base + (size_t) wd * 32, 32);
+            std::memcpy(bd + 34, d2 + 2, 2);
+            std::memcpy(bd + 36, qs1_base + (size_t) wd * 32, 32);
+        }
+    }
+}
+
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
@@ -742,6 +878,60 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         const char* v = std::getenv("STRATA_KQ256");
         return cpu_avx2_ok() && (v == nullptr || std::atoi(v) != 0);
     }();
+    if (f.gu_type == 13 && f.q5k_ktile) {
+        const int k_sbs = n / 256;
+        thread_local std::vector<uint8_t> ktile_buf;
+        float* ff_stack[64];
+        thread_local std::vector<float*> ff_vec;
+        float** ff_off = ff_stack;
+        if (nt > 64) {
+            ff_vec.resize((size_t) nt);
+            ff_off = ff_vec.data();
+        }
+        const bool use_kq_situ = kq_q5k && f.situ && f.tail_off == 0 && nt >= 1 &&
+                                 (Arithmetic == NativeArithmetic::Default || flavour_avx2());
+        float sg = 1.f, su = 1.f;
+        if (!use_kq_situ && f.tail_off) {
+            float tail[4];
+            std::memcpy(tail, blob + f.tail_off, sizeof tail);
+            sg = tail[0];
+            su = tail[1];
+        }
+        const Tr dot = !use_kq_situ ? traits(13) : Tr{};
+        for (int c0 = r0; c0 < r1;) {
+            const int c1 = std::min(r1, (c0 & ~63) + 64);
+            const int cnt = c1 - c0;
+            const size_t up_off_chunk = (size_t) cnt * f.gu_row;
+            if (ktile_buf.size() < 2 * up_off_chunk) ktile_buf.resize(2 * up_off_chunk);
+            unpack_q5k_ktile_gu(blob, f.gu_row, k_sbs, c0, c1, ktile_buf.data(), ktile_buf.data() + up_off_chunk);
+            for (int t = 0; t < nt; ++t) ff_off[t] = ff[t] + c0;
+            if (use_kq_situ) {
+                kq256_gu_rows_situ(13, ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt,
+                                   f.situ_beta, f.situ_linear_beta);
+            } else {
+                for (int i = 0; i < cnt; ++i) {
+                    const uint8_t* gr = ktile_buf.data() + (size_t) i * f.gu_row;
+                    const uint8_t* ur = ktile_buf.data() + up_off_chunk + (size_t) i * f.gu_row;
+                    for (int t = 0; t < nt; ++t) {
+                        float g = 0.f, u = 0.f;
+                        dot.dot(n, &g, gr, act[t]);
+                        dot.dot(n, &u, ur, act[t]);
+                        const float gs = *static_cast<volatile const float*>(&g) * sg;
+                        const float us = *static_cast<volatile const float*>(&u) * su;
+                        if (f.situ) {
+                            const float tg = f.situ_beta * std::tanh(gs / f.situ_beta);
+                            const float tu = f.situ_linear_beta > 0.f ? f.situ_linear_beta * std::tanh(us / f.situ_linear_beta) : us;
+                            ff_off[t][i] = (tg / (1.f + std::exp(-gs))) * tu;
+                        } else {
+                            ff_off[t][i] = (gs / (1.f + std::exp(-gs))) * us;
+                        }
+                    }
+                }
+            }
+            c0 = c1;
+        }
+        return;
+    }
     if (kq_q5k && f.situ && f.gu_type == 13 && f.tail_off == 0 && nt >= 1 &&
         (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
         kq256_gu_rows_situ(f.gu_type, blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, f.situ_beta, f.situ_linear_beta);
@@ -759,13 +949,63 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // NVFP4 in 512-bit lanes: ggml's arithmetic, blocks decoded once per window; 1.8x at one token, 3.7x at seven
     // (nvfp4_avx512_parity). STRATA_NO_NVFP4_512 falls back to ggml-cpu.
     static const bool nvfp4_512 = cpu_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
+    // Without AVX-512: the same rows in 256-bit lanes, bit-equal to ggml-cpu's AVX2 dot below; 2.0-2.4x it at 4-8
+    // tokens, 2x under DRAM load with 6 threads (nvfp4_avx512_parity). STRATA_NO_NVFP4_256 falls back to ggml-cpu.
+    static const bool nvfp4_256 = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_256") == nullptr;
+    if (f.gu_type == kNvfp4Type && f.nvfp4_ktile) {
+        const int nb = n / 64;
+        thread_local std::vector<uint8_t> ktile_buf;
+        float* ff_stack[64];
+        thread_local std::vector<float*> ff_vec;
+        float** ff_off = ff_stack;
+        if (nt > 64) {
+            ff_vec.resize((size_t) nt);
+            ff_off = ff_vec.data();
+        }
+        const bool use_512 = !f.situ && nvfp4_512 && nvfp4_512_fits(n);
+        const bool use_256 = !use_512 && nvfp4_256 && nvfp4_256_fits(n);
+        const Tr dot = (!use_512 && !use_256) ? traits(f.gu_type) : Tr{};
+        for (int c0 = r0; c0 < r1;) {
+            const int n_tile = c0 / 64;
+            const int c1 = std::min(r1, (n_tile + 1) * 64);
+            const int cnt = c1 - c0;
+            const size_t up_off_chunk = (size_t) cnt * f.gu_row;
+            if (ktile_buf.size() < 2 * up_off_chunk) ktile_buf.resize(2 * up_off_chunk);
+            unpack_nvfp4_ktile_gu(blob, f.gu_row, nb, c0, c1, ktile_buf.data(), ktile_buf.data() + up_off_chunk);
+            for (int t = 0; t < nt; ++t) ff_off[t] = ff[t] + c0;
+            if (use_512) {
+                nvfp4_512_gu_rows(ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt, sg, su);
+            } else if (use_256) {
+                if (f.situ) nvfp4_256_gu_rows_situ(ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt, sg, su, f.situ_beta, f.situ_linear_beta);
+                else nvfp4_256_gu_rows(ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt, sg, su);
+            } else {
+                for (int i = 0; i < cnt; ++i) {
+                    const uint8_t* gr = ktile_buf.data() + (size_t) i * f.gu_row;
+                    const uint8_t* ur = ktile_buf.data() + up_off_chunk + (size_t) i * f.gu_row;
+                    for (int t = 0; t < nt; ++t) {
+                        float g = 0.f, u = 0.f;
+                        dot.dot(n, &g, gr, act[t]);
+                        dot.dot(n, &u, ur, act[t]);
+                        const float gs = *static_cast<volatile const float*>(&g) * sg;
+                        const float us = *static_cast<volatile const float*>(&u) * su;
+                        if (f.situ) {
+                            const float tg = f.situ_beta * std::tanh(gs / f.situ_beta);
+                            const float tu = f.situ_linear_beta > 0.f ? f.situ_linear_beta * std::tanh(us / f.situ_linear_beta) : us;
+                            ff_off[t][i] = (tg / (1.f + std::exp(-gs))) * tu;
+                        } else {
+                            ff_off[t][i] = (gs / (1.f + std::exp(-gs))) * us;
+                        }
+                    }
+                }
+            }
+            c0 = c1;
+        }
+        return;
+    }
     if (f.gu_type == kNvfp4Type && !f.situ && nvfp4_512 && nvfp4_512_fits(n)) {
         nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su);
         return;
     }
-    // Without AVX-512: the same rows in 256-bit lanes, bit-equal to ggml-cpu's AVX2 dot below; 2.0-2.4x it at 4-8
-    // tokens, 2x under DRAM load with 6 threads (nvfp4_avx512_parity). STRATA_NO_NVFP4_256 falls back to ggml-cpu.
-    static const bool nvfp4_256 = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_256") == nullptr;
     if (f.gu_type == kNvfp4Type && nvfp4_256 && nvfp4_256_fits(n)) {
         if (f.situ) nvfp4_256_gu_rows_situ(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su, f.situ_beta, f.situ_linear_beta);
         else nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su);
@@ -862,6 +1102,50 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     static const bool kq512 = cpu_avx512_ok() && std::getenv("STRATA_NO_KQ512") == nullptr;
     static const int kq512_min = [] { const char* e = std::getenv("STRATA_KQ512_MIN"); return e ? std::atoi(e) : 8; }();
     static const bool kq512_q51_ok = kq512 && kq512_ok(7), kq512_q80_ok = kq512 && kq512_ok(8);   // (checked once, see native_gu_rows)
+    if (f.d_type == 8 && f.q8_0_ktile) {
+        const int n = (int) f.n_ff;
+        const int k_64 = n / 64;
+        thread_local std::vector<uint8_t> ktile_buf;
+        float* out_stack[64];
+        thread_local std::vector<float*> out_vec;
+        float** out_off = out_stack;
+        if (nt > 64) {
+            out_vec.resize((size_t) nt);
+            out_off = out_vec.data();
+        }
+        const bool use_kq512 = kq512_q80_ok && nt >= kq512_min &&
+                               (Arithmetic == NativeArithmetic::Default || flavour_avx2());
+        const bool use_kq256 = !use_kq512 && cpu_avx2_ok() && nt >= 1 && kq_q80_def &&
+                               (Arithmetic == NativeArithmetic::Default || flavour_avx2());
+        float sd = 1.f;
+        if (!use_kq512 && !use_kq256 && f.tail_off)
+            std::memcpy(&sd, blob + f.tail_off + 2 * sizeof(float), sizeof sd);
+        const Tr dot = (!use_kq512 && !use_kq256) ? traits(8) : Tr{};
+        for (int c0 = r0; c0 < r1;) {
+            const int c1 = std::min(r1, (c0 & ~127) + 128);
+            const int cnt = c1 - c0;
+            const size_t need = (size_t) cnt * f.d_row;
+            if (ktile_buf.size() < need) ktile_buf.resize(need);
+            unpack_q8_0_ktile_down(blob + f.down_off, f.d_row, k_64, c0, c1, ktile_buf.data());
+            for (int t = 0; t < nt; ++t) out_off[t] = out[t] + c0;
+            if (use_kq512) {
+                kq512_rows(8, ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt);
+            } else if (use_kq256) {
+                kq256_rows(8, ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt);
+            } else {
+                for (int i = 0; i < cnt; ++i) {
+                    const uint8_t* dr = ktile_buf.data() + (size_t) i * f.d_row;
+                    for (int t = 0; t < nt; ++t) {
+                        float s = 0.f;
+                        dot.dot(n, &s, dr, hq[t]);
+                        out_off[t][i] = s * sd;
+                    }
+                }
+            }
+            c0 = c1;
+        }
+        return;
+    }
     if (((f.d_type == 7 && kq512_q51_ok) || (f.d_type == 8 && kq512_q80_ok)) && nt >= kq512_min && (Arithmetic == NativeArithmetic::Default || flavour_avx2())) {
         kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
@@ -901,11 +1185,50 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     float sd = 1.f;                                   // NVFP4: the expert's s_down (see native_gu_rows)
     if (f.tail_off) std::memcpy(&sd, blob + f.tail_off + 2 * sizeof(float), sizeof sd);
     static const bool nvfp4_512 = cpu_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
+    static const bool nvfp4_256 = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_256") == nullptr;   // see above
+    if (f.d_type == kNvfp4Type && f.nvfp4_ktile) {
+        const int nb = n / 64;
+        thread_local std::vector<uint8_t> ktile_buf;
+        float* out_stack[64];
+        thread_local std::vector<float*> out_vec;
+        float** out_off = out_stack;
+        if (nt > 64) {
+            out_vec.resize((size_t) nt);
+            out_off = out_vec.data();
+        }
+        const bool use_512 = nvfp4_512 && nvfp4_512_fits(n);
+        const bool use_256 = !use_512 && nvfp4_256 && nvfp4_256_fits(n);
+        const Tr dot = (!use_512 && !use_256) ? traits(f.d_type) : Tr{};
+        for (int c0 = r0; c0 < r1;) {
+            const int n_tile = c0 / 128;
+            const int c1 = std::min(r1, (n_tile + 1) * 128);
+            const int cnt = c1 - c0;
+            const size_t need = (size_t) cnt * f.d_row;
+            if (ktile_buf.size() < need) ktile_buf.resize(need);
+            unpack_nvfp4_ktile_down(blob + f.down_off, f.d_row, nb, c0, c1, ktile_buf.data());
+            for (int t = 0; t < nt; ++t) out_off[t] = out[t] + c0;
+            if (use_512) {
+                nvfp4_512_rows(ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt, sd);
+            } else if (use_256) {
+                nvfp4_256_rows(ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt, sd);
+            } else {
+                for (int i = 0; i < cnt; ++i) {
+                    const uint8_t* dr = ktile_buf.data() + (size_t) i * f.d_row;
+                    for (int t = 0; t < nt; ++t) {
+                        float s = 0.f;
+                        dot.dot(n, &s, dr, hq[t]);
+                        out_off[t][i] = s * sd;
+                    }
+                }
+            }
+            c0 = c1;
+        }
+        return;
+    }
     if (f.d_type == kNvfp4Type && nvfp4_512 && nvfp4_512_fits(n)) {
         nvfp4_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1, sd);
         return;
     }
-    static const bool nvfp4_256 = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_256") == nullptr;   // see above
     if (f.d_type == kNvfp4Type && nvfp4_256 && nvfp4_256_fits(n)) {
         nvfp4_256_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1, sd);
         return;

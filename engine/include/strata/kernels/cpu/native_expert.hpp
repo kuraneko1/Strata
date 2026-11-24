@@ -55,6 +55,9 @@ struct NativeFmt {
     bool situ = false;
     float situ_beta = 4.0f;
     float situ_linear_beta = 25.0f;
+    bool nvfp4_ktile = false;
+    bool q5k_ktile = false;
+    bool q8_0_ktile = false;
 };
 constexpr int kBf16Type = 30;
 constexpr int kNvfp4Type = 40;

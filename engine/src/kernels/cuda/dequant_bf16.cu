@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -303,6 +305,58 @@ bool dequant_wide_on() {
     return per_dev[dev] == 2;
 }
 
+// Fast warp-tiled Q8_0 -> FP16 dequant: each warp cooperatively loads 8 contiguous blocks (272 B = 68 u32)
+// into SMEM with 100% coalesced 128B transactions, then converts 32x8 values via exact 0x6400/1152.0f HMUL2.
+__global__ void __launch_bounds__(256, 4) dequant_q8_0_h16_fast_kernel(
+    const uint8_t* __restrict__ blocks, uint32_t base_group, uint32_t total_groups, H16* __restrict__ out) {
+    __shared__ uint32_t s_raw[8 * 72];
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wg = ((uint32_t) blockIdx.x * 8u + warp) * 8u;
+    if (wg >= total_groups) return;
+
+    uint32_t* sw = s_raw + warp * 72u;
+    const uint32_t* g32 = reinterpret_cast<const uint32_t*>(blocks + ((size_t) base_group + wg) * 34u);
+    sw[lane] = __ldg(g32 + lane);
+    sw[32u + lane] = __ldg(g32 + 32u + lane);
+    if (lane < 4u) sw[64u + lane] = __ldg(g32 + 64u + lane);
+    __syncwarp();
+
+    const uint32_t blk = lane >> 2;
+    const uint32_t piece = lane & 3u;
+    const uint8_t* sb = reinterpret_cast<const uint8_t*>(sw) + blk * 34u;
+    __half d_h;
+    std::memcpy(&d_h, sb, 2);
+    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(sb + 2u + piece * 8u);
+    uint4 out_u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 530
+    const __half2 d_h2 = __half2half2(d_h);
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    uint32_t vals[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t x = (uint32_t) q16[k] ^ 0x8080u;
+        const uint32_t u = ((x & 0x00FFu) | ((x & 0xFF00u) << 8)) | 0x64006400u;
+        __half2 h2;
+        std::memcpy(&h2, &u, 4);
+        h2 = __hmul2(__hsub2(h2, c1152), d_h2);
+        std::memcpy(&vals[k], &h2, 4);
+    }
+    out_u = make_uint4(vals[0], vals[1], vals[2], vals[3]);
+#else
+    const float d = __half2float(d_h);
+    __align__(16) H16 v[8];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint16_t w = q16[k];
+        put(v, 2 * k, (float) (int8_t) (w & 0xFFu) * d);
+        put(v, 2 * k + 1, (float) (int8_t) (w >> 8) * d);
+    }
+    std::memcpy(&out_u, v, 16);
+#endif
+    *reinterpret_cast<uint4*>(out + ((size_t) (wg + blk) * 32u + (size_t) piece * 8u)) = out_u;
+}
+
 // Q8_0 with four threads per block, 8 values each: the warp reads 8 consecutive blocks and writes 512 consecutive
 // bytes (a thread per block wrote 2-byte values 64 bytes apart: ~110 GB/s, a quarter of a prompt projection's time).
 // Zero 64-bit div/mod when contiguous (row_bytes == groups_per_row * 34) + __shfl_sync scale sharing + __ldg.
@@ -364,6 +418,17 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
+    if constexpr (std::is_same<T, H16>::value) {
+        if (type == 8 && ld == cols && (reinterpret_cast<uintptr_t>(blocks) & 3) == 0 &&
+            (reinterpret_cast<uintptr_t>(out) & 15) == 0 &&
+            ((row0 * gpr) & 7) == 0 && (total & 7) == 0 && total <= (1ll << 29)) {
+            dequant_q8_0_h16_fast_kernel<<<(unsigned) ((total + 63) / 64), 256, 0, st>>>(
+                p, (uint32_t) (row0 * gpr), (uint32_t) total, reinterpret_cast<H16*>(out));
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return;
+        }
+    }
     if (type == 8 && ld == cols && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
         (reinterpret_cast<uintptr_t>(out) & 15) == 0) {   // contiguous rows only (the kernel writes out + g * 32)
         dequant_q8_0_kernel<T><<<(unsigned) ((4 * total + 255) / 256), 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out);

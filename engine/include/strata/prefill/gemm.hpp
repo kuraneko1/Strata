@@ -21,6 +21,15 @@ void gemm_set_f16_range(bool on);
 bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool reset);
 
 
+/// Multi-output split descriptor for fused Q8_0 x FP16 -> FP32 Tensor Core GEMM (Gemm::native_q8_0_f16_multi).
+/// Output slice s in [0, n_outs) receives weight rows [start_s, ends[s]) into ptrs[s] with row stride (ends[s] - start_s),
+/// where start_0 = 0 and start_s = ends[s - 1].  For the zero-branching fused path, every ends[s] is a multiple of 128.
+struct MultiOut5 {
+    int n_outs;
+    float* ptrs[5];
+    int ends[5];
+};
+
 class Gemm {
 public:
     Gemm() = default;
@@ -55,6 +64,10 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
+    /// Y_f16[T, N] (fp16, row stride ldy) = X[T, K] (fp16) . W[N, K]^T (fp16) with STRICT CUBLAS_COMPUTE_32F FP32 accumulation.
+    void f16_f16out(const uint16_t* X, const uint16_t* W, uint16_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+                    float beta = 0.0f);
+
     /// Y[T, N] = X[T, K] . W[N, K]^T with both in FP32, reusing Gemm's cuBLAS handle & workspace.
     void sgemm(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K);
 
@@ -65,6 +78,20 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
+    /// Native quantized W dequantized to FP16 scratch -> Y_f16[T, N] (fp16) with STRICT CUBLAS_COMPUTE_32F FP32 accumulation.
+    void native_f16out(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y, int64_t T, int64_t N, int64_t K,
+                       int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
+
+    /// Dequantize native quantized W[N, K] into caller-provided FP16 buffer `dst` (row-major [N, K]) on stream_.
+    void dequant_to_f16(int ggml_type, const void* W_blocks, uint16_t* dst, int64_t N, int64_t K);
+
+    /// Persistent L2-swizzled fused Q8_0 x FP16 -> FP32-accum Tensor Core GEMM (CUDA sm_80+) with multi-pointer split epilogue.
+    /// Computes Y_s[T, ends[s] - start_s] = X_f16[T, K] . W_q8_0[start_s..ends[s], K]^T into outs.ptrs[s] in a single launch.
+    /// `x_f16` points to row-major FP16 activations (const __half* or const uint16_t*); `st` is the CUDA stream (cudaStream_t).
+    /// Falls back cleanly to per-slice native() on architectures < sm_80, when opt-in STRATA_FUSED_Q8_GEMM=1 is not set, or unaligned shapes.
+    void native_q8_0_f16_multi(const void* w_q8_0, const void* x_f16, const MultiOut5& outs, int T, int M_total, int K,
+                               void* st);
+
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
@@ -72,6 +99,9 @@ public:
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
+
+    // Temporarily override FP16 dequant scratch buffer (pass nullptr, 0 to restore default scratch_).
+    void set_temp_scratch(void* ptr, size_t elems);
 
     /// STRATA_DEQUANT_SIDE=1 (gemm_dequant_side): a second dequant scratch of scratch_elems() elements, caller-owned
     /// like the first.  native() then dequantizes on a side stream into the two in turn, so a weight's dequant runs
@@ -86,10 +116,15 @@ public:
 
 private:
     void* handle_ = nullptr;
+    void* lt_ = nullptr;        // CUDA: cublasLtHandle_t (created in init / init_external, destroyed in ~Gemm)
+    void* lt_cache_ = nullptr;  // CUDA: shape-keyed cublasLtMatmul autotune cache
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
+    void* temp_scratch_ = nullptr;
+    size_t temp_scratch_elems_ = 0;
     void* workspace_ = nullptr;
+    size_t ws_bytes_ = 0;
     bool external_ = false;
     // STRATA_DEQUANT_SIDE (set_dequant_side): the second scratch, the side stream and, per scratch, "the dequant
     // landed" (recorded on the side stream) and "the GEMM read it" (recorded on the compute stream); side_cur_ is
@@ -147,6 +182,11 @@ private:
     bool mmq_failed_ = false;
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
+    /// CUDA sm_80+: shape-keyed cublasLtMatmul heuristic autotuner for prefill FP16 (is_f32=false, out_f16=false/true)
+    /// and strict IEEE FP32 (is_f32=true, out_f16=false) GEMMs, always using STRICT CUBLAS_COMPUTE_32F.
+    /// Returns false to fall back to cublasGemmEx / cublasSgemm.
+    bool try_cublaslt_tune(const void* X, const void* W, void* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                           float beta, bool is_f32, bool out_f16 = false);
 };
 
 /// Pascal, opt-in: Gemm::f16's large dense shapes as cublasSgemm on FP32 copies (gemm.cu; bitwise the FP16 call's

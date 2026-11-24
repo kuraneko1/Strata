@@ -58,6 +58,15 @@ struct NativeExpertLayout {
     bool situ = false;
     float situ_beta = 4.0f;
     float situ_linear_beta = 25.0f;
+    // Coalesced K-Tile layout for NVFP4 (type == 40) expert blobs (exact same byte size & tail_off):
+    // GU   [0 .. down_off)       : [n_ff/64,    n_embd/64, 4608 B] (wr=0..63 gate, wr=64..127 up)
+    // DOWN [down_off .. tail_off): [n_embd/128, n_ff/64,   4608 B] (wr=0..127 down)
+    bool nvfp4_ktile = false;
+    // Coalesced K-Tile layouts for Q5_K GU (type == 13) & Q8_0 DOWN (type == 8) (exact same byte size):
+    // Q5_K GU   [0 .. down_off)     : [n_ff/64,    n_embd/256, 22528 B] (wr=0..63 gate, wr=64..127 up)
+    // Q8_0 DOWN [down_off .. bytes) : [n_embd/128, n_ff/64,     8704 B] (wr=0..127 down)
+    bool q5k_ktile = false;
+    bool q8_0_ktile = false;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:
@@ -99,7 +108,8 @@ bool native_expert_wmma_supported(const NativeExpertLayout& L) noexcept;
 bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                                 const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
                                 int64_t cap_groups, int64_t cap_entries, const void* x_f16, void* scratch, float* out,
-                                void* stream, int64_t expected_entries = 0);
+                                void* stream, int64_t expected_entries = 0, const float* ent_weights = nullptr,
+                                float* zero_moe_out = nullptr, size_t zero_moe_floats = 0);
 /// Exact FP32-activation x BF16-weight grouped MoE for decode/verify (`gu_type == 30 && d_type == 30`, zero activation quantization).
 void native_expert_grouped_bf16_f32(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                                     const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,

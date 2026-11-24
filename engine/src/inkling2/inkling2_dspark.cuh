@@ -90,6 +90,66 @@ __global__ void k_dspark_mix_features(const float* __restrict__ f0, const float*
     }
 }
 
+/// Final term (k=3) + fused FP32 RMSNorm (exact bit-for-bit parity with k_dspark_mix_features).
+/// Safe for in-place `out == acc` (used for `f_rnn_last` update and FP32/BF16-sm80+ fallback).
+/// Grid: (T_eff), Block: (N == 2304) ? 576 : 256.
+__global__ void k_dspark_accum_final_rmsnorm_f32(
+        const float* __restrict__ cur, const float* acc,
+        const float* __restrict__ norm_w, float* out,
+        float w, float eps, int T_eff, int t_offset, int N) {
+    __shared__ float ssum[32];
+    const int ti = (int) blockIdx.x;
+    if (ti >= T_eff) return;
+    const float* cr = cur + (size_t) (t_offset + ti) * (size_t) N;
+    const float* ar = acc + (size_t) ti * (size_t) N;
+    float* dst = out + (size_t) ti * (size_t) N;
+    if (N == 2304 && blockDim.x == 576) {
+        const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+        const float4 cv = reinterpret_cast<const float4*>(cr)[tid];
+        const float4 av = reinterpret_cast<const float4*>(ar)[tid];
+        const float4 x = make_float4(av.x + w * cv.x, av.y + w * cv.y, av.z + w * cv.z, av.w + w * cv.w);
+        float s = warp_sum_d(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
+        if (lane == 0) ssum[warp] = s;
+        __syncthreads();
+        if (warp == 0) {
+            float tot = (lane < 18) ? ssum[lane] : 0.0f;
+            tot = warp_sum_d(tot);
+            if (lane == 0) ssum[0] = rsqrtf(tot / 2304.0f + eps);
+        }
+        __syncthreads();
+        const float sc = ssum[0];
+        if (norm_w) {
+            const float4 nw = __ldg(reinterpret_cast<const float4*>(norm_w) + tid);
+            reinterpret_cast<float4*>(dst)[tid] = make_float4(
+                x.x * sc * nw.x, x.y * sc * nw.y, x.z * sc * nw.z, x.w * sc * nw.w);
+        } else {
+            reinterpret_cast<float4*>(dst)[tid] = make_float4(x.x * sc, x.y * sc, x.z * sc, x.w * sc);
+        }
+        return;
+    }
+    float s = 0.0f;
+    for (int c = threadIdx.x; c < N; c += blockDim.x) {
+        const float x = ar[c] + w * cr[c];
+        dst[c] = x;
+        s += x * x;
+    }
+    s = warp_sum_d(s);
+    if ((threadIdx.x & 31) == 0) ssum[threadIdx.x >> 5] = s;
+    __syncthreads();
+    float tot = 0.0f;
+    if (threadIdx.x < 8) tot = ssum[threadIdx.x];
+    if (threadIdx.x < 32) {
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, o);
+        if (threadIdx.x == 0) ssum[0] = rsqrtf(tot / (float) N + eps);
+    }
+    __syncthreads();
+    const float sc = ssum[0];
+    for (int c = threadIdx.x; c < N; c += blockDim.x) {
+        dst[c] = dst[c] * sc * (norm_w ? norm_w[c] : 1.0f);
+    }
+}
+
 /// Fused per-head RMSNorm(k) + NeoX RoPE(k) + Q8 store for injected k_ctx, v_ctx.
 /// Reads pos0 from `pos0_d[0]` when non-null (enabling CUDA Graph capture of inject!), else uses `pos0_imm`.
 /// Grid (n_head_kv, T), Block 64 (d = 0..63 pairs (d, d+64) for D=128).
@@ -1515,6 +1575,7 @@ struct DsparkModel : GpuWeightStore {
     DsparkHparams hp;
 
     float* dspark_fuse = nullptr;       // [n_layer + 1, ntarget] = [4, 4]
+    float fuse_w_host[4][4] = {};       // Host-precomputed exact FP32 softmax of dspark_fuse rows 0..3
     float* dspark_norm = nullptr;       // [n_embd]
     float* mask_embd = nullptr;         // [n_embd]
     float* output_norm = nullptr;       // [n_embd]
@@ -1534,9 +1595,14 @@ struct DsparkModel : GpuWeightStore {
     uint8_t* decode_w_gpu = nullptr;
     uint8_t* decode_w_pin = nullptr;
     bool decode_w_pin_cuda = false;
+    bool decode_w_from_pool = false;
     size_t decode_w_bytes = 0;
     bool decode_w_offloadable = false;
     bool decode_w_resident = true;
+    cudaStream_t decode_w_alloc_st = nullptr;
+    cudaEvent_t ev_decode_w_alloc = nullptr;
+    cudaEvent_t ev_decode_w_ready = nullptr;
+    bool decode_w_h2d_pending = false;
     std::vector<DecodeWeightRef> decode_w_refs;
 
     void bind_decode_weight_ptrs(uint8_t* base) {
@@ -1545,29 +1611,89 @@ struct DsparkModel : GpuWeightStore {
         }
     }
 
-    void evict_decode_weights() {
-        if (!decode_w_offloadable || !decode_w_resident) return;
+    void evict_decode_weights(cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
+        if (!decode_w_offloadable || (!decode_w_resident && !decode_w_gpu)) return;
         if (decode_w_gpu) {
-            cudaFree(decode_w_gpu);
+            if (decode_w_from_pool && pool != nullptr) {
+                if (decode_w_h2d_pending && ev_decode_w_ready) {
+                    CK(cudaStreamWaitEvent(pool_st, ev_decode_w_ready, 0));
+                }
+                CK(cudaFreeAsync(decode_w_gpu, pool_st));
+            } else {
+                cudaFree(decode_w_gpu);
+            }
             decode_w_gpu = nullptr;
+            decode_w_from_pool = false;
+            decode_w_alloc_st = nullptr;
         }
         bind_decode_weight_ptrs(nullptr);
         decode_w_resident = false;
+        decode_w_h2d_pending = false;
     }
 
-    void restore_decode_weights(cudaStream_t st) {
+    // Stream-ordered allocation from `pool` on `pool_st` when provided (falls back to cudaMalloc).
+    // Records `ev_decode_w_alloc` on `pool_st` so a subsequent H2D on a different stream (e.g. `cst`)
+    // automatically waits on the pool allocation before writing `decode_w_gpu`.
+    bool alloc_decode_weights(cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
+        if (!decode_w_offloadable || decode_w_resident) return false;
+        if (!decode_w_gpu) {
+            void* p = nullptr;
+            if (pool != nullptr &&
+                cudaMallocFromPoolAsync(&p, decode_w_bytes, pool, pool_st) == cudaSuccess && p != nullptr) {
+                decode_w_gpu = reinterpret_cast<uint8_t*>(p);
+                decode_w_from_pool = true;
+                decode_w_alloc_st = pool_st;
+                if (!ev_decode_w_alloc) CK(cudaEventCreateWithFlags(&ev_decode_w_alloc, cudaEventDisableTiming));
+                CK(cudaEventRecord(ev_decode_w_alloc, pool_st));
+            } else {
+                if (pool != nullptr) (void) cudaGetLastError();
+                decode_w_gpu = nullptr;
+                CK(cudaMalloc(&decode_w_gpu, decode_w_bytes));
+                decode_w_from_pool = false;
+                decode_w_alloc_st = nullptr;
+            }
+            bind_decode_weight_ptrs(decode_w_gpu);
+        }
+        return true;
+    }
+
+    void queue_decode_weights_h2d(cudaStream_t s, bool async_stream = false,
+                                  cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
         if (!decode_w_offloadable || decode_w_resident) return;
+        if (!decode_w_gpu) alloc_decode_weights(pool, pool ? (pool_st ? pool_st : s) : nullptr);
+        // Critical sync safety: when `decode_w_gpu` was stream-allocated on `pool_st` (e.g. `st`)
+        // and H2D runs on another non-blocking stream `s` (e.g. `cst`), order `s` after `ev_decode_w_alloc`.
+        if (decode_w_from_pool && s != decode_w_alloc_st && ev_decode_w_alloc) {
+            CK(cudaStreamWaitEvent(s, ev_decode_w_alloc, 0));
+        }
         const auto t0 = Clock::now();
-        CK(cudaMalloc(&decode_w_gpu, decode_w_bytes));
-        CK(cudaMemcpyAsync(decode_w_gpu, decode_w_pin, decode_w_bytes, cudaMemcpyHostToDevice, st));
-        bind_decode_weight_ptrs(decode_w_gpu);
+        CK(cudaMemcpyAsync(decode_w_gpu, decode_w_pin, decode_w_bytes, cudaMemcpyHostToDevice, s));
+        if (async_stream) {
+            if (!ev_decode_w_ready) CK(cudaEventCreateWithFlags(&ev_decode_w_ready, cudaEventDisableTiming));
+            CK(cudaEventRecord(ev_decode_w_ready, s));
+            decode_w_h2d_pending = true;
+        } else {
+            decode_w_h2d_pending = false;
+        }
         decode_w_resident = true;
-        std::fprintf(stderr, "strata-inkling2: dspark decode weights restored (%.1f MiB) queued in %.1f ms\n",
-                     (double) decode_w_bytes / (1 << 20), ms_since(t0));
+        std::fprintf(stderr, "strata-inkling2: dspark decode weights restored (%.1f MiB, async=%d, pool=%d) queued in %.1f ms\n",
+                     (double) decode_w_bytes / (1 << 20), async_stream ? 1 : 0, decode_w_from_pool ? 1 : 0, ms_since(t0));
+    }
+
+    void restore_decode_weights(cudaStream_t st, cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
+        queue_decode_weights_h2d(st, false, pool, pool ? (pool_st ? pool_st : st) : nullptr);
     }
 
     ~DsparkModel() {
-        if (decode_w_gpu) { cudaFree(decode_w_gpu); decode_w_gpu = nullptr; }
+        if (ev_decode_w_alloc) { cudaEventDestroy(ev_decode_w_alloc); ev_decode_w_alloc = nullptr; }
+        if (ev_decode_w_ready) { cudaEventDestroy(ev_decode_w_ready); ev_decode_w_ready = nullptr; }
+        if (decode_w_gpu) {
+            // Pool-backed decode_w_gpu must be evicted by Engine::~Engine() before destroying phase_pool.
+            if (!decode_w_from_pool) cudaFree(decode_w_gpu);
+            decode_w_gpu = nullptr;
+            decode_w_from_pool = false;
+            decode_w_alloc_st = nullptr;
+        }
         if (decode_w_pin) {
             if (decode_w_pin_cuda) cudaFreeHost(decode_w_pin);
             else std::free(decode_w_pin);
@@ -1648,6 +1774,19 @@ inline bool load_dspark_model(const std::string& path, const Hparams& target_hp,
     const int64_t N = hp.n_embd;
     const int64_t rank = hp.markov_rank;
     dm.dspark_fuse = dm.upload_f32("dspark_fuse.weight", (size_t) (hp.n_layer + 1) * 4);
+    {
+        const int n_fuse_rows = std::min(hp.n_layer + 1, 4);
+        float raw_fuse[4 * 4] = {};
+        CK(cudaMemcpy(raw_fuse, dm.dspark_fuse, (size_t) (n_fuse_rows * 4) * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int r = 0; r < n_fuse_rows; ++r) {
+            float a[4] = {raw_fuse[r * 4 + 0], raw_fuse[r * 4 + 1], raw_fuse[r * 4 + 2], raw_fuse[r * 4 + 3]};
+            const float mx = fmaxf(fmaxf(a[0], a[1]), fmaxf(a[2], a[3]));
+            float s = 0.0f;
+            for (int k = 0; k < 4; ++k) { a[k] = expf(a[k] - mx); s += a[k]; }
+            const float inv = 1.0f / s;
+            for (int k = 0; k < 4; ++k) dm.fuse_w_host[r][k] = a[k] * inv;
+        }
+    }
     dm.dspark_norm = dm.upload_f32("dspark_norm.weight", (size_t) N);
     dm.mask_embd = dm.upload_f32("mask_embd.weight", (size_t) N);
     dm.output_norm = dm.upload_f32("output_norm.weight", (size_t) N);
@@ -1767,6 +1906,7 @@ inline bool load_dspark_model(const std::string& path, const Hparams& target_hp,
         CK(cudaMalloc(&dm.decode_w_gpu, staged_bytes));
         CK(cudaMemcpy(dm.decode_w_gpu, dm.decode_w_pin, staged_bytes, cudaMemcpyHostToDevice));
         dm.bind_decode_weight_ptrs(dm.decode_w_gpu);
+        dm.decode_w_from_pool = false;
         dm.decode_w_offloadable = true;
         dm.decode_w_resident = true;
     }
@@ -1824,9 +1964,16 @@ struct DsparkEngine {
     bool markov_graph_oom[8] = {};
     cudaGraphExec_t inject_graphs[9] = {};        // captured inject(T=1..8, feat_off=0) graphs
     bool inject_graph_oom[9] = {};
+    std::vector<cudaGraphExec_t> deferred_graphs_destroy;
     std::vector<float> h_anchor;     // [N]
     bool ctx_aliased = false;
     bool split_aliased = false;
+
+    // Wave 5: Zero-PCIe Running VRAM Accumulator state (prefill T > 8 only; decode/verify T <= 8 stays on d_tgt_feat)
+    float fuse_w_host[4][4] = {};
+    bool prefill_vram_acc_active = false;
+    float* d_pp_acc[3] = {nullptr, nullptr, nullptr}; // [0]=SWA L0, [1]=Full L1 (aliases E.msg3), [2]=SWA L2
+    int pp_acc_swa_start = 0;
 
     // Stats
     int64_t n_draft_calls = 0;
@@ -1853,22 +2000,78 @@ struct DsparkEngine {
         }
     }
 
-    void evict_decode_weights() {
-        if (!dm || !dm->decode_w_offloadable || !dm->decode_w_resident) return;
-        destroy_decode_graphs();
-        dm->evict_decode_weights();
+    void defer_destroy_kv_graphs() {
+        auto defer = [&](cudaGraphExec_t& g) {
+            if (g) { deferred_graphs_destroy.push_back(g); g = nullptr; }
+        };
+        defer(dflare_graph_short);
+        defer(dflare_graph_split);
+        for (int i = 0; i < 9; ++i) {
+            defer(inject_graphs[i]);
+            inject_graph_oom[i] = false;
+        }
     }
 
-    void ensure_decode_weights_resident(cudaStream_t st) {
+    void defer_destroy_decode_graphs() {
+        auto defer = [&](cudaGraphExec_t& g) {
+            if (g) { deferred_graphs_destroy.push_back(g); g = nullptr; }
+        };
+        defer(dflare_graph_short);
+        defer(dflare_graph_split);
+        for (int i = 0; i < 8; ++i) {
+            defer(markov_graphs[i]);
+            markov_graph_oom[i] = false;
+        }
+    }
+
+    void flush_deferred_graphs() {
+        if (deferred_graphs_destroy.empty()) return;
+        for (cudaGraphExec_t g : deferred_graphs_destroy) {
+            if (g) cudaGraphExecDestroy(g);
+        }
+        deferred_graphs_destroy.clear();
+    }
+
+    void evict_decode_weights(cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
+        if (!dm || !dm->decode_w_offloadable || (!dm->decode_w_resident && !dm->decode_w_gpu)) return;
+        defer_destroy_decode_graphs();
+        dm->evict_decode_weights(pool, pool_st);
+    }
+
+    bool alloc_decode_weights(cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
+        if (!dm || !dm->decode_w_offloadable || dm->decode_w_resident) return false;
+        defer_destroy_decode_graphs();
+        return dm->alloc_decode_weights(pool, pool_st);
+    }
+
+    void queue_decode_weights_h2d(cudaStream_t s, bool async_stream = false,
+                                  cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
         if (!dm || !dm->decode_w_offloadable || dm->decode_w_resident) return;
-        destroy_decode_graphs();
-        dm->restore_decode_weights(st);
+        defer_destroy_decode_graphs();
+        dm->queue_decode_weights_h2d(s, async_stream, pool, pool_st);
+    }
+
+    void wait_decode_weights_ready(cudaStream_t st) {
+        if (dm && dm->decode_w_h2d_pending && dm->ev_decode_w_ready) {
+            CK(cudaStreamWaitEvent(st, dm->ev_decode_w_ready, 0));
+            dm->decode_w_h2d_pending = false;
+        }
+    }
+
+    void restore_decode_weights(cudaStream_t st, cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
+        if (!dm || !dm->decode_w_offloadable || dm->decode_w_resident) return;
+        defer_destroy_decode_graphs();
+        dm->restore_decode_weights(st, pool, pool_st);
+    }
+
+    void ensure_decode_weights_resident(cudaStream_t st, cudaMemPool_t pool = nullptr, cudaStream_t pool_st = nullptr) {
+        restore_decode_weights(st, pool, pool_st);
     }
 
     /// Rebind aliased arena buffers (ctx_norm/k/v and split_out) when Engine switches Prefill <-> Decode arena.
     void rebind_arena(uint8_t* ext_arena, size_t ext_arena_bytes, int cur_tmax) {
-        destroy_kv_graphs();
-        destroy_decode_graphs();
+        defer_destroy_kv_graphs();
+        defer_destroy_decode_graphs();
         if (!ctx_aliased && !split_aliased) return;
         const auto& hp = dm->hp;
         auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
@@ -1900,9 +2103,8 @@ struct DsparkEngine {
 
     ~DsparkEngine() {
         destroy_kv_graphs();
-        for (int i = 0; i < 8; ++i) {
-            if (markov_graphs[i]) cudaGraphExecDestroy(markov_graphs[i]);
-        }
+        destroy_decode_graphs();
+        flush_deferred_graphs();
         for (auto* p : kq) cudaFree(p);
         for (auto* p : vq) cudaFree(p);
         for (auto* p : ks) cudaFree(p);
@@ -2032,11 +2234,16 @@ struct DsparkEngine {
             h_anchor_pin = nullptr;
         }
         h_anchor.resize((size_t) hp.n_embd);
+        std::memcpy(fuse_w_host, dm->fuse_w_host, sizeof(fuse_w_host));
+        prefill_vram_acc_active = false;
+        d_pp_acc[0] = d_pp_acc[1] = d_pp_acc[2] = nullptr;
+        pp_acc_swa_start = 0;
         pos = 0;
     }
 
     void reset(cudaStream_t st) {
         pos = 0;
+        prefill_vram_acc_active = false;
         CK(cudaMemsetAsync(f_rnn_last, 0, (size_t) dm->hp.n_embd * sizeof(float), st));
     }
 
@@ -2242,18 +2449,26 @@ struct DsparkEngine {
         }
         for (int il = 0; il < hp.n_layer; ++il) {
             const auto& L = dm->layers[(size_t) il];
-            dspark_detail::k_dspark_mix_features<<<(unsigned) T, mix_blk, 0, E.st>>>(
-                f0, f1, f2, f3, dm->dspark_fuse + il * 4, L.dflare_norm, ctx_norm, hp.n_embd, hp.rms_eps);
-            E.prep_q8(ctx_norm, E.xq, T, hp.n_embd);
-            if (!E.try_project_pair_q8_0(T <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, hp.kv_dim,
-                                         L.attn_v_ctx, ctx_v, hp.kv_dim, T, hp.n_embd)) {
-                E.project_preq(ctx_norm, T <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, T, hp.kv_dim, hp.n_embd);
-                E.project_preq(ctx_norm, T <= 8 ? E.xq : nullptr, L.attn_v_ctx, ctx_v, T, hp.kv_dim, hp.n_embd);
+            // EX-5: SWA ring only retains the last hp.n_swa (1024) tokens! When T > hp.n_swa,
+            // injecting the first (T - hp.n_swa) tokens is 100% overwritten before decode ever reads them.
+            // Skipping them saves 74% of zero-copy PCIe feature reads + K/V GEMM on both SWA draft layers (bit-exact!).
+            const int swa_skip = (hp.is_swa(il) && T > (int) hp.n_swa) ? (T - (int) hp.n_swa) : 0;
+            const int t_eff = T - swa_skip;
+            const int pos_eff = pos0 + swa_skip;
+            const size_t f_off = (size_t) swa_skip * (size_t) hp.n_embd;
+            dspark_detail::k_dspark_mix_features<<<(unsigned) t_eff, mix_blk, 0, E.st>>>(
+                f0 + f_off, f1 + f_off, f2 + f_off, f3 + f_off,
+                dm->dspark_fuse + il * 4, L.dflare_norm, ctx_norm, hp.n_embd, hp.rms_eps);
+            E.prep_q8(ctx_norm, E.xq, t_eff, hp.n_embd);
+            if (!E.try_project_pair_q8_0(t_eff <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, hp.kv_dim,
+                                         L.attn_v_ctx, ctx_v, hp.kv_dim, t_eff, hp.n_embd)) {
+                E.project_preq(ctx_norm, t_eff <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, t_eff, hp.kv_dim, hp.n_embd);
+                E.project_preq(ctx_norm, t_eff <= 8 ? E.xq : nullptr, L.attn_v_ctx, ctx_v, t_eff, hp.kv_dim, hp.n_embd);
             }
-            dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 64, 0, E.st>>>(
+            dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) t_eff), 64, 0, E.st>>>(
                 ctx_k, ctx_v, L.attn_k_ctx_norm,
                 kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
-                hp.n_head_kv, pos0, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                hp.n_head_kv, pos_eff, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
                 hp.rms_eps, hp.freq_base, hp.n_rot);
         }
         const size_t last_off = (size_t) (T - 1) * (size_t) hp.n_embd;
@@ -2267,12 +2482,108 @@ struct DsparkEngine {
         }
     }
 
+    /// Wave 5: Arm zero-PCIe running VRAM feature accumulators for a prefill chunk of length `T` (`T > 8`).
+    /// [0]=SWA L0 ([T - pp_acc_swa_start, N]), [1]=Full L1 ([T, N], aliases E.msg3), [2]=SWA L2 ([T - pp_acc_swa_start, N]).
+    void begin_prefill_vram_acc(float* acc_swa0, float* acc_full1, float* acc_swa2, int T) {
+        d_pp_acc[0] = acc_swa0;
+        d_pp_acc[1] = acc_full1;
+        d_pp_acc[2] = acc_swa2;
+        if (!dm) {
+            pp_acc_swa_start = 0;
+            prefill_vram_acc_active = false;
+            return;
+        }
+        const auto& hp = dm->hp;
+        // Match Wave 3C (EX-5) exact swa_skip formula in inject(): retain last hp.n_swa tokens.
+        pp_acc_swa_start = (T > (int) hp.n_swa) ? (T - (int) hp.n_swa) : 0;
+        const bool layout_ok = (hp.n_layer == 3 && hp.is_swa(0) && !hp.is_swa(1) && hp.is_swa(2));
+        prefill_vram_acc_active = (layout_ok && acc_swa0 != nullptr && acc_full1 != nullptr && acc_swa2 != nullptr && T > 8);
+    }
+
+    /// Wave 5: Accumulate target layer feature `ti` (0, 1, 2 at il = 5, 23, 41) directly into VRAM accumulators.
+    void accum_prefill_feat(int ti, const float* cur, int T, cudaStream_t st) {
+        if (!prefill_vram_acc_active || ti < 0 || ti >= 3 || T <= 0) return;
+        const int N = dm->hp.n_embd;
+        const int blk = (N == 2304) ? 576 : 256;
+        k_dspark_accum_cur<<<(unsigned) T, blk, 0, st>>>(
+            cur, d_pp_acc[0], d_pp_acc[1], d_pp_acc[2], f_rnn_last,
+            fuse_w_host[0][ti], fuse_w_host[1][ti], fuse_w_host[2][ti], fuse_w_host[3][ti],
+            T, pp_acc_swa_start, N, ti == 0);
+    }
+
+    /// Wave 5: Finalize `ti = 3` (`cur_final`) + fused RMSNorm + FP16 emit -> K/V ctx GEMM -> Q8 KV store (ZERO PCIe!).
+    /// Falls back cleanly to `inject(E, pos0, T)` whenever `!prefill_vram_acc_active`.
+    template <typename EngineT>
+    void inject_from_vram_acc(EngineT& E, const float* cur_final, int T, int pos0, cudaStream_t st) {
+        if (T <= 0) {
+            prefill_vram_acc_active = false;
+            return;
+        }
+        if (!prefill_vram_acc_active || !cur_final) {
+            prefill_vram_acc_active = false;
+            inject(E, pos0, T);
+            return;
+        }
+        const auto t0 = Clock::now();
+        const auto& hp = dm->hp;
+        const int N = hp.n_embd;
+        const int mix_blk = (N == 2304) ? 576 : 256;
+
+        // 1. Finalize f_rnn_last for the last token (T - 1) + exact FP32 RMSNorm (matches inject() bit-for-bit).
+        dspark_detail::k_dspark_accum_final_rmsnorm_f32<<<1, mix_blk, 0, st>>>(
+            cur_final, f_rnn_last, dm->dspark_norm, f_rnn_last,
+            fuse_w_host[hp.n_layer][3], hp.rms_eps, 1, T - 1, N);
+
+        // 2. Finalize each draft layer il = 0..2: fused k=3 accum + RMSNorm + direct FP16 emit (zero k_f32_to_f16!).
+        for (int il = 0; il < hp.n_layer; ++il) {
+            const auto& L = dm->layers[(size_t) il];
+            const int t_off = L.is_swa ? pp_acc_swa_start : 0;
+            const int T_eff = T - t_off;
+            const int pos_eff = pos0 + t_off;
+            const bool kv_can_f16 = (T_eff > 8 &&
+                                     L.attn_k_ctx.type != 0 && (L.attn_k_ctx.type != 30 || E.bf16_x_f16) &&
+                                     L.attn_v_ctx.type != 0 && (L.attn_v_ctx.type != 30 || E.bf16_x_f16));
+            uint16_t* ctx_f16_u16 = E.act_bf16 ? E.act_bf16 : reinterpret_cast<uint16_t*>(ctx_norm);
+            if (kv_can_f16 && ctx_f16_u16) {
+                k_dspark_accum_final_rmsnorm_f16<<<(unsigned) T_eff, mix_blk, 0, st>>>(
+                    cur_final, d_pp_acc[il], L.dflare_norm,
+                    reinterpret_cast<__half*>(ctx_f16_u16),
+                    fuse_w_host[il][3], hp.rms_eps, T_eff, t_off, N);
+                E.project_preq(nullptr, nullptr, L.attn_k_ctx, ctx_k, T_eff, hp.kv_dim, N, ctx_f16_u16);
+                E.project_preq(nullptr, nullptr, L.attn_v_ctx, ctx_v, T_eff, hp.kv_dim, N, ctx_f16_u16);
+            } else {
+                dspark_detail::k_dspark_accum_final_rmsnorm_f32<<<(unsigned) T_eff, mix_blk, 0, st>>>(
+                    cur_final, d_pp_acc[il], L.dflare_norm, ctx_norm,
+                    fuse_w_host[il][3], hp.rms_eps, T_eff, t_off, N);
+                E.prep_q8(ctx_norm, E.xq, T_eff, N);
+                if (!E.try_project_pair_q8_0(T_eff <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, hp.kv_dim,
+                                             L.attn_v_ctx, ctx_v, hp.kv_dim, T_eff, N)) {
+                    E.project_preq(ctx_norm, T_eff <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, T_eff, hp.kv_dim, N);
+                    E.project_preq(ctx_norm, T_eff <= 8 ? E.xq : nullptr, L.attn_v_ctx, ctx_v, T_eff, hp.kv_dim, N);
+                }
+            }
+            dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T_eff), 64, 0, st>>>(
+                ctx_k, ctx_v, L.attn_k_ctx_norm,
+                kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                hp.n_head_kv, pos_eff, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                hp.rms_eps, hp.freq_base, hp.n_rot);
+        }
+
+        pos = pos0 + T;
+        prefill_vram_acc_active = false;
+        if (E.prof) {
+            CK(cudaStreamSynchronize(st));
+            inject_ms += ms_since(t0);
+        }
+    }
+
     /// Draft `n_draft` (1..7) speculative tokens from `anchor` (placed at `pos`, seeing context `0..pos-1`).
     /// When `out_logits != nullptr` (`n_draft` rows of `vocab_unpadded`), uses `sample_fn(row_vec)` for each draft step.
     template <typename EngineT, typename SampleFn>
     void draft(EngineT& E, int32_t anchor, int n_draft, std::vector<int32_t>& out_tokens,
                std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn, bool gpu_sampled = false) {
         ensure_decode_weights_resident(E.st);
+        wait_decode_weights_ready(E.st);
         const auto t0 = Clock::now();
         const auto& hp = dm->hp;
         const int block_n = hp.block_size;

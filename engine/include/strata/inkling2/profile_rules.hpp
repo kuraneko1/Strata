@@ -30,6 +30,7 @@ struct ArchProfile {
     int full_vram_want_sp = 7;            // Split-KV arena reserve in FullVram (V100 80-SM needs total_sp=6 for 6 exact waves)
     int hybrid_want_sp_1024 = 5;          // Split-KV arena reserve in Hybrid at T<=1024 (Ada 46-SM: best_sp=4 + 1 tail)
     int hybrid_want_sp_2048 = 4;          // Split-KV arena reserve in Hybrid at T>=2048 (Ada 46-SM: best_sp=3 + 1 tail)
+    int hybrid_want_sp_8192 = 2;          // Split-KV arena reserve at T>=8192 (saves 32 MiB @ 8K, 64 MiB @ 16K)
     int t1_full_split_mult = 8;           // attn_split_t1_full = clamp(sm_count * mult / n_head_kv, 40, kAttnSplitMax)
     int t1_swa_split_mult = 2;            // attn_split_t1_swa  = clamp(sm_count * mult / n_head_kv, 8, 24)
     int pp_stage_mb = 64;                 // Default pp_streaming ring slot size (MiB)
@@ -39,6 +40,7 @@ struct ArchProfile {
     bool allow_tight_chunk_2048 = false;  // Measured win on sm_89 12GB TightHybrid (halves PCIe streaming bytes/tok)
     bool allow_core_chunk_2048 = false;   // Measured win on sm_89 12GB CoreResidentHybrid when tier1 still fits 128/128
     bool allow_core_chunk_4096 = false;   // EX-4: Measured win on sm_89 12GB with SWA compaction + dynamic KV init
+    bool allow_core_chunk_8192 = false;   // Wave 4/5: Enables adaptive T=8192 upper cap on sm_89 12GB CoreResidentHybrid
     bool allow_full_vram_chunk_2048 = false; // Measured +21-23% prefill win on sm_70 32GB FullVram (fills BM=128 tiles)
     int core_hybrid_kv_init = 0;          // Optional initial Full-KV cap on CoreResidentHybrid (0 = max_ctx upfront)
 };
@@ -78,6 +80,7 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.allow_tight_chunk_2048 = true;
         p.allow_core_chunk_2048 = true;
         p.allow_core_chunk_4096 = true;
+        p.allow_core_chunk_8192 = true;
         p.allow_full_vram_chunk_2048 = true;
         p.core_hybrid_kv_init = 16384;
         return p;
@@ -137,6 +140,10 @@ struct ResolvedProfile {
     ArchProfile arch{};
     VramRegime regime = VramRegime::TightHybrid;
     int chunk = 1024;
+    // Upper prefill chunk cap for prompt-adaptive expansion: 12288 on sm_89 CoreResidentHybrid
+    // (fits 100% Core 1536/1536 + 4x162 MiB staging thanks to Wave 9 Shared-Scratch SWA KV Pool,
+    // with automatic step-down 12288 -> 8192 -> 4096 -> 2048 as kv_cur grows for 262K ctx).
+    int max_adaptive_chunk = 4096;
     int full_kv_init = 32768;
     int want_sp = 5;
     int pp_stage_mb = 64;
@@ -218,7 +225,8 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     const size_t full_vram_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + in.all_experts_bytes + dspark_kv_need + 256 * MiB;
 
     if (in.requested_chunk > 0) {
-        out.chunk = std::clamp(in.requested_chunk, 1, 4096);
+        out.chunk = std::clamp(in.requested_chunk, 1, 16384);
+        out.max_adaptive_chunk = out.chunk;
     } else {
         if (out.regime == VramRegime::FullVram && out.arch.allow_full_vram_chunk_2048 &&
             in.kv_q8 && in.vram_free_bytes >= full_vram_2048_need) {
@@ -237,10 +245,17 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
         } else {
             out.chunk = 512;
         }
+        out.max_adaptive_chunk =
+            (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_8192 &&
+             in.kv_q8 && out.chunk == 4096)
+                ? 12288
+                : out.chunk;
     }
 
     // 3. Split-KV arena reserve, PCIe staging ring, and GPU routing hit counters:
-    if (out.chunk >= 2048) {
+    if (out.chunk >= 8192) {
+        out.want_sp = out.arch.hybrid_want_sp_8192;
+    } else if (out.chunk >= 2048) {
         out.want_sp = out.arch.hybrid_want_sp_2048;
     } else if (out.regime == VramRegime::FullVram) {
         out.want_sp = out.arch.full_vram_want_sp;
