@@ -58,12 +58,8 @@ inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si1
 
 // Decode all 4 sub-blocks (32 bytes of qs -> 64 signed doubled E2M1 values and magnitudes) in 256-bit AVX2 lanes.
 // Bit-identical to calling the 128-bit unpack + kAbsFp4 table twice, using vpabsb and half the shuffle/cross-lane ops.
-inline void values64_both(const uint8_t* qs, const __m256i kv,
-                          __m256i& v01, __m256i& a01, __m256i& v23, __m256i& a23) {
-    const __m256i q = _mm256_loadu_si256((const __m256i*) qs);
-    const __m256i m4 = _mm256_set1_epi8(0x0F);
-    const __m256i ql = _mm256_and_si256(q, m4);
-    const __m256i qh = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+inline void values64_decode(__m256i ql, __m256i qh, const __m256i kv,
+                            __m256i& v01, __m256i& a01, __m256i& v23, __m256i& a23) {
     const __m256i lo = _mm256_shuffle_epi8(kv, ql);
     const __m256i hi = _mm256_shuffle_epi8(kv, qh);
     const __m256i sb02 = _mm256_unpacklo_epi64(lo, hi);
@@ -72,6 +68,32 @@ inline void values64_both(const uint8_t* qs, const __m256i kv,
     v23 = _mm256_permute2x128_si256(sb02, sb13, 0x31);
     a01 = _mm256_abs_epi8(v01);
     a23 = _mm256_abs_epi8(v23);
+}
+
+inline void values64_both(const uint8_t* qs, const __m256i kv,
+                          __m256i& v01, __m256i& a01, __m256i& v23, __m256i& a23) {
+    const __m256i q = _mm256_loadu_si256((const __m256i*) qs);
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    const __m256i ql = _mm256_and_si256(q, m4);
+    const __m256i qh = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+    values64_decode(ql, qh, kv, v01, a01, v23, a23);
+}
+
+// Zero-copy K-tile decode: loads q0 (16 B) and q1 (16 B) and inverts perm(b) = (l3 h2 h1 h0 l2 l1 l0 h3) in YMM
+// registers before running the exact same shuffle/unpack/permute/abs sequence as values64_both.
+inline void values64_ktile_both(const uint8_t* q0_ptr, const uint8_t* q1_ptr, const __m256i kv,
+                                __m256i& v01, __m256i& a01, __m256i& v23, __m256i& a23) {
+    const __m128i q0 = _mm_loadu_si128((const __m128i*) q0_ptr);
+    const __m128i q1 = _mm_loadu_si128((const __m128i*) q1_ptr);
+    const __m256i qp = _mm256_inserti128_si256(_mm256_castsi128_si256(q0), q1, 1);
+    const __m256i sr4 = _mm256_srli_epi16(qp, 4);
+    const __m256i m08 = _mm256_set1_epi8(0x08);
+    const __m256i m07 = _mm256_set1_epi8(0x07);
+    const __m256i ql = _mm256_or_si256(_mm256_and_si256(sr4, m08),
+                                       _mm256_and_si256(_mm256_srli_epi16(qp, 1), m07));
+    const __m256i qh = _mm256_or_si256(_mm256_and_si256(_mm256_slli_epi16(qp, 3), m08),
+                                       _mm256_and_si256(sr4, m07));
+    values64_decode(ql, qh, kv, v01, a01, v23, a23);
 }
 
 inline float hsum8(const __m256 x) {   // ggml's hsum_float_8
@@ -257,6 +279,137 @@ void dot_rows(const uint8_t* w, size_t row_bytes, const Acts& a, float* const* o
     }
 }
 
+template <int NT>
+inline void ktile_accum_rows(const uint8_t* d_base, const uint8_t* q0_base, const uint8_t* q1_base,
+                             int w0, int len, const __m256i kv, const __m256i ones,
+                             const __m256i* aq01, const __m256i* aq23, const __m256* ady0, const __m256* ady1,
+                             __m256 acc[][NT]) {
+    for (int i = 0; i < len; ++i) {
+        const int w = w0 + i;
+        __m256i v01, a01, v23, a23;
+        values64_ktile_both(q0_base + (size_t) w * 16, q1_base + (size_t) w * 16, kv, v01, a01, v23, a23);
+        const uint8_t* d = d_base + (size_t) w * 4;
+        const __m256 u01 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[d[1]]), _mm_set1_ps(kUe4m3.v[d[0]]));
+        const __m256 u23 = _mm256_set_m128(_mm_set1_ps(kUe4m3.v[d[3]]), _mm_set1_ps(kUe4m3.v[d[2]]));
+        for (int t = 0; t < NT; ++t) {
+            const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(a01, _mm256_sign_epi8(aq01[t], v01)), ones);
+            const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(a23, _mm256_sign_epi8(aq23[t], v23)), ones);
+            acc[i][t] = _mm256_fmadd_ps(_mm256_mul_ps(u01, ady0[t]), _mm256_cvtepi32_ps(p1), acc[i][t]);
+            acc[i][t] = _mm256_fmadd_ps(_mm256_mul_ps(u23, ady1[t]), _mm256_cvtepi32_ps(p2), acc[i][t]);
+        }
+    }
+}
+
+template <int NT>
+inline void ktile_load_acts(const Acts& a, int kbx, __m256i* aq01, __m256i* aq23, __m256* ady0, __m256* ady1) {
+    for (int t = 0; t < NT; ++t) {
+        const block_q8_0* yb = a.y[t] + 2 * kbx;
+        aq01[t] = _mm256_loadu_si256((const __m256i*) yb[0].qs);
+        aq23[t] = _mm256_loadu_si256((const __m256i*) yb[1].qs);
+        const float* dy = a.dy + (size_t) t * 2 * a.nb + 2 * kbx;
+        ady0[t] = _mm256_broadcast_ss(dy);
+        ady1[t] = _mm256_broadcast_ss(dy + 1);
+    }
+}
+
+template <int NT, bool SITU = false>
+void ktile_gu_rows(const uint8_t* blob, const Acts& a, float* const* ff, int r0, int r1,
+                   float sg, float su, float beta = 4.f, float lb = 25.f) {
+    constexpr size_t kTileBytes = 4608;
+    constexpr int kStrip = (NT <= 2) ? 64 : (NT <= 4 ? 32 : 16);
+    const __m256i kv = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) kvalues_fp4));
+    const __m256i ones = _mm256_set1_epi16(1);
+    const int prefetch_ahead = prefetch_distance();
+    for (int c0 = r0; c0 < r1;) {
+        const int n_tile = c0 / 64;
+        const int c1 = std::min(r1, (n_tile + 1) * 64);
+        const int wr0 = c0 - n_tile * 64;
+        const int cnt = c1 - c0;
+        const uint8_t* tile_base = blob + (size_t) n_tile * (size_t) a.nb * kTileBytes;
+        for (int s0 = 0; s0 < cnt; s0 += kStrip) {
+            const int len = std::min(kStrip, cnt - s0);
+            __m256 acc_g[kStrip][NT];
+            __m256 acc_u[kStrip][NT];
+            for (int i = 0; i < len; ++i) {
+                for (int t = 0; t < NT; ++t) {
+                    acc_g[i][t] = _mm256_setzero_ps();
+                    acc_u[i][t] = _mm256_setzero_ps();
+                }
+            }
+            for (int kbx = 0; kbx < a.nb; ++kbx) {
+                const uint8_t* kt = tile_base + (size_t) kbx * kTileBytes;
+                if (prefetch_ahead > 0 && kbx + 1 < a.nb) {
+                    const char* pf = (const char*) (kt + kTileBytes);
+                    _mm_prefetch(pf, _MM_HINT_T0);
+                    _mm_prefetch(pf + 512, _MM_HINT_T0);
+                    _mm_prefetch(pf + 2560, _MM_HINT_T0);
+                    _mm_prefetch(pf + 3072, _MM_HINT_T0);
+                }
+                __m256i aq01[NT], aq23[NT];
+                __m256 ady0[NT], ady1[NT];
+                ktile_load_acts<NT>(a, kbx, aq01, aq23, ady0, ady1);
+                ktile_accum_rows<NT>(kt, kt + 512, kt + 2560, wr0 + s0, len, kv, ones, aq01, aq23, ady0, ady1, acc_g);
+                ktile_accum_rows<NT>(kt, kt + 512, kt + 2560, wr0 + s0 + 64, len, kv, ones, aq01, aq23, ady0, ady1, acc_u);
+            }
+            for (int i = 0; i < len; ++i) {
+                const int r = c0 + s0 + i;
+                for (int t = 0; t < NT; ++t) {
+                    const float gs = hsum8(acc_g[i][t]) * sg;
+                    const float us = hsum8(acc_u[i][t]) * su;
+                    if constexpr (SITU) {
+                        const float tg = beta * std::tanh((beta == 4.0f) ? (gs * 0.25f) : (gs / beta));
+                        const float tu = lb > 0.f ? lb * std::tanh(us / lb) : us;
+                        ff[t][r] = (tg / (1.f + std::exp(-gs))) * tu;
+                    } else {
+                        ff[t][r] = (gs / (1.f + std::exp(-gs))) * us;
+                    }
+                }
+            }
+        }
+        c0 = c1;
+    }
+}
+
+template <int NT>
+void ktile_dot_rows(const uint8_t* w, const Acts& a, float* const* out, int r0, int r1, float scale) {
+    constexpr size_t kTileBytes = 4608;
+    constexpr int kStrip = (NT <= 2) ? 128 : (NT <= 4 ? 64 : 32);
+    const __m256i kv = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) kvalues_fp4));
+    const __m256i ones = _mm256_set1_epi16(1);
+    const int prefetch_ahead = prefetch_distance();
+    for (int c0 = r0; c0 < r1;) {
+        const int n_tile = c0 / 128;
+        const int c1 = std::min(r1, (n_tile + 1) * 128);
+        const int wr0 = c0 - n_tile * 128;
+        const int cnt = c1 - c0;
+        const uint8_t* tile_base = w + (size_t) n_tile * (size_t) a.nb * kTileBytes;
+        for (int s0 = 0; s0 < cnt; s0 += kStrip) {
+            const int len = std::min(kStrip, cnt - s0);
+            __m256 acc[kStrip][NT];
+            for (int i = 0; i < len; ++i)
+                for (int t = 0; t < NT; ++t) acc[i][t] = _mm256_setzero_ps();
+            for (int kbx = 0; kbx < a.nb; ++kbx) {
+                const uint8_t* kt = tile_base + (size_t) kbx * kTileBytes;
+                if (prefetch_ahead > 0 && kbx + 1 < a.nb) {
+                    const char* pf = (const char*) (kt + kTileBytes);
+                    _mm_prefetch(pf, _MM_HINT_T0);
+                    _mm_prefetch(pf + 512, _MM_HINT_T0);
+                    _mm_prefetch(pf + 2560, _MM_HINT_T0);
+                }
+                __m256i aq01[NT], aq23[NT];
+                __m256 ady0[NT], ady1[NT];
+                ktile_load_acts<NT>(a, kbx, aq01, aq23, ady0, ady1);
+                ktile_accum_rows<NT>(kt, kt + 512, kt + 2560, wr0 + s0, len, kv, ones, aq01, aq23, ady0, ady1, acc);
+            }
+            for (int i = 0; i < len; ++i) {
+                const int r = c0 + s0 + i;
+                for (int t = 0; t < NT; ++t) out[t][r] = hsum8(acc[i][t]) * scale;
+            }
+        }
+        c0 = c1;
+    }
+}
+
 // windows wider than kMaxW (not from the pool) run in balanced slices of at most kMaxW
 template <typename F>
 inline void slices(int nt, F&& run) {
@@ -322,6 +475,60 @@ void nvfp4_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const
             case 6: dot_rows<6>(w, row_bytes, a, o, r0, r1, scale); break;
             case 7: dot_rows<7>(w, row_bytes, a, o, r0, r1, scale); break;
             default: dot_rows<8>(w, row_bytes, a, o, r0, r1, scale); break;
+        }
+    });
+}
+
+void nvfp4_256_ktile_gu_rows(const uint8_t* blob, int n, const void* const* act, int nt,
+                             float* const* ff, int r0, int r1, float s_gate, float s_up) {
+    slices(nt, [&](int t0, int w) {
+        const Acts a(act + t0, w, n / QK_NVFP4);
+        float* const* f = ff + t0;
+        switch (w) {
+            case 1: ktile_gu_rows<1, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+            case 2: ktile_gu_rows<2, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+            case 3: ktile_gu_rows<3, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+            case 4: ktile_gu_rows<4, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+            case 5: ktile_gu_rows<5, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+            case 6: ktile_gu_rows<6, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+            case 7: ktile_gu_rows<7, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+            default: ktile_gu_rows<8, false>(blob, a, f, r0, r1, s_gate, s_up); break;
+        }
+    });
+}
+
+void nvfp4_256_ktile_gu_rows_situ(const uint8_t* blob, int n, const void* const* act, int nt,
+                                  float* const* ff, int r0, int r1, float s_gate, float s_up, float beta, float lb) {
+    slices(nt, [&](int t0, int w) {
+        const Acts a(act + t0, w, n / QK_NVFP4);
+        float* const* f = ff + t0;
+        switch (w) {
+            case 1: ktile_gu_rows<1, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+            case 2: ktile_gu_rows<2, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+            case 3: ktile_gu_rows<3, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+            case 4: ktile_gu_rows<4, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+            case 5: ktile_gu_rows<5, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+            case 6: ktile_gu_rows<6, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+            case 7: ktile_gu_rows<7, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+            default: ktile_gu_rows<8, true>(blob, a, f, r0, r1, s_gate, s_up, beta, lb); break;
+        }
+    });
+}
+
+void nvfp4_256_ktile_rows(const uint8_t* w, int n, const void* const* act, int nt, float* const* out,
+                          int r0, int r1, float scale) {
+    slices(nt, [&](int t0, int k) {
+        const Acts a(act + t0, k, n / QK_NVFP4);
+        float* const* o = out + t0;
+        switch (k) {
+            case 1: ktile_dot_rows<1>(w, a, o, r0, r1, scale); break;
+            case 2: ktile_dot_rows<2>(w, a, o, r0, r1, scale); break;
+            case 3: ktile_dot_rows<3>(w, a, o, r0, r1, scale); break;
+            case 4: ktile_dot_rows<4>(w, a, o, r0, r1, scale); break;
+            case 5: ktile_dot_rows<5>(w, a, o, r0, r1, scale); break;
+            case 6: ktile_dot_rows<6>(w, a, o, r0, r1, scale); break;
+            case 7: ktile_dot_rows<7>(w, a, o, r0, r1, scale); break;
+            default: ktile_dot_rows<8>(w, a, o, r0, r1, scale); break;
         }
     });
 }

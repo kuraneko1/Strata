@@ -247,6 +247,11 @@ struct CudaLtCache {
 // lock-free hot-path map in lt_cache_ with pre-initialized opaque descriptors.
 std::mutex g_cuda_lt_global_mu;
 std::unordered_map<CudaLtKey, CudaLtGlobalEntry, CudaLtKeyHash> g_cuda_lt_global_cache;
+std::unordered_map<CudaLtKey, CudaLtGlobalEntry, CudaLtKeyHash> g_cuda_lt_bucket_cache;
+
+inline int cublaslt_t_bucket(int T) {
+    return (T >= 4096) ? 4 : (T >= 2048) ? 3 : (T >= 1024) ? 2 : (T >= 512) ? 1 : 0;
+}
 
 bool init_cuda_lt_descs(CudaLtEntry& e, const CudaLtKey& key) {
     if (e.descs_ready) return true;
@@ -1855,6 +1860,42 @@ bool Gemm::try_cublaslt_tune(const void* X, const void* W, void* Y, int64_t T, i
             cublasLtMatrixLayout_t b_desc = &tune_descs.b_desc;
             cublasLtMatrixLayout_t c_desc = &tune_descs.c_desc;
 
+            CudaLtKey bucket_key = key;
+            bucket_key.N = cublaslt_t_bucket((int) T);
+            if (beta == 0.0f) {
+                bool found_bucket = false;
+                CudaLtGlobalEntry b_entry{};
+                {
+                    std::lock_guard<std::mutex> lk(g_cuda_lt_global_mu);
+                    const auto bit = g_cuda_lt_bucket_cache.find(bucket_key);
+                    if (bit != g_cuda_lt_bucket_cache.end() && bit->second.valid) {
+                        b_entry = bit->second;
+                        found_bucket = true;
+                    }
+                }
+                if (found_bucket) {
+                    cublasLtMatmulHeuristicResult_t chk{};
+                    if (cublasLtMatmulAlgoCheck(lt_handle, op_desc, a_desc, b_desc, c_desc, c_desc,
+                                                &b_entry.algo, &chk) == CUBLAS_STATUS_SUCCESS &&
+                        chk.state == CUBLAS_STATUS_SUCCESS && chk.workspaceSize <= avail_ws) {
+                        CudaLtEntry entry = tune_descs;
+                        entry.algo = b_entry.algo;
+                        entry.workspace_bytes = chk.workspaceSize;
+                        entry.valid = true;
+                        it = local_cache->map.emplace(key, entry).first;
+                        CudaLtGlobalEntry ge{};
+                        ge.algo = b_entry.algo;
+                        ge.workspace_bytes = chk.workspaceSize;
+                        ge.valid = true;
+                        {
+                            std::lock_guard<std::mutex> lk(g_cuda_lt_global_mu);
+                            g_cuda_lt_global_cache.emplace(key, ge);
+                        }
+                        goto have_cached_lt;
+                    }
+                }
+            }
+
             cublasLtMatmulPreferenceOpaque_t pref_storage{};
             cublasLtMatmulPreference_t pref = &pref_storage;
             constexpr uint32_t kMinAlign = 16;
@@ -2073,10 +2114,14 @@ bool Gemm::try_cublaslt_tune(const void* X, const void* W, void* Y, int64_t T, i
             {
                 std::lock_guard<std::mutex> lk(g_cuda_lt_global_mu);
                 g_cuda_lt_global_cache.emplace(key, g_entry);
+                if (g_entry.valid) {
+                    g_cuda_lt_bucket_cache.emplace(bucket_key, g_entry);
+                }
             }
         }
     }
 
+have_cached_lt:
     CudaLtEntry& chosen = it->second;
     if (!chosen.valid || chosen.workspace_bytes > avail_ws) return false;
     if (!chosen.descs_ready && !init_cuda_lt_descs(chosen, key)) {

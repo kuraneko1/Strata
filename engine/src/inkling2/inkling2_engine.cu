@@ -1257,6 +1257,16 @@ struct Engine {
     size_t vram_free_after_place = 0;
     int pool_workers = 0;
 
+    bool is_core_full_resident() const {
+        if (!core_all_gpu || profile.regime == strata::inkling2::VramRegime::FullVram) return false;
+        const auto& hp = m->hp;
+        const int ne = (int) hp.n_expert;
+        for (int ip = (int) hp.core_start; ip < (int) hp.core_end && ip < hp.n_phys; ++ip) {
+            if (m->layers[(size_t) ip].n_slots < ne) return false;
+        }
+        return true;
+    }
+
     bool prof = false;
     bool prof_detail = false;
     double p_embd_ms = 0, p_attn_ms = 0, p_moe_gpu_ms = 0, p_moe_wait_ms = 0, p_moe_cpu_ms = 0;
@@ -2398,7 +2408,7 @@ struct Engine {
                     static const bool no_core_f16_pack = (std::getenv("STRATA_NO_CORE_F16_PACK") != nullptr);
                     size_t fr_pack = 0, tot_pack = 0;
                     CK(cudaMemGetInfo(&fr_pack, &tot_pack));
-                    if (!no_core_f16_pack && profile.regime != strata::inkling2::VramRegime::TightHybrid &&
+                    if (!no_core_f16_pack && profile.regime != strata::inkling2::VramRegime::FullVram &&
                         fr_pack > vram_reserve_bytes + ((size_t) 512 << 20)) {
                         const size_t wdown_cur_elems = (size_t) 48 * 64u * (size_t) N;
                         const size_t wup_mat_elems = (size_t) N * 64u;
@@ -3390,8 +3400,7 @@ struct Engine {
     // and free back to phase_pool right after Prefill finishes (ZERO permanent VRAM cost, 262K-safe!).
     void maybe_alloc_transient_pp_stages(size_t avail_known_min = 0) {
         static const bool no_transient_pp = (std::getenv("STRATA_NO_TRANSIENT_PP_STAGE") != nullptr);
-        if (no_transient_pp || !use_phase_pool || !phase_pool || !core_all_gpu) return;
-        if (profile.regime == strata::inkling2::VramRegime::TightHybrid) return;
+        if (no_transient_pp || !use_phase_pool || !phase_pool || !is_core_full_resident()) return;
         if (pp_stage_cnt < 2 || pp_stage_bytes < ((size_t) 64 << 20)) return;
         if (transient_pp_pool != nullptr || pp_tasks.size() <= (size_t) pp_stage_cnt) return;
         const size_t stride_b = (pp_stage_bytes + 255u) & ~size_t(255u);
@@ -4280,7 +4289,7 @@ struct Engine {
                 for (int ip : tier1) {
                     if (target_slots[(size_t) ip] < ne) { tier1_full = false; break; }
                 }
-                if (tier1_full && profile.regime != strata::inkling2::VramRegime::TightHybrid && tier2[0] == 0) {
+                if (tier1_full && tier2[0] == 0) {
                     size_t sum_t2_b = 0;
                     for (int ip : tier2) sum_t2_b += (size_t) target_slots[(size_t) ip] * m->layers[(size_t) ip].stride;
                     const size_t blk0_full_b = (size_t) ne * m->layers[0].stride;
@@ -4763,7 +4772,7 @@ struct Engine {
         size_t need_free = vram_reserve_bytes + peak_growth + ((size_t) 64 << 20);
         // Reclaim scattered non-blk.0 Tier-2 slots on CoreResidentHybrid (>=4K prefill) so Turn 2
         // maybe_alloc_transient_pp_stages() gets trans = 3 (NEVER touches blk.0 128/128, Core 1536/1536, or TightHybrid/262K).
-        if (core_all_gpu && profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid &&
+        if (is_core_full_resident() &&
             tgt_cap >= 4096 && use_phase_pool && phase_pool != nullptr && saved_pp_stage_bytes > 0) {
             if (!have_mem_info) {
                 CK(cudaMemGetInfo(&fr_sp, &tot_sp));
@@ -4803,11 +4812,33 @@ struct Engine {
         if (want_stage_cnt > 0 && saved_pp_stage_bytes > 0) {
             if (!alloc_pp_stages(want_stage_cnt, saved_pp_stage_bytes)) {
                 trim_phase_pool(0);
-                const size_t min_st_need = vram_reserve_bytes + (size_t) 2 * saved_pp_stage_bytes + ((size_t) 96 << 20);
+                if (d_core_wdown_cur_f16) { cudaFree(d_core_wdown_cur_f16); d_core_wdown_cur_f16 = nullptr; }
+                if (d_core_wup_f16) { cudaFree(d_core_wup_f16); d_core_wup_f16 = nullptr; }
+                size_t fr_st = 0, tot_st = 0;
+                CK(cudaMemGetInfo(&fr_st, &tot_st));
+                (void) fr_st; (void) tot_st;
+                const size_t pool_st = pool_cached_free_bytes();
+                const size_t min_st_need = pool_st + vram_reserve_bytes + (size_t) 2 * saved_pp_stage_bytes + ((size_t) 128 << 20);
                 resize_experts_vram(min_st_need, 0, /*equalize_tier2=*/false, /*async_cst=*/false,
                                     /*whole_layer_evict=*/false, /*restore_dspark_decode_w=*/false, /*skip_sync=*/false);
                 trim_phase_pool(0);
-                alloc_pp_stages(2, saved_pp_stage_bytes);
+                if (!alloc_pp_stages(2, saved_pp_stage_bytes)) {
+                    size_t compact_bytes = (size_t) 64 << 20;
+                    for (int ip = 0; ip < (int) m->layers.size(); ++ip) {
+                        const auto& L = m->layers[(size_t) ip];
+                        if (L.gu_type == 40 && L.stride > 0) {
+                            const size_t nm = ((compact_bytes + L.stride - 1) / L.stride) * L.stride;
+                            if (nm > compact_bytes && nm - compact_bytes <= ((size_t) 256 << 10)) compact_bytes = nm;
+                            break;
+                        }
+                    }
+                    trim_phase_pool(0);
+                    alloc_pp_stages(2, compact_bytes);
+                }
+                if (pp_stage_cnt > 0) {
+                    saved_pp_stage_cnt = pp_stage_cnt;
+                    saved_pp_stage_bytes = pp_stage_bytes;
+                }
             }
         }
         in_decode_phase = false;
@@ -4829,8 +4860,7 @@ struct Engine {
         }
         const bool core_full_ok = core_all_gpu && (core_experts_total <= 0 || core_experts_res >= core_experts_total);
         int target_cap = std::clamp(want_cap, tmax, meta_tmax);
-        if (no_adaptive_chunk || profile.max_adaptive_chunk <= tmax || !hybrid ||
-            profile.regime != strata::inkling2::VramRegime::CoreResidentHybrid || !core_full_ok ||
+        if (no_adaptive_chunk || profile.max_adaptive_chunk <= tmax || !hybrid || !core_full_ok ||
             (dspark && (no_dspark_vram_acc || no_vmsg || !can_vmsg_all_core))) {
             target_cap = tmax;
         }
@@ -4852,8 +4882,8 @@ struct Engine {
                 const size_t per_tok = kv_q8
                     ? ((size_t) hp.kv_dim * 2 + (size_t) hp.n_head_kv * sizeof(__half) * 2)
                     : ((size_t) hp.kv_dim * sizeof(__half) * 2);
-                int target_kv = full_kv_cap;
-                while (target_kv < prompt_total_len && target_kv < ctx) target_kv = std::min(ctx, target_kv * 2);
+                const bool use_headroom = (profile.full_kv_init <= 16384 && ctx <= 262144);
+                const int target_kv = next_kv_ladder_cap(full_kv_cap, prompt_total_len, ctx, use_headroom);
                 kv_delta = (size_t) n_full * (size_t) std::max(0, target_kv - full_kv_cap) * per_tok;
             }
             size_t fr = 0, tot = 0;
@@ -4869,14 +4899,15 @@ struct Engine {
             const size_t avail_no_core = fr + pool_cached_free_bytes() + tier2_bytes + dspark_evict_b;
             const size_t extra_margin = (kv_delta > 0)
                 ? ((size_t) std::max(64, profile.kv_grow_reserve_mib) << 20)
-                : ((size_t) 64 << 20);
+                : ((size_t) 80 << 20);
             const int avail_stage_cnt = in_decode_phase ? saved_pp_stage_cnt : pp_stage_cnt;
             const size_t avail_stage_bytes = in_decode_phase ? saved_pp_stage_bytes : pp_stage_bytes;
 
-            int cands[3];
+            int cands[4];
             int n_cands = 0;
             cands[n_cands++] = target_cap;
             if (target_cap > 8192 && 8192 > tmax) cands[n_cands++] = 8192;
+            if (target_cap > 4096 && 4096 > tmax) cands[n_cands++] = 4096;
             cands[n_cands++] = tmax;
 
             int chosen_cap = tmax;
@@ -4940,7 +4971,7 @@ struct Engine {
             const size_t swa_peak = (use_shared_swa_scratch || tgt_swa_cap == swa_kv_cap || tgt_swa_b <= prefill_ephemeral_bytes)
                 ? 0 : (tgt_swa_b - prefill_ephemeral_bytes);
             const size_t peak_growth = std::max(swa_peak, extra_eph + net_swa);
-            const size_t grow_pad = (target_cap > 8192) ? ((size_t) 96 << 20) : ((size_t) 64 << 20);
+            const size_t grow_pad = (target_cap > 8192) ? ((size_t) 128 << 20) : ((size_t) 96 << 20);
             const size_t need_free = vram_reserve_bytes + peak_growth + grow_pad;
             resize_experts_vram(need_free, 0, /*equalize_tier2=*/false, /*async_cst=*/false, /*whole_layer_evict=*/true,
                                 /*restore_dspark_decode_w=*/false, /*skip_sync=*/true);
@@ -4951,7 +4982,7 @@ struct Engine {
                 size_t fr_post = 0, tot_post = 0;
                 CK(cudaMemGetInfo(&fr_post, &tot_post));
                 const size_t avail_post = fr_post + pool_cached_free_bytes();
-                const size_t slab_pad = (size_t) 32 << 20;
+                const size_t slab_pad = (size_t) 80 << 20;
                 while (target_cap > tmax) {
                     const int cur_swa_c = use_shared_swa_scratch ? swa_ring_cap() : ((int) hp.n_swa + target_cap);
                     const size_t cur_swa_b = use_shared_swa_scratch ? 0 : swa_kv_pool_size_for(cur_swa_c);
@@ -4959,7 +4990,9 @@ struct Engine {
                         ? (cur_swa_b - swa_kv_pool_bytes) : 0;
                     const size_t need_post = estimate_ephemeral_total_bytes(target_cap) + cur_swa_need + slab_pad;
                     if (avail_post >= need_post) break;
-                    const int next_cap = (target_cap > 8192 && 8192 > tmax) ? 8192 : tmax;
+                    const int next_cap = (target_cap > 8192 && 8192 > tmax)
+                        ? 8192
+                        : ((target_cap > 4096 && 4096 > tmax) ? 4096 : tmax);
                     std::fprintf(stderr, "strata-inkling2: post-trim VRAM %.1f MiB < %.1f MiB needed for cap=%d; stepping down to %d\n",
                                  (double) avail_post / (1 << 20), (double) need_post / (1 << 20), target_cap, next_cap);
                     target_cap = next_cap;
@@ -4986,13 +5019,29 @@ struct Engine {
         return active_pp_cap;
     }
 
-    void ensure_kv_cap(int needed_pos) {
+    static int next_kv_ladder_cap(int cur_cap, int needed, int max_ctx, bool use_headroom_ladder) {
+        if (needed <= cur_cap || cur_cap >= max_ctx) return cur_cap;
+        if (use_headroom_ladder) {
+            static constexpr int kLadder[] = {36864, 69632, 139264, 262144};
+            for (int c : kLadder) {
+                const int clamped = std::min(max_ctx, c);
+                if (clamped > cur_cap && clamped >= needed) return clamped;
+            }
+        }
+        return std::min(max_ctx, std::max(needed, cur_cap * 2));
+    }
+
+    void ensure_kv_cap(int needed_pos, int cur_t = 1) {
         if (needed_pos <= full_kv_cap || full_kv_cap >= ctx) return;
         const auto& hp = m->hp;
-        const int step_cap = (profile.regime == strata::inkling2::VramRegime::TightHybrid && full_kv_cap < 65536)
-                           ? (full_kv_cap + 16384)
-                           : (full_kv_cap * 2);
-        const int new_cap = std::min(ctx, std::max(needed_pos, step_cap));
+        const bool use_headroom = (profile.full_kv_init <= 16384 && ctx <= 262144);
+        const int new_cap = use_headroom
+            ? next_kv_ladder_cap(full_kv_cap, needed_pos, ctx, true)
+            : std::min(ctx, std::max(needed_pos,
+                                     (profile.regime == strata::inkling2::VramRegime::TightHybrid &&
+                                      profile.full_kv_init > 16384 && full_kv_cap < 65536)
+                                     ? (full_kv_cap + 16384)
+                                     : (full_kv_cap * 2)));
         if (new_cap <= full_kv_cap) return;
 
         CK(cudaStreamSynchronize(st));
@@ -5163,6 +5212,27 @@ struct Engine {
                     if (ip >= hp.core_start && ip < hp.core_end) continue;
                     if (shrink_layer(ip, 0)) CK(cudaMemGetInfo(&fr, &tot));
                 }
+            }
+            // 1.25. Shrink oversized adaptive prefill slabs down to safe_cap = max(tmax, cur_t) and release optional FP16 packs before Tier-1 eviction.
+            if (fr < need_free && !in_decode_phase && active_pp_cap > std::max(tmax, cur_t)) {
+                const int safe_cap = std::max(tmax, cur_t);
+                const int tgt_swa_cap = use_shared_swa_scratch
+                    ? swa_ring_cap()
+                    : ((safe_cap <= 1) ? (int) hp.n_swa : (int) (hp.n_swa + safe_cap));
+                free_ephemeral_bufs();
+                trim_phase_pool(0);
+                prefill_ephemeral_bytes = alloc_ephemeral_bufs(safe_cap);
+                if (!use_shared_swa_scratch && swa_kv_cap != tgt_swa_cap) resize_swa_kv_pool(tgt_swa_cap);
+                if (dspark) dspark->rebind_arena(layer_arena, layer_arena_bytes, safe_cap);
+                active_pp_cap = safe_cap;
+                prefill_swa_kv_cap = tgt_swa_cap;
+                trim_phase_pool(0);
+                CK(cudaMemGetInfo(&fr, &tot));
+            }
+            if (fr < need_free && (d_core_wdown_cur_f16 || d_core_wup_f16)) {
+                if (d_core_wdown_cur_f16) { cudaFree(d_core_wdown_cur_f16); d_core_wdown_cur_f16 = nullptr; }
+                if (d_core_wup_f16) { cudaFree(d_core_wup_f16); d_core_wup_f16 = nullptr; }
+                CK(cudaMemGetInfo(&fr, &tot));
             }
             // 1.5. EX-4: Before ever evicting 3x/tok Tier-1 core experts (which also forces 6.4 GiB host blob rebuilds!),
             //      shrink oversized pp_stage (e.g. 4x192 MiB = 768 MiB) down to compact 2x64 MiB (128 MiB -> +640 MiB in <1 ms!).
@@ -5412,7 +5482,7 @@ struct Engine {
         moe_raw_zero_pending = false;
         if (in_decode_phase && T > kDecodePhaseCap) set_phase_prefill();
         if (T > active_pp_cap) ensure_pp_cap(T, (int) (pos + T));
-        ensure_kv_cap((int) (pos + T));
+        ensure_kv_cap((int) (pos + T), T);
         // EX-5 Idea A & B + Wave 17: RAII scope guard guarantees any clobbered Prelude donor d_blobs are cleanly freed
         // and invalidated on ALL return paths, while any in-place borrowed Core donor (blk.6) is NEVER freed/invalidated
         // and is asynchronously restored from pinned hblobs on cst after free_transient_pp_stages() (0 ms prefill penalty).
@@ -5524,8 +5594,7 @@ struct Engine {
             size_t avail_known_min = 0;
             static const bool no_transient_pp_cap = (std::getenv("STRATA_NO_TRANSIENT_PP_STAGE") != nullptr);
             if (!no_transient_pp_cap && !allow_prelude_borrow && T >= 4096 &&
-                use_phase_pool && phase_pool && core_all_gpu &&
-                profile.regime != strata::inkling2::VramRegime::TightHybrid &&
+                use_phase_pool && phase_pool && is_core_full_resident() &&
                 pp_stage_cnt >= 2 && pp_stage_cnt < 6 && pp_stage_bytes >= ((size_t) 64 << 20)) {
                 const int core_tot = (hp.num_loops > 1 && hp.core_end > hp.core_start)
                     ? (int) ((hp.core_end - hp.core_start) * hp.n_expert) : 0;
@@ -8013,7 +8082,7 @@ struct Engine {
                 return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
             }();
             if (!no_core_borrow && pp_streaming && core_all_gpu &&
-                profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid &&
+                profile.regime != strata::inkling2::VramRegime::FullVram &&
                 hp.num_loops > 1 && n_core > 0 && pp_stage_bytes > 0 &&
                 il == (int) (hp.core_start + (hp.num_loops - 1) * n_core) &&
                 pp_kick_idx < pp_tasks.size()) {
@@ -8583,7 +8652,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
 
         const bool is_tier2_ip = (ip < hp.core_start || ip >= hp.core_end) && L.gu_type != 30;
         const bool want_core_borrow_pin = (!no_core_borrow_place &&
-                                           E.profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid &&
+                                           E.profile.regime != strata::inkling2::VramRegime::FullVram &&
                                            tier1_planned_all_gpu && will_need_cpu &&
                                            hp.num_loops > 1 && hp.core_start < hp.core_end &&
                                            ip == (int) hp.core_start && s == ne && L.gu_type != 30);
@@ -9646,14 +9715,14 @@ int run(int argc, char** argv) {
                 } else {
                     int want_cap = chunk;
                     if (fresh > (size_t) chunk && E.profile.max_adaptive_chunk > chunk) {
-                        if (fresh <= 8192u && E.profile.max_adaptive_chunk >= 8192) {
-                            want_cap = std::max(chunk, 8192);
-                        } else if (fresh > 8192u && E.profile.max_adaptive_chunk > 8192) {
-                            const size_t rounded = ((fresh + 4095u) / 4096u) * 4096u;
-                            want_cap = std::min<int>(E.profile.max_adaptive_chunk,
-                                                     (int) std::min<size_t>(rounded, (size_t) E.profile.max_adaptive_chunk));
+                        if (fresh <= 4096u) {
+                            want_cap = std::max(chunk, std::min(4096, E.profile.max_adaptive_chunk));
+                        } else if (fresh <= 8192u) {
+                            want_cap = std::max(chunk, std::min(8192, E.profile.max_adaptive_chunk));
+                        } else if (fresh <= 12288u && E.profile.max_adaptive_chunk >= 12288) {
+                            want_cap = 12288;
                         } else {
-                            want_cap = E.profile.max_adaptive_chunk;
+                            want_cap = std::max(chunk, std::min(8192, E.profile.max_adaptive_chunk));
                         }
                     }
                     eff_chunk = E.ensure_pp_cap(want_cap, (int) prompt.size());

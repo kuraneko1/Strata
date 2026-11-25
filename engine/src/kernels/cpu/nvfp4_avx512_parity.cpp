@@ -321,6 +321,108 @@ int expert_e2e(const char* path, int layer, int e) {
     return 0;
 }
 
+int check_ktile_256(std::mt19937& rng) {
+    auto perm_byte = [](uint8_t b) -> uint8_t {
+        return (uint8_t) (((b & 0x08) << 4) | (b & 0x70) | ((b & 0x07) << 1) | ((b & 0x80) >> 7));
+    };
+    auto pack_blk = [&](uint8_t* kt, size_t s_off, size_t q0_off, size_t q1_off, const uint8_t* blk) {
+        std::memcpy(kt + s_off, blk, 4u);
+        for (int i = 0; i < 16; ++i) kt[q0_off + i] = perm_byte(blk[4 + i]);
+        for (int i = 0; i < 16; ++i) kt[q1_off + i] = perm_byte(blk[20 + i]);
+    };
+    std::uniform_int_distribution<int> byte(0, 255), sc(0x20, 0x5f);
+    int bad = 0;
+    {
+        constexpr int n = 2048, n_ff = 256;
+        const int nb = n / 64;
+        const size_t row_bytes = (size_t) nb * BLK;
+        const size_t up_off = (size_t) n_ff * row_bytes;
+        std::vector<uint8_t> raw(2 * up_off), kt((size_t) (n_ff / 64) * nb * 4608);
+        for (size_t b = 0; b + BLK <= raw.size(); b += BLK) {
+            for (int s = 0; s < 4; ++s) raw[b + s] = (uint8_t) sc(rng);
+            for (int q = 4; q < BLK; ++q) raw[b + q] = (uint8_t) byte(rng);
+        }
+        for (int nt = 0; nt < n_ff / 64; ++nt) {
+            uint8_t* nt_base = kt.data() + (size_t) nt * nb * 4608;
+            for (int wr = 0; wr < 128; ++wr) {
+                const uint8_t* row_ptr = (wr < 64)
+                    ? (raw.data() + (size_t) (nt * 64 + wr) * row_bytes)
+                    : (raw.data() + up_off + (size_t) (nt * 64 + wr - 64) * row_bytes);
+                for (int kb = 0; kb < nb; ++kb)
+                    pack_blk(nt_base + (size_t) kb * 4608, (size_t) wr * 4, 512 + (size_t) wr * 16,
+                             2560 + (size_t) wr * 16, row_ptr + (size_t) kb * BLK);
+            }
+        }
+        constexpr int NT = 9;
+        Acts a(n, NT, rng);
+        for (auto [r0, r1, label] : std::vector<std::tuple<int, int, const char*>>{
+                 {0, n_ff, "ktile gu full"}, {17, 150, "ktile gu cross-tile [17,150)"}}) {
+            for (bool situ : {false, true}) {
+                std::vector<std::vector<float>> mine(NT, std::vector<float>(n_ff, 0.f));
+                std::vector<std::vector<float>> ref(NT, std::vector<float>(n_ff, 0.f));
+                std::vector<float*> mp(NT), rp(NT);
+                for (int t = 0; t < NT; ++t) { mp[t] = mine[t].data(); rp[t] = ref[t].data(); }
+                const float sg = 0.0137f, su = 0.0211f, beta = 4.f, lb = 25.f;
+                for (int w = 1; w <= NT; ++w) {
+                    if (situ) {
+                        strata::kernels::cpu::nvfp4_256_ktile_gu_rows_situ(kt.data(), n, a.p.data(), w, mp.data(), r0, r1, sg, su, beta, lb);
+                        strata::kernels::cpu::nvfp4_256_gu_rows_situ(raw.data(), row_bytes, up_off, n, a.p.data(), w, rp.data(), r0, r1, sg, su, beta, lb);
+                    } else {
+                        strata::kernels::cpu::nvfp4_256_ktile_gu_rows(kt.data(), n, a.p.data(), w, mp.data(), r0, r1, sg, su);
+                        strata::kernels::cpu::nvfp4_256_gu_rows(raw.data(), row_bytes, up_off, n, a.p.data(), w, rp.data(), r0, r1, sg, su);
+                    }
+                    for (int t = 0; t < w; ++t) {
+                        for (int r = r0; r < r1; ++r) {
+                            if (std::memcmp(&mine[t][r], &ref[t][r], sizeof(float)) != 0) ++bad;
+                        }
+                    }
+                }
+                std::printf("avx2    %-36s (%s) bad=%d\n", label, situ ? "situ" : "silu", bad);
+            }
+        }
+    }
+    {
+        constexpr int n = 768, n_embd = 384;
+        const int nb = n / 64;
+        const size_t row_bytes = (size_t) nb * BLK;
+        std::vector<uint8_t> raw((size_t) n_embd * row_bytes), kt((size_t) (n_embd / 128) * nb * 4608);
+        for (size_t b = 0; b + BLK <= raw.size(); b += BLK) {
+            for (int s = 0; s < 4; ++s) raw[b + s] = (uint8_t) sc(rng);
+            for (int q = 4; q < BLK; ++q) raw[b + q] = (uint8_t) byte(rng);
+        }
+        for (int nt = 0; nt < n_embd / 128; ++nt) {
+            uint8_t* nt_base = kt.data() + (size_t) nt * nb * 4608;
+            for (int wr = 0; wr < 128; ++wr) {
+                const uint8_t* row_ptr = raw.data() + (size_t) (nt * 128 + wr) * row_bytes;
+                for (int kb = 0; kb < nb; ++kb)
+                    pack_blk(nt_base + (size_t) kb * 4608, (size_t) wr * 4, 512 + (size_t) wr * 16,
+                             2560 + (size_t) wr * 16, row_ptr + (size_t) kb * BLK);
+            }
+        }
+        constexpr int NT = 9;
+        Acts a(n, NT, rng);
+        for (auto [r0, r1, label] : std::vector<std::tuple<int, int, const char*>>{
+                 {0, n_embd, "ktile down full"}, {33, 290, "ktile down cross-tile [33,290)"}}) {
+            std::vector<std::vector<float>> mine(NT, std::vector<float>(n_embd, 0.f));
+            std::vector<std::vector<float>> ref(NT, std::vector<float>(n_embd, 0.f));
+            std::vector<float*> mp(NT), rp(NT);
+            for (int t = 0; t < NT; ++t) { mp[t] = mine[t].data(); rp[t] = ref[t].data(); }
+            const float sd = 0.0173f;
+            for (int w = 1; w <= NT; ++w) {
+                strata::kernels::cpu::nvfp4_256_ktile_rows(kt.data(), n, a.p.data(), w, mp.data(), r0, r1, sd);
+                strata::kernels::cpu::nvfp4_256_rows(raw.data(), row_bytes, n, a.p.data(), w, rp.data(), r0, r1, sd);
+                for (int t = 0; t < w; ++t) {
+                    for (int r = r0; r < r1; ++r) {
+                        if (std::memcmp(&mine[t][r], &ref[t][r], sizeof(float)) != 0) ++bad;
+                    }
+                }
+            }
+            std::printf("avx2    %-36s bad=%d\n", label, bad);
+        }
+    }
+    return bad;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -348,6 +450,7 @@ int main(int argc, char** argv) {
         bad += check_rows(*k, w.data(), N, ROW_BYTES, ROWS, "random blocks, n 2560", rng);
         bad += check_rows(*k, w.data(), FF, D_ROW, N, "random blocks, n 640", rng);
     }
+    if (has256) bad += check_ktile_256(rng);
     if (argc >= 2) {                                                   // layer 0, expert 0 of the pack
         std::ifstream f(argv[1], std::ios::binary);
         if (!f.read((char*) w.data(), (std::streamsize) w.size())) {

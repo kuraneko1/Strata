@@ -189,11 +189,15 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
 
     // 1. Initial full-attention KV capacity:
     //    - FullVram allocates max_ctx upfront (zero mid-run KV expansion pauses).
-    //    - CoreResidentHybrid on sm_89 starts at min(max_ctx, 16384) (frees +780 MiB @ 65K / +1.8 GiB @ 131K for
-    //      chunk=4096 + 4x128MiB staging + blk.0 100% resident on short/medium prompts; grows cleanly on 62K/126K).
-    //    - TightHybrid starts at min(max_ctx, 36864) (32K + 4K decode headroom) so a 32K prompt never hits
-    //      a mid-decode KV growth cliff on token #1 while still keeping maximum VRAM experts for short prompts.
-    if (out.regime == VramRegime::TightHybrid && in.max_ctx > 36864) {
+    //    - CoreResidentHybrid and sm_89 Q8KV TightHybrid (when --expert-vram permits Core) start at
+    //      min(max_ctx, 16384) so short/medium prompts keep +328..1800 MiB VRAM for adaptive 8K/12K prefill.
+    //    - Non-sm89 or expert-capped TightHybrid starts at min(max_ctx, 36864).
+    const bool sm89_tight_adaptive =
+        (out.regime == VramRegime::TightHybrid && out.arch.allow_core_chunk_8192 &&
+         in.kv_q8 && in.tier1_experts_bytes > 0 && cap_allows_core);
+    if (sm89_tight_adaptive && out.arch.core_hybrid_kv_init > 0 && in.max_ctx > out.arch.core_hybrid_kv_init) {
+        out.full_kv_init = out.arch.core_hybrid_kv_init;
+    } else if (out.regime == VramRegime::TightHybrid && in.max_ctx > 36864) {
         out.full_kv_init = 36864;
     } else if (out.regime == VramRegime::CoreResidentHybrid && out.arch.core_hybrid_kv_init > 0 &&
                in.max_ctx > out.arch.core_hybrid_kv_init) {
@@ -246,8 +250,9 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
             out.chunk = 512;
         }
         out.max_adaptive_chunk =
-            (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_8192 &&
-             in.kv_q8 && out.chunk == 4096)
+            ((out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_8192 &&
+              in.kv_q8 && out.chunk == 4096) ||
+             (sm89_tight_adaptive && out.chunk == 2048))
                 ? 12288
                 : out.chunk;
     }

@@ -953,6 +953,13 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // tokens, 2x under DRAM load with 6 threads (nvfp4_avx512_parity). STRATA_NO_NVFP4_256 falls back to ggml-cpu.
     static const bool nvfp4_256 = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_256") == nullptr;
     if (f.gu_type == kNvfp4Type && f.nvfp4_ktile) {
+        const bool use_512 = !f.situ && nvfp4_512 && nvfp4_512_fits(n);
+        const bool use_256 = !use_512 && nvfp4_256 && nvfp4_256_fits(n);
+        if (use_256) {
+            if (f.situ) nvfp4_256_ktile_gu_rows_situ(blob, n, act, nt, ff, r0, r1, sg, su, f.situ_beta, f.situ_linear_beta);
+            else nvfp4_256_ktile_gu_rows(blob, n, act, nt, ff, r0, r1, sg, su);
+            return;
+        }
         const int nb = n / 64;
         thread_local std::vector<uint8_t> ktile_buf;
         float* ff_stack[64];
@@ -962,9 +969,7 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
             ff_vec.resize((size_t) nt);
             ff_off = ff_vec.data();
         }
-        const bool use_512 = !f.situ && nvfp4_512 && nvfp4_512_fits(n);
-        const bool use_256 = !use_512 && nvfp4_256 && nvfp4_256_fits(n);
-        const Tr dot = (!use_512 && !use_256) ? traits(f.gu_type) : Tr{};
+        const Tr dot = !use_512 ? traits(f.gu_type) : Tr{};
         for (int c0 = r0; c0 < r1;) {
             const int n_tile = c0 / 64;
             const int c1 = std::min(r1, (n_tile + 1) * 64);
@@ -975,9 +980,6 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
             for (int t = 0; t < nt; ++t) ff_off[t] = ff[t] + c0;
             if (use_512) {
                 nvfp4_512_gu_rows(ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt, sg, su);
-            } else if (use_256) {
-                if (f.situ) nvfp4_256_gu_rows_situ(ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt, sg, su, f.situ_beta, f.situ_linear_beta);
-                else nvfp4_256_gu_rows(ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt, sg, su);
             } else {
                 for (int i = 0; i < cnt; ++i) {
                     const uint8_t* gr = ktile_buf.data() + (size_t) i * f.gu_row;
@@ -1187,6 +1189,12 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     static const bool nvfp4_512 = cpu_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
     static const bool nvfp4_256 = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_256") == nullptr;   // see above
     if (f.d_type == kNvfp4Type && f.nvfp4_ktile) {
+        const bool use_512 = nvfp4_512 && nvfp4_512_fits(n);
+        const bool use_256 = !use_512 && nvfp4_256 && nvfp4_256_fits(n);
+        if (use_256) {
+            nvfp4_256_ktile_rows(blob + f.down_off, n, hq, nt, out, r0, r1, sd);
+            return;
+        }
         const int nb = n / 64;
         thread_local std::vector<uint8_t> ktile_buf;
         float* out_stack[64];
@@ -1196,9 +1204,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
             out_vec.resize((size_t) nt);
             out_off = out_vec.data();
         }
-        const bool use_512 = nvfp4_512 && nvfp4_512_fits(n);
-        const bool use_256 = !use_512 && nvfp4_256 && nvfp4_256_fits(n);
-        const Tr dot = (!use_512 && !use_256) ? traits(f.d_type) : Tr{};
+        const Tr dot = !use_512 ? traits(f.d_type) : Tr{};
         for (int c0 = r0; c0 < r1;) {
             const int n_tile = c0 / 128;
             const int c1 = std::min(r1, (n_tile + 1) * 128);
@@ -1209,8 +1215,6 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
             for (int t = 0; t < nt; ++t) out_off[t] = out[t] + c0;
             if (use_512) {
                 nvfp4_512_rows(ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt, sd);
-            } else if (use_256) {
-                nvfp4_256_rows(ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt, sd);
             } else {
                 for (int i = 0; i < cnt; ++i) {
                     const uint8_t* dr = ktile_buf.data() + (size_t) i * f.d_row;

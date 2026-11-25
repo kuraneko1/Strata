@@ -128,15 +128,15 @@ int main() {
         check(p_fb.max_adaptive_chunk == 12288, "RTX 4070 131K tight desktop exposes max_adaptive_chunk=12288");
     }
 
-    // 5. RTX 4070 12GB @ 262,144 ctx: TightHybrid (auto chunk=2048 halves PCIe streaming, dynamic 32K->262K KV)
+    // 5. RTX 4070 12GB @ 262,144 ctx: TightHybrid (auto floor chunk=2048, adaptive 8K/12K enabled while Core fits, 16K->262K KV)
     {
         const auto in = rtx4070_12g(262144);
         const auto p = resolve_inkling2_profile(in);
         std::printf("%s\n", format_profile_line(in, p).c_str());
         check(p.regime == VramRegime::TightHybrid, "RTX 4070 262K selects TightHybrid");
         check(p.chunk == 2048, "RTX 4070 262K auto-selects chunk=2048");
-        check(p.max_adaptive_chunk == 2048, "RTX 4070 262K TightHybrid strictly preserves max_adaptive_chunk=2048");
-        check(p.full_kv_init == 36864, "RTX 4070 262K starts KV at 36K (32K+4K decode headroom) avoiding token-1 KV cliff");
+        check(p.max_adaptive_chunk == 12288, "RTX 4070 262K TightHybrid unlocks max_adaptive_chunk=12288 while keeping chunk=2048 floor");
+        check(p.full_kv_init == 16384, "RTX 4070 262K starts KV at 16K (+328 MiB VRAM for adaptive 8K/12K short/medium prefill)");
         check(p.want_sp == 4, "RTX 4070 262K reserves 4 splits at T=2048");
         check(p.pp_stage_cnt_pref == 3 && p.pp_stage_mb == 64, "RTX 4070 262K uses 3x64 MiB ring");
     }
@@ -195,6 +195,7 @@ int main() {
         in.expert_vram_cap_bytes = (size_t) (4.46 * (double) GiB);
         const auto p = resolve_inkling2_profile(in);
         check(p.regime == VramRegime::TightHybrid, "forced --expert-vram 4.46 GiB selects TightHybrid");
+        check(p.max_adaptive_chunk == 2048, "forced --expert-vram 4.46 GiB keeps max_adaptive_chunk=2048");
         check(p.use_d_hits && p.pp_stage_cnt_pref == 3, "forced hybrid keeps d_hits & staging active");
         check(p.full_kv_init == 16384, "16K ctx still allocates 16K KV upfront");
     }
@@ -207,7 +208,8 @@ int main() {
         std::printf("%s\n", format_profile_line(in131, p131).c_str());
         check(p131.regime == VramRegime::TightHybrid, "RTX 4070 131K + DSpark demotes cleanly to TightHybrid");
         check(p131.chunk == 2048, "RTX 4070 131K + DSpark uses chunk=2048");
-        check(p131.max_adaptive_chunk == 2048, "RTX 4070 131K + DSpark TightHybrid keeps max_adaptive_chunk=2048");
+        check(p131.max_adaptive_chunk == 12288, "RTX 4070 131K + DSpark TightHybrid exposes max_adaptive_chunk=12288");
+        check(p131.full_kv_init == 16384, "RTX 4070 131K + DSpark TightHybrid starts KV at 16K");
         check(p131.pp_stage_mb == 64, "RTX 4070 12GB + DSpark TightHybrid uses 64 MiB pp_stage");
         check(p131.kv_grow_reserve_mib == 80, "RTX 4070 12GB + DSpark TightHybrid uses 80 MiB kv grow reserve");
 
