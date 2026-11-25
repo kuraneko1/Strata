@@ -2005,7 +2005,7 @@ bool Gemm::try_cublaslt_tune(const void* X, const void* W, void* Y, int64_t T, i
                 // For small-M (N_out <= 64, e.g. conv_proj M=32, N=8192, K=2304), use 5 warmups + 7 median iters
                 // so boost clock and L2 residency settle and tiny-kernel timing jitter cannot flip best_idx.
                 const bool small_m = (N <= 64);
-                const int n_warmup = small_m ? 5 : 2;
+                const int n_warmup = small_m ? 5 : 4;
                 const int n_runs = small_m ? 7 : 5;
                 cudaEvent_t ev[8] = {};
                 bool ev_ok = true;

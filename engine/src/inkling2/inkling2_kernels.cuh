@@ -18372,9 +18372,9 @@ __global__ void __launch_bounds__(256) k_group_experts_hist16(
 }
 
 /// 13b. Multi-CTA Expert Grouping Stage 2 (VRAM Resident): Prefix Scan & Per-CTA Scatter Offsets.
-/// Grid: (1), Block: 128 (4 warps). Encodes -1 in part_cnt[b*128 + x] for inactive experts so Stage 3 is unified!
+/// Grid: (1), Block: 128 (4 warps). Reads part_hist (preserved!) and writes part_off (-1 for inactive experts).
 __global__ void __launch_bounds__(128) k_group_experts_prefix16(
-        int32_t* __restrict__ part_cnt, int n_cta,
+        const int32_t* __restrict__ part_hist, int32_t* __restrict__ part_off, int n_cta,
         const int32_t* __restrict__ slot_of, const uint8_t* __restrict__ blobs, size_t stride,
         int n_exp, int n_slots,
         unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
@@ -18387,8 +18387,8 @@ __global__ void __launch_bounds__(128) k_group_experts_prefix16(
     int total_c = 0;
     if (tid < n_exp && sl >= 0) {
         for (int b = 0; b < n_cta; ++b) {
-            const int c = part_cnt[b * 128 + tid];
-            part_cnt[b * 128 + tid] = total_c;  // local exclusive offset across CTAs
+            const int c = part_hist[b * 128 + tid];
+            part_off[b * 128 + tid] = total_c;  // local exclusive offset across CTAs
             total_c += c;
         }
     }
@@ -18426,20 +18426,20 @@ __global__ void __launch_bounds__(128) k_group_experts_prefix16(
             grp_ptr[ng_idx] = (unsigned long long) (blobs + (size_t) sl * stride);
             grp_start[ng_idx] = off_idx;
             for (int b = 0; b < n_cta; ++b) {
-                part_cnt[b * 128 + tid] += off_idx;
+                part_off[b * 128 + tid] += off_idx;
             }
         } else {
             for (int b = 0; b < n_cta; ++b) {
-                part_cnt[b * 128 + tid] = -1;
+                part_off[b * 128 + tid] = -1;
             }
         }
     }
 }
 
 /// 13c. Multi-CTA Expert Grouping Stage 2 (PCIe-Staged Miss Map): Prefix Scan & Per-CTA Scatter Offsets.
-/// Grid: (1), Block: 128 (4 warps). Encodes -1 in part_cnt[b*128 + x] for inactive experts so Stage 3 is unified!
+/// Grid: (1), Block: 128 (4 warps). Reads part_hist (preserved!) and writes part_off (-1 for inactive experts).
 __global__ void __launch_bounds__(128) k_group_experts_prefix16_miss_map(
-        int32_t* __restrict__ part_cnt, int n_cta,
+        const int32_t* __restrict__ part_hist, int32_t* __restrict__ part_off, int n_cta,
         const uint8_t* __restrict__ stage_blobs, size_t stride,
         int n_exp, PpStageMap map,
         unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
@@ -18452,8 +18452,8 @@ __global__ void __launch_bounds__(128) k_group_experts_prefix16_miss_map(
     int total_c = 0;
     if (tid < n_exp && sp >= 0) {
         for (int b = 0; b < n_cta; ++b) {
-            const int c = part_cnt[b * 128 + tid];
-            part_cnt[b * 128 + tid] = total_c;
+            const int c = part_hist[b * 128 + tid];
+            part_off[b * 128 + tid] = total_c;
             total_c += c;
         }
     }
@@ -18488,11 +18488,11 @@ __global__ void __launch_bounds__(128) k_group_experts_prefix16_miss_map(
             grp_ptr[ng_idx] = (unsigned long long) (stage_blobs + (size_t) sp * stride);
             grp_start[ng_idx] = off_idx;
             for (int b = 0; b < n_cta; ++b) {
-                part_cnt[b * 128 + tid] += off_idx;
+                part_off[b * 128 + tid] += off_idx;
             }
         } else {
             for (int b = 0; b < n_cta; ++b) {
-                part_cnt[b * 128 + tid] = -1;
+                part_off[b * 128 + tid] = -1;
             }
         }
     }

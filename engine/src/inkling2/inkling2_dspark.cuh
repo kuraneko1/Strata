@@ -217,6 +217,84 @@ __global__ void k_dspark_norm_rope_kv_store_q8(const float* __restrict__ K, cons
     }
 }
 
+/// 4-token-per-CTA variant with precomputed inv_freq_d (zero powf, 256 thr = 4 tokens x 64 threads).
+/// Grid (n_head_kv, (T + 3) / 4), Block 256. Bit-exact to k_dspark_norm_rope_kv_store_q8.
+__global__ void __launch_bounds__(256) k_dspark_norm_rope_kv_store_q8_x4(
+        const float* __restrict__ K, const float* __restrict__ V,
+        const float* __restrict__ k_norm_w,
+        int8_t* __restrict__ kq, __half* __restrict__ ks,
+        int8_t* __restrict__ vq, __half* __restrict__ vs,
+        int n_head_kv, int pos0, int T, int cap, int is_swa,
+        float eps, int n_rot, const float* __restrict__ inv_freq_d) {
+    __shared__ float s_red[4][2];
+    __shared__ float s_red_k[4][2];
+    __shared__ float s_red_v[4][2];
+    const int hkv = (int) blockIdx.x;
+    const int tid = threadIdx.x;
+    const int sub = tid >> 6;          // 0..3 token within CTA
+    const int d   = tid & 63;          // 0..63
+    const int w2  = (tid >> 5) & 1;    // 0..1 warp within token's 64 threads
+    const int t   = (int) blockIdx.y * 4 + sub;
+    const bool valid = (t < T);
+    const int kv_dim = n_head_kv * 128;
+
+    float k0_raw = 0.0f, k1_raw = 0.0f, v0 = 0.0f, v1 = 0.0f;
+    if (valid) {
+        const size_t src_off = (size_t) t * kv_dim + hkv * 128;
+        k0_raw = K[src_off + d];
+        k1_raw = K[src_off + d + 64];
+        v0 = V[src_off + d];
+        v1 = V[src_off + d + 64];
+    }
+
+    const float sq = warp_sum_d(k0_raw * k0_raw + k1_raw * k1_raw);
+    if ((d & 31) == 0) s_red[sub][w2] = sq;
+    __syncthreads();
+
+    float k0 = 0.0f, k1 = 0.0f;
+    if (valid) {
+        const float rms = rsqrtf((s_red[sub][0] + s_red[sub][1]) / 128.0f + eps);
+        k0 = k0_raw * rms * k_norm_w[d];
+        k1 = k1_raw * rms * k_norm_w[d + 64];
+        if (d * 2 < n_rot) {
+            const float theta = (float) (pos0 + t) * __ldg(inv_freq_d + d);
+            float sv, cv;
+            __sincosf(theta, &sv, &cv);
+            const float rk0 = k0 * cv - k1 * sv;
+            const float rk1 = k0 * sv + k1 * cv;
+            k0 = rk0;
+            k1 = rk1;
+        }
+    }
+
+    const float ak = warp_max_d(fmaxf(fabsf(k0), fabsf(k1)));
+    const float av = warp_max_d(fmaxf(fabsf(v0), fabsf(v1)));
+    if ((d & 31) == 0) { s_red_k[sub][w2] = ak; s_red_v[sub][w2] = av; }
+    __syncthreads();
+
+    if (valid) {
+        const float amax_k = fmaxf(s_red_k[sub][0], s_red_k[sub][1]);
+        const float amax_v = fmaxf(s_red_v[sub][0], s_red_v[sub][1]);
+        const int pos = pos0 + t;
+        const int slot = is_swa ? (pos % cap) : pos;
+        const float dk = amax_k / 127.0f;
+        const float dv = amax_v / 127.0f;
+        const float idk = dk > 0.0f ? (127.0f / amax_k) : 0.0f;
+        const float idv = dv > 0.0f ? (127.0f / amax_v) : 0.0f;
+
+        const size_t dst_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
+        kq[dst_off + d]      = (int8_t) __float2int_rn(k0 * idk);
+        kq[dst_off + d + 64] = (int8_t) __float2int_rn(k1 * idk);
+        vq[dst_off + d]      = (int8_t) __float2int_rn(v0 * idv);
+        vq[dst_off + d + 64] = (int8_t) __float2int_rn(v1 * idv);
+        if (d == 0) {
+            const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
+            ks[s_off] = __float2half(dk);
+            vs[s_off] = __float2half(dv);
+        }
+    }
+}
+
 /// Fused per-head RMSNorm + NeoX RoPE for Q (blocks 0..n_head-1) and K (blocks n_head..n_head+n_head_kv-1).
 /// Reads *pos0_d dynamically from device memory so the DFlare block can be captured in a CUDA Graph.
 /// Grid (n_head + n_head_kv, T), Block 64 (D = 128).
@@ -2079,6 +2157,7 @@ struct DsparkEngine {
     int32_t* h_draft_ids_pin = nullptr; // pinned [8] host staging for d_draft_ids
     float* d_prob_sum = nullptr;        // [64] device softmax sum partials for per-step confidence
     float* d_draft_prob = nullptr;      // [8] device top-1 probability per drafted token
+    float* inv_freq_d = nullptr;        // [64] precomputed NeoX RoPE inv_freq for fast KV store
     float* h_draft_prob_pin = nullptr;  // pinned [8] host staging for d_draft_prob
     float* h_anchor_pin = nullptr;   // pinned [N] host buffer for async anchor upload
     cudaGraphExec_t dflare_graph_short = nullptr; // captured 3-layer DFlare block (pos < 256)
@@ -2271,6 +2350,7 @@ struct DsparkEngine {
         cudaFree(d_draft_ids);
         cudaFree(d_prob_sum);
         cudaFree(d_draft_prob);
+        cudaFree(inv_freq_d);
         if (h_pos_pin) cudaFreeHost(h_pos_pin);
         if (h_inj_pos_pin) cudaFreeHost(h_inj_pos_pin);
         if (h_draft_ids_pin) cudaFreeHost(h_draft_ids_pin);
@@ -2370,6 +2450,15 @@ struct DsparkEngine {
         }
         CK(cudaMalloc(&d_prob_sum, 64 * sizeof(float)));
         CK(cudaMalloc(&d_draft_prob, 8 * sizeof(float)));
+        CK(cudaMalloc(&inv_freq_d, 64 * sizeof(float)));
+        {
+            const int n_half_rot = std::min(64, std::max(1, hp.n_rot / 2));
+            std::vector<float> h_if(64, 0.0f);
+            for (int d = 0; d < n_half_rot; ++d) {
+                h_if[(size_t) d] = std::pow((float) hp.freq_base, -2.0f * (float) d / (float) hp.n_rot);
+            }
+            CK(cudaMemcpy(inv_freq_d, h_if.data(), 64 * sizeof(float), cudaMemcpyHostToDevice));
+        }
         if (cudaMallocHost(&h_draft_prob_pin, 8 * sizeof(float)) != cudaSuccess) {
             (void) cudaGetLastError();
             h_draft_prob_pin = nullptr;
@@ -2610,11 +2699,19 @@ struct DsparkEngine {
                 E.project_preq(ctx_norm, t_eff <= 8 ? E.xq : nullptr, L.attn_k_ctx, ctx_k, t_eff, hp.kv_dim, hp.n_embd);
                 E.project_preq(ctx_norm, t_eff <= 8 ? E.xq : nullptr, L.attn_v_ctx, ctx_v, t_eff, hp.kv_dim, hp.n_embd);
             }
-            dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) t_eff), 64, 0, E.st>>>(
-                ctx_k, ctx_v, L.attn_k_ctx_norm,
-                kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
-                hp.n_head_kv, pos_eff, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
-                hp.rms_eps, hp.freq_base, hp.n_rot);
+            if (t_eff > 8 && inv_freq_d) {
+                dspark_detail::k_dspark_norm_rope_kv_store_q8_x4<<<dim3((unsigned) hp.n_head_kv, (unsigned) ((t_eff + 3) / 4)), 256, 0, E.st>>>(
+                    ctx_k, ctx_v, L.attn_k_ctx_norm,
+                    kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                    hp.n_head_kv, pos_eff, t_eff, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                    hp.rms_eps, hp.n_rot, inv_freq_d);
+            } else {
+                dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) t_eff), 64, 0, E.st>>>(
+                    ctx_k, ctx_v, L.attn_k_ctx_norm,
+                    kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                    hp.n_head_kv, pos_eff, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                    hp.rms_eps, hp.freq_base, hp.n_rot);
+            }
         }
         const size_t last_off = (size_t) (T - 1) * (size_t) hp.n_embd;
         dspark_detail::k_dspark_mix_features<<<1, mix_blk, 0, E.st>>>(
@@ -2654,6 +2751,21 @@ struct DsparkEngine {
             cur, d_pp_acc[0], d_pp_acc[1], d_pp_acc[2], f_rnn_last,
             fuse_w_host[0][ti], fuse_w_host[1][ti], fuse_w_host[2][ti], fuse_w_host[3][ti],
             T, pp_acc_swa_start, N, ti == 0);
+    }
+
+    template <typename EngineT>
+    bool can_inject_all_f16(const EngineT& E, int T) const {
+        if (!prefill_vram_acc_active || !dm || !E.act_bf16) return false;
+        const auto& hp = dm->hp;
+        for (int il = 0; il < hp.n_layer; ++il) {
+            const auto& L = dm->layers[(size_t) il];
+            const int t_off = L.is_swa ? pp_acc_swa_start : 0;
+            const int T_eff = T - t_off;
+            if (T_eff <= 8) return false;
+            if (L.attn_k_ctx.type == 0 || (L.attn_k_ctx.type == 30 && !E.bf16_x_f16)) return false;
+            if (L.attn_v_ctx.type == 0 || (L.attn_v_ctx.type == 30 && !E.bf16_x_f16)) return false;
+        }
+        return true;
     }
 
     /// Wave 5: Finalize `ti = 3` (`cur_final`) + fused RMSNorm + FP16 emit -> K/V ctx GEMM -> Q8 KV store (ZERO PCIe!).
@@ -2707,11 +2819,19 @@ struct DsparkEngine {
                     E.project_preq(ctx_norm, T_eff <= 8 ? E.xq : nullptr, L.attn_v_ctx, ctx_v, T_eff, hp.kv_dim, N);
                 }
             }
-            dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T_eff), 64, 0, st>>>(
-                ctx_k, ctx_v, L.attn_k_ctx_norm,
-                kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
-                hp.n_head_kv, pos_eff, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
-                hp.rms_eps, hp.freq_base, hp.n_rot);
+            if (T_eff > 8 && inv_freq_d) {
+                dspark_detail::k_dspark_norm_rope_kv_store_q8_x4<<<dim3((unsigned) hp.n_head_kv, (unsigned) ((T_eff + 3) / 4)), 256, 0, st>>>(
+                    ctx_k, ctx_v, L.attn_k_ctx_norm,
+                    kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                    hp.n_head_kv, pos_eff, T_eff, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                    hp.rms_eps, hp.n_rot, inv_freq_d);
+            } else {
+                dspark_detail::k_dspark_norm_rope_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T_eff), 64, 0, st>>>(
+                    ctx_k, ctx_v, L.attn_k_ctx_norm,
+                    kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                    hp.n_head_kv, pos_eff, nullptr, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0,
+                    hp.rms_eps, hp.freq_base, hp.n_rot);
+            }
         }
 
         pos = pos0 + T;

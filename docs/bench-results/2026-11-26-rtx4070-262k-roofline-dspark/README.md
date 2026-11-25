@@ -39,11 +39,11 @@ $$T_{\min} = \frac{\text{GPU non-MoE (Dense + LM Head + KV)}}{461.2\text{ GB/s}}
 
 | Context Depth (GPU Hit Rate) | GPU Non-MoE (`461.2 GB/s`) | Core MoE (GPU/CPU Overlap) | Outer CPU Miss (`33.4 GB/s`) | **Physical Limit (`461.2` / `504 GB/s`)** | **Measured (`DSpark OFF`)** | **Achievement (vs `461.2 GB/s`)** |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`8K`** (Hit `85.5%`) | `4.75 ms` | `2.80 ms` | `9.42 ms` (`315 MB`) | **`58.9 t/s`** (`60.5 t/s` @ 504) | **`52.6–53.9 t/s`** | **89–92%** |
+| **`8K`** (Hit `85.5%`) | `4.75 ms` | `2.80 ms` | `9.42 ms` (`315 MB`) | **`58.9 t/s`** (`60.5 t/s` @ 504) | **`50.3–55.8 t/s`** | **85–95%** |
 | **`8K` High-Hit** (`88.2%`, `prose`) | `4.75 ms` | `2.80 ms` | `7.34 ms` (`245 MB`) | **`67.2 t/s`** (`69.3 t/s` @ 504) | **`65.8–68.5 t/s`** | **~98%** (L2-assisted) |
-| **`64K`** (Hit `85.5%`) | `6.91 ms` | `2.80 ms` | `9.42 ms` (`315 MB`) | **`52.3 t/s`** (`54.0 t/s` @ 504) | **`46.4 t/s`** | **89%** |
-| **`128K`** (Hit `86.1%`) | `9.38 ms` | `2.80 ms` | `8.98 ms` (`300 MB`) | **`47.3 t/s`** (`49.1 t/s` @ 504) | **`37.3 t/s`** | **79%** |
-| **`256K`** (Hit `65.2%`) | `14.30 ms` | `~5.90 ms` (`168 MB` miss) | `14.78 ms` (`494 MB`) | **`28.6 t/s`** (`29.7 t/s` @ 504) | **`27.2–27.7 t/s`** | **95–97%** |
+| **`64K`** (Hit `85.5%`) | `6.91 ms` | `2.80 ms` | `9.42 ms` (`315 MB`) | **`52.3 t/s`** (`54.0 t/s` @ 504) | **`43.8 t/s`** | **84%** |
+| **`128K`** (Hit `86.0%`) | `9.38 ms` | `2.80 ms` | `9.05 ms` (`302 MB`) | **`47.1 t/s`** (`48.9 t/s` @ 504) | **`37.7 t/s`** | **80%** |
+| **`256K`** (Hit `65.2%`) | `14.30 ms` | `~5.90 ms` (`168 MB` miss) | `14.78 ms` (`494 MB`) | **`28.6 t/s`** (`29.7 t/s` @ 504) | **`27.5 t/s`** | **96%** |
 
 At `8K–64K`, `T=1` already achieves **~89–92%** (and **~98%** on high-hit prose) of the physical STREAM limit; at **`256K`**, it reaches **95–97%** of the absolute hardware ceiling (`28.6 t/s` @ `461.2 GB/s` STREAM, `29.7 t/s` @ `504 GB/s` catalog). Further `T=1` scheduling improvements without hardware or precision changes have `< 5%` physical headroom at `256K` (and ~`10–15%` around `128K`).
 
@@ -54,7 +54,7 @@ At `8K–64K`, `T=1` already achieves **~89–92%** (and **~98%** on high-hit pr
 ### Theoretical Roofline with DSpark (`--draft-max 3`, `T=4` Verify)
 Speculative decoding amortizes GPU Non-MoE reads (`Dense + LM Head + KV`: `4.75 ms` @ `8K`, `14.30 ms` @ `256K`) across multiple verified tokens, while trading off ~`3×` more unique CPU MoE misses on misses in hybrid memory:
 * **`8K` (`draft-max 3`)**: Verify step floor ≈ `30–33 ms` → **`~65–75 t/s`** at typical real-code acceptance (`2.0–2.3 tok/step`, measured **`56.5–75.1 t/s`**) and **`~120–130 t/s`** at 100% PLD/verbatim acceptance (measured **`124.3 t/s`** at `96.3%` accept).
-* **`256K` (`draft-max 3`)**: Verify step floor ≈ `75 ms` (`1.9 GB` unique DDR4 misses ≈ `57 ms`) → **`~30–33 t/s`** at real-code acceptance (measured **`29.4 t/s`**), **`~52 t/s`** at 100% acceptance.
+* **`256K` (`draft-max 3`)**: Verify step floor ≈ `75 ms` (`1.9 GB` unique DDR4 misses ≈ `57 ms`) → **`~30–33 t/s`** at real-code acceptance (measured **`32.9 t/s`**), **`~52 t/s`** at 100% acceptance.
 
 ### `--draft-max` Ablation at `65K` Context (`OFF / 3 / 5 / 6`, 256 Tokens Generated)
 
@@ -95,21 +95,21 @@ Measured across `edit_rag` (code verbatim edit), `code` (C++/CUDA generation), `
 1. **Zero-Copy AVX2 CPU MoE (`q5k_ktile` / `q8_0_ktile`)**: Pre-transposes `blk.20..23` CPU experts (`Q5_K`/`Q8_0`) once into cache-friendly tiles, eliminating per-token `dequant + h2f` overhead.
 2. **Decode `L.score` Normalization (`prior=4.0`) + GPU Top-K Sampling Fix**: Stabilizes hybrid expert LRU hot-set retention during decode across `8K–256K` and fixes `row_off` indexing in GPU Top-K repeat-penalty sampling.
 3. **Confidence-Gated DSpark + `PromptSuffixDrafter` (`PLD`)**: Combines zero-spill `k_dspark_argmax_prob_stage{1,2}` early stopping with suffix matching for verbatim code/RAG spans (`96.3%` accept / `124.3 t/s` on `65K` edit tasks).
-4. **Upfront Tier-1 Host Blob Pre-Building (`>=131K`)**: Pre-builds and pins Tier-1 Core `L.hblobs` at model placement when `MemAvailable` budget permits (`tier1 + tier2 <= max_pin_bytes`), eliminating the `12–13 s` synchronous `cudaHostAlloc` mid-prefill stall at `96K` (OFF) and `160K` (ON) and raising `256K` Prefill from **`2,753.7 → 3,017.6 t/s`** (DSpark ON) and **`2,586.2 → 3,068.8 t/s`** (DSpark OFF).
+4. **Upfront Tier-1 Host Blob Pre-Building (`>=131K`)**: Pre-builds and pins Tier-1 Core `L.hblobs` at model placement when `MemAvailable` budget permits (`tier1 + tier2 <= max_pin_bytes`), eliminating the `12–13 s` synchronous `cudaHostAlloc` mid-prefill stall at `96K` (OFF) and `160K` (ON) and raising `256K` Prefill from **`2,753.7 → 3,009.7 t/s`** (DSpark ON) and **`2,586.2 → 3,062.8 t/s`** (DSpark OFF), while pushing **`8K` fresh Prefill cleanly past `8,000 t/s` on both modes (`8,016.1` ON / `8,012.8` OFF)** via multi-layer Core borrow (`blk.6..7`), overlapped `aux_st` DSpark feature accumulation + LM head, and `set_phase_prefill` sync deduplication.
 
 | Depth | DSpark ON PP (Before → After) | DSpark OFF PP (Before → After) | DSpark ON Dec (Before → After) | DSpark OFF Dec (Before → After) |
 | ---: | ---: | ---: | ---: | ---: |
-| `8K` | `8,004.5` → `7,970.7 t/s` | `7,993.5` → **`8,018.0 t/s`** | `49.1` → **`56.5 t/s`** | `49.2` → **`52.6 t/s`** |
-| `16K` | `6,842.5` → `6,811.8 t/s` | `6,762.3` → **`6,774.4 t/s`** | `55.7` → **`56.0 t/s`** | `45.6` → **`51.2 t/s`** |
-| `32K` | `6,473.6` → `6,412.5 t/s` | `5,216.9` → **`6,458.2 t/s`** (+23.8%) | `46.8` → **`54.0 t/s`** | `45.0` → **`49.8 t/s`** |
-| `48K` | `5,656.7` → **`5,800.0 t/s`** | `4,627.0` → **`6,066.9 t/s`** (+31.1%) | `46.6` → **`54.4 t/s`** | `42.3` → **`47.9 t/s`** |
-| `64K` | `5,489.6` → **`5,579.1 t/s`** | `4,732.9` → **`5,778.7 t/s`** (+22.1%) | `45.5` → **`51.6 t/s`** | `41.0` → **`46.4 t/s`** |
-| `96K` | `4,805.0` → **`4,849.5 t/s`** | `2,732.8` → **`4,941.6 t/s`** (+80.8%) | `50.1` → `46.2 t/s` | `37.0` → **`38.8 t/s`** |
-| `128K` | `4,236.0` → **`4,256.3 t/s`** | `2,848.1` → **`4,294.3 t/s`** (+50.8%) | `37.6` → **`44.0 t/s`** (+16.9%) | `33.6` → **`37.3 t/s`** |
-| `160K` | `3,207.2` → **`3,816.8 t/s`** (+19.0%) | `2,822.1` → **`3,870.7 t/s`** (+37.2%) | `35.7` → **`39.2 t/s`** | `31.0` → **`34.4 t/s`** |
-| `192K` | `3,068.8` → **`3,515.8 t/s`** (+14.6%) | `2,752.7` → **`3,543.4 t/s`** (+28.7%) | `31.5` → **`40.2 t/s`** (+27.9%) | `30.3` → `29.8 t/s` |
-| `224K` | `2,882.7` → **`3,217.0 t/s`** (+11.6%) | `2,665.6` → **`3,268.6 t/s`** (+22.6%) | `25.0` → **`32.3 t/s`** (+29.4%) | `27.8` → **`28.3 t/s`** |
-| **`256K`** | **`2,753.7` → `3,017.6 t/s`** (**+9.6%**) | **`2,586.2` → `3,068.8 t/s`** (**+18.7%**) | **`25.1` → `29.4 t/s`** (**+17.3%**) | **`26.3` → `27.2 t/s`** |
+| `8K` | `8,004.5` → **`8,016.1 t/s`** | `7,993.5` → **`8,012.8 t/s`** | `49.1` → **`57.1 t/s`** | `49.2` → **`50.3 t/s`** |
+| `16K` | `6,842.5` → `6,704.2 t/s` | `6,762.3` → `6,515.2 t/s` | `55.7` → **`59.0 t/s`** | `45.6` → **`47.9 t/s`** |
+| `32K` | `6,473.6` → `6,371.9 t/s` | `5,216.9` → **`6,317.1 t/s`** (+21.1%) | `46.8` → **`55.2 t/s`** | `45.0` → **`49.7 t/s`** |
+| `48K` | `5,656.7` → **`5,785.6 t/s`** | `4,627.0` → **`5,990.6 t/s`** (+29.5%) | `46.6` → **`52.7 t/s`** | `42.3` → **`45.5 t/s`** |
+| `64K` | `5,489.6` → **`5,567.3 t/s`** | `4,732.9` → **`5,709.3 t/s`** (+20.6%) | `45.5` → **`51.8 t/s`** | `41.0` → **`43.8 t/s`** |
+| `96K` | `4,805.0` → **`4,839.9 t/s`** | `2,732.8` → **`4,923.8 t/s`** (+80.2%) | `50.1` → **`51.3 t/s`** | `37.0` → **`40.6 t/s`** |
+| `128K` | `4,236.0` → **`4,253.5 t/s`** | `2,848.1` → **`4,312.8 t/s`** (+51.4%) | `37.6` → **`39.2 t/s`** | `33.6` → **`37.7 t/s`** |
+| `160K` | `3,207.2` → **`3,812.8 t/s`** (+18.9%) | `2,822.1` → **`3,869.8 t/s`** (+37.1%) | `35.7` → **`39.6 t/s`** | `31.0` → **`34.9 t/s`** |
+| `192K` | `3,068.8` → **`3,510.2 t/s`** (+14.4%) | `2,752.7` → **`3,540.8 t/s`** (+28.6%) | `31.5` → **`34.5 t/s`** | `30.3` → `29.4 t/s` |
+| `224K` | `2,882.7` → **`3,211.9 t/s`** (+11.4%) | `2,665.6` → **`3,268.4 t/s`** (+22.6%) | `25.0` → **`32.0 t/s`** (+28.0%) | `27.8` → **`28.1 t/s`** |
+| **`256K`** | **`2,753.7` → `3,009.7 t/s`** (**+9.3%**) | **`2,586.2` → `3,062.8 t/s`** (**+18.4%**) | **`25.1` → `32.9 t/s`** (**+31.1%**) | **`26.3` → `27.5 t/s`** |
 
 Raw CSVs: [rtx4070-262k-dspark-on.csv](rtx4070-262k-dspark-on.csv) | [rtx4070-262k-dspark-off.csv](rtx4070-262k-dspark-off.csv)
 

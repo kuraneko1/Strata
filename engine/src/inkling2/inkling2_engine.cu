@@ -1088,6 +1088,8 @@ struct Engine {
     cudaEvent_t ev_attn_done = nullptr;
     cudaEvent_t ev_moe_zeroed = nullptr;
     cudaEvent_t ev_pool_ready = nullptr; // Wave 6: orders st pool_alloc before cst H2D (0 host stall)
+    cudaEvent_t ev_dspark_acc_src = nullptr;
+    cudaEvent_t ev_dspark_acc_done = nullptr;
     bool moe_raw_zero_pending = false;
     cudaMemPool_t phase_pool = nullptr;
     bool use_phase_pool = false;
@@ -1228,7 +1230,8 @@ struct Engine {
     void *xq = nullptr, *xq_k = nullptr, *xq_v = nullptr, *escr = nullptr;
     size_t escr_bytes = 0;
     int32_t *ids = nullptr, *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
-    int32_t* d_grp_part_cnt = nullptr; // Wave 5: [16 * 128] multi-CTA expert grouping scratch (8 KiB)
+    int32_t* d_grp_part_cnt = nullptr; // Wave 5: [2 * 16 * 128] multi-CTA expert grouping scratch (hist + off)
+    int32_t* d_grp_part_off = nullptr;
     uint32_t* d_hits_pool = nullptr;   // Wave 5: contiguous [n_phys * n_expert] GPU hit counters (12 KiB)
     uint32_t* d_router_done = nullptr;
     unsigned long long* grp_ptr = nullptr;
@@ -1311,8 +1314,10 @@ struct Engine {
     cudaEvent_t ev_rebal_layer[kMaxRebalLayers] = {};
     bool layer_pending_rebal[kMaxRebalLayers] = {};
     bool donor_clobbered[kMaxRebalLayers] = {};
-    int core_borrowed_ip = -1;
-    size_t core_borrowed_bytes = 0;
+    static constexpr int kMaxCoreBorrow = 4;
+    int core_borrowed_ips[kMaxCoreBorrow] = {};
+    size_t core_borrowed_bytes[kMaxCoreBorrow] = {};
+    int core_borrowed_cnt = 0;
     std::vector<PpTask> pp_tasks;
     std::vector<int> pp_layer_cnt;
     size_t pp_take_idx = 0;
@@ -2188,6 +2193,8 @@ struct Engine {
         if (ev_attn_done) cudaEventDestroy(ev_attn_done);
         if (ev_moe_zeroed) cudaEventDestroy(ev_moe_zeroed);
         if (ev_pool_ready) cudaEventDestroy(ev_pool_ready);
+        if (ev_dspark_acc_src) cudaEventDestroy(ev_dspark_acc_src);
+        if (ev_dspark_acc_done) cudaEventDestroy(ev_dspark_acc_done);
         if (transient_pp_pool) { pool_free(transient_pp_pool); transient_pp_pool = nullptr; }
         transient_pp_cnt = 0;
         free_pp_stages();
@@ -2254,6 +2261,8 @@ struct Engine {
         CK(cudaEventCreateWithFlags(&ev_attn_done, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_moe_zeroed, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_pool_ready, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_dspark_acc_src, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_dspark_acc_done, cudaEventDisableTiming));
         int cur_dev = 0, cc_min = 0, max_smem_optin = 49152;
         cc_maj = 0;
         cudaGetDevice(&cur_dev);
@@ -2547,7 +2556,8 @@ struct Engine {
         CK(cudaMalloc(&ent_dst, (size_t) max_ent * sizeof(int32_t)));
         CK(cudaMalloc(&ent_tok, (size_t) max_ent * sizeof(int32_t)));
         CK(cudaMalloc(&grp_ptr, (size_t) hp.n_expert * sizeof(unsigned long long)));
-        CK(cudaMalloc(&d_grp_part_cnt, 16 * 128 * sizeof(int32_t)));
+        CK(cudaMalloc(&d_grp_part_cnt, 2 * 16 * 128 * sizeof(int32_t)));
+        d_grp_part_off = d_grp_part_cnt + 16 * 128;
         {
             const size_t hits_tot = (size_t) hp.n_phys * (size_t) hp.n_expert;
             CK(cudaMalloc(&d_hits_pool, hits_tot * sizeof(uint32_t)));
@@ -3364,8 +3374,7 @@ struct Engine {
             pp_slot_needs_wait[b] = false;
         }
         for (int i = 0; i < kMaxRebalLayers; ++i) donor_clobbered[i] = false;
-        core_borrowed_ip = -1;
-        core_borrowed_bytes = 0;
+        core_borrowed_cnt = 0;
         if (pp_stage_cnt <= 0 || !pp_stage[0] || pp_stage_bytes == 0) return;
         for (int b = 0; b < pp_stage_cnt; ++b) {
             pp_buf_ptr[b] = pp_stage[b];
@@ -3824,13 +3833,15 @@ struct Engine {
             // Zero host-GPU stalls across all 48 layers: k_route_inkling2 tracks exact routing counts in L.d_hits on GPU!
             const int ne = (int) hp.n_expert;
             const int n_chunks = pp_layer_cnt[(size_t) il];
+            if (use_group16 && (has_gpu || n_chunks > 0)) {
+                k_group_experts_hist16<<<16, 256, 0, st>>>(ids, n_ent, ne, d_grp_part_cnt);
+            }
             auto run_gpu_res = [&]() {
                 if (!has_gpu) return;
                 if (use_group16) {
-                    k_group_experts_hist16<<<16, 256, 0, st>>>(ids, n_ent, ne, d_grp_part_cnt);
-                    k_group_experts_prefix16<<<1, 128, 0, st>>>(d_grp_part_cnt, 16, L.d_slot_of, L.d_blobs, L.stride,
+                    k_group_experts_prefix16<<<1, 128, 0, st>>>(d_grp_part_cnt, d_grp_part_off, 16, L.d_slot_of, L.d_blobs, L.stride,
                                                                 ne, L.n_slots, grp_ptr, grp_start, n_groups);
-                    k_group_experts_scatter16<<<16, 256, 0, st>>>(ids, d_grp_part_cnt, n_ent, ne, ent_dst, ent_tok, Kp);
+                    k_group_experts_scatter16<<<16, 256, 0, st>>>(ids, d_grp_part_off, n_ent, ne, ent_dst, ent_tok, Kp);
                 } else {
                     k_group_experts<<<1, 512, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, ne, L.n_slots,
                                                        grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
@@ -3854,10 +3865,9 @@ struct Engine {
                     // k_group_experts_miss_map computes pointer arithmetic only (never dereferences pp_buf_ptr[b]);
                     // running it before waiting on ev_pp_copy[b] hides grouping latency behind PCIe DMA!
                     if (use_group16) {
-                        k_group_experts_hist16<<<16, 256, 0, st>>>(ids, n_ent, ne, d_grp_part_cnt);
-                        k_group_experts_prefix16_miss_map<<<1, 128, 0, st>>>(d_grp_part_cnt, 16, pp_buf_ptr[b], L.stride,
+                        k_group_experts_prefix16_miss_map<<<1, 128, 0, st>>>(d_grp_part_cnt, d_grp_part_off, 16, pp_buf_ptr[b], L.stride,
                                                                              ne, tk.map, grp_ptr, grp_start, n_groups);
-                        k_group_experts_scatter16<<<16, 256, 0, st>>>(ids, d_grp_part_cnt, n_ent, ne, ent_dst, ent_tok, Kp);
+                        k_group_experts_scatter16<<<16, 256, 0, st>>>(ids, d_grp_part_off, n_ent, ne, ent_dst, ent_tok, Kp);
                     } else {
                         k_group_experts_miss_map<<<1, 512, 0, st>>>(ids, pp_buf_ptr[b], L.stride, n_ent, ne, tk.map,
                                                                     grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
@@ -3932,9 +3942,9 @@ struct Engine {
             if (!fused_rg && !pre_grouped_t1 && !can_fused_router_t1) {
                 if (use_group16) {
                     k_group_experts_hist16<<<16, 256, 0, st>>>(ids, n_ent, (int) hp.n_expert, d_grp_part_cnt);
-                    k_group_experts_prefix16<<<1, 128, 0, st>>>(d_grp_part_cnt, 16, L.d_slot_of, L.d_blobs, L.stride,
+                    k_group_experts_prefix16<<<1, 128, 0, st>>>(d_grp_part_cnt, d_grp_part_off, 16, L.d_slot_of, L.d_blobs, L.stride,
                                                                 (int) hp.n_expert, L.n_slots, grp_ptr, grp_start, n_groups);
-                    k_group_experts_scatter16<<<16, 256, 0, st>>>(ids, d_grp_part_cnt, n_ent, (int) hp.n_expert, ent_dst, ent_tok, Kp);
+                    k_group_experts_scatter16<<<16, 256, 0, st>>>(ids, d_grp_part_off, n_ent, (int) hp.n_expert, ent_dst, ent_tok, Kp);
                 } else {
                     k_group_experts<<<1, 512, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
                                                        grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
@@ -4260,7 +4270,7 @@ struct Engine {
     // pinned d_slot_of upload on st; Pass 3: priority-ordered coalesced H2D on cst with optional async return!).
     void resize_experts_vram(size_t target_free_bytes, size_t guard_override = 0, bool equalize_tier2 = false,
                              bool async_cst = false, bool whole_layer_evict = false, bool restore_dspark_decode_w = false,
-                             bool skip_sync = false) {
+                             bool skip_sync = false, size_t known_fr = 0, size_t known_tot = 0) {
         const auto t0 = Clock::now();
         const auto& hp = m->hp;
         const int ne = (int) hp.n_expert;
@@ -4345,8 +4355,9 @@ struct Engine {
         std::vector<int> target_slots((size_t) hp.n_phys);
         for (int ip = 0; ip < hp.n_phys; ++ip) target_slots[(size_t) ip] = m->layers[(size_t) ip].n_slots;
 
-        size_t fr = 0, tot = 0;
-        CK(cudaMemGetInfo(&fr, &tot));
+        size_t fr = known_fr, tot = known_tot;
+        if (tot == 0) CK(cudaMemGetInfo(&fr, &tot));
+        bool any_raw_vram_op = false;
         const size_t pool_free0 = pool_cached_free_bytes();
         const size_t eff_fr = fr + pool_free0;
 
@@ -4574,6 +4585,7 @@ struct Engine {
                             }
                         }
                         if (any_d2d && !L.d_blobs_from_pool) CK(cudaStreamSynchronize(st));
+                        if (!L.d_blobs_from_pool && L.d_blobs != nullptr) any_raw_vram_op = true;
                         free_layer_blobs(L);
                         L.d_blobs = new_blobs;
                         L.d_blobs_from_pool = ndb_from_pool;
@@ -4593,6 +4605,7 @@ struct Engine {
                 }
             }
 
+            if (!L.d_blobs_from_pool && L.d_blobs != nullptr) any_raw_vram_op = true;
             free_layer_blobs(L);
             L.n_slots = 0;
             std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
@@ -4601,6 +4614,7 @@ struct Engine {
 
         // ---- Pass 2: Batched alloc (pool-backed DSpark decode_w & Tier-2/3, raw Tier-1) + pinned d_slot_of uploads on st ----
         {
+            if (!pool_active) any_raw_vram_op = true;
             size_t need_raw_pass2_bytes = pool_active ? 0 : dspark_w_need;
             for (int ip = 0; ip < hp.n_phys; ++ip) {
                 const bool is_tier1 = (ip >= hp.core_start && ip < hp.core_end);
@@ -4760,7 +4774,10 @@ struct Engine {
         placed_slots = tot_slots;
         placed_bytes = exp_bytes;
         if (exp_bytes > full_cache_bytes) full_cache_bytes = exp_bytes;
-        CK(cudaMemGetInfo(&fr, &tot));
+        if (any_pool_alloc || !deferred_graphs_destroy.empty()) any_raw_vram_op = any_raw_vram_op || !deferred_graphs_destroy.empty();
+        if (!(skip_sync && known_tot > 0 && use_phase_pool && !any_raw_vram_op)) {
+            CK(cudaMemGetInfo(&fr, &tot));
+        }
         vram_free_after_place = fr;
         std::fprintf(stderr, "strata-inkling2: VRAM resize(target=%.0f MiB, async=%d) -> slots=%d/%lld (%.0f/%.0f MiB, free=%.0f MiB, hybrid=%d) in %.1f ms\n",
                      (double) target_free_bytes / (1 << 20), do_async_cst ? 1 : 0, tot_slots, (long long) hp.n_phys * ne,
@@ -4839,13 +4856,15 @@ struct Engine {
 
     /// Phase-split Prefill transition: evict DSpark decode-only weights (+358 MiB!), zero-H2D whole-layer evict
     /// decode-bonus experts (~1.5 ms), re-expand SWA KV pool, and restore active_pp_cap prefill scratch + pp_stage_pool.
-    void set_phase_prefill() {
+    void set_phase_prefill(bool streams_already_synced = false, size_t known_fr = 0, size_t known_tot = 0) {
         if (!in_decode_phase) return;
-        CK(cudaStreamSynchronize(st));
-        if (cst) CK(cudaStreamSynchronize(cst));
-        if (aux_st) CK(cudaStreamSynchronize(aux_st));
+        if (!streams_already_synced) {
+            CK(cudaStreamSynchronize(st));
+            if (cst) CK(cudaStreamSynchronize(cst));
+            if (aux_st) CK(cudaStreamSynchronize(aux_st));
+            defer_destroy_graphs();
+        }
         for (int i = 0; i < kMaxRebalLayers; ++i) layer_pending_rebal[i] = false;
-        defer_destroy_graphs();
 
         // 1. EX-4A + Wave 6: Evict DSpark decode-only weights FIRST (+358 MiB immediately back into phase_pool!)
         if (dspark) dspark->evict_decode_weights(use_phase_pool ? phase_pool : nullptr, st);
@@ -4877,12 +4896,16 @@ struct Engine {
         size_t stage_need = (size_t) saved_pp_stage_cnt * saved_pp_stage_bytes;
         const size_t min_stage_need = (size_t) std::min(saved_pp_stage_cnt, 2) * saved_pp_stage_bytes;
         int want_stage_cnt = saved_pp_stage_cnt;
-        bool have_mem_info = false;
-        size_t fr_sp = 0, tot_sp = 0, cached_pool_sp = 0;
+        bool have_mem_info = (known_tot > 0 && use_phase_pool && phase_pool != nullptr);
+        size_t fr_sp = have_mem_info ? known_fr : 0;
+        size_t tot_sp = have_mem_info ? known_tot : 0;
+        size_t cached_pool_sp = have_mem_info ? pool_cached_free_bytes() : 0;
         if (saved_pp_stage_cnt > 2 && saved_pp_stage_bytes > 0) {
-            CK(cudaMemGetInfo(&fr_sp, &tot_sp));
-            cached_pool_sp = pool_cached_free_bytes();
-            have_mem_info = true;
+            if (!have_mem_info) {
+                CK(cudaMemGetInfo(&fr_sp, &tot_sp));
+                cached_pool_sp = pool_cached_free_bytes();
+                have_mem_info = true;
+            }
             size_t t2_b = 0;
             const auto& hp_sp = m->hp;
             for (int ip = 0; ip < hp_sp.n_phys; ++ip) {
@@ -4929,7 +4952,8 @@ struct Engine {
             }
         }
         resize_experts_vram(need_free, 0, /*equalize_tier2=*/false, /*async_cst=*/false, /*whole_layer_evict=*/true,
-                            /*restore_dspark_decode_w=*/false, /*skip_sync=*/true);
+                            /*restore_dspark_decode_w=*/false, /*skip_sync=*/true,
+                            have_mem_info ? fr_sp : 0, have_mem_info ? tot_sp : 0);
 
         // 3. Re-expand SWA KV ring only when shared-scratch SWA is disabled
         if (!use_shared_swa_scratch && swa_kv_cap < prefill_swa_kv_cap) {
@@ -4938,12 +4962,18 @@ struct Engine {
 
         // 4. Restore active_pp_cap prefill scratch & DSpark arena via stream-ordered phase_pool
         free_ephemeral_bufs();
-        if (tgt_cap > 8192 || (!is_core_full_resident() && tgt_cap >= 4096)) trim_phase_pool(0);
+        const bool did_trim_post = (tgt_cap > 8192 || (!is_core_full_resident() && tgt_cap >= 4096));
+        if (did_trim_post) trim_phase_pool(0);
         if (tgt_cap > tmax) {
-            size_t fr_post = 0, tot_post = 0;
-            CK(cudaMemGetInfo(&fr_post, &tot_post));
-            const size_t avail_post = fr_post + pool_cached_free_bytes();
             const size_t slab_pad = (size_t) 80 << 20;
+            size_t avail_post = (have_mem_info && use_phase_pool && use_shared_swa_scratch &&
+                                 !did_trim_post && swa_kv_cap >= prefill_swa_kv_cap)
+                ? (fr_sp + pool_cached_free_bytes()) : 0;
+            if (avail_post == 0 || avail_post < estimate_ephemeral_total_bytes(tgt_cap) + slab_pad) {
+                size_t fr_post = 0, tot_post = 0;
+                CK(cudaMemGetInfo(&fr_post, &tot_post));
+                avail_post = fr_post + pool_cached_free_bytes();
+            }
             const int orig_cap = tgt_cap;
             while (tgt_cap > tmax) {
                 const size_t need_post = estimate_ephemeral_total_bytes(tgt_cap) + slab_pad;
@@ -5002,7 +5032,7 @@ struct Engine {
                 }
             }
         }
-        if (pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
+        if (!is_core_full_resident() && pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
         in_decode_phase = false;
     }
 
@@ -5030,6 +5060,8 @@ struct Engine {
             target_cap = tmax;
         }
         if (!in_decode_phase && target_cap == active_pp_cap && prompt_total_len <= full_kv_cap) return active_pp_cap;
+        size_t fr_cap = 0, tot_cap = 0;
+        bool synced_in_cap = false;
         if (target_cap > tmax) {
             if (in_decode_phase) {
                 CK(cudaStreamSynchronize(st));
@@ -5037,6 +5069,7 @@ struct Engine {
                 if (aux_st) CK(cudaStreamSynchronize(aux_st));
                 defer_destroy_graphs();
                 if (dspark) dspark->defer_destroy_decode_graphs();
+                synced_in_cap = true;
             }
             const size_t cur_eph = in_decode_phase ? decode_ephemeral_bytes : prefill_ephemeral_bytes;
             size_t kv_delta = 0;
@@ -5051,8 +5084,8 @@ struct Engine {
                 const int target_kv = next_kv_ladder_cap(full_kv_cap, prompt_total_len, ctx, use_headroom);
                 kv_delta = (size_t) n_full * (size_t) std::max(0, target_kv - full_kv_cap) * per_tok;
             }
-            size_t fr = 0, tot = 0;
-            CK(cudaMemGetInfo(&fr, &tot));
+            CK(cudaMemGetInfo(&fr_cap, &tot_cap));
+            const size_t fr = fr_cap;
             size_t tier2_bytes = 0;
             for (int ip = 0; ip < hp.n_phys; ++ip) {
                 if (ip >= hp.core_start && ip < hp.core_end) continue;
@@ -5125,7 +5158,7 @@ struct Engine {
         }
         if (in_decode_phase) {
             active_pp_cap = target_cap;
-            set_phase_prefill();
+            set_phase_prefill(synced_in_cap, fr_cap, tot_cap);
             return active_pp_cap;
         }
         if (target_cap == active_pp_cap) return active_pp_cap;
@@ -5710,23 +5743,25 @@ struct Engine {
                     E->hybrid = true;
                 }
                 E->free_transient_pp_stages();
-                const int core_ip = E->core_borrowed_ip;
-                const size_t core_bytes = E->core_borrowed_bytes;
-                E->core_borrowed_ip = -1;
-                E->core_borrowed_bytes = 0;
-                if (core_ip >= core_start_ip && core_ip < n_phys && core_ip < kMaxRebalLayers &&
-                    E->donor_clobbered[core_ip]) {
-                    E->donor_clobbered[core_ip] = false;
-                    PhysLayer& Lc = E->m->layers[(size_t) core_ip];
-                    if (Lc.d_blobs && Lc.hblobs && core_bytes > 0 && E->cst) {
-                        for (int b = 0; b < E->pp_active_slots && b < kMaxPpStages; ++b) {
-                            if (E->pp_buf_owner_ip[b] == core_ip) {
-                                CK(cudaStreamWaitEvent(E->cst, E->ev_pp_used[b], 0));
+                const int n_cb = E->core_borrowed_cnt;
+                E->core_borrowed_cnt = 0;
+                for (int ci = 0; ci < n_cb; ++ci) {
+                    const int core_ip = E->core_borrowed_ips[ci];
+                    const size_t core_bytes = E->core_borrowed_bytes[ci];
+                    if (core_ip >= core_start_ip && core_ip < n_phys && core_ip < kMaxRebalLayers &&
+                        E->donor_clobbered[core_ip]) {
+                        E->donor_clobbered[core_ip] = false;
+                        PhysLayer& Lc = E->m->layers[(size_t) core_ip];
+                        if (Lc.d_blobs && Lc.hblobs && core_bytes > 0 && E->cst) {
+                            for (int b = 0; b < E->pp_active_slots && b < kMaxPpStages; ++b) {
+                                if (E->pp_buf_owner_ip[b] == core_ip) {
+                                    CK(cudaStreamWaitEvent(E->cst, E->ev_pp_used[b], 0));
+                                }
                             }
+                            CK(cudaMemcpyAsync(Lc.d_blobs, Lc.hblobs, core_bytes, cudaMemcpyHostToDevice, E->cst));
+                            CK(cudaEventRecord(E->ev_rebal_layer[core_ip], E->cst));
+                            E->layer_pending_rebal[core_ip] = true;
                         }
-                        CK(cudaMemcpyAsync(Lc.d_blobs, Lc.hblobs, core_bytes, cudaMemcpyHostToDevice, E->cst));
-                        CK(cudaEventRecord(E->ev_rebal_layer[core_ip], E->cst));
-                        E->layer_pending_rebal[core_ip] = true;
                     }
                 }
                 E->pp_free_slots.clear();
@@ -6099,6 +6134,13 @@ struct Engine {
         int pre_push_done_il = -1;
         float* pre_push_ndst = nullptr;
         bool pre_routed_pp_cur = false;
+        bool dspark_acc_pending = false;
+        auto wait_dspark_acc = [&]() {
+            if (dspark_acc_pending) {
+                CK(cudaStreamWaitEvent(st, ev_dspark_acc_done, 0));
+                dspark_acc_pending = false;
+            }
+        };
 
         auto run_layer_pre = [&](int il, bool include_route_t1 = false) {
             const int ip = hp.loop_layer(il);
@@ -6119,7 +6161,16 @@ struct Engine {
             auto emit_dspark_capture = [&]() {
                 if (!is_dspark_tgt) return;
                 if (dspark->prefill_vram_acc_active) {
-                    dspark->accum_prefill_feat(dspark_ti, cur_in, T, st);
+                    if (aux_st != nullptr && ev_dspark_acc_src && ev_dspark_acc_done &&
+                        !capturing_full_graph && !prof && !prof_detail) {
+                        CK(cudaEventRecord(ev_dspark_acc_src, st));
+                        CK(cudaStreamWaitEvent(aux_st, ev_dspark_acc_src, 0));
+                        dspark->accum_prefill_feat(dspark_ti, cur_in, T, aux_st);
+                        CK(cudaEventRecord(ev_dspark_acc_done, aux_st));
+                        dspark_acc_pending = true;
+                    } else {
+                        dspark->accum_prefill_feat(dspark_ti, cur_in, T, st);
+                    }
                 } else if (d_tgt_feat[dspark_ti]) {
                     CK(cudaMemcpyAsync(d_tgt_feat[dspark_ti], cur_in, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
                 }
@@ -8209,6 +8260,7 @@ struct Engine {
                 if (is_outer) p_attn_ms += ms_since(tp_ly0);
                 else p_core_ms += ms_since(tp_ly0);
             }
+            wait_dspark_acc();
             run_layer_post(il, include_route_t1);
             // EX-5 Idea A: On the final prefill chunk before set_phase_decode(), reclaim finished Prelude
             // d_blobs as transient pp_stage slots so cst pre-buffers Epilogue experts during the 36-layer Core!
@@ -8266,12 +8318,14 @@ struct Engine {
                 const char* v = std::getenv("STRATA_NO_CORE_BORROW");
                 return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
             }();
+            const int il_core_final0 = (int) (hp.core_start + (hp.num_loops - 1) * n_core);
             if (!no_core_borrow && pp_streaming && core_all_gpu &&
                 profile.regime != strata::inkling2::VramRegime::FullVram &&
                 hp.num_loops > 1 && n_core > 0 && pp_stage_bytes > 0 &&
-                il == (int) (hp.core_start + (hp.num_loops - 1) * n_core) &&
+                il >= il_core_final0 && il < il_core_final0 + 2 &&
+                core_borrowed_cnt < kMaxCoreBorrow &&
                 pp_kick_idx < pp_tasks.size()) {
-                const int ip_core = (int) hp.core_start;
+                const int ip_core = (int) hp.core_start + (il - il_core_final0);
                 PhysLayer& Lc = m->layers[(size_t) ip_core];
                 const size_t slot_stride = (pp_stage_bytes + 255u) & ~size_t(255u);
                 bool id_map = (Lc.hblobs != nullptr && Lc.hblobs_pinned && Lc.d_blobs != nullptr &&
@@ -8284,8 +8338,9 @@ struct Engine {
                     const size_t donor_bytes = (size_t) Lc.n_slots * Lc.stride;
                     const int n_carve = std::min((int) (donor_bytes / slot_stride), kMaxPpStages - pp_active_slots);
                     if (n_carve > 0) {
-                        core_borrowed_ip = ip_core;
-                        core_borrowed_bytes = std::min(donor_bytes, (size_t) n_carve * slot_stride);
+                        core_borrowed_ips[core_borrowed_cnt] = ip_core;
+                        core_borrowed_bytes[core_borrowed_cnt] = std::min(donor_bytes, (size_t) n_carve * slot_stride);
+                        ++core_borrowed_cnt;
                         for (int si = 0; si < n_carve; ++si) {
                             const int b = pp_active_slots++;
                             pp_buf_ptr[b] = Lc.d_blobs + (size_t) si * slot_stride;
@@ -8354,8 +8409,41 @@ struct Engine {
                 }
             }
         }
+        wait_dspark_acc();
         // Wave 5: Overlap DSpark inject_from_vram_acc() directly on st BEFORE forward()'s final sync!
-        if (dspark_vram_acc_on) {
+        const int64_t tot_lg = (int64_t) rows * hp.vocab_unpadded;
+        const bool overlap_head_dspark = (dspark_vram_acc_on && compute_logits && rows == 1 &&
+                                          !capturing_full_graph && !prof && !prof_detail &&
+                                          aux_st != nullptr && ev_dspark_acc_src && ev_dspark_acc_done &&
+                                          dspark->can_inject_all_f16(*this, T) &&
+                                          m->output_weight.type == 8 && !m->output_weight.q8_in_place &&
+                                          hp.vocab_unpadded > 3072 && (N % 256) == 0 &&
+                                          ((((uintptr_t) m->output_weight.d) & 3u) == 0u));
+        if (overlap_head_dspark) {
+            CK(cudaEventRecord(ev_dspark_acc_src, st));
+            CK(cudaStreamWaitEvent(aux_st, ev_dspark_acc_src, 0));
+            K::native_quantize_q8_1(head_h, xq, (int) N, 1, aux_st);
+            k_mmvq_q8_0_smallT<1, true, false, 4><<<(unsigned) ((hp.vocab_unpadded + 3) / 4), 128, 0, aux_st>>>(
+                (const uint8_t*) m->output_weight.d, (const uint32_t*) xq, logits, (int) N, (int) hp.vocab_unpadded, 1);
+            if (want_softcap) {
+                k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, aux_st>>>(logits, tot_lg, hp.softcap);
+            }
+            if (want_argmax) {
+                if (hp.vocab_unpadded >= 4096 && argmax_val && argmax_idx && rows <= verify_max_t) {
+                    constexpr int kArgBlks = 64;
+                    k_argmax_stage1<<<dim3(kArgBlks, 1u), 256, 0, aux_st>>>(
+                        logits, argmax_val, argmax_idx, (int) hp.vocab_unpadded);
+                    k_argmax_stage2<<<1u, 32, 0, aux_st>>>(
+                        argmax_val, argmax_idx, pick_d, kArgBlks);
+                } else {
+                    k_argmax<<<1u, 256, 0, aux_st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+                }
+            }
+            CK(cudaEventRecord(ev_dspark_acc_done, aux_st));
+            dspark->inject_from_vram_acc(*this, cur, T, (int) pos, st);
+            dspark_injected_in_fwd = true;
+            CK(cudaStreamWaitEvent(st, ev_dspark_acc_done, 0));
+        } else if (dspark_vram_acc_on) {
             dspark->inject_from_vram_acc(*this, cur, T, (int) pos, st);
             dspark_injected_in_fwd = true;
         }
@@ -8368,20 +8456,21 @@ struct Engine {
             pos += T;
             return 0;
         }
-        project_preq(head_h, fuse_head_q8 ? xq : nullptr, m->output_weight, logits, rows, hp.vocab_unpadded, N);
-        const int64_t tot_lg = (int64_t) rows * hp.vocab_unpadded;
-        if (want_softcap) {
-            k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);
-        }
-        if (want_argmax) {
-            if (hp.vocab_unpadded >= 4096 && argmax_val && argmax_idx && rows <= verify_max_t) {
-                constexpr int kArgBlks = 64;
-                k_argmax_stage1<<<dim3(kArgBlks, (unsigned) rows), 256, 0, st>>>(
-                    logits, argmax_val, argmax_idx, (int) hp.vocab_unpadded);
-                k_argmax_stage2<<<(unsigned) rows, 32, 0, st>>>(
-                    argmax_val, argmax_idx, pick_d, kArgBlks);
-            } else {
-                k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+        if (!overlap_head_dspark) {
+            project_preq(head_h, fuse_head_q8 ? xq : nullptr, m->output_weight, logits, rows, hp.vocab_unpadded, N);
+            if (want_softcap) {
+                k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);
+            }
+            if (want_argmax) {
+                if (hp.vocab_unpadded >= 4096 && argmax_val && argmax_idx && rows <= verify_max_t) {
+                    constexpr int kArgBlks = 64;
+                    k_argmax_stage1<<<dim3(kArgBlks, (unsigned) rows), 256, 0, st>>>(
+                        logits, argmax_val, argmax_idx, (int) hp.vocab_unpadded);
+                    k_argmax_stage2<<<(unsigned) rows, 32, 0, st>>>(
+                        argmax_val, argmax_idx, pick_d, kArgBlks);
+                } else {
+                    k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+                }
             }
         }
         if (capturing_full_graph) {
@@ -8855,7 +8944,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                                            E.profile.regime != strata::inkling2::VramRegime::FullVram &&
                                            tier1_planned_all_gpu && will_need_cpu &&
                                            hp.num_loops > 1 && hp.core_start < hp.core_end &&
-                                           ip == (int) hp.core_start && s == ne && L.gu_type != 30);
+                                           ip >= (int) hp.core_start && ip < (int) hp.core_start + 2 &&
+                                           s == ne && L.gu_type != 30);
         if (s < ne || (frontload_en && will_need_cpu && is_tier2_ip) || (prebuild_tier1_hblobs && is_tier1_ip)) {
             if (s < ne) need_cpu = true;
             const size_t hb_bytes = (size_t) ne * L.stride;

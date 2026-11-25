@@ -23,7 +23,7 @@ It runs **65K–262K** context on a single **12 GB consumer GPU (RTX 4070)** and
 
 - **Zero-knob automatic tuning (`SM arch × VRAM regime`)** — Choose `--max-context` (and optionally `--draft` for DSpark). The engine inspects the GPU architecture and live free VRAM to select the verified chunk size, KV allocation policy, staging budget, FA2 split-K width, and CUDA Graph mode via [profile_rules.hpp](engine/include/strata/inkling2/profile_rules.hpp).
 - **Zero quantization / precision compromises** — Native `UD-Q4_K_M` weights and `Q8` KV cache (`--kv-q8`), verified for 64/64 greedy token parity across optimization rounds.
-- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, a single `--max-context 262144` run on real C++/CUDA code reaches **`7,994–8,005 t/s` prefill** at `8K` (`5,490` at `64K`, `4,236` at `128K`, **`2,754 t/s`** cumulative at `256K`) and sustains **`55.7 t/s`** (`16K`), **`45.5 t/s`** (`64K`), **`37.6 t/s`** (`128K`), **`35.7 t/s`** (`160K`), and **`25.1–26.2 t/s`** (`256K`) steady decode with **DSpark ON** / **OFF** dynamic phase-split offload/reload. On V100 32 GB (GPU 0, ECC Off), all 3,072 experts fit in VRAM up to 819K with DSpark (`135–167 t/s` decode at 64K–256K, `109.5 t/s` at 512K, `89.9 t/s` at 800K, `192.8 t/s` at 512).
+- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, a single `--max-context 262144` run on real C++/CUDA code reaches **`8,016 t/s` prefill** (`8,013 t/s` DSpark OFF) at `8K` (`5,567` at `64K`, `4,254` at `128K`, **`3,010 t/s`** ON / **`3,063 t/s`** OFF cumulative at `256K`) and sustains **`57.1–59.0 t/s`** (`8K–16K`), **`51.8 t/s`** (`64K`), **`39.2 t/s`** (`128K`), **`39.6 t/s`** (`160K`), and **`32.9 t/s`** (`256K`) steady decode with **DSpark ON** / **OFF** dynamic phase-split offload/reload. On V100 32 GB (GPU 0, ECC Off), all 3,072 experts fit in VRAM up to 819K with DSpark (`135–167 t/s` decode at 64K–256K, `109.5 t/s` at 512K, `89.9 t/s` at 800K, `192.8 t/s` at 512).
 - **Drop-in OpenAI & Anthropic API** — Works directly with Claude Code, Codex CLI, OpenCode, and other local coding agents, plus upstream Strata's Qwen3.8-Flash-Next and Qwen3.6-35B-A3B engines.
 
 ## Supported Hardware & Auto-Profiles
@@ -54,17 +54,17 @@ Apples-to-apples real tokenized C++/CUDA code context ladder (`--max-context 262
 
 | Context Depth | DSpark ON (`--draft-max 3`) Prefill | DSpark ON Decode | DSpark OFF Prefill | DSpark OFF Decode | GPU Hit (ON / OFF) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| `8K` (fresh) | `7,970.7 t/s` | **`56.5 t/s`** | **`8,018.0 t/s`** | `52.6 t/s` | `85.5%` / `85.5%` |
-| `16K` | **`6,811.8 t/s`** | **`56.0 t/s`** | `6,774.4 t/s` | `51.2 t/s` | `85.5%` / `86.7%` |
-| `32K` | `6,412.5 t/s` | **`54.0 t/s`** | **`6,458.2 t/s`** | `49.8 t/s` | `85.5%` / `86.9%` |
-| `64K` | `5,579.1 t/s` | **`51.6 t/s`** | **`5,778.7 t/s`** | `46.4 t/s` | `85.4%` / `85.5%` |
-| `96K` | `4,849.5 t/s` | **`46.2 t/s`** | **`4,941.6 t/s`** | `38.8 t/s` | `85.4%` / `85.5%` |
-| `128K` | `4,256.3 t/s` | **`44.0 t/s`** | **`4,294.3 t/s`** | `37.3 t/s` | `84.7%` / `86.1%` |
-| `160K` | `3,816.8 t/s` | **`39.2 t/s`** | **`3,870.7 t/s`** | `34.4 t/s` | `72.6%` / `84.8%` |
-| `192K` | `3,515.8 t/s` | **`40.2 t/s`** | **`3,543.4 t/s`** | `29.8 t/s` | `70.7%` / `67.3%` |
-| `256K` (`261.5K`) | `3,017.6 t/s` | **`29.4 t/s`** | **`3,068.8 t/s`** | `27.2 t/s` | `65.8%` / `65.2%` |
+| `8K` (fresh) | **`8,016.1 t/s`** | **`57.1 t/s`** | `8,012.8 t/s` | `50.3 t/s` | `85.5%` / `85.6%` |
+| `16K` | **`6,704.2 t/s`** | **`59.0 t/s`** | `6,515.2 t/s` | `47.9 t/s` | `85.4%` / `86.7%` |
+| `32K` | **`6,371.9 t/s`** | **`55.2 t/s`** | `6,317.1 t/s` | `49.7 t/s` | `85.5%` / `86.9%` |
+| `64K` | `5,567.3 t/s` | **`51.8 t/s`** | **`5,709.3 t/s`** | `43.8 t/s` | `85.4%` / `85.5%` |
+| `96K` | `4,839.9 t/s` | **`51.3 t/s`** | **`4,923.8 t/s`** | `40.6 t/s` | `85.4%` / `85.5%` |
+| `128K` | `4,253.5 t/s` | **`39.2 t/s`** | **`4,312.8 t/s`** | `37.7 t/s` | `84.8%` / `86.0%` |
+| `160K` | `3,812.8 t/s` | **`39.6 t/s`** | **`3,869.8 t/s`** | `34.9 t/s` | `72.9%` / `84.8%` |
+| `192K` | `3,510.2 t/s` | **`34.5 t/s`** | **`3,540.8 t/s`** | `29.4 t/s` | `70.9%` / `72.4%` |
+| `256K` (`261.5K`) | `3,009.7 t/s` | **`32.9 t/s`** | **`3,062.8 t/s`** | `27.5 t/s` | `65.5%` / `65.2%` |
 
-> **Why DSpark ON accelerates Decode across `8K–256K` while Prefill hits `~8,000 -> ~3,018–3,069 t/s` with zero mid-prefill stalls**: With Phase-Split dynamic offload/reload (`357.8 MiB` async pool transfer), a finer 7-step KV ladder (`16K → 36K → 69K → 102K → 139K → 172K → 204K → 262K`), upfront Tier-1/2 pinned host blob pre-building at `>=131K` (eliminating mid-prefill host-pinning cliffs), zero-copy AVX2 `q5k_ktile`/`q8_0_ktile` CPU MoE kernels, decode `L.score` normalization (`prior=4.0`), and Confidence-Gated + Suffix (`PLD`) speculative drafting, **`8K` prefill stays `~8,000 t/s`**, **`128K` runs `4,256.3 t/s` PP & `44.0 t/s` Decode**, **`192K` hits `40.2 t/s`**, and **`256K` breaks `3,017.6 t/s` PP / `29.4 t/s` Decode** (`3,068.8 t/s` PP DSpark OFF) — zero precision/quantization loss.
+> **Why DSpark ON accelerates Decode across `8K–256K` while Prefill starts cleanly at `8,016 / 8,013 t/s` and holds `3,010–3,063 t/s` at `256K` with zero mid-prefill stalls**: With Phase-Split dynamic offload/reload (`357.8 MiB` async pool transfer), a finer 7-step KV ladder (`16K → 36K → 69K → 102K → 139K → 172K → 204K → 262K`), upfront Tier-1/2 pinned host blob pre-building at `>=131K` (eliminating mid-prefill host-pinning cliffs), multi-layer Core borrow (`blk.6..7`), overlapped `aux_st` DSpark feature accumulation & LM head overlap, zero-copy AVX2 `q5k_ktile`/`q8_0_ktile` CPU MoE kernels, decode `L.score` normalization (`prior=4.0`), and Confidence-Gated + Suffix (`PLD`) speculative drafting, **`8K` prefill exceeds `8,016 t/s`**, **`128K` runs `4,253.5 t/s` PP & `39.2 t/s` Decode**, **`160K` hits `39.6 t/s`**, and **`256K` achieves `3,009.7 t/s` PP / `32.9 t/s` Decode** (`3,062.8 t/s` PP DSpark OFF) — zero precision/quantization loss.
 
 Full RTX 4070 Roofline ceiling, achievement rates & `--draft-max` analysis: [2026-11-26 RTX 4070 262K Roofline & DSpark Report](docs/bench-results/2026-11-26-rtx4070-262k-roofline-dspark/README.md) ([2026-11-22 progression](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md)).
 
@@ -219,19 +219,19 @@ Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCo
 Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the engine auto-selects the matching profile, chunk size, and KV strategy.
 
 ```bash
-# RTX 4070 12 GB — 65K daily coding (~7,959 PP @ 8K, ~48.2–66.5 t/s real-code Dec; DSpark ON)
+# RTX 4070 12 GB — 65K daily coding (~8,013 PP @ 8K, ~51.9–61.1 t/s real-code Dec; DSpark ON)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
   --max-context 65536 --bench --max-new 128
 
-# RTX 4070 12 GB — 131K balanced (~7,975 PP @ 8K, ~41.5–58.4 t/s real-code Dec; DSpark ON)
+# RTX 4070 12 GB — 131K balanced (~7,972 PP @ 8K, ~42.1–57.7 t/s real-code Dec; DSpark ON)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
   --max-context 131072 --bench --max-new 128
 
-# RTX 4070 12 GB — 262K max context (~7,971 PP @ 8K -> 3,018 @ 256K / 56.5 -> 29.4 t/s real-code Dec; DSpark ON)
+# RTX 4070 12 GB — 262K max context (8,016 PP @ 8K -> 3,010 @ 256K / 57.1 -> 32.9 t/s real-code Dec; DSpark ON)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
