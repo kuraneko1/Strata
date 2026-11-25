@@ -19,6 +19,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -545,6 +546,250 @@ void kq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         for (int r = r0; r < r1; ++r) {
             dot_rows(type, w + (size_t) r * row_bytes, n, act + t0, m, s);
             for (int t = 0; t < m; ++t) out[t0 + t][r] = s[t];
+        }
+    }
+}
+
+namespace {
+
+constexpr int kMaxQ5kSbs = 64;     // up to 16384 cols
+constexpr int kMaxQ80Pairs = 256;  // up to 16384 cols (512 Q8_0 blocks)
+
+template <int NT>
+inline void q5k_ktile_row_step(const uint8_t* hdr, const __m256i hbits,
+                               const uint8_t* qs0, const uint8_t* qs1,
+                               const uint8_t* qs2, const uint8_t* qs3,
+                               const block_q8_K* const* yt, const __m128i (&q8s_pre)[NT][kMaxQ5kSbs], int ksb,
+                               __m256 acc[NT], float summs[NT]) {
+    static const uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    const __m128i mzero = _mm_setzero_si128();
+    const float xd = half_at(hdr, 0), xdmin = half_at(hdr, 1);
+    uint32_t utmp[4];
+    std::memcpy(utmp, hdr + 4, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+    const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32((int) utmp[3], (int) utmp[2],
+                                                                       (int) utmp[1], (int) utmp[0]));
+    const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
+    const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+    const __m256i scales = _mm256_insertf128_si256(_mm256_castsi128_si256(sc128), sc128, 1);
+
+    const uint8_t* qs[4] = {qs0, qs1, qs2, qs3};
+    // Process J=0..3 one chunk at a time so decoded q5_0/q5_1/s0/s1 stay in YMM registers with zero stack spills.
+    for (int t = 0; t < NT; ++t) {
+        const block_q8_K* y = yt[t] + ksb;
+        const float dmin = -y->d * xdmin;
+        const __m128i prod = _mm_madd_epi16(mins, q8s_pre[t][ksb]);
+        const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
+        summs[t] += dmin * _mm_extract_epi32(hsum, 0);
+    }
+    __m256i sumi[NT];
+    for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+    auto step = [&]<int J>() {
+        const __m256i s0 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * J + 0));
+        const __m256i s1 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * J + 1));
+        const __m256i q5bits = _mm256_loadu_si256((const __m256i*) qs[J]);
+        const __m256i q5_0 = _mm256_add_epi8(_mm256_and_si256(q5bits, m4), q5k_bit_to_4<2 * J + 0>(hbits));
+        const __m256i q5_1 = _mm256_add_epi8(_mm256_and_si256(_mm256_srli_epi16(q5bits, 4), m4), q5k_bit_to_4<2 * J + 1>(hbits));
+        for (int t = 0; t < NT; ++t) {
+            const int8_t* q8 = yt[t][ksb].qs;
+            const __m256i q8_0 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * J));
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * J + 32));
+            const __m256i p16_0 = _mm256_madd_epi16(s0, _mm256_maddubs_epi16(q5_0, q8_0));
+            const __m256i p16_1 = _mm256_madd_epi16(s1, _mm256_maddubs_epi16(q5_1, q8_1));
+            sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(p16_0, p16_1));
+        }
+    };
+    step.template operator()<0>();
+    step.template operator()<1>();
+    step.template operator()<2>();
+    step.template operator()<3>();
+    for (int t = 0; t < NT; ++t) {
+        const float d = yt[t][ksb].d * xd;
+        acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+    }
+}
+
+template <int NT>
+void ktile_q5k_gu_t(const uint8_t* blob, int n, const void* const* act, float* const* ff,
+                    int r0, int r1, float beta, float lb) {
+    constexpr size_t kTileBytes = 22528;
+    constexpr int kStrip = (NT == 1) ? 64 : ((NT == 2) ? 32 : 16);
+    const int k_sbs = n / QK_K;
+    const block_q8_K* yt[NT];
+    __m128i q8s_pre[NT][kMaxQ5kSbs];
+    for (int t = 0; t < NT; ++t) {
+        yt[t] = (const block_q8_K*) act[t];
+        for (int i = 0; i < k_sbs; ++i) {
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i*) yt[t][i].bsums);
+            q8s_pre[t][i] = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+        }
+    }
+    for (int c0 = r0; c0 < r1;) {
+        const int n_tile = c0 >> 6;
+        const int c1 = std::min(r1, (n_tile + 1) * 64);
+        const int wr0 = c0 - n_tile * 64;
+        const int cnt = c1 - c0;
+        const uint8_t* tile_base = blob + (size_t) n_tile * (size_t) k_sbs * kTileBytes;
+        for (int s0 = 0; s0 < cnt; s0 += kStrip) {
+            const int len = std::min(kStrip, cnt - s0);
+            __m256 acc_g[kStrip][NT];
+            __m256 acc_u[kStrip][NT];
+            float summs_g[kStrip][NT];
+            float summs_u[kStrip][NT];
+            for (int i = 0; i < len; ++i) {
+                for (int t = 0; t < NT; ++t) {
+                    acc_g[i][t] = _mm256_setzero_ps();
+                    acc_u[i][t] = _mm256_setzero_ps();
+                    summs_g[i][t] = 0.0f;
+                    summs_u[i][t] = 0.0f;
+                }
+            }
+            for (int ksb = 0; ksb < k_sbs; ++ksb) {
+                const uint8_t* kt = tile_base + (size_t) ksb * kTileBytes;
+                if (ksb + 1 < k_sbs) {
+                    const char* pf = (const char*) (kt + kTileBytes);
+                    _mm_prefetch(pf + (size_t) (wr0 + s0) * 16u, _MM_HINT_T0);
+                    _mm_prefetch(pf + 2048u + (size_t) (wr0 + s0) * 32u, _MM_HINT_T0);
+                    _mm_prefetch(pf + 6144u + (size_t) (wr0 + s0) * 32u, _MM_HINT_T0);
+                    _mm_prefetch(pf + 10240u + (size_t) (wr0 + s0) * 32u, _MM_HINT_T0);
+                    _mm_prefetch(pf + 14336u + (size_t) (wr0 + s0) * 32u, _MM_HINT_T0);
+                    _mm_prefetch(pf + 18432u + (size_t) (wr0 + s0) * 32u, _MM_HINT_T0);
+                }
+                const uint8_t* hdr_base = kt;
+                const uint8_t* qh_base  = kt + 2048u;
+                const uint8_t* qs0_base = kt + 6144u;
+                const uint8_t* qs1_base = kt + 10240u;
+                const uint8_t* qs2_base = kt + 14336u;
+                const uint8_t* qs3_base = kt + 18432u;
+                for (int i = 0; i < len; ++i) {
+                    const int wg = wr0 + s0 + i;
+                    const __m256i hg = _mm256_loadu_si256((const __m256i*) (qh_base + (size_t) wg * 32u));
+                    q5k_ktile_row_step<NT>(hdr_base + (size_t) wg * 16u, hg,
+                                           qs0_base + (size_t) wg * 32u, qs1_base + (size_t) wg * 32u,
+                                           qs2_base + (size_t) wg * 32u, qs3_base + (size_t) wg * 32u,
+                                           yt, q8s_pre, ksb, acc_g[i], summs_g[i]);
+                    const int wu = wg + 64;
+                    const __m256i hu = _mm256_loadu_si256((const __m256i*) (qh_base + (size_t) wu * 32u));
+                    q5k_ktile_row_step<NT>(hdr_base + (size_t) wu * 16u, hu,
+                                           qs0_base + (size_t) wu * 32u, qs1_base + (size_t) wu * 32u,
+                                           qs2_base + (size_t) wu * 32u, qs3_base + (size_t) wu * 32u,
+                                           yt, q8s_pre, ksb, acc_u[i], summs_u[i]);
+                }
+            }
+            for (int i = 0; i < len; ++i) {
+                const int r = c0 + s0 + i;
+                for (int t = 0; t < NT; ++t) {
+                    const float gs = hsum_float_8(acc_g[i][t]) + summs_g[i][t];
+                    const float us = hsum_float_8(acc_u[i][t]) + summs_u[i][t];
+                    const float tg = beta * std::tanh((beta == 4.0f) ? (gs * 0.25f) : (gs / beta));
+                    const float tu = lb > 0.f ? lb * std::tanh(us / lb) : us;
+                    ff[t][r] = (tg / (1.f + std::exp(-gs))) * tu;
+                }
+            }
+        }
+        c0 = c1;
+    }
+}
+
+template <int NT>
+void ktile_q8_0_down_t(const uint8_t* w, int n, const void* const* act, float* const* out, int r0, int r1) {
+    constexpr size_t kTileBytes = 8704;
+    constexpr int kStrip = (NT == 1) ? 128 : ((NT == 2) ? 64 : 32);
+    const int k_64 = n / 64;
+    const block_q8_0* yt[NT];
+    float dy_pre[NT][kMaxQ80Pairs * 2];
+    for (int t = 0; t < NT; ++t) {
+        yt[t] = (const block_q8_0*) act[t];
+        for (int ib = 0; ib < 2 * k_64; ++ib) dy_pre[t][ib] = h2f(yt[t][ib].d);
+    }
+    for (int c0 = r0; c0 < r1;) {
+        const int n_tile = c0 >> 7;
+        const int c1 = std::min(r1, (n_tile + 1) * 128);
+        const int wr0 = c0 - n_tile * 128;
+        const int cnt = c1 - c0;
+        const uint8_t* tile_base = w + (size_t) n_tile * (size_t) k_64 * kTileBytes;
+        for (int s0 = 0; s0 < cnt; s0 += kStrip) {
+            const int len = std::min(kStrip, cnt - s0);
+            __m256 acc[kStrip][NT];
+            for (int i = 0; i < len; ++i)
+                for (int t = 0; t < NT; ++t) acc[i][t] = _mm256_setzero_ps();
+            for (int kb = 0; kb < k_64; ++kb) {
+                const uint8_t* kt = tile_base + (size_t) kb * kTileBytes;
+                if (kb + 1 < k_64) {
+                    const char* pf = (const char*) (kt + kTileBytes);
+                    _mm_prefetch(pf + (size_t) (wr0 + s0) * 4u, _MM_HINT_T0);
+                    _mm_prefetch(pf + 512u + (size_t) (wr0 + s0) * 32u, _MM_HINT_T0);
+                    _mm_prefetch(pf + 4608u + (size_t) (wr0 + s0) * 32u, _MM_HINT_T0);
+                }
+                const uint8_t* d2_base = kt;
+                const uint8_t* qs0_base = kt + 512u;
+                const uint8_t* qs1_base = kt + 4608u;
+                const int ib0 = 2 * kb, ib1 = ib0 + 1;
+                __m256i aq0[NT], aq1[NT];
+                __m256 dy0[NT], dy1[NT];
+                for (int t = 0; t < NT; ++t) {
+                    aq0[t] = _mm256_loadu_si256((const __m256i*) yt[t][ib0].qs);
+                    aq1[t] = _mm256_loadu_si256((const __m256i*) yt[t][ib1].qs);
+                    dy0[t] = _mm256_set1_ps(dy_pre[t][ib0]);
+                    dy1[t] = _mm256_set1_ps(dy_pre[t][ib1]);
+                }
+                for (int i = 0; i < len; ++i) {
+                    const int wd = wr0 + s0 + i;
+                    const uint8_t* d2 = d2_base + (size_t) wd * 4u;
+                    const __m256 xd0 = _mm256_set1_ps(half_at(d2, 0));
+                    const __m256 xd1 = _mm256_set1_ps(half_at(d2, 1));
+                    const __m256i qx0 = _mm256_loadu_si256((const __m256i*) (qs0_base + (size_t) wd * 32u));
+                    const __m256i ax0 = _mm256_sign_epi8(qx0, qx0);
+                    const __m256i qx1 = _mm256_loadu_si256((const __m256i*) (qs1_base + (size_t) wd * 32u));
+                    const __m256i ax1 = _mm256_sign_epi8(qx1, qx1);
+                    for (int t = 0; t < NT; ++t) {
+                        const __m256 d0 = _mm256_mul_ps(xd0, dy0[t]);
+                        const __m256 q0 = mul_sum_us8_pairs_float(ax0, _mm256_sign_epi8(aq0[t], qx0));
+                        acc[i][t] = _mm256_fmadd_ps(d0, q0, acc[i][t]);
+                        const __m256 d1 = _mm256_mul_ps(xd1, dy1[t]);
+                        const __m256 q1 = mul_sum_us8_pairs_float(ax1, _mm256_sign_epi8(aq1[t], qx1));
+                        acc[i][t] = _mm256_fmadd_ps(d1, q1, acc[i][t]);
+                    }
+                }
+            }
+            for (int i = 0; i < len; ++i) {
+                const int r = c0 + s0 + i;
+                for (int t = 0; t < NT; ++t) out[t][r] = hsum_float_8(acc[i][t]);
+            }
+        }
+        c0 = c1;
+    }
+}
+
+}  // namespace
+
+void kq256_ktile_gu_rows_situ(const uint8_t* blob, int n, const void* const* act, int nt, float* const* ff,
+                              int r0, int r1, float beta, float lb) {
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        switch (k) {
+            case 1: ktile_q5k_gu_t<1>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            case 2: ktile_q5k_gu_t<2>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            case 3: ktile_q5k_gu_t<3>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            default: ktile_q5k_gu_t<4>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+        }
+    }
+}
+
+void kq256_ktile_rows(const uint8_t* w, int n, const void* const* act, int nt, float* const* out,
+                      int r0, int r1) {
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        switch (k) {
+            case 1: ktile_q8_0_down_t<1>(w, n, act + t0, out + t0, r0, r1); break;
+            case 2: ktile_q8_0_down_t<2>(w, n, act + t0, out + t0, r0, r1); break;
+            case 3: ktile_q8_0_down_t<3>(w, n, act + t0, out + t0, r0, r1); break;
+            default: ktile_q8_0_down_t<4>(w, n, act + t0, out + t0, r0, r1); break;
         }
     }
 }

@@ -991,6 +991,96 @@ __global__ void __launch_bounds__(256) k_pack_f32_to_f16_exact(
     }
 }
 
+struct PromptSuffixDrafter {
+    static constexpr size_t kBuckets = 1u << 17;
+    struct Bucket {
+        int32_t p[4] = {-1, -1, -1, -1};
+    };
+    std::vector<Bucket> buckets;
+    size_t indexed_len = 0;
+    int32_t sig0 = 0, sig_mid = 0, sig_last = 0;
+
+    static inline uint32_t hash4(int32_t a, int32_t b, int32_t c, int32_t d) {
+        uint64_t h = (uint64_t) (uint32_t) a * 0x9e3779b97f4a7c15ULL;
+        h = (h ^ ((uint64_t) (uint32_t) b * 0xbf58476d1ce4e5b9ULL)) * 0x94d049bb133111ebULL;
+        h = (h ^ ((uint64_t) (uint32_t) c * 0x9e3779b97f4a7c15ULL)) * 0xbf58476d1ce4e5b9ULL;
+        h ^= (uint64_t) (uint32_t) d * 0x94d049bb133111ebULL;
+        h ^= h >> 31;
+        return (uint32_t) (h & (kBuckets - 1));
+    }
+
+    void reset() {
+        buckets.clear();
+        buckets.resize(kBuckets);
+        indexed_len = 0;
+        sig0 = sig_mid = sig_last = 0;
+    }
+
+    void sync(const std::vector<int32_t>& toks) {
+        const size_t n = toks.size();
+        if (n < 4) {
+            indexed_len = 0;
+            return;
+        }
+        if (buckets.empty()) buckets.resize(kBuckets);
+        size_t start = 3;
+        if (indexed_len >= 4 && n >= indexed_len &&
+            toks[0] == sig0 && toks[indexed_len >> 1] == sig_mid && toks[indexed_len - 1] == sig_last) {
+            start = indexed_len;
+        } else {
+            std::fill(buckets.begin(), buckets.end(), Bucket{});
+        }
+        for (size_t i = start; i < n; ++i) {
+            Bucket& bk = buckets[hash4(toks[i - 3], toks[i - 2], toks[i - 1], toks[i])];
+            bk.p[3] = bk.p[2];
+            bk.p[2] = bk.p[1];
+            bk.p[1] = bk.p[0];
+            bk.p[0] = (int32_t) i;
+        }
+        indexed_len = n;
+        sig0 = toks[0];
+        sig_mid = toks[n >> 1];
+        sig_last = toks[n - 1];
+    }
+
+    bool try_draft(const std::vector<int32_t>& toks, int32_t anchor, int max_k, int min_match,
+                   std::vector<int32_t>& out) const {
+        const size_t n = toks.size();
+        if (buckets.empty() || max_k < 1 || n < 3) return false;
+        const int32_t w0 = toks[n - 3], w1 = toks[n - 2], w2 = toks[n - 1], w3 = anchor;
+        const Bucket& bk = buckets[hash4(w0, w1, w2, w3)];
+        int best_c = -1;
+        int best_len = 0;
+        for (int s = 0; s < 4; ++s) {
+            const int c = bk.p[s];
+            if (c < 3 || (size_t) (c + 1) >= n) continue;
+            if (toks[(size_t) c] != w3 || toks[(size_t) (c - 1)] != w2 ||
+                toks[(size_t) (c - 2)] != w1 || toks[(size_t) (c - 3)] != w0) {
+                continue;
+            }
+            int mlen = 4;
+            while (mlen < 16 && (size_t) mlen <= n && c >= mlen &&
+                   toks[(size_t) (c - mlen)] == toks[n - (size_t) mlen]) {
+                ++mlen;
+            }
+            if (mlen > best_len) {
+                best_len = mlen;
+                best_c = c;
+                if (best_len >= 12) break;
+            }
+        }
+        if (best_c < 0 || best_len < min_match) return false;
+        const int avail = (int) (n - (size_t) (best_c + 1));
+        const int len_cap = (best_len >= 8) ? max_k
+                            : ((best_len >= 7) ? std::min(max_k, 4) : std::min(max_k, 3));
+        const int k = std::min(avail, len_cap);
+        if (k <= 0) return false;
+        out.resize((size_t) k);
+        for (int i = 0; i < k; ++i) out[(size_t) i] = toks[(size_t) (best_c + 1 + i)];
+        return true;
+    }
+};
+
 struct Engine {
     Model* m = nullptr;
     cudaStream_t st = nullptr;
@@ -1256,6 +1346,8 @@ struct Engine {
     size_t placed_bytes = 0;
     size_t vram_free_after_place = 0;
     int pool_workers = 0;
+    bool decode_scores_normalized = false;
+    PromptSuffixDrafter pld;
 
     bool is_core_full_resident() const {
         if (!core_all_gpu || profile.regime == strata::inkling2::VramRegime::FullVram) return false;
@@ -2540,26 +2632,27 @@ struct Engine {
         k_f32_to_bf16<<<(unsigned) ((nt + 255) / 256), 256, 0, st>>>(src, dst, tot);
     }
 
-    /// Exact GPU Top-K (K <= 256) + optional in-place penalties over `rows` rows of `logits` [rows, V].
+    /// Exact GPU Top-K (K <= 256) + optional in-place penalties over `rows` rows of `logits + row_off*V` [rows, V].
     /// Returns true on success (writing sorted descending top-K vals/idxs to out_vals/out_idxs); false on bucket overflow.
     bool gpu_topk_rows(int rows, int K, const int32_t* pen_toks, const int32_t* pen_cnts, int n_pen,
-                       float rep_pen, float freq_pen, float pres_pen, float* out_vals, int32_t* out_idxs) {
+                       float rep_pen, float freq_pen, float pres_pen, float* out_vals, int32_t* out_idxs, int row_off = 0) {
         const int V = (int) m->hp.vocab_unpadded;
-        if (rows <= 0 || rows > verify_max_t || K <= 0 || K > 256 || K > V) return false;
+        if (rows <= 0 || row_off < 0 || row_off + rows > verify_max_t || K <= 0 || K > 256 || K > V) return false;
+        float* lgt = logits + (size_t) row_off * (size_t) V;
         if (n_pen > 0 && n_pen <= 256 && (rep_pen != 1.0f || freq_pen != 0.0f || pres_pen != 0.0f)) {
             std::memcpy(h_pen_toks_pin, pen_toks, (size_t) n_pen * sizeof(int32_t));
             std::memcpy(h_pen_cnts_pin, pen_cnts, (size_t) n_pen * sizeof(int32_t));
             CK(cudaMemcpyAsync(d_pen_toks, h_pen_toks_pin, (size_t) n_pen * sizeof(int32_t), cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(d_pen_cnts, h_pen_cnts_pin, (size_t) n_pen * sizeof(int32_t), cudaMemcpyHostToDevice, st));
             k_apply_penalties<<<dim3((unsigned) ((n_pen + 63) / 64), (unsigned) rows), 64, 0, st>>>(
-                logits, V, d_pen_toks, d_pen_cnts, n_pen, rep_pen, freq_pen, pres_pen);
+                lgt, V, d_pen_toks, d_pen_cnts, n_pen, rep_pen, freq_pen, pres_pen);
         }
         constexpr int kHistBlks = 64;
         CK(cudaMemsetAsync(d_topk_hist, 0, (size_t) rows * 2048 * sizeof(uint32_t), st));
-        k_topk_hist<<<dim3(kHistBlks, (unsigned) rows), 256, 0, st>>>(logits, d_topk_hist, V);
+        k_topk_hist<<<dim3(kHistBlks, (unsigned) rows), 256, 0, st>>>(lgt, d_topk_hist, V);
         k_topk_select_thresh<<<(unsigned) rows, 256, 0, st>>>(d_topk_hist, d_topk_thr, d_topk_cnt, K);
         k_topk_collect<<<dim3(kHistBlks, (unsigned) rows), 256, 0, st>>>(
-            logits, d_topk_thr, d_topk_cand_val, d_topk_cand_idx, d_topk_cnt, V);
+            lgt, d_topk_thr, d_topk_cand_val, d_topk_cand_idx, d_topk_cnt, V);
         k_topk_finalize<<<(unsigned) rows, 256, 0, st>>>(
             d_topk_cand_val, d_topk_cand_idx, d_topk_cnt, d_topk_out_val, d_topk_out_idx, d_topk_out_cnt, K);
         CK(cudaMemcpyAsync(h_topk_val_pin, d_topk_out_val, (size_t) rows * (size_t) K * sizeof(float), cudaMemcpyDeviceToHost, st));
@@ -2603,6 +2696,8 @@ struct Engine {
 
     void reset_state() {
         pos = 0;
+        decode_scores_normalized = false;
+        pld.reset();
         CK(cudaMemsetAsync(conv_hist_pool, 0, (size_t) m->hp.n_layer * layer_conv_floats * sizeof(float), st));
         if (dspark) dspark->reset(st);
     }
@@ -4673,6 +4768,31 @@ struct Engine {
                      (double) fr / (1 << 20), hybrid ? 1 : 0, ms_since(t0));
     }
 
+    void normalize_decode_scores() {
+        static const double prior = [] {
+            const char* v = std::getenv("STRATA_DECODE_SCORE_PRIOR");
+            return v ? std::atof(v) : 4.0;
+        }();
+        decode_scores_normalized = true;
+        if (!hybrid || prior < 0.0) return;
+        const int ne = (int) m->hp.n_expert;
+        for (PhysLayer& L : m->layers) {
+            if (L.score.empty()) continue;
+            if (prior == 0.0) {
+                std::fill(L.score.begin(), L.score.end(), 0.0);
+                continue;
+            }
+            double mx = 0.0;
+            for (int e = 0; e < ne; ++e) {
+                if (L.score[(size_t) e] > mx) mx = L.score[(size_t) e];
+            }
+            if (mx > prior) {
+                const double scale = prior / mx;
+                for (int e = 0; e < ne; ++e) L.score[(size_t) e] *= scale;
+            }
+        }
+    }
+
     /// Phase-split Decode transition: free Prefill-only scratch (chunk arena, ephemeral_pool, pp_stage_pool),
     /// compact SWA KV pool (5,120 -> 1,048 -> +323 MiB!), batch-alloc & async-stream DSpark decode weights +
     /// hottest Tier-1/Tier-2 experts on cst while Decode starts immediately!
@@ -4714,6 +4834,7 @@ struct Engine {
         const size_t dec_guard = (verify_max_t > 1) ? ((size_t) 176 << 20) : ((size_t) 144 << 20);
         resize_experts_vram(vram_reserve_bytes, dec_guard, /*equalize_tier2=*/true, /*async_cst=*/true,
                             /*whole_layer_evict=*/false, /*restore_dspark_decode_w=*/(dspark != nullptr));
+        normalize_decode_scores();
     }
 
     /// Phase-split Prefill transition: evict DSpark decode-only weights (+358 MiB!), zero-H2D whole-layer evict
@@ -5541,7 +5662,10 @@ struct Engine {
                     size_t* img_cursor = nullptr, bool allow_prelude_borrow = false) {
         dspark_injected_in_fwd = false;
         moe_raw_zero_pending = false;
-        if (in_decode_phase && T > kDecodePhaseCap) set_phase_prefill();
+        if (T > kDecodePhaseCap) {
+            decode_scores_normalized = false;
+            if (in_decode_phase) set_phase_prefill();
+        }
         if (T > active_pp_cap) ensure_pp_cap(T, (int) (pos + T));
         ensure_kv_cap((int) (pos + T), T);
         // EX-5 Idea A & B + Wave 17: RAII scope guard guarantees any clobbered Prelude donor d_blobs are cleanly freed
@@ -8672,6 +8796,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             tier2_hblobs_need += (size_t) ne * m.layers[(size_t) tip].stride;
         }
     }
+    size_t tier1_hblobs_need = 0;
+    for (int tip : tier1) {
+        tier1_hblobs_need += (size_t) ne * m.layers[(size_t) tip].stride;
+    }
+    static const bool no_prebuild_tier1 = [] {
+        const char* v = std::getenv("STRATA_NO_PREBUILD_TIER1");
+        return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
+    }();
+    const bool prebuild_tier1_hblobs = (!no_prebuild_tier1 &&
+                                        frontload_en && will_need_cpu &&
+                                        E.profile.regime != strata::inkling2::VramRegime::FullVram &&
+                                        E.ctx >= 131072 &&
+                                        tier1_hblobs_need > 0 &&
+                                        (tier1_hblobs_need + tier2_hblobs_need <= max_pin_bytes));
 
     for (int ip : alloc_order) {
         PhysLayer& L = m.layers[(size_t) ip];
@@ -8711,13 +8849,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         L.n_slots = s;
         L.exp_in_slot.assign((size_t) s, -1);
 
+        const bool is_tier1_ip = (ip >= hp.core_start && ip < hp.core_end) && L.gu_type != 30;
         const bool is_tier2_ip = (ip < hp.core_start || ip >= hp.core_end) && L.gu_type != 30;
         const bool want_core_borrow_pin = (!no_core_borrow_place &&
                                            E.profile.regime != strata::inkling2::VramRegime::FullVram &&
                                            tier1_planned_all_gpu && will_need_cpu &&
                                            hp.num_loops > 1 && hp.core_start < hp.core_end &&
                                            ip == (int) hp.core_start && s == ne && L.gu_type != 30);
-        if (s < ne || (frontload_en && will_need_cpu && is_tier2_ip)) {
+        if (s < ne || (frontload_en && will_need_cpu && is_tier2_ip) || (prebuild_tier1_hblobs && is_tier1_ip)) {
             if (s < ne) need_cpu = true;
             const size_t hb_bytes = (size_t) ne * L.stride;
             const bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr) && (pinned_used + hb_bytes <= max_pin_bytes);
@@ -9041,19 +9180,19 @@ inline void collect_penalty_counts(const std::vector<int32_t>& history, const in
 
 bool build_sampling_dists_gpu(Engine& E, int rows, const std::vector<int32_t>& history,
                               const int32_t* extra, int n_extra, const SamplingParams& smp,
-                              std::vector<SamplingDist>& out_dists) {
+                              std::vector<SamplingDist>& out_dists, int row_off = 0) {
     const int V = (int) E.m->hp.vocab_unpadded;
-    if (!can_use_gpu_topk(smp, V) || rows <= 0 || rows > E.verify_max_t) return false;
+    if (!can_use_gpu_topk(smp, V) || rows <= 0 || row_off < 0 || row_off + rows > E.verify_max_t) return false;
     const int K = (smp.top_k > 0 && smp.top_k < V) ? smp.top_k : std::min(V, 256);
     std::vector<int32_t> p_toks, p_cnts;
     collect_penalty_counts(history, extra, n_extra, V, smp, p_toks, p_cnts);
     std::vector<float> vals((size_t) rows * (size_t) K);
     std::vector<int32_t> idxs((size_t) rows * (size_t) K);
     if (!E.gpu_topk_rows(rows, K, p_toks.data(), p_cnts.data(), (int) p_toks.size(),
-                         smp.rep_pen, smp.freq_pen, smp.pres_pen, vals.data(), idxs.data())) {
+                         smp.rep_pen, smp.freq_pen, smp.pres_pen, vals.data(), idxs.data(), row_off)) {
         // Fallback: copy full logits D2H (note penalties were already applied in-place on GPU if n_pen > 0).
         std::vector<float> full((size_t) rows * (size_t) V);
-        CK(cudaMemcpyAsync(full.data(), E.logits, full.size() * sizeof(float), cudaMemcpyDeviceToHost, E.st));
+        CK(cudaMemcpyAsync(full.data(), E.logits + (size_t) row_off * (size_t) V, full.size() * sizeof(float), cudaMemcpyDeviceToHost, E.st));
         CK(cudaStreamSynchronize(E.st));
         SamplingParams smp_nopen = smp;
         smp_nopen.rep_pen = 1.0f; smp_nopen.freq_pen = 0.0f; smp_nopen.pres_pen = 0.0f;
@@ -9105,6 +9244,8 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
                         const SamplingParams& smp, std::mt19937_64& rng,
                         std::vector<int32_t>& hist, std::vector<int32_t>& live_tokens,
                         EmitFn&& on_emit, StopCheckFn&& is_stopped, bool* out_hit_eos = nullptr) {
+    if (E.hybrid && !E.decode_scores_normalized) E.normalize_decode_scores();
+
     const int V = (int) E.m->hp.vocab_unpadded;
     const bool sample_on = smp.needs_logits();
     int32_t next_tok = first_tok;
@@ -9136,6 +9277,35 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         const char* v = std::getenv("STRATA_DSPARK_ADAPTIVE");
         return !(v && v[0] == '0');
     }();
+    const bool conf_gate = [] {
+        const char* v = std::getenv("STRATA_DSPARK_CONF_GATE");
+        return !(v && v[0] == '0');
+    }();
+    const bool pld_enabled = [] {
+        const char* v = std::getenv("STRATA_DSPARK_PLD");
+        return !(v && v[0] == '0');
+    }();
+    auto env_f = [](const char* k, float def) -> float {
+        const char* v = std::getenv(k);
+        return (v && v[0]) ? (float) std::atof(v) : def;
+    };
+    const bool tight_hy = (E.hybrid && !E.core_all_gpu);
+    const float tau_min0 = env_f("STRATA_DSPARK_TAU0", tight_hy ? 0.15f : 0.0f);
+    const float tau_step = env_f("STRATA_DSPARK_TAU_STEP", tight_hy ? 0.50f : 0.45f);
+    const float tau_cum  = env_f("STRATA_DSPARK_TAU_CUM", tight_hy ? 0.30f : 0.25f);
+    const float tau_ext  = env_f("STRATA_DSPARK_TAU_EXT", 0.90f);
+    const float tau_cum_ext = env_f("STRATA_DSPARK_TAU_CUM_EXT", 0.72f);
+    const int max_ext_cfg = [&] {
+        const char* v = std::getenv("STRATA_DSPARK_MAX_EXT");
+        return (v && v[0]) ? std::clamp(std::atoi(v), 1, 7) : draft_max;
+    }();
+    const int pld_base_min = [] (size_t init_n, bool th) {
+        const char* v = std::getenv("STRATA_DSPARK_PLD_MIN_MATCH");
+        if (v && v[0]) return std::clamp(std::atoi(v), 4, 12);
+        return (init_n >= 65536 || th) ? 7 : 6;
+    }(live_tokens.size(), tight_hy);
+    int pld_min_match = pld_base_min;
+    int pld_cooldown = 0;
     // D7: Unbiased truncated-geometric MLE for per-token acceptance probability alpha + batched cooldown inject!
     // Every verify step observes `m` successes out of `min(K, m + 1)` Bernoulli trials (unbiased for all K=1..7).
     float alpha_num = 3.25f;
@@ -9203,38 +9373,67 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
             continue;
         }
 
-        if (adaptive_dspark && cur_dm == 0 && skip_cd > 0) {
-            feed_single_cd(next_tok);
-            --skip_cd;
-            if (E.hybrid && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 8, 2, false);
-            continue;
-        }
-        flush_cd_inject();
-
-        const int use_dm = adaptive_dspark ? std::max(1, cur_dm) : draft_max;
-        const int K = std::min(use_dm, rem - 1);
         const int32_t anchor = next_tok;
-        if (use_gpu_topk) {
-            q_dists.resize((size_t) K);
-            dspark->draft(E, anchor, K, d_toks, nullptr, [&](int step_i, std::vector<float>&) {
-                build_sampling_dists_gpu(E, 1, hist, d_toks.data(), step_i, smp, tmp_dists);
-                q_dists[(size_t) step_i] = std::move(tmp_dists[0]);
-                return sample_from_dist(q_dists[(size_t) step_i], rng);
-            }, true);
-        } else if (sample_on) {
-            q_dists.resize((size_t) K);
-            const size_t tail_keep = smp.pen_last_n > 0 ? (size_t) smp.pen_last_n : 0;
-            const size_t h_start = hist.size() > tail_keep ? (hist.size() - tail_keep) : 0;
-            dspark->draft(E, anchor, K, d_toks, &d_logits, [&](int step_i, std::vector<float>& row_lg) {
-                std::vector<int32_t> tmp_hist(hist.begin() + (ptrdiff_t) h_start, hist.end());
-                tmp_hist.insert(tmp_hist.end(), d_toks.begin(), d_toks.begin() + step_i);
-                q_dists[(size_t) step_i] = build_sampling_dist(row_lg.data(), V, tmp_hist, smp);
-                return sample_from_dist(q_dists[(size_t) step_i], rng);
-            });
-        } else {
-            dspark->draft(E, anchor, K, d_toks, nullptr, [&](int, std::vector<float>&) -> int32_t { return 0; });
+        bool used_pld = false;
+        d_toks.clear();
+        if (!sample_on && pld_enabled) {
+            E.pld.sync(live_tokens);
+            const int pld_max_k = std::min(std::min(E.verify_max_t - 1, std::max(draft_max, tight_hy ? 4 : 5)), rem - 1);
+            if (pld_max_k >= 1 && E.pld.try_draft(live_tokens, anchor, pld_max_k, pld_min_match, d_toks)) {
+                used_pld = true;
+            }
         }
 
+        if (!used_pld) {
+            if (adaptive_dspark && ((!conf_gate && cur_dm == 0) || (conf_gate && tight_hy)) && skip_cd > 0) {
+                feed_single_cd(next_tok);
+                --skip_cd;
+                if (E.hybrid && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 8, 2, false);
+                continue;
+            }
+            flush_cd_inject();
+
+            if (!sample_on && adaptive_dspark && conf_gate) {
+                const int base_k = std::min(draft_max, rem - 1);
+                const int ext_lim = (draft_max >= 3) ? std::max(draft_max, max_ext_cfg) : draft_max;
+                const int max_k = std::min(std::min(E.verify_max_t - 1, ext_lim), rem - 1);
+                dspark->draft_confident(E, anchor, base_k, max_k,
+                                        tau_min0, tau_step, tau_cum, tau_ext, tau_cum_ext, d_toks);
+                if (d_toks.empty()) {
+                    feed_single(anchor);
+                    if (pld_cooldown > 0 && --pld_cooldown == 0) pld_min_match = std::max(pld_base_min, pld_min_match - 1);
+                    if (E.hybrid && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 8, 2, false);
+                    continue;
+                }
+            } else {
+                const int use_dm = (adaptive_dspark && !conf_gate) ? std::max(1, cur_dm) : draft_max;
+                const int max_k = std::min(use_dm, rem - 1);
+                if (use_gpu_topk) {
+                    q_dists.resize((size_t) max_k);
+                    dspark->draft(E, anchor, max_k, d_toks, nullptr, [&](int step_i, std::vector<float>&) {
+                        build_sampling_dists_gpu(E, 1, hist, d_toks.data(), step_i, smp, tmp_dists);
+                        q_dists[(size_t) step_i] = std::move(tmp_dists[0]);
+                        return sample_from_dist(q_dists[(size_t) step_i], rng);
+                    }, true);
+                } else if (sample_on) {
+                    q_dists.resize((size_t) max_k);
+                    const size_t tail_keep = smp.pen_last_n > 0 ? (size_t) smp.pen_last_n : 0;
+                    const size_t h_start = hist.size() > tail_keep ? (hist.size() - tail_keep) : 0;
+                    dspark->draft(E, anchor, max_k, d_toks, &d_logits, [&](int step_i, std::vector<float>& row_lg) {
+                        std::vector<int32_t> tmp_hist(hist.begin() + (ptrdiff_t) h_start, hist.end());
+                        tmp_hist.insert(tmp_hist.end(), d_toks.begin(), d_toks.begin() + step_i);
+                        q_dists[(size_t) step_i] = build_sampling_dist(row_lg.data(), V, tmp_hist, smp);
+                        return sample_from_dist(q_dists[(size_t) step_i], rng);
+                    });
+                } else {
+                    dspark->draft(E, anchor, max_k, d_toks, nullptr, [&](int, std::vector<float>&) -> int32_t { return 0; });
+                }
+            }
+        } else {
+            flush_cd_inject();
+        }
+
+        const int K = (int) d_toks.size();
         vtoks.resize((size_t) (1 + K));
         vtoks[0] = anchor;
         for (int i = 0; i < K; ++i) vtoks[(size_t) (1 + i)] = d_toks[(size_t) i];
@@ -9244,7 +9443,16 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         E.forward(vtoks.data(), 1 + K, sample_on, use_gpu_topk ? nullptr : &lg, sample_on, true, K,
                   sample_on ? nullptr : &t_picks, true, use_gpu_topk);
         if (use_gpu_topk) {
-            build_sampling_dists_gpu(E, 1 + K, hist, nullptr, 0, smp, p_dists);
+            const bool has_pen = (smp.pen_last_n > 0 && (smp.rep_pen != 1.0f || smp.freq_pen != 0.0f || smp.pres_pen != 0.0f));
+            if (!has_pen || K == 0) {
+                build_sampling_dists_gpu(E, 1 + K, hist, nullptr, 0, smp, p_dists, 0);
+            } else {
+                p_dists.resize((size_t) (1 + K));
+                for (int r = 0; r <= K; ++r) {
+                    build_sampling_dists_gpu(E, 1, hist, d_toks.data(), r, smp, tmp_dists, r);
+                    p_dists[(size_t) r] = std::move(tmp_dists[0]);
+                }
+            }
         }
 
         int m = 0;
@@ -9292,33 +9500,56 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         emitted += m;
         E.commit_verify(m, K, pos_pre);
         for (int i = 0; i < 1 + m; ++i) live_tokens.push_back(vtoks[(size_t) i]);
-        dspark->n_accepted += m;
+        if (used_pld) {
+            ++dspark->pld_calls;
+            dspark->pld_drafted += K;
+            dspark->pld_accepted += m;
+            if (m == 0) {
+                pld_min_match = std::min(10, pld_min_match + 1);
+                pld_cooldown = 24;
+            } else if (m >= 2) {
+                pld_cooldown = 0;
+                pld_min_match = std::max(pld_base_min, pld_min_match - 1);
+            }
+        } else {
+            dspark->n_accepted += m;
+            if (pld_cooldown > 0 && --pld_cooldown == 0) pld_min_match = std::max(pld_base_min, pld_min_match - 1);
+        }
         dspark->inject(E, pos_pre, 1 + m);
-        if (adaptive_dspark && K >= 1) {
+        if (adaptive_dspark && !used_pld && K >= 1 && (!conf_gate || tight_hy)) {
             const int trials = std::min(K, m + 1);
             alpha_num = 0.85f * alpha_num + (float) m;
             alpha_den = 0.85f * alpha_den + (float) trials;
             const float alpha = alpha_num / std::max(1e-3f, alpha_den);
-            // Hybrid mode pays incremental CPU DDR4 bandwidth per extra draft token, so raise K-promotion thresholds
-            // to match the exact mathematical break-even (keeps dm=4 for high-acceptance code, dm=2 for prose).
-            const float th_max = E.hybrid ? 0.76f : 0.55f;
-            const float th_3   = E.hybrid ? 0.56f : 0.38f;
-            const float th_2   = E.hybrid ? 0.38f : 0.24f;
-            const float th_1   = E.hybrid ? 0.22f : 0.16f;
-            if (cur_dm == 0) {
+            if (!conf_gate) {
+                // Hybrid mode pays incremental CPU DDR4 bandwidth per extra draft token, so raise K-promotion thresholds
+                // to match the exact mathematical break-even (keeps dm=4 for high-acceptance code, dm=2 for prose).
+                const float th_max = E.hybrid ? 0.76f : 0.55f;
+                const float th_3   = E.hybrid ? 0.56f : 0.38f;
+                const float th_2   = E.hybrid ? 0.38f : 0.24f;
+                const float th_1   = E.hybrid ? 0.22f : 0.16f;
+                if (cur_dm == 0) {
+                    if (m >= 1) {
+                        cd_backoff = 12;
+                        cur_dm = (alpha >= th_3) ? std::min(draft_max, 3) : std::min(draft_max, 2);
+                    } else {
+                        skip_cd = cd_backoff;
+                        cd_backoff = std::min(48, cd_backoff * 2);
+                    }
+                } else {
+                    if (alpha >= th_max) { cur_dm = draft_max; cd_backoff = 12; }
+                    else if (alpha >= th_3) { cur_dm = std::min(draft_max, 3); cd_backoff = 12; }
+                    else if (alpha >= th_2) { cur_dm = std::min(draft_max, 2); cd_backoff = 12; }
+                    else if (alpha >= th_1) { cur_dm = 1; cd_backoff = 12; }
+                    else { cur_dm = 0; skip_cd = cd_backoff; cd_backoff = std::min(48, cd_backoff * 2); }
+                }
+            } else {
                 if (m >= 1) {
                     cd_backoff = 12;
-                    cur_dm = (alpha >= th_3) ? std::min(draft_max, 3) : std::min(draft_max, 2);
-                } else {
+                } else if (alpha_den >= 4.0f && alpha < 0.18f) {
                     skip_cd = cd_backoff;
                     cd_backoff = std::min(48, cd_backoff * 2);
                 }
-            } else {
-                if (alpha >= th_max) { cur_dm = draft_max; cd_backoff = 12; }
-                else if (alpha >= th_3) { cur_dm = std::min(draft_max, 3); cd_backoff = 12; }
-                else if (alpha >= th_2) { cur_dm = std::min(draft_max, 2); cd_backoff = 12; }
-                else if (alpha >= th_1) { cur_dm = 1; cd_backoff = 12; }
-                else { cur_dm = 0; skip_cd = cd_backoff; cd_backoff = std::min(48, cd_backoff * 2); }
             }
         }
         if (hit_eos) {
@@ -9780,7 +10011,7 @@ int run(int argc, char** argv) {
                             want_cap = std::max(chunk, std::min(4096, E.profile.max_adaptive_chunk));
                         } else if (fresh <= 8192u) {
                             want_cap = std::max(chunk, std::min(8192, E.profile.max_adaptive_chunk));
-                        } else if (fresh <= 12288u && E.profile.max_adaptive_chunk >= 12288) {
+                        } else if (reuse == 0 && fresh <= 12288u && E.profile.max_adaptive_chunk >= 12288) {
                             want_cap = 12288;
                         } else {
                             want_cap = std::max(chunk, std::min(8192, E.profile.max_adaptive_chunk));
@@ -9933,6 +10164,7 @@ int run(int argc, char** argv) {
         E.hy_cpu_ms = 0.0;
         if (dspark) {
             dspark->n_draft_calls = dspark->n_drafted = dspark->n_accepted = 0;
+            dspark->pld_calls = dspark->pld_drafted = dspark->pld_accepted = 0;
             dspark->draft_ms = dspark->inject_ms = 0.0;
         }
     }
@@ -10004,12 +10236,18 @@ int run(int argc, char** argv) {
     const double pp_tps = (double) prompt.size() / (pp_ms / 1000.0);
     const double tg_tps = gen.size() > 1 ? (double) (gen.size() - 1) / (tg_ms / 1000.0) : 0.0;
     if (dspark) {
-        const double acc_rate = dspark->n_drafted > 0 ? (100.0 * (double) dspark->n_accepted / (double) dspark->n_drafted) : 0.0;
-        const double mean_len = dspark->n_draft_calls > 0 ? (1.0 + (double) dspark->n_accepted / (double) dspark->n_draft_calls) : 1.0;
+        const int64_t tot_acc = dspark->n_accepted + dspark->pld_accepted;
+        const int64_t tot_drf = dspark->n_drafted + dspark->pld_drafted;
+        const int64_t tot_cls = dspark->n_draft_calls + dspark->pld_calls;
+        const double acc_rate = tot_drf > 0 ? (100.0 * (double) tot_acc / (double) tot_drf) : 0.0;
+        const double mean_len = tot_cls > 0 ? (1.0 + (double) tot_acc / (double) tot_cls) : 1.0;
+        const double ds_rate = dspark->n_drafted > 0 ? (100.0 * (double) dspark->n_accepted / (double) dspark->n_drafted) : 0.0;
         std::fprintf(stderr,
-                     "strata-inkling2: pp %zu tok in %.1f ms (%.2f t/s) | tg %d tok in %.1f ms (%.2f t/s) | dspark acc=%lld/%lld (%.1f%%, %.2f tok/step) | hits=%lld misses=%lld cpu_ms=%.1f\n",
+                     "strata-inkling2: pp %zu tok in %.1f ms (%.2f t/s) | tg %d tok in %.1f ms (%.2f t/s) | dspark acc=%lld/%lld (%.1f%%, %.2f tok/step; neural=%lld/%lld %.1f%% pld=%lld/%lld) | hits=%lld misses=%lld cpu_ms=%.1f\n",
                      prompt.size(), pp_ms, pp_tps, std::max(0, (int) gen.size() - 1), tg_ms, tg_tps,
-                     (long long) dspark->n_accepted, (long long) dspark->n_drafted, acc_rate, mean_len,
+                     (long long) tot_acc, (long long) tot_drf, acc_rate, mean_len,
+                     (long long) dspark->n_accepted, (long long) dspark->n_drafted, ds_rate,
+                     (long long) dspark->pld_accepted, (long long) dspark->pld_drafted,
                      (long long) E.hy_gpu, (long long) E.hy_cpu, E.hy_cpu_ms);
     } else {
         std::fprintf(stderr, "strata-inkling2: pp %zu tok in %.1f ms (%.2f t/s) | tg %d tok in %.1f ms (%.2f t/s) | hits=%lld misses=%lld cpu_ms=%.1f\n",

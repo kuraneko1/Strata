@@ -16,9 +16,15 @@ void kq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 /// SiTU variant: ff[t][r] = (beta * tanh(g/beta) / (1 + exp(-g))) * (lb > 0 ? lb * tanh(u/lb) : u).
 void kq256_gu_rows_situ(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                         int nt, float* const* ff, int r0, int r1, float beta, float lb);
+/// Zero-copy Q5_K K-tile gate+up+SiTU ([n_ff/64, n_embd/256, 22528 B]), bit-exact to kq256_gu_rows_situ(13, ...).
+void kq256_ktile_gu_rows_situ(const uint8_t* blob, int n, const void* const* act,
+                              int nt, float* const* ff, int r0, int r1, float beta, float lb);
 /// out[t][r] = w_r . a[t], rows [r0, r1).
 void kq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
+/// Zero-copy Q8_0 K-tile down ([n_embd/128, n_ff/64, 8704 B]), bit-exact to kq256_rows(8, ...).
+void kq256_ktile_rows(const uint8_t* w, int n, const void* const* act, int nt,
+                      float* const* out, int r0, int r1);
 
 /// out[r] = w_r . x for BF16 rows (bits), fp32 x: the routing-aware prefetch's router (an estimate only).
 void bf16_rows_dot(const uint16_t* w, int rows, int cols, const float* x, float* out);

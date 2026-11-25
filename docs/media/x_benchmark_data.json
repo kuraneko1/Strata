@@ -1,0 +1,51 @@
+{
+  "title": "Strata · Inkling-2-Mini (UD-Q4_K_M) on RTX 4070 12 GB",
+  "subtitle": "262K Real-Code Ladder · Confidence-Gated DSpark Draft-3 + Suffix PLD · Upfront Tier-1 Pinning · Zero Precision Loss",
+  "footer": "RTX 4070 12 GB (461.2 GB/s STREAM) + Ryzen 7 5700X (33.4 GB/s DDR4) · Real-Code Corpus (261.5K max) · Edit x_benchmark_data.json or pass --on-csv / --off-csv to regenerate",
+  "badges": [
+    {
+      "label": "DSpark",
+      "value": "Draft-3 (--draft-max 3 + PLD)",
+      "bg": "#EFF6FF",
+      "border": "#93C5FD",
+      "color": "#1D4ED8"
+    },
+    {
+      "label": "KV Cache",
+      "value": "Q8_0 (4.33 GiB @ 256K)",
+      "bg": "#ECFDF5",
+      "border": "#6EE7B7",
+      "color": "#047857"
+    },
+    {
+      "label": "Vision",
+      "value": "Elastic F16 (1.4 GiB peak / 0 B idle)",
+      "bg": "#F5F3FF",
+      "border": "#C4B5FD",
+      "color": "#6D28D9"
+    },
+    {
+      "label": "Roofline",
+      "value": "95–97% Physical Limit @ 256K",
+      "bg": "#F8FAFC",
+      "border": "#CBD5E1",
+      "color": "#334155"
+    }
+  ],
+  "depths_k": [8.192, 16.384, 32.768, 49.152, 65.536, 98.304, 131.072, 163.84, 196.608, 229.376, 261.5],
+  "prefill_on": [7970.7, 6811.8, 6412.5, 5800.0, 5579.1, 4849.5, 4256.3, 3816.8, 3515.8, 3217.0, 3017.6],
+  "prefill_off": [8018.0, 6774.4, 6458.2, 6066.9, 5778.7, 4941.6, 4294.3, 3870.7, 3543.4, 3268.6, 3068.8],
+  "decode_on": [56.46, 55.98, 53.98, 54.43, 51.56, 46.17, 43.99, 39.18, 40.22, 32.3, 29.42],
+  "decode_off": [52.64, 51.19, 49.8, 47.85, 46.39, 38.84, 37.34, 34.44, 29.83, 28.32, 27.17],
+  "labels": {
+    "on": "DSpark ON (Draft-3)",
+    "off": "DSpark OFF (T=1)",
+    "prefill_ylim": 9000,
+    "decode_ylim": 72,
+    "kpi_notes": {
+      "pp_8k": "Smooth 8K–256K curve · zero mid-prefill stalls",
+      "pp_256k": "Up from 2,754 / 2,586 t/s (+9.6% / +18.7%)",
+      "decode": "Beats DSpark OFF at every depth (8K → 256K)"
+    }
+  }
+}

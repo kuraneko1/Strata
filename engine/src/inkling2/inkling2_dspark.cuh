@@ -1515,6 +1515,126 @@ __global__ void k_dspark_copy_row(float* __restrict__ dst, const float* __restri
     if (i < N) dst[i] = src[(size_t) row * N + i];
 }
 
+/// Single-pass online-softmax argmax + exact top-1 softmax probability with in-register softcapping (reads logits ONCE).
+/// Grid: (n_blk), Block: 256 -> writes per-block partials into p_val/p_idx/p_sum.
+__global__ void k_dspark_argmax_prob_stage1(const float* __restrict__ logits,
+                                            float* __restrict__ p_val, int32_t* __restrict__ p_idx,
+                                            float* __restrict__ p_sum, int V, float softcap) {
+    __shared__ float sv_raw[8];
+    __shared__ int32_t si[8];
+    __shared__ float sv_sc[8];
+    __shared__ float sl[8];
+    const int b = (int) blockIdx.x, n_blk = (int) gridDim.x;
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const float inv_sc = (softcap > 0.0f) ? (1.0f / softcap) : 0.0f;
+    float mv_raw = -1e30f;
+    int32_t mi = 0;
+    float mv_sc = -1e30f;
+    float l = 0.0f;
+    auto push_elem = [&](float raw, int32_t idx) {
+        if (raw > mv_raw || (raw == mv_raw && idx < mi)) { mv_raw = raw; mi = idx; }
+        const float v = (softcap > 0.0f) ? (softcap * tanhf(raw * inv_sc)) : raw;
+        if (v > mv_sc) {
+            l = (l > 0.0f) ? (l * expf(mv_sc - v) + 1.0f) : 1.0f;
+            mv_sc = v;
+        } else {
+            l += expf(v - mv_sc);
+        }
+    };
+    const int stride = n_blk * 256;
+    if ((((uintptr_t) logits) & 15u) == 0u) {
+        const int v4 = V >> 2;
+        const float4* row4 = reinterpret_cast<const float4*>(logits);
+        for (int i4 = b * 256 + tid; i4 < v4; i4 += stride) {
+            const float4 v = row4[i4];
+            const int base = i4 << 2;
+            push_elem(v.x, base);
+            push_elem(v.y, base + 1);
+            push_elem(v.z, base + 2);
+            push_elem(v.w, base + 3);
+        }
+        if (b == 0) {
+            const int tail0 = v4 << 2;
+            for (int i = tail0 + tid; i < V; i += 256) push_elem(logits[i], i);
+        }
+    } else {
+        for (int i = b * 256 + tid; i < V; i += stride) push_elem(logits[i], i);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float oraw = __shfl_xor_sync(0xffffffffu, mv_raw, o);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+        const float osc = __shfl_xor_sync(0xffffffffu, mv_sc, o);
+        const float ol = __shfl_xor_sync(0xffffffffu, l, o);
+        if (oraw > mv_raw || (oraw == mv_raw && oi < mi)) { mv_raw = oraw; mi = oi; }
+        const float mx = fmaxf(mv_sc, osc);
+        l = (l > 0.0f ? l * expf(mv_sc - mx) : 0.0f) + (ol > 0.0f ? ol * expf(osc - mx) : 0.0f);
+        mv_sc = mx;
+    }
+    if (lane == 0) {
+        sv_raw[warp] = mv_raw;
+        si[warp] = mi;
+        sv_sc[warp] = mv_sc;
+        sl[warp] = l;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        mv_raw = (lane < 8) ? sv_raw[lane] : -1e30f;
+        mi = (lane < 8) ? si[lane] : 0;
+        mv_sc = (lane < 8) ? sv_sc[lane] : -1e30f;
+        l = (lane < 8) ? sl[lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+            const float oraw = __shfl_xor_sync(0xffffffffu, mv_raw, o);
+            const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+            const float osc = __shfl_xor_sync(0xffffffffu, mv_sc, o);
+            const float ol = __shfl_xor_sync(0xffffffffu, l, o);
+            if (oraw > mv_raw || (oraw == mv_raw && oi < mi)) { mv_raw = oraw; mi = oi; }
+            const float mx = fmaxf(mv_sc, osc);
+            l = (l > 0.0f ? l * expf(mv_sc - mx) : 0.0f) + (ol > 0.0f ? ol * expf(osc - mx) : 0.0f);
+            mv_sc = mx;
+        }
+        if (lane == 0) {
+            p_val[b] = mv_sc;
+            p_idx[b] = mi;
+            p_sum[b] = l;
+        }
+    }
+}
+
+/// Stage 2: reduce n_blk partials to global (out_id[0], out_prob[0]). Grid: 1, Block: 32.
+__global__ void k_dspark_argmax_prob_stage2(const float* __restrict__ p_val, const int32_t* __restrict__ p_idx,
+                                            const float* __restrict__ p_sum,
+                                            int32_t* __restrict__ out_id, float* __restrict__ out_prob, int n_blk) {
+    const int lane = (int) threadIdx.x;
+    float mv_sc = -1e30f;
+    int32_t mi = 0;
+    float l = 0.0f;
+    for (int i = lane; i < n_blk; i += 32) {
+        const float v = p_val[i];
+        const int32_t idx = p_idx[i];
+        const float ps = p_sum[i];
+        const float mx = fmaxf(mv_sc, v);
+        if (v > mv_sc || (v == mv_sc && idx < mi)) mi = idx;
+        l = (l > 0.0f ? l * expf(mv_sc - mx) : 0.0f) + (ps > 0.0f ? ps * expf(v - mx) : 0.0f);
+        mv_sc = mx;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float osc = __shfl_xor_sync(0xffffffffu, mv_sc, o);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, mi, o);
+        const float ol = __shfl_xor_sync(0xffffffffu, l, o);
+        if (osc > mv_sc || (osc == mv_sc && oi < mi)) mi = oi;
+        const float mx = fmaxf(mv_sc, osc);
+        l = (l > 0.0f ? l * expf(mv_sc - mx) : 0.0f) + (ol > 0.0f ? ol * expf(osc - mx) : 0.0f);
+        mv_sc = mx;
+    }
+    if (lane == 0) {
+        out_id[0] = mi;
+        out_prob[0] = (l > 0.0f) ? (1.0f / l) : 1.0f;
+    }
+}
+
 __global__ void k_dspark_softmax_probs(const float* __restrict__ logits, const float* __restrict__ logits_buf_row,
                                        int V, float inv_temp, float max_val, float* __restrict__ tmp_sum) {
     // Wait: host-side sampling reuses Engine::sample_logits directly cleanly when probabilistic is active.
@@ -1957,11 +2077,16 @@ struct DsparkEngine {
     int32_t* h_inj_pos_pin = nullptr;// [1] separate pinned host pos for inject H2D (no race with subsequent draft()!)
     int32_t* d_draft_ids = nullptr;  // [8] device token chain [anchor, d0, d1, ...] for zero-sync Markov graph
     int32_t* h_draft_ids_pin = nullptr; // pinned [8] host staging for d_draft_ids
+    float* d_prob_sum = nullptr;        // [64] device softmax sum partials for per-step confidence
+    float* d_draft_prob = nullptr;      // [8] device top-1 probability per drafted token
+    float* h_draft_prob_pin = nullptr;  // pinned [8] host staging for d_draft_prob
     float* h_anchor_pin = nullptr;   // pinned [N] host buffer for async anchor upload
     cudaGraphExec_t dflare_graph_short = nullptr; // captured 3-layer DFlare block (pos < 256)
     cudaGraphExec_t dflare_graph_split = nullptr; // captured 3-layer DFlare block (pos >= 256, WMMA Split-KV)
     cudaGraphExec_t markov_graphs[8] = {};        // captured greedy Markov chains indexed by n_draft (1..7)
     bool markov_graph_oom[8] = {};
+    cudaGraphExec_t markov_step_graphs[7] = {};   // per-step captured Markov graph with argmax + prob
+    bool markov_step_oom[7] = {};
     cudaGraphExec_t inject_graphs[9] = {};        // captured inject(T=1..8, feat_off=0) graphs
     bool inject_graph_oom[9] = {};
     std::vector<cudaGraphExec_t> deferred_graphs_destroy;
@@ -1979,6 +2104,9 @@ struct DsparkEngine {
     int64_t n_draft_calls = 0;
     int64_t n_drafted = 0;
     int64_t n_accepted = 0;
+    int64_t pld_calls = 0;
+    int64_t pld_drafted = 0;
+    int64_t pld_accepted = 0;
     double draft_ms = 0.0;
     double inject_ms = 0.0;
 
@@ -1997,6 +2125,10 @@ struct DsparkEngine {
         for (int i = 0; i < 8; ++i) {
             if (markov_graphs[i]) { cudaGraphExecDestroy(markov_graphs[i]); markov_graphs[i] = nullptr; }
             markov_graph_oom[i] = false;
+        }
+        for (int i = 0; i < 7; ++i) {
+            if (markov_step_graphs[i]) { cudaGraphExecDestroy(markov_step_graphs[i]); markov_step_graphs[i] = nullptr; }
+            markov_step_oom[i] = false;
         }
     }
 
@@ -2021,6 +2153,10 @@ struct DsparkEngine {
         for (int i = 0; i < 8; ++i) {
             defer(markov_graphs[i]);
             markov_graph_oom[i] = false;
+        }
+        for (int i = 0; i < 7; ++i) {
+            defer(markov_step_graphs[i]);
+            markov_step_oom[i] = false;
         }
     }
 
@@ -2133,9 +2269,12 @@ struct DsparkEngine {
         cudaFree(h_pred);
         cudaFree(pos_d);
         cudaFree(d_draft_ids);
+        cudaFree(d_prob_sum);
+        cudaFree(d_draft_prob);
         if (h_pos_pin) cudaFreeHost(h_pos_pin);
         if (h_inj_pos_pin) cudaFreeHost(h_inj_pos_pin);
         if (h_draft_ids_pin) cudaFreeHost(h_draft_ids_pin);
+        if (h_draft_prob_pin) cudaFreeHost(h_draft_prob_pin);
         if (h_anchor_pin) cudaFreeHost(h_anchor_pin);
     }
 
@@ -2228,6 +2367,12 @@ struct DsparkEngine {
         if (cudaMallocHost(&h_draft_ids_pin, 8 * sizeof(int32_t)) != cudaSuccess) {
             (void) cudaGetLastError();
             h_draft_ids_pin = nullptr;
+        }
+        CK(cudaMalloc(&d_prob_sum, 64 * sizeof(float)));
+        CK(cudaMalloc(&d_draft_prob, 8 * sizeof(float)));
+        if (cudaMallocHost(&h_draft_prob_pin, 8 * sizeof(float)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            h_draft_prob_pin = nullptr;
         }
         if (cudaMallocHost(&h_anchor_pin, (size_t) hp.n_embd * sizeof(float)) != cudaSuccess) {
             (void) cudaGetLastError();
@@ -2577,21 +2722,12 @@ struct DsparkEngine {
         }
     }
 
-    /// Draft `n_draft` (1..7) speculative tokens from `anchor` (placed at `pos`, seeing context `0..pos-1`).
-    /// When `out_logits != nullptr` (`n_draft` rows of `vocab_unpadded`), uses `sample_fn(row_vec)` for each draft step.
-    template <typename EngineT, typename SampleFn>
-    void draft(EngineT& E, int32_t anchor, int n_draft, std::vector<int32_t>& out_tokens,
-               std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn, bool gpu_sampled = false) {
-        ensure_decode_weights_resident(E.st);
-        wait_decode_weights_ready(E.st);
-        const auto t0 = Clock::now();
+    template <typename EngineT>
+    void run_dflare(EngineT& E, int32_t anchor) {
         const auto& hp = dm->hp;
         const int block_n = hp.block_size;
         const int N = hp.n_embd;
         const int rank = hp.markov_rank;
-
-        out_tokens.resize((size_t) n_draft);
-        if (out_logits) out_logits->resize((size_t) n_draft);
 
         // 1. Anchor embedding (with target tok_embd_norm) + device pos upload
         float* anchor_src = h_anchor_pin ? h_anchor_pin : h_anchor.data();
@@ -2676,6 +2812,128 @@ struct DsparkEngine {
         } else {
             emit_dflare();
         }
+    }
+
+    /// Confidence-gated greedy DSpark draft (1..max_k tokens; returns 0 tokens if step 0 falls below tau_min0).
+    template <typename EngineT>
+    void draft_confident(EngineT& E, int32_t anchor, int base_k, int max_k,
+                         float tau_min0, float tau_step, float tau_cum,
+                         float tau_ext, float tau_cum_ext,
+                         std::vector<int32_t>& out_tokens) {
+        ensure_decode_weights_resident(E.st);
+        wait_decode_weights_ready(E.st);
+        const auto t0 = Clock::now();
+        const auto& hp = dm->hp;
+        const int N = hp.n_embd;
+        const int rank = hp.markov_rank;
+        const int eff_max = std::clamp(max_k, 1, std::min(7, hp.block_size - 1));
+        out_tokens.clear();
+
+        run_dflare(E, anchor);
+
+        if (h_draft_ids_pin) {
+            h_draft_ids_pin[0] = anchor;
+            CK(cudaMemcpyAsync(d_draft_ids, h_draft_ids_pin, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+        } else {
+            CK(cudaMemcpyAsync(d_draft_ids, &anchor, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+        }
+
+        const int joint_tot = 2 * rank + 2 * N;
+        float p_cum = 1.0f;
+        for (int i = 0; i < eff_max; ++i) {
+            auto emit_step = [&]() {
+                const float* hi = block_cur + (size_t) (i + 1) * N;
+                dspark_detail::k_dspark_prep_joint_d<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
+                    rnn_state, dm->markov_w1, dm->markov_w1_type, d_draft_ids + i, hi, f_rnn_last, joint_inp, rank, N);
+                E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+                dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
+                    joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
+                E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
+                dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
+                    h_pred, hi, rnn_corr, dm->hidden_out_b, N);
+                E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
+                constexpr int kArgBlks = 64;
+                dspark_detail::k_dspark_argmax_prob_stage1<<<kArgBlks, 256, 0, E.st>>>(
+                    E.logits, E.argmax_val, E.argmax_idx, d_prob_sum, (int) hp.vocab_unpadded, hp.softcap);
+                dspark_detail::k_dspark_argmax_prob_stage2<<<1, 32, 0, E.st>>>(
+                    E.argmax_val, E.argmax_idx, d_prob_sum, d_draft_ids + i + 1, d_draft_prob + i, kArgBlks);
+            };
+            if (!E.prof && !markov_step_oom[i]) {
+                cudaGraphExec_t& sg = markov_step_graphs[i];
+                if (!sg) {
+                    cudaGraph_t g = nullptr;
+                    if (cudaStreamBeginCapture(E.st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                        emit_step();
+                        if (cudaStreamEndCapture(E.st, &g) == cudaSuccess && g) {
+                            if (cudaGraphInstantiate(&sg, g, nullptr, nullptr, 0) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                sg = nullptr;
+                                markov_step_oom[i] = true;
+                            }
+                            cudaGraphDestroy(g);
+                        } else {
+                            (void) cudaGetLastError();
+                            markov_step_oom[i] = true;
+                        }
+                    } else {
+                        (void) cudaGetLastError();
+                        markov_step_oom[i] = true;
+                    }
+                }
+                if (sg) CK(cudaGraphLaunch(sg, E.st));
+                else emit_step();
+            } else {
+                emit_step();
+            }
+
+            int32_t tok_i = 0;
+            float p_i = 0.0f;
+            if (h_draft_ids_pin && h_draft_prob_pin) {
+                CK(cudaMemcpyAsync(h_draft_ids_pin + 1 + i, d_draft_ids + 1 + i, sizeof(int32_t), cudaMemcpyDeviceToHost, E.st));
+                CK(cudaMemcpyAsync(h_draft_prob_pin + i, d_draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, E.st));
+                CK(cudaStreamSynchronize(E.st));
+                tok_i = h_draft_ids_pin[1 + i];
+                p_i = h_draft_prob_pin[i];
+            } else {
+                CK(cudaMemcpyAsync(&tok_i, d_draft_ids + 1 + i, sizeof(int32_t), cudaMemcpyDeviceToHost, E.st));
+                CK(cudaMemcpyAsync(&p_i, d_draft_prob + i, sizeof(float), cudaMemcpyDeviceToHost, E.st));
+                CK(cudaStreamSynchronize(E.st));
+            }
+            p_cum *= p_i;
+            if (i == 0 && p_i < tau_min0) {
+                break;
+            }
+            out_tokens.push_back(tok_i);
+            if (i + 1 >= eff_max) break;
+            if (i + 1 < base_k) {
+                if (p_i < tau_step || p_cum < tau_cum) break;
+            } else {
+                if (p_i < tau_ext || p_cum < tau_cum_ext) break;
+            }
+        }
+        if (!out_tokens.empty()) {
+            ++n_draft_calls;
+            n_drafted += (int64_t) out_tokens.size();
+        }
+        if (E.prof) draft_ms += ms_since(t0);
+    }
+
+    /// Draft `n_draft` (1..7) speculative tokens from `anchor` (placed at `pos`, seeing context `0..pos-1`).
+    /// When `out_logits != nullptr` (`n_draft` rows of `vocab_unpadded`), uses `sample_fn(row_vec)` for each draft step.
+    template <typename EngineT, typename SampleFn>
+    void draft(EngineT& E, int32_t anchor, int n_draft, std::vector<int32_t>& out_tokens,
+               std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn, bool gpu_sampled = false) {
+        ensure_decode_weights_resident(E.st);
+        wait_decode_weights_ready(E.st);
+        const auto t0 = Clock::now();
+        const auto& hp = dm->hp;
+        const int N = hp.n_embd;
+        const int rank = hp.markov_rank;
+
+        out_tokens.resize((size_t) n_draft);
+        if (out_logits) out_logits->resize((size_t) n_draft);
+
+        run_dflare(E, anchor);
 
         // 3. Recurrent Markov chain for i = 1 .. n_draft
         const int joint_tot = 2 * rank + 2 * N;

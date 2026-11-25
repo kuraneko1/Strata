@@ -163,7 +163,13 @@ void kq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*,
 void kq256_gu_rows_situ(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int, float, float) {
     unsupported("the AVX-2 k-quant kernel");
 }
+void kq256_ktile_gu_rows_situ(const uint8_t*, int, const void* const*, int, float* const*, int, int, float, float) {
+    unsupported("the AVX-2 k-quant kernel");
+}
 void kq256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-2 k-quant kernel");
+}
+void kq256_ktile_rows(const uint8_t*, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 k-quant kernel");
 }
 void kq512_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {

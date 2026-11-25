@@ -879,6 +879,13 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         return cpu_avx2_ok() && (v == nullptr || std::atoi(v) != 0);
     }();
     if (f.gu_type == 13 && f.q5k_ktile) {
+        const bool use_kq_situ = kq_q5k && f.situ && f.tail_off == 0 && nt >= 1 &&
+                                 n / 256 <= 64 && (n % 256) == 0 &&
+                                 (Arithmetic == NativeArithmetic::Default || flavour_avx2());
+        if (use_kq_situ) {
+            kq256_ktile_gu_rows_situ(blob, n, act, nt, ff, r0, r1, f.situ_beta, f.situ_linear_beta);
+            return;
+        }
         const int k_sbs = n / 256;
         thread_local std::vector<uint8_t> ktile_buf;
         float* ff_stack[64];
@@ -888,16 +895,14 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
             ff_vec.resize((size_t) nt);
             ff_off = ff_vec.data();
         }
-        const bool use_kq_situ = kq_q5k && f.situ && f.tail_off == 0 && nt >= 1 &&
-                                 (Arithmetic == NativeArithmetic::Default || flavour_avx2());
         float sg = 1.f, su = 1.f;
-        if (!use_kq_situ && f.tail_off) {
+        if (f.tail_off) {
             float tail[4];
             std::memcpy(tail, blob + f.tail_off, sizeof tail);
             sg = tail[0];
             su = tail[1];
         }
-        const Tr dot = !use_kq_situ ? traits(13) : Tr{};
+        const Tr dot = traits(13);
         for (int c0 = r0; c0 < r1;) {
             const int c1 = std::min(r1, (c0 & ~63) + 64);
             const int cnt = c1 - c0;
@@ -905,26 +910,21 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
             if (ktile_buf.size() < 2 * up_off_chunk) ktile_buf.resize(2 * up_off_chunk);
             unpack_q5k_ktile_gu(blob, f.gu_row, k_sbs, c0, c1, ktile_buf.data(), ktile_buf.data() + up_off_chunk);
             for (int t = 0; t < nt; ++t) ff_off[t] = ff[t] + c0;
-            if (use_kq_situ) {
-                kq256_gu_rows_situ(13, ktile_buf.data(), f.gu_row, up_off_chunk, n, act, nt, ff_off, 0, cnt,
-                                   f.situ_beta, f.situ_linear_beta);
-            } else {
-                for (int i = 0; i < cnt; ++i) {
-                    const uint8_t* gr = ktile_buf.data() + (size_t) i * f.gu_row;
-                    const uint8_t* ur = ktile_buf.data() + up_off_chunk + (size_t) i * f.gu_row;
-                    for (int t = 0; t < nt; ++t) {
-                        float g = 0.f, u = 0.f;
-                        dot.dot(n, &g, gr, act[t]);
-                        dot.dot(n, &u, ur, act[t]);
-                        const float gs = *static_cast<volatile const float*>(&g) * sg;
-                        const float us = *static_cast<volatile const float*>(&u) * su;
-                        if (f.situ) {
-                            const float tg = f.situ_beta * std::tanh(gs / f.situ_beta);
-                            const float tu = f.situ_linear_beta > 0.f ? f.situ_linear_beta * std::tanh(us / f.situ_linear_beta) : us;
-                            ff_off[t][i] = (tg / (1.f + std::exp(-gs))) * tu;
-                        } else {
-                            ff_off[t][i] = (gs / (1.f + std::exp(-gs))) * us;
-                        }
+            for (int i = 0; i < cnt; ++i) {
+                const uint8_t* gr = ktile_buf.data() + (size_t) i * f.gu_row;
+                const uint8_t* ur = ktile_buf.data() + up_off_chunk + (size_t) i * f.gu_row;
+                for (int t = 0; t < nt; ++t) {
+                    float g = 0.f, u = 0.f;
+                    dot.dot(n, &g, gr, act[t]);
+                    dot.dot(n, &u, ur, act[t]);
+                    const float gs = *static_cast<volatile const float*>(&g) * sg;
+                    const float us = *static_cast<volatile const float*>(&u) * su;
+                    if (f.situ) {
+                        const float tg = f.situ_beta * std::tanh(gs / f.situ_beta);
+                        const float tu = f.situ_linear_beta > 0.f ? f.situ_linear_beta * std::tanh(us / f.situ_linear_beta) : us;
+                        ff_off[t][i] = (tg / (1.f + std::exp(-gs))) * tu;
+                    } else {
+                        ff_off[t][i] = (gs / (1.f + std::exp(-gs))) * us;
                     }
                 }
             }
@@ -1107,6 +1107,15 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     if (f.d_type == 8 && f.q8_0_ktile) {
         const int n = (int) f.n_ff;
         const int k_64 = n / 64;
+        const bool use_kq512 = kq512_q80_ok && nt >= kq512_min &&
+                               (Arithmetic == NativeArithmetic::Default || flavour_avx2());
+        const bool use_kq256 = !use_kq512 && cpu_avx2_ok() && nt >= 1 && kq_q80_def &&
+                               f.tail_off == 0 && (n % 64) == 0 && k_64 <= 256 &&
+                               (Arithmetic == NativeArithmetic::Default || flavour_avx2());
+        if (use_kq256) {
+            kq256_ktile_rows(blob + f.down_off, n, hq, nt, out, r0, r1);
+            return;
+        }
         thread_local std::vector<uint8_t> ktile_buf;
         float* out_stack[64];
         thread_local std::vector<float*> out_vec;
@@ -1115,14 +1124,10 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
             out_vec.resize((size_t) nt);
             out_off = out_vec.data();
         }
-        const bool use_kq512 = kq512_q80_ok && nt >= kq512_min &&
-                               (Arithmetic == NativeArithmetic::Default || flavour_avx2());
-        const bool use_kq256 = !use_kq512 && cpu_avx2_ok() && nt >= 1 && kq_q80_def &&
-                               (Arithmetic == NativeArithmetic::Default || flavour_avx2());
         float sd = 1.f;
-        if (!use_kq512 && !use_kq256 && f.tail_off)
+        if (!use_kq512 && f.tail_off)
             std::memcpy(&sd, blob + f.tail_off + 2 * sizeof(float), sizeof sd);
-        const Tr dot = (!use_kq512 && !use_kq256) ? traits(8) : Tr{};
+        const Tr dot = !use_kq512 ? traits(8) : Tr{};
         for (int c0 = r0; c0 < r1;) {
             const int c1 = std::min(r1, (c0 & ~127) + 128);
             const int cnt = c1 - c0;
@@ -1132,8 +1137,6 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
             for (int t = 0; t < nt; ++t) out_off[t] = out[t] + c0;
             if (use_kq512) {
                 kq512_rows(8, ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt);
-            } else if (use_kq256) {
-                kq256_rows(8, ktile_buf.data(), f.d_row, n, hq, nt, out_off, 0, cnt);
             } else {
                 for (int i = 0; i < cnt; ++i) {
                     const uint8_t* dr = ktile_buf.data() + (size_t) i * f.d_row;
