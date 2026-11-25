@@ -23,7 +23,7 @@ It runs **65K–262K** context on a single **12 GB consumer GPU (RTX 4070)** and
 
 - **Zero-knob automatic tuning (`SM arch × VRAM regime`)** — Choose `--max-context` (and optionally `--draft` for DSpark). The engine inspects the GPU architecture and live free VRAM to select the verified chunk size, KV allocation policy, staging budget, FA2 split-K width, and CUDA Graph mode via [profile_rules.hpp](engine/include/strata/inkling2/profile_rules.hpp).
 - **Zero quantization / precision compromises** — Native `UD-Q4_K_M` weights and `Q8` KV cache (`--kv-q8`), verified for 64/64 greedy token parity across optimization rounds.
-- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, a single `--max-context 262144` run on real C++/CUDA code reaches **`8,054–8,072 t/s` prefill** at `8K` and sustains **`50.4 t/s`** (`16K`), **`43.4 t/s`** (`64K`), **`39.5 t/s`** (`128K`), and **`28.7 t/s`** (`256K`) steady decode with **DSpark ON** + dynamic offload/reload (`+4.5%` to `+15.4%` faster than DSpark OFF from `16K`–`256K`). On V100 32 GB (GPU 0, ECC Off), all 3,072 experts fit in VRAM up to 819K with DSpark (`135–167 t/s` decode at 64K–256K, `109.5 t/s` at 512K, `89.9 t/s` at 800K, `192.8 t/s` at 512).
+- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, a single `--max-context 262144` run on real C++/CUDA code reaches **`7,994–8,005 t/s` prefill** at `8K` (`5,490` at `64K`, `4,236` at `128K`, **`2,754 t/s`** cumulative at `256K`) and sustains **`55.7 t/s`** (`16K`), **`45.5 t/s`** (`64K`), **`37.6 t/s`** (`128K`), **`35.7 t/s`** (`160K`), and **`25.1–26.2 t/s`** (`256K`) steady decode with **DSpark ON** / **OFF** dynamic phase-split offload/reload. On V100 32 GB (GPU 0, ECC Off), all 3,072 experts fit in VRAM up to 819K with DSpark (`135–167 t/s` decode at 64K–256K, `109.5 t/s` at 512K, `89.9 t/s` at 800K, `192.8 t/s` at 512).
 - **Drop-in OpenAI & Anthropic API** — Works directly with Claude Code, Codex CLI, OpenCode, and other local coding agents, plus upstream Strata's Qwen3.8-Flash-Next and Qwen3.6-35B-A3B engines.
 
 ## Supported Hardware & Auto-Profiles
@@ -34,7 +34,7 @@ The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) f
 | --- | ---: | --- | ---: | --- | --- |
 | **RTX 4070 12 GB** (`sm_89`) | `65536` | `sm89 + core_resident_hybrid` | `4096` (adapt. `<= 8192`) | Dynamic `16K → 36K → 65K` | `tier1` 100%, Phase-Split compaction |
 | **RTX 4070 12 GB** (`sm_89`) | `131072` | `sm89 + core_resident_hybrid` | `4096` (adapt. `<= 8192`) | Dynamic `16K → 36K → 69K → 131K` | `tier1` 100%, Phase-Split compaction |
-| **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` (adapt. `<= 12288`) | Dynamic `16K → 36K → 69K → 139K → 262K` | Adaptive eviction (`75.0%` hit @ 262K) |
+| **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` (adapt. `<= 12288`, `4096` w/ Core borrow) | Dynamic `16K → 36K → 69K → 102K → 139K → 172K → 204K → 262K` | Adaptive eviction (`66.9%–68.0%` hit @ 262K; `84.6%–85.5%` @ 128K) |
 | **Tesla V100 32 GB** (`sm_70`) | `819200` (+ DSpark) | `sm70 + full_vram` | `1024` | Upfront `819K` | `3,072 / 3,072` (`100%` VRAM, `916 MiB` free) |
 | **Tesla V100 32 GB** (`sm_70`) | `1048576` | `sm70 + core_resident_hybrid` | `1024` | Dynamic | `2,897 / 3,072` (`tier1` 100%) |
 
@@ -54,15 +54,17 @@ Apples-to-apples real tokenized C++/CUDA code context ladder (`--max-context 262
 
 | Context Depth | DSpark ON (`--draft-max 3`) Prefill | DSpark ON Decode | DSpark OFF Prefill | DSpark OFF Decode | GPU Hit (ON / OFF) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| `8K` (fresh) | **`8,053.6 t/s`** | `47.3 t/s` | **`8,071.9 t/s`** | **`48.6 t/s`** | `85.4%` / `85.5%` |
-| `16K` | **`6,869.8 t/s`** | **`50.4 t/s`** | `6,706.3 t/s` | `45.1 t/s` | `85.4%` / `85.5%` |
-| `32K` | `5,222.7 t/s` | **`47.6 t/s`** | **`5,241.2 t/s`** | `45.4 t/s` | `85.4%` / `85.5%` |
-| `64K` | `4,674.8 t/s` | **`43.4 t/s`** | `4,699.6 t/s` | `40.4 t/s` | `85.3%` / `85.5%` |
-| `128K` | `3,297.7 t/s` | **`39.5 t/s`** | `3,691.3 t/s` | `35.1 t/s` | `86.8%` / `85.5%` |
-| `160K` | `2,811.8 t/s` | **`31.6 t/s`** | `2,766.0 t/s` | `28.9 t/s` | `72.3%` / `72.3%` |
-| `256K` (`261.5K`) | `2,359.2 t/s` | **`28.7 t/s`** | `2,370.6 t/s` | `25.6 t/s` | `72.7%` / `71.7%` |
+| `8K` (fresh) | **`8,004.5 t/s`** | `49.1 t/s` | `7,993.5 t/s` | **`49.2 t/s`** | `85.4%` / `85.5%` |
+| `16K` | **`6,842.5 t/s`** | **`55.7 t/s`** | `6,762.3 t/s` | `45.6 t/s` | `85.4%` / `85.5%` |
+| `32K` | **`6,473.6 t/s`** | **`46.8 t/s`** | `5,216.9 t/s` | `45.0 t/s` | `85.4%` / `85.5%` |
+| `64K` | **`5,489.6 t/s`** | **`45.5 t/s`** | `4,732.9 t/s` | `41.0 t/s` | `85.3%` / `85.5%` |
+| `96K` | **`4,805.0 t/s`** | **`50.1 t/s`** | `2,732.8 t/s` | `37.0 t/s` | `85.4%` / `86.2%` |
+| `128K` | **`4,236.0 t/s`** | **`37.6 t/s`** | `2,848.1 t/s` | `33.6 t/s` | `84.6%` / `85.5%` |
+| `160K` | **`3,207.2 t/s`** | **`35.7 t/s`** | `2,822.1 t/s` | `31.0 t/s` | `73.4%` / `84.7%` |
+| `192K` | **`3,068.8 t/s`** | **`31.5 t/s`** | `2,752.7 t/s` | `30.3 t/s` | `72.3%` / `78.1%` |
+| `256K` (`261.5K`) | **`2,753.7 t/s`** | `25.1 t/s` | `2,586.2 t/s` | **`26.2 t/s`** | `66.9%` / `68.0%` |
 
-> **Why DSpark ON preserves Prefill and wins `16K–256K` Decode**: With Phase-Split dynamic offload/reload (`357.8 MiB` async pool transfer), DSpark weights are evicted before `pp_streaming` so initial `8K` prefill stays **`>8,050 t/s`**, then restored asynchronously for decode where speculative verification beats DSpark OFF across the entire `16K–256K` sweep (**`28.7` vs `25.6 t/s` at 256K**, **`+12.0%`**; on `131K`, **`39.2` vs `32.4 t/s`**, **`+21.2%`**). Zero precision degradation (`64/64` parity on both DSpark OFF & ON).
+> **Why DSpark ON preserves Prefill and boosts `16K–192K` Decode**: With Phase-Split dynamic offload/reload (`357.8 MiB` async pool transfer), a finer 7-step KV ladder (`16K → 36K → 69K → 102K → 139K → 172K → 204K → 262K`), and adaptive `T=4096` prefill up to `256K` (borrowing only non-resident Core headroom above `64/128` slots/layer), `8K` prefill stays **`>8,000 t/s`**, `96K–256K` cumulative prefill improves **`+16.7%` to `+32.6%`** (`2,753.7 t/s` at `256K` DSpark ON; `2,586.2 t/s` DSpark OFF), and speculative verification beats DSpark OFF across `16K–192K` (**`55.7` vs `45.6 t/s`** at `16K`, **`35.7` vs `31.0 t/s`** at `160K`, **`31.5` vs `30.3 t/s`** at `192K`; on `131K`, **`36.4` vs `34.9 t/s`** and **`4,155.4` vs `3,408.3 t/s`** cum. PP). Zero precision degradation (`64/64` parity on both DSpark OFF & ON).
 
 Full RTX 4070 progression & CSV data: [2026-11-22 RTX 4070 262K Report](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md).
 

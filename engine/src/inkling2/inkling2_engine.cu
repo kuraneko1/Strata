@@ -4730,7 +4730,7 @@ struct Engine {
         if (dspark) dspark->evict_decode_weights(use_phase_pool ? phase_pool : nullptr, st);
 
         // 2. EX-5 Idea C + Wave 6: Zero-H2D whole-layer evict of tail Tier-2 experts enough to fit peak(SWA, eph + net_swa + stage)
-        const int tgt_cap = active_pp_cap;
+        int tgt_cap = active_pp_cap;
         const size_t target_eph = estimate_ephemeral_total_bytes(tgt_cap);
         const size_t extra_eph = (target_eph > decode_ephemeral_bytes)
             ? (target_eph - decode_ephemeral_bytes) : 0;
@@ -4740,6 +4740,19 @@ struct Engine {
         const size_t target_swa_bytes = use_shared_swa_scratch ? 0 : swa_kv_pool_size_for(prefill_swa_kv_cap);
         const size_t net_swa = (!use_shared_swa_scratch && target_swa_bytes > swa_kv_pool_bytes)
             ? (target_swa_bytes - swa_kv_pool_bytes) : 0;
+        if (!is_core_full_resident() && (saved_pp_stage_bytes > ((size_t) 66 << 20) || saved_pp_stage_cnt > 2)) {
+            size_t compact_bytes = (size_t) 64 << 20;
+            for (int ip = 0; ip < (int) m->layers.size(); ++ip) {
+                const auto& L = m->layers[(size_t) ip];
+                if (L.gu_type == 40 && L.stride > 0) {
+                    const size_t nm = ((compact_bytes + L.stride - 1) / L.stride) * L.stride;
+                    if (nm > compact_bytes && nm - compact_bytes <= ((size_t) 256 << 10)) compact_bytes = nm;
+                    break;
+                }
+            }
+            if (saved_pp_stage_bytes > 0) saved_pp_stage_bytes = std::min(saved_pp_stage_bytes, compact_bytes);
+            if (saved_pp_stage_cnt > 0) saved_pp_stage_cnt = std::min(saved_pp_stage_cnt, 2);
+        }
         size_t stage_need = (size_t) saved_pp_stage_cnt * saved_pp_stage_bytes;
         const size_t min_stage_need = (size_t) std::min(saved_pp_stage_cnt, 2) * saved_pp_stage_bytes;
         int want_stage_cnt = saved_pp_stage_cnt;
@@ -4804,7 +4817,34 @@ struct Engine {
 
         // 4. Restore active_pp_cap prefill scratch & DSpark arena via stream-ordered phase_pool
         free_ephemeral_bufs();
-        if (tgt_cap > 8192) trim_phase_pool(0);
+        if (tgt_cap > 8192 || (!is_core_full_resident() && tgt_cap >= 4096)) trim_phase_pool(0);
+        if (tgt_cap > tmax) {
+            size_t fr_post = 0, tot_post = 0;
+            CK(cudaMemGetInfo(&fr_post, &tot_post));
+            const size_t avail_post = fr_post + pool_cached_free_bytes();
+            const size_t slab_pad = (size_t) 80 << 20;
+            const int orig_cap = tgt_cap;
+            while (tgt_cap > tmax) {
+                const size_t need_post = estimate_ephemeral_total_bytes(tgt_cap) + slab_pad;
+                if (avail_post >= need_post) break;
+                const int next_cap = (tgt_cap > 8192 && 8192 > tmax)
+                    ? 8192
+                    : ((tgt_cap > 4096 && 4096 > tmax) ? 4096 : tmax);
+                std::fprintf(stderr, "strata-inkling2: set_phase_prefill post-trim VRAM %.1f MiB < %.1f MiB needed for cap=%d; stepping down to %d\n",
+                             (double) avail_post / (1 << 20), (double) need_post / (1 << 20), tgt_cap, next_cap);
+                tgt_cap = next_cap;
+            }
+            if (tgt_cap != orig_cap) {
+                active_pp_cap = tgt_cap;
+                const int new_swa_cap = use_shared_swa_scratch
+                    ? swa_ring_cap()
+                    : ((tgt_cap <= 1) ? (int) m->hp.n_swa : (int) (m->hp.n_swa + tgt_cap));
+                if (!use_shared_swa_scratch && swa_kv_cap != new_swa_cap) {
+                    resize_swa_kv_pool(new_swa_cap);
+                }
+                prefill_swa_kv_cap = new_swa_cap;
+            }
+        }
         prefill_ephemeral_bytes = alloc_ephemeral_bufs(tgt_cap);
         if (dspark) dspark->rebind_arena(layer_arena, layer_arena_bytes, tgt_cap);
 
@@ -4841,6 +4881,7 @@ struct Engine {
                 }
             }
         }
+        if (pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
         in_decode_phase = false;
     }
 
@@ -4860,7 +4901,10 @@ struct Engine {
         }
         const bool core_full_ok = core_all_gpu && (core_experts_total <= 0 || core_experts_res >= core_experts_total);
         int target_cap = std::clamp(want_cap, tmax, meta_tmax);
-        if (no_adaptive_chunk || profile.max_adaptive_chunk <= tmax || !hybrid || !core_full_ok ||
+        if (!core_full_ok) {
+            target_cap = std::max(tmax, std::min(target_cap, 4096));
+        }
+        if (no_adaptive_chunk || profile.max_adaptive_chunk <= tmax || !hybrid ||
             (dspark && (no_dspark_vram_acc || no_vmsg || !can_vmsg_all_core))) {
             target_cap = tmax;
         }
@@ -4893,6 +4937,14 @@ struct Engine {
                 if (ip >= hp.core_start && ip < hp.core_end) continue;
                 tier2_bytes += (size_t) m->layers[(size_t) ip].n_slots * m->layers[(size_t) ip].stride;
             }
+            constexpr int kMinCoreSlotsFor4K = 64;
+            size_t tier1_borrow_bytes = 0;
+            for (int ip = (int) hp.core_start; ip < (int) hp.core_end && ip < hp.n_phys; ++ip) {
+                const PhysLayer& L = m->layers[(size_t) ip];
+                if (L.n_slots > kMinCoreSlotsFor4K) {
+                    tier1_borrow_bytes += (size_t) (L.n_slots - kMinCoreSlotsFor4K) * L.stride;
+                }
+            }
             const size_t dspark_evict_b = (dspark && dspark->dm &&
                                            dspark->dm->decode_w_offloadable && dspark->dm->decode_w_resident)
                                           ? dspark->dm->decode_w_bytes : 0;
@@ -4913,6 +4965,7 @@ struct Engine {
             int chosen_cap = tmax;
             for (int ci = 0; ci < n_cands - 1; ++ci) {
                 const int cand_cap = cands[ci];
+                if (cand_cap > 4096 && !core_full_ok) continue;
                 if (cand_cap > 8192 && avail_stage_bytes > 0 && avail_stage_cnt < 3) continue;
                 const size_t tgt_eph = estimate_ephemeral_total_bytes(cand_cap);
                 const size_t extra_eph = (tgt_eph > cur_eph) ? (tgt_eph - cur_eph) : 0;
@@ -4937,6 +4990,14 @@ struct Engine {
                 if (avail_no_core + freed_eph + freed_swa >= need_tot) {
                     chosen_cap = cand_cap;
                     break;
+                }
+                if (cand_cap <= 4096 && cand_cap > tmax && core_experts_total > 0) {
+                    const size_t borrow_margin = std::max(cand_margin, (size_t) 112 << 20);
+                    const size_t need_borrow = peak_growth + kv_delta + vram_reserve_bytes + borrow_margin;
+                    if (avail_no_core + tier1_borrow_bytes + freed_eph + freed_swa >= need_borrow) {
+                        chosen_cap = cand_cap;
+                        break;
+                    }
                 }
             }
             target_cap = chosen_cap;
@@ -5022,7 +5083,7 @@ struct Engine {
     static int next_kv_ladder_cap(int cur_cap, int needed, int max_ctx, bool use_headroom_ladder) {
         if (needed <= cur_cap || cur_cap >= max_ctx) return cur_cap;
         if (use_headroom_ladder) {
-            static constexpr int kLadder[] = {36864, 69632, 139264, 262144};
+            static constexpr int kLadder[] = {36864, 69632, 102400, 139264, 172032, 204800, 262144};
             for (int c : kLadder) {
                 const int clamped = std::min(max_ctx, c);
                 if (clamped > cur_cap && clamped >= needed) return clamped;
