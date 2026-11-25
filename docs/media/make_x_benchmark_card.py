@@ -166,7 +166,14 @@ def render(cfg: dict, out_path: Path):
     )
     ax_pp.fill_between(depths, 0, pp_on, color=C_ON, alpha=0.045, zorder=1)
 
-    ann(ax_pp, depths[0], max(pp_on[0], pp_off[0]), f"{pp_on[0]:,.0f}", C_ON, dx=9, dy=3, ha="left", va="bottom", fs=10.8)
+    if pp_off[0] - pp_on[0] >= 120:
+        ann(ax_pp, depths[0], pp_off[0], f"{pp_off[0]:,.0f}", C_OFF_TXT, dx=9, dy=4, ha="left", va="bottom", fs=10.2, weight="normal")
+        ann(ax_pp, depths[0], pp_on[0], f"{pp_on[0]:,.0f}", C_ON, dx=9, dy=-12, ha="left", va="top", fs=10.8)
+    elif pp_on[0] - pp_off[0] >= 120:
+        ann(ax_pp, depths[0], pp_on[0], f"{pp_on[0]:,.0f}", C_ON, dx=9, dy=4, ha="left", va="bottom", fs=10.8)
+        ann(ax_pp, depths[0], pp_off[0], f"{pp_off[0]:,.0f}", C_OFF_TXT, dx=9, dy=-12, ha="left", va="top", fs=10.2, weight="normal")
+    else:
+        ann(ax_pp, depths[0], max(pp_on[0], pp_off[0]), f"{max(pp_on[0], pp_off[0]):,.0f}", C_ON, dx=9, dy=3, ha="left", va="bottom", fs=10.8)
     if 65.536 in idx_map:
         i64 = idx_map[65.536]
         ann(ax_pp, depths[i64], pp_on[i64], f"{pp_on[i64]:,.0f}", C_ON, dx=-6, dy=-14, ha="right", va="top", fs=10.2)
@@ -182,7 +189,7 @@ def render(cfg: dict, out_path: Path):
         ann(ax_pp, depths[-1], pp_off[-1], f"{pp_off[-1]:,.0f}", C_OFF_TXT, dx=-2, dy=-14, ha="right", va="top", fs=9.8, weight="normal")
 
     # --- Right: Decode ---
-    style_plot_ax(ax_tg, "Decode", "tok / s · steady-state", labels.get("decode_ylim", 70), comma_y=False)
+    style_plot_ax(ax_tg, "Decode", "tok / s · steady-state", labels.get("decode_ylim", 80), comma_y=False)
     ax_tg.plot(
         depths, tg_off, "--o", color=C_OFF, linewidth=2.0, markersize=4.6,
         markeredgecolor="#FFFFFF", markeredgewidth=1.0, zorder=3,
@@ -193,14 +200,21 @@ def render(cfg: dict, out_path: Path):
     )
     ax_tg.fill_between(depths, tg_off, tg_on, color=C_ON, alpha=0.075, zorder=1)
 
-    ann(ax_tg, depths[0], tg_on[0], f"{tg_on[0]:.1f}", C_ON, dx=-1, dy=11, ha="center", va="bottom", fs=10.8)
-    ann(ax_tg, depths[0], tg_off[0], f"{tg_off[0]:.1f}", C_OFF_TXT, dx=-1, dy=-15, ha="center", va="top", fs=9.8, weight="normal")
+    if 16.384 in idx_map:
+        i16 = idx_map[16.384]
+        ann(ax_tg, depths[i16], tg_on[i16], f"{tg_on[i16]:.1f}", C_ON, dx=2, dy=11, ha="left", va="bottom", fs=10.8)
+    else:
+        ann(ax_tg, depths[0], tg_on[0], f"{tg_on[0]:.1f}", C_ON, dx=-1, dy=11, ha="center", va="bottom", fs=10.8)
+    ann(ax_tg, depths[0], tg_off[0], f"{tg_off[0]:.1f}", C_OFF_TXT, dx=-1, dy=-14, ha="center", va="top", fs=9.8, weight="normal")
     if 65.536 in idx_map:
         i64 = idx_map[65.536]
         ann(ax_tg, depths[i64], tg_on[i64], f"{tg_on[i64]:.1f}", C_ON, dx=0, dy=11, ha="center", va="bottom", fs=10.2)
     if 131.072 in idx_map:
         i128 = idx_map[131.072]
-        ann(ax_tg, depths[i128], tg_on[i128], f"{tg_on[i128]:.1f}", C_ON, dx=0, dy=11, ha="center", va="bottom", fs=10.2)
+        ann(ax_tg, depths[i128], tg_on[i128], f"{tg_on[i128]:.1f}", C_ON, dx=-2, dy=-15, ha="center", va="top", fs=10.0)
+    if 163.84 in idx_map:
+        i160 = idx_map[163.84]
+        ann(ax_tg, depths[i160], tg_on[i160], f"{tg_on[i160]:.1f}", C_ON, dx=2, dy=11, ha="left", va="bottom", fs=10.2)
 
     if tg_on[-1] >= tg_off[-1]:
         ann(ax_tg, depths[-1], tg_on[-1], f"{tg_on[-1]:.1f}", C_ON, dx=-2, dy=11, ha="right", va="bottom", fs=10.8)

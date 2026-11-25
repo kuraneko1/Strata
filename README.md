@@ -22,8 +22,10 @@ It runs **65K–262K** context on a single **12 GB consumer GPU (RTX 4070)** and
 ## Highlights
 
 - **Zero-knob automatic tuning (`SM arch × VRAM regime`)** — Choose `--max-context` (and optionally `--draft` for DSpark). The engine inspects the GPU architecture and live free VRAM to select the verified chunk size, KV allocation policy, staging budget, FA2 split-K width, and CUDA Graph mode via [profile_rules.hpp](engine/include/strata/inkling2/profile_rules.hpp).
-- **Zero quantization / precision compromises** — Native `UD-Q4_K_M` weights and `Q8` KV cache (`--kv-q8`), verified for 64/64 greedy token parity across optimization rounds.
-- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, a single `--max-context 262144` run on real C++/CUDA code reaches **`8,016 t/s` prefill** (`8,013 t/s` DSpark OFF) at `8K` (`5,567` at `64K`, `4,254` at `128K`, **`3,010 t/s`** ON / **`3,063 t/s`** OFF cumulative at `256K`) and sustains **`57.1–59.0 t/s`** (`8K–16K`), **`51.8 t/s`** (`64K`), **`39.2 t/s`** (`128K`), **`39.6 t/s`** (`160K`), and **`32.9 t/s`** (`256K`) steady decode with **DSpark ON** / **OFF** dynamic phase-split offload/reload. On V100 32 GB (GPU 0, ECC Off), all 3,072 experts fit in VRAM up to 819K with DSpark (`135–167 t/s` decode at 64K–256K, `109.5 t/s` at 512K, `89.9 t/s` at 800K, `192.8 t/s` at 512).
+- **Zero quantization / precision compromises** — Native `UD-Q4_K_M` weights and `Q8` KV cache (`--kv-q8`), verified for `64/64` greedy token parity across optimization rounds.
+- **Decode Frequency-Prior & Cross-Layer Knapsack Expert Caching** — Seeds VRAM expert slots from measured decode routing frequencies ([inkling2_expert_prior.cuh](engine/src/inkling2/inkling2_expert_prior.cuh)), applies Bayesian eviction/rebalancing during decode, and runs a Phase-Decode Cross-Layer Knapsack (`Core=128` + Outer knapsack at `65K–128K`, global 24-layer knapsack at `160K–256K`), lifting RTX 4070 `262K` decode to **`64.7–68.1 t/s`** (`8K–16K`), **`60.5 t/s`** (`64K`), **`48.2 t/s`** (`160K`), **`42.3 t/s`** (`192K`), and **`36.4 t/s`** (`256K` ON, **`31.7 t/s`** OFF).
+- **Distribution-Preserving Sampling DSpark + 1-Hot PLD** — Deterministic-peak sampling confidence gating (`draft_sampled_confident`) and exact rejection-sampled 1-hot suffix drafting (`PromptSuffixDrafter`) preserve `temperature=1.0` sampling distributions while eliminating Japanese regressions (`65K` sampling: **`68.5–72.9 t/s`** OFF → **`74.6–88.4 t/s`** ON on RTX 4070; **`92.5–93.6 t/s`** OFF → **`104.3–137.6 t/s`** ON on V100 32 GB).
+- **Fast on both 12 GB hybrid and 32 GB full-VRAM GPUs** — On RTX 4070 12 GB, a single `--max-context 262144` run on real C++/CUDA code reaches **`8,052 t/s` prefill** (`3,101 t/s` cumulative @ `256K` DSpark OFF; `7,874 t/s` warm / `8,010 t/s` cool @ `8K`, `2,935 t/s` @ `256K` DSpark ON). On V100 32 GB (GPU 0, ECC Off), all 3,072 experts fit in VRAM up to `819K` with DSpark (`135–167 t/s` decode at `64K–256K`, `109.5 t/s` at `512K`, `89.9 t/s` at `800K`, `192.8 t/s` at `512`).
 - **Drop-in OpenAI & Anthropic API** — Works directly with Claude Code, Codex CLI, OpenCode, and other local coding agents, plus upstream Strata's Qwen3.8-Flash-Next and Qwen3.6-35B-A3B engines.
 
 ## Supported Hardware & Auto-Profiles
@@ -32,11 +34,11 @@ The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) f
 
 | Verified GPU | `--max-context` | Auto-Resolved Profile | Prefill Chunk | KV Cache Strategy | Expert Placement |
 | --- | ---: | --- | ---: | --- | --- |
-| **RTX 4070 12 GB** (`sm_89`) | `65536` | `sm89 + core_resident_hybrid` | `4096` (adapt. `<= 8192`) | Dynamic `16K → 36K → 65K` | `tier1` 100%, Phase-Split compaction |
-| **RTX 4070 12 GB** (`sm_89`) | `131072` | `sm89 + core_resident_hybrid` | `4096` (adapt. `<= 8192`) | Dynamic `16K → 36K → 69K → 131K` | `tier1` 100%, Phase-Split compaction |
-| **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` (adapt. `<= 12288`, `4096` w/ Core borrow) | Dynamic `16K → 36K → 69K → 102K → 139K → 172K → 204K → 262K` | Adaptive eviction (`66.9%–68.0%` hit @ 262K; `84.6%–85.5%` @ 128K) |
+| **RTX 4070 12 GB** (`sm_89`) | `65536` | `sm89 + core_resident_hybrid` | `4096` (adapt. `<= 8192`) | Dynamic `16K → 36K → 65K` | `tier1` `100%` + Decode Frequency-Prior Outer Knapsack (`~90–92%` decode hit) |
+| **RTX 4070 12 GB** (`sm_89`) | `131072` | `sm89 + core_resident_hybrid` | `4096` (adapt. `<= 8192`) | Dynamic `16K → 36K → 69K → 131K` | `tier1` `100%` + Decode Frequency-Prior Outer Knapsack |
+| **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` (adapt. `<= 12288`, `4096` w/ Core borrow) | Dynamic `16K → 36K → 69K → 102K → 139K → 172K → 204K → 262K` | Phase-Decode Cross-Layer Knapsack (`62.4%–71.4%` hit @ `262K`; `84.8%–85.9%` @ `128K`) |
 | **Tesla V100 32 GB** (`sm_70`) | `819200` (+ DSpark) | `sm70 + full_vram` | `1024` | Upfront `819K` | `3,072 / 3,072` (`100%` VRAM, `916 MiB` free) |
-| **Tesla V100 32 GB** (`sm_70`) | `1048576` | `sm70 + core_resident_hybrid` | `1024` | Dynamic | `2,897 / 3,072` (`tier1` 100%) |
+| **Tesla V100 32 GB** (`sm_70`) | `1048576` | `sm70 + core_resident_hybrid` | `1024` | Dynamic | `2,897 / 3,072` (`tier1` `100%`) |
 
 > **Other NVIDIA GPUs (`sm_75+`)**: Turing (`sm_75`), Ampere (`sm_86`), other Ada (`sm_89`), and Blackwell (`sm_120`, CUDA 13+) GPUs build and run via the safe `generic` profile and automatic VRAM sizing. Hardware verification and dedicated profiles currently cover **RTX 4070 12 GB** and **Tesla V100 32 GB**.
 
@@ -54,19 +56,38 @@ Apples-to-apples real tokenized C++/CUDA code context ladder (`--max-context 262
 
 | Context Depth | DSpark ON (`--draft-max 3`) Prefill | DSpark ON Decode | DSpark OFF Prefill | DSpark OFF Decode | GPU Hit (ON / OFF) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| `8K` (fresh) | **`8,016.1 t/s`** | **`57.1 t/s`** | `8,012.8 t/s` | `50.3 t/s` | `85.5%` / `85.6%` |
-| `16K` | **`6,704.2 t/s`** | **`59.0 t/s`** | `6,515.2 t/s` | `47.9 t/s` | `85.4%` / `86.7%` |
-| `32K` | **`6,371.9 t/s`** | **`55.2 t/s`** | `6,317.1 t/s` | `49.7 t/s` | `85.5%` / `86.9%` |
-| `64K` | `5,567.3 t/s` | **`51.8 t/s`** | **`5,709.3 t/s`** | `43.8 t/s` | `85.4%` / `85.5%` |
-| `96K` | `4,839.9 t/s` | **`51.3 t/s`** | **`4,923.8 t/s`** | `40.6 t/s` | `85.4%` / `85.5%` |
-| `128K` | `4,253.5 t/s` | **`39.2 t/s`** | **`4,312.8 t/s`** | `37.7 t/s` | `84.8%` / `86.0%` |
-| `160K` | `3,812.8 t/s` | **`39.6 t/s`** | **`3,869.8 t/s`** | `34.9 t/s` | `72.9%` / `84.8%` |
-| `192K` | `3,510.2 t/s` | **`34.5 t/s`** | **`3,540.8 t/s`** | `29.4 t/s` | `70.9%` / `72.4%` |
-| `256K` (`261.5K`) | `3,009.7 t/s` | **`32.9 t/s`** | **`3,062.8 t/s`** | `27.5 t/s` | `65.5%` / `65.2%` |
+| `8K` (fresh) | `7,874.3 t/s`¹ | `64.7 t/s` | **`8,051.9 t/s`** | **`65.2 t/s`** | `86.1%` / `86.3%` |
+| `16K` | `6,557.3 t/s` | **`68.1 t/s`** | **`6,612.9 t/s`** | `60.9 t/s` | `86.1%` / `86.4%` |
+| `32K` | `6,276.0 t/s` | `58.1 t/s` | **`6,365.5 t/s`** | **`61.2 t/s`** | `86.0%` / `86.3%` |
+| `48K` | `5,587.6 t/s` | **`56.3 t/s`** | **`6,014.0 t/s`** | `53.8 t/s` | `86.4%` / `86.2%` |
+| `64K` | `5,424.3 t/s` | **`60.5 t/s`** | **`5,753.5 t/s`** | `53.9 t/s` | `86.2%` / `86.2%` |
+| `96K` | `4,694.8 t/s` | **`53.8 t/s`** | **`4,999.2 t/s`** | `48.3 t/s` | `87.1%` / `86.0%` |
+| `128K` | `4,116.0 t/s` | **`43.5 t/s`** | **`4,425.7 t/s`** | `42.0 t/s` | `84.8%` / `85.9%` |
+| `160K` | `3,716.1 t/s` | **`48.2 t/s`** | **`3,955.5 t/s`** | `37.3 t/s` | `77.0%` / `84.7%` |
+| `192K` | `3,396.2 t/s` | **`42.3 t/s`** | **`3,605.1 t/s`** | `37.4 t/s` | `71.6%` / `76.6%` |
+| `224K` | `3,135.4 t/s` | **`35.4 t/s`** | **`3,325.1 t/s`** | `32.4 t/s` | `62.3%` / `71.2%` |
+| `256K` (`261.5K`) | `2,934.6 t/s` | **`36.4 t/s`** | **`3,100.6 t/s`** | `31.7 t/s` | `62.4%` / `71.4%` |
 
-> **Why DSpark ON accelerates Decode across `8K–256K` while Prefill starts cleanly at `8,016 / 8,013 t/s` and holds `3,010–3,063 t/s` at `256K` with zero mid-prefill stalls**: With Phase-Split dynamic offload/reload (`357.8 MiB` async pool transfer), a finer 7-step KV ladder (`16K → 36K → 69K → 102K → 139K → 172K → 204K → 262K`), upfront Tier-1/2 pinned host blob pre-building at `>=131K` (eliminating mid-prefill host-pinning cliffs), multi-layer Core borrow (`blk.6..7`), overlapped `aux_st` DSpark feature accumulation & LM head overlap, zero-copy AVX2 `q5k_ktile`/`q8_0_ktile` CPU MoE kernels, decode `L.score` normalization (`prior=4.0`), and Confidence-Gated + Suffix (`PLD`) speculative drafting, **`8K` prefill exceeds `8,016 t/s`**, **`128K` runs `4,253.5 t/s` PP & `39.2 t/s` Decode**, **`160K` hits `39.6 t/s`**, and **`256K` achieves `3,009.7 t/s` PP / `32.9 t/s` Decode** (`3,062.8 t/s` PP DSpark OFF) — zero precision/quantization loss.
+<p><sub>¹ Cool single-turn <code>8K</code> DSpark ON prefill also measures <code>8,009.5 t/s</code> (<code>7,874.3 t/s</code> shown above is the warm back-to-back ladder run).</sub></p>
 
-Full RTX 4070 Roofline ceiling, achievement rates & `--draft-max` analysis: [2026-11-26 RTX 4070 262K Roofline & DSpark Report](docs/bench-results/2026-11-26-rtx4070-262k-roofline-dspark/README.md) ([2026-11-22 progression](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md)).
+> **Why RTX 4070 `262K` now pushes `68.1 t/s` at `16K`, `60.5 t/s` at `64K`, `48.2 t/s` at `160K`, and `36.4 t/s` at `256K` while Prefill hits `8,052 t/s` at `8K` and `3,101 t/s` at `256K`**: Combining Static Decode Frequency Prior ([inkling2_expert_prior.cuh](engine/src/inkling2/inkling2_expert_prior.cuh)) + Bayesian `rebalance()` + Phase-Decode Cross-Layer Knapsack (`Case A`: `Core=128` + Outer knapsack when Core fits; `Case B`: global 24-layer knapsack under tight `160K–256K` VRAM) with Phase-Split dynamic offload/reload, the 7-step KV ladder, upfront Tier-1/2 pinned host blobs, multi-layer Core borrow (`blk.6..7`), overlapped `aux_st` DSpark + LM head execution, zero-copy AVX2 `nvfp4`/`q5k`/`q8_0` ktile CPU MoE kernels, and Distribution-Preserving Confidence-Gated DSpark + 1-Hot `PLD` lifts decode across every context depth with zero precision loss.
+
+### `65K` Practical Chat & Coding (`Sampling temp=1.0`, RTX 4070 12 GB & Tesla V100 32 GB)
+
+Realistic live-server sampling (`temperature=1.0, top_p=0.95, top_k=40`, 256 generated tokens across 4 diverse prompts) at `65K` context:
+
+<p align="center">
+  <img src="docs/media/bench-65k-practical.png" width="960" alt="65K Practical Chat and Coding Sampling Decode on RTX 4070 12 GB and Tesla V100 32 GB">
+</p>
+
+| Workload (`65K`, `temp=1.0`) | RTX 4070 OFF | RTX 4070 ON (`--draft-max 3`) | 4070 Delta | Tesla V100 OFF | Tesla V100 ON (`--draft-max 3`) | V100 Delta |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `edit_rag` (Code Edit / RAG) | `68.5 t/s` | **`88.4 t/s`** | **`+29.1%`** | `93.6 t/s` | **`137.6 t/s`** | **`+47.0%`** |
+| `code` (C++/CUDA Gen) | `71.5 t/s` | **`75.5 t/s`** | **`+5.5%`** | `92.6 t/s` | **`117.9 t/s`** | **`+27.3%`** |
+| `prose` (English Tech) | `72.9 t/s` | **`86.2 t/s`** | **`+18.2%`** | `93.5 t/s` | **`128.0 t/s`** | **`+37.0%`** |
+| `japanese` (Japanese Tech) | `72.1 t/s` | **`74.6 t/s`** | **`+3.4%`** | `92.5 t/s` | **`104.3 t/s`** | **`+12.8%`** |
+
+Full RTX 4070 Roofline ceiling, achievement rates & `--draft-max` / sampling gate analysis: [2026-11-26 RTX 4070 262K Roofline & DSpark Report](docs/bench-results/2026-11-26-rtx4070-262k-roofline-dspark/README.md) ([2026-11-22 progression](docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md)).
 
 ### Tesla V100-PCIE-32GB (`sm_70`, CUDA 12.9)
 
@@ -86,7 +107,7 @@ Full V100 800K progression, Roofline analysis & chart: [2026-11-22 V100 800K Rep
 
 ### Practical & Coding Multimodal Benchmarks (`mmproj-F16` + `--vram-elastic`)
 
-End-to-end HTTP SSE practical benchmarks (`1,536` completion tokens, real 4-bug C++/Python debugging & Japanese cross-referencing, Text-only vs +1,024-token Image via native CUDA WMMA FA2 `strata-vision`):
+End-to-end HTTP SSE practical benchmarks (`1,536` completion tokens, real 4-bug C++/Python debugging & Japanese cross-referencing, Text-only vs +1,024-token Image via native CUDA WMMA FA2 `strata-vision`, captured `2026-11-23` as the multimodal vision overhead & KV+Image reuse baseline; subsequent text engine updates above further accelerated RTX 4070 decode & prefill):
 
 <p align="center">
   <img src="docs/media/bench-rtx4070-v100-practical.png" width="960" alt="RTX 4070 and Tesla V100 Practical & Coding Multimodal Prefill and Decode vs Context Depth">
@@ -219,19 +240,19 @@ Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCo
 Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the engine auto-selects the matching profile, chunk size, and KV strategy.
 
 ```bash
-# RTX 4070 12 GB — 65K daily coding (~8,013 PP @ 8K, ~51.9–61.1 t/s real-code Dec; DSpark ON)
+# RTX 4070 12 GB — 65K daily coding (68.5–72.9 OFF / 74.6–88.4 t/s DSpark ON @ temp=1.0)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
   --max-context 65536 --bench --max-new 128
 
-# RTX 4070 12 GB — 131K balanced (~7,972 PP @ 8K, ~42.1–57.7 t/s real-code Dec; DSpark ON)
+# RTX 4070 12 GB — 131K balanced (Core 128/128 resident + Outer Knapsack)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
   --max-context 131072 --bench --max-new 128
 
-# RTX 4070 12 GB — 262K max context (8,016 PP @ 8K -> 3,010 @ 256K / 57.1 -> 32.9 t/s real-code Dec; DSpark ON)
+# RTX 4070 12 GB — 262K max context (8,052->3,101 PP OFF; 64.7–68.1->36.4 t/s Dec ON)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
@@ -273,6 +294,8 @@ Explicit CLI flags and environment variables always override auto-profile defaul
 | `STRATA_TIER2_FLOOR` | Optional `tier2` expert slots reserved per layer before maximizing `tier1` |
 | `STRATA_MAX_PIN_MB` | Cap (`MiB`) on pinned host RAM for offloaded experts (`7168` default) |
 | `STRATA_NO_PIN_EXPERTS` | Disable `cudaHostAlloc` pinned host memory for offloaded experts |
+| `STRATA_EXPERT_PRIOR_W` | Bayesian prior weight for `effective_score()` during `rebalance()` (default `2.5`) |
+| `STRATA_NO_EXPERT_PRIOR` | Disable static decode frequency prior & Phase-Decode cross-layer knapsack (`1` disables) |
 
 See [docs/INKLING2.md](docs/INKLING2.md) for the complete CLI flag list and wire-format details.
 
@@ -284,8 +307,10 @@ See [docs/INKLING2.md](docs/INKLING2.md) for the complete CLI flag list and wire
 
 - **Two-Axis Profile Table** ([profile_rules.hpp](engine/include/strata/inkling2/profile_rules.hpp)): Pure, CPU-testable rules keyed by `ArchProfile × VramRegime`. Keeps V100 `full_vram` on `want_sp=7` (`6` exact waves on 80 SMs) and skips `d_hits` atomics when all experts are VRAM-resident, while giving 12 GB `tight_hybrid` a tighter arena and `T=2048` prefill.
 - **Unified Phase-Disjoint `layer_arena`**: Reuses a single 256B-aligned scratch arena across disjoint layer phases (attention, message passing, MoE routing/grouped WMMA), reclaiming `~400 MiB` on 12 GB GPUs and `+264 MiB` on V100.
+- **Decode Frequency-Prior & Phase-Decode Cross-Layer Knapsack** ([inkling2_expert_prior.cuh](engine/src/inkling2/inkling2_expert_prior.cuh)): Seeds initial expert VRAM placement with empirical decode routing frequencies (`kInkling2MiniDecodePrior`), applies Bayesian `effective_score` (`score + prior_w * prior_score`) in `rebalance()` and KV-grow eviction, and runs a Phase-Decode cross-layer knapsack (`Core=128` + Outer knapsack when Core fits at `65K–128K`; global 24-layer knapsack when tight at `160K–256K`) before restoring pinned Core experts in `set_phase_prefill()`, lifting RTX 4070 decode by `+10–29%` across `8K–256K`.
+- **Distribution-Preserving Confidence-Gated DSpark + 1-Hot PLD** ([inkling2_dspark.cuh](engine/src/inkling2/inkling2_dspark.cuh)): Combines deterministic-peak sampling confidence gating (`draft_sampled_confident`), exact rejection-sampled 1-hot suffix drafting (`PromptSuffixDrafter`), and adaptive cooldown for `temperature > 0` serving alongside zero-spill greedy drafting.
 - **Compact-Miss PCIe Double-Buffered Prefill (`pp_streaming`)**: Packs only VRAM-missing experts in contiguous host-to-device DMA runs into double-buffered staging (`pp_stage[2]`) with `expected_entries`-aware grouped WMMA launch sizing. Prefill↔Decode Phase-Split (`set_phase_prefill()` / `ensure_pp_cap()`), adaptive `T=8192/12288` chunking, and the cuBLASLt `g_cuda_lt_bucket_cache` push `262K` initial prefill past **`8,000+ t/s`** while keeping `DSpark` decode weights dynamically offloaded during prefill and asynchronously restored for decode.
-- **Zero-Copy Direct AVX2 `nvfp4_256_ktile_*` CPU MoE** ([nvfp4_avx2.cpp](engine/src/kernels/cpu/nvfp4_avx2.cpp)): Unpermutes GPU K-tile NVFP4 weights directly in YMM registers via K-outer streaming, bit-identical to `ggml-cpu` (`0` differing bits), eliminating scalar LUT unpacking and cutting hybrid CPU MoE time nearly in half while keeping GPU `nvfp4_ktile` enabled.
+- **Zero-Copy Direct AVX2 `nvfp4_256_ktile_*`, `q5k_ktile` & `q8_0_ktile` CPU MoE** ([nvfp4_avx2.cpp](engine/src/kernels/cpu/nvfp4_avx2.cpp)): Unpermutes GPU K-tile NVFP4 weights and pre-tiled `Q5_K`/`Q8_0` outer experts directly in YMM registers via K-outer streaming, bit-identical to `ggml-cpu` (`0` differing bits), eliminating per-token unpack/dequant overhead while keeping GPU `nvfp4_ktile` enabled.
 - **Decode CUDA Graphs & Prefix Checkpoints**: Uses a single 36-layer `core_graph` when `tier1` is 100% resident (`full_vram` / `core_resident_hybrid`), per-layer `layer_pre_graph[48]` during partial offload (`tight_hybrid`), and prefix checkpoint caching for multi-turn coding sessions.
 - **Multi-Threaded `dequant_tok`**: Parallelizes CPU-side Q4_K/Q6_K token dequantization for `T >= 128`, cutting 4K-token host dequant latency by `3.4×`.
 

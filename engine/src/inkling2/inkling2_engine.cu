@@ -1,6 +1,7 @@
 // src/inkling2/inkling2_engine.cu - Standalone / integrated CUDA + AVX2 hybrid engine for Inkling-2-Mini (arch inkling2).
 #include "strata/inkling2/engine.hpp"
 #include "strata/inkling2/profile_rules.hpp"
+#include "inkling2_expert_prior.cuh"
 #include "inkling2_kernels.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -352,6 +353,7 @@ struct PhysLayer {
     std::vector<int32_t> slot_of;        // [n_expert] on host (-1 = CPU)
     std::vector<int32_t> exp_in_slot;    // [n_slots]
     std::vector<double> score;           // [n_expert]
+    std::vector<double> prior_score;     // [n_expert] static decode frequency prior
 };
 
 struct Model : GpuWeightStore {
@@ -1272,7 +1274,17 @@ struct Engine {
     int cpu_buf_cap = 0;
     cudaEvent_t ev_route = nullptr;
     bool hybrid = false;
+    bool knapsack_decode_active = false;
     int rebal_burst = 2;
+
+    double effective_score(const PhysLayer& L, int e) const {
+        static const double prior_w = [] {
+            const char* v = std::getenv("STRATA_EXPERT_PRIOR_W");
+            return (v && v[0]) ? std::atof(v) : 2.5;
+        }();
+        const double p = (e < (int) L.prior_score.size()) ? L.prior_score[(size_t) e] : 0.0;
+        return L.score[(size_t) e] + prior_w * p;
+    }
     int pp_chunk_cnt = 0;
     size_t pinned_used = 0;
     size_t max_pin_bytes = (size_t) 7168 << 20;
@@ -4180,13 +4192,13 @@ struct Engine {
             const double weight = is_core ? 3.0 : ((L.L.gu_type == 13) ? 1.43 : 1.0);
             for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
             std::sort(order.begin(), order.end(),
-                      [&](int a, int b) { return L.score[(size_t) a] > L.score[(size_t) b]; });
+                      [&](int a, int b) { return effective_score(L, a) > effective_score(L, b); });
             victims.resize((size_t) S);
             for (int s = 0; s < S; ++s) victims[(size_t) s] = s;
             const int k_lim = std::min(S, std::max(1, max_per_layer));
             std::partial_sort(victims.begin(), victims.begin() + k_lim, victims.end(),
                               [&](int a, int b) {
-                                  return L.score[(size_t) L.exp_in_slot[(size_t) a]] < L.score[(size_t) L.exp_in_slot[(size_t) b]];
+                                  return effective_score(L, L.exp_in_slot[(size_t) a]) < effective_score(L, L.exp_in_slot[(size_t) b]);
                               });
             int v_idx = 0;
             for (int i = 0; i < S && v_idx < k_lim; ++i) {
@@ -4194,9 +4206,9 @@ struct Engine {
                 if (L.slot_of[(size_t) hot_cand] >= 0) continue;
                 const int s = victims[(size_t) v_idx];
                 const int y = L.exp_in_slot[(size_t) s];
-                const double diff = L.score[(size_t) hot_cand] - L.score[(size_t) y];
+                const double diff = effective_score(L, hot_cand) - effective_score(L, y);
                 // Hysteresis avoids thrashing 4.5 MiB H2D swaps on near-tied scores during decode.
-                const double min_diff = (max_swaps >= 48) ? 0.0 : std::max(0.25, 0.15 * L.score[(size_t) y]);
+                const double min_diff = (max_swaps >= 48) ? 0.0 : std::max(0.25, 0.15 * effective_score(L, y));
                 if (diff <= min_diff) break;
                 cands.push_back(Cand{diff * weight, li, s, hot_cand, y});
                 ++v_idx;
@@ -4270,7 +4282,8 @@ struct Engine {
     // pinned d_slot_of upload on st; Pass 3: priority-ordered coalesced H2D on cst with optional async return!).
     void resize_experts_vram(size_t target_free_bytes, size_t guard_override = 0, bool equalize_tier2 = false,
                              bool async_cst = false, bool whole_layer_evict = false, bool restore_dspark_decode_w = false,
-                             bool skip_sync = false, size_t known_fr = 0, size_t known_tot = 0) {
+                             bool skip_sync = false, size_t known_fr = 0, size_t known_tot = 0,
+                             bool knapsack_decode = false) {
         const auto t0 = Clock::now();
         const auto& hp = m->hp;
         const int ne = (int) hp.n_expert;
@@ -4362,7 +4375,98 @@ struct Engine {
         const size_t eff_fr = fr + pool_free0;
 
         // ---- Plan target_slots[0..n_phys-1] ----
-        if (eff_fr < target_free_bytes + dspark_w_need) {
+        const float* prior_ptr = strata::inkling2::inkling2_mini_decode_prior(hp.n_phys, ne);
+        const bool use_knapsack = (knapsack_decode && prior_ptr != nullptr && !whole_layer_evict);
+        std::vector<double> blended_scores;
+        if (use_knapsack) {
+            blended_scores.resize((size_t) hp.n_phys * (size_t) ne, 0.0);
+            for (int ip = 0; ip < hp.n_phys; ++ip) {
+                const PhysLayer& L = m->layers[(size_t) ip];
+                const double mult = (ip >= hp.core_start && ip < hp.core_end) ? 24.0 : 8.0;
+                double sum_live = 0.0;
+                for (int e = 0; e < ne; ++e) sum_live += L.score[(size_t) e];
+                for (int e = 0; e < ne; ++e) {
+                    const double pe = (e < (int) L.prior_score.size()) ? L.prior_score[(size_t) e] : (double) prior_ptr[(size_t) ip * ne + e];
+                    const double le = (sum_live > 1e-6) ? (L.score[(size_t) e] / sum_live) * mult : pe;
+                    blended_scores[(size_t) ip * ne + e] = 0.65 * pe + 0.35 * le;
+                }
+            }
+            const size_t keep_free = std::max(target_free_bytes, base_guard) + dspark_w_need;
+            size_t cur_all_b = 0;
+            size_t tier1_full_b = 0;
+            size_t t1_t2_full_b = 0;
+            for (int ip = 0; ip < hp.n_phys; ++ip) {
+                const PhysLayer& L = m->layers[(size_t) ip];
+                cur_all_b += (size_t) L.n_slots * L.stride;
+                if (L.gu_type == 30) continue;
+                const size_t lb = (size_t) ne * L.stride;
+                if (ip >= hp.core_start && ip < hp.core_end) tier1_full_b += lb;
+                t1_t2_full_b += lb;
+            }
+            const size_t avail_total = (cur_all_b + eff_fr > keep_free) ? (cur_all_b + eff_fr - keep_free) : 0;
+            struct KnapItem {
+                double val;
+                int ip;
+                int e;
+                size_t stride;
+            };
+            if (avail_total >= t1_t2_full_b) {
+                for (int ip : tier1) target_slots[(size_t) ip] = ne;
+                for (int ip : tier2) target_slots[(size_t) ip] = ne;
+                knapsack_decode_active = false;
+            } else if (avail_total >= tier1_full_b) {
+                for (int ip : tier1) target_slots[(size_t) ip] = ne;
+                for (int ip : tier2) target_slots[(size_t) ip] = 0;
+                for (int ip : tier3) target_slots[(size_t) ip] = 0;
+                size_t rem = avail_total - tier1_full_b;
+                std::vector<KnapItem> items;
+                items.reserve(tier2.size() * (size_t) ne);
+                for (int ip : tier2) {
+                    const size_t st_b = m->layers[(size_t) ip].stride;
+                    for (int e = 0; e < ne; ++e) {
+                        items.push_back(KnapItem{blended_scores[(size_t) ip * ne + e], ip, e, st_b});
+                    }
+                }
+                std::sort(items.begin(), items.end(), [](const KnapItem& a, const KnapItem& b) {
+                    if (a.val != b.val) return a.val > b.val;
+                    if (a.ip != b.ip) return a.ip < b.ip;
+                    return a.e < b.e;
+                });
+                for (const KnapItem& it : items) {
+                    if (rem >= it.stride && target_slots[(size_t) it.ip] < ne) {
+                        ++target_slots[(size_t) it.ip];
+                        rem -= it.stride;
+                    }
+                }
+                knapsack_decode_active = false;
+            } else {
+                for (int ip : tier1) target_slots[(size_t) ip] = 0;
+                for (int ip : tier2) target_slots[(size_t) ip] = 0;
+                for (int ip : tier3) target_slots[(size_t) ip] = 0;
+                size_t rem = avail_total;
+                std::vector<KnapItem> items;
+                items.reserve((tier1.size() + tier2.size()) * (size_t) ne);
+                for (int ip = 0; ip < hp.n_phys; ++ip) {
+                    const PhysLayer& L = m->layers[(size_t) ip];
+                    if (L.gu_type == 30) continue;
+                    for (int e = 0; e < ne; ++e) {
+                        items.push_back(KnapItem{blended_scores[(size_t) ip * ne + e], ip, e, L.stride});
+                    }
+                }
+                std::sort(items.begin(), items.end(), [](const KnapItem& a, const KnapItem& b) {
+                    if (a.val != b.val) return a.val > b.val;
+                    if (a.ip != b.ip) return a.ip < b.ip;
+                    return a.e < b.e;
+                });
+                for (const KnapItem& it : items) {
+                    if (rem >= it.stride && target_slots[(size_t) it.ip] < ne) {
+                        ++target_slots[(size_t) it.ip];
+                        rem -= it.stride;
+                    }
+                }
+                knapsack_decode_active = true;
+            }
+        } else if (eff_fr < target_free_bytes + dspark_w_need) {
             const size_t eff_target = target_free_bytes + dspark_w_need;
             size_t freed_est = 0;
             auto plan_shrink_tier = [&](const std::vector<int>& tier, bool whole_evict) {
@@ -4524,7 +4628,9 @@ struct Engine {
                 std::vector<int> order((size_t) ne);
                 for (int e = 0; e < ne; ++e) order[(size_t) e] = e;
                 std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-                    if (L.score[(size_t) a] != L.score[(size_t) b]) return L.score[(size_t) a] > L.score[(size_t) b];
+                    const double sa = use_knapsack ? blended_scores[(size_t) ip * ne + a] : effective_score(L, a);
+                    const double sb = use_knapsack ? blended_scores[(size_t) ip * ne + b] : effective_score(L, b);
+                    if (sa != sb) return sa > sb;
                     return (L.slot_of[(size_t) a] >= 0) > (L.slot_of[(size_t) b] >= 0);
                 });
                 keep_list[(size_t) ip].assign(order.begin(), order.begin() + tgt);
@@ -4847,10 +4953,12 @@ struct Engine {
         }
         in_decode_phase = true;
 
-        // 5. D2D-shrink frontloaded layers, batch-alloc, and stream DSpark decode_w + blk.0..5 + blk.18..23 async on cst!
+        // 5. D2D-shrink frontloaded layers, batch-alloc, and stream DSpark decode_w + knapsack-ranked experts async on cst!
         const size_t dec_guard = (verify_max_t > 1) ? ((size_t) 176 << 20) : ((size_t) 144 << 20);
+        static const bool no_dec_knapsack = (std::getenv("STRATA_NO_DECODE_KNAPSACK") != nullptr);
         resize_experts_vram(vram_reserve_bytes, dec_guard, /*equalize_tier2=*/true, /*async_cst=*/true,
-                            /*whole_layer_evict=*/false, /*restore_dspark_decode_w=*/(dspark != nullptr));
+                            /*whole_layer_evict=*/false, /*restore_dspark_decode_w=*/(dspark != nullptr),
+                            /*skip_sync=*/false, 0, 0, /*knapsack_decode=*/!no_dec_knapsack);
         normalize_decode_scores();
     }
 
@@ -4858,6 +4966,8 @@ struct Engine {
     /// decode-bonus experts (~1.5 ms), re-expand SWA KV pool, and restore active_pp_cap prefill scratch + pp_stage_pool.
     void set_phase_prefill(bool streams_already_synced = false, size_t known_fr = 0, size_t known_tot = 0) {
         if (!in_decode_phase) return;
+        const bool was_knapsack_dec = knapsack_decode_active;
+        knapsack_decode_active = false;
         if (!streams_already_synced) {
             CK(cudaStreamSynchronize(st));
             if (cst) CK(cudaStreamSynchronize(cst));
@@ -5031,6 +5141,12 @@ struct Engine {
                     saved_pp_stage_bytes = pp_stage_bytes;
                 }
             }
+        }
+        if (was_knapsack_dec && !is_core_full_resident()) {
+            // Restore Core 3x-loop layers first from pinned hblobs before Prefill pp_streaming begins.
+            resize_experts_vram(vram_reserve_bytes + ((size_t) 64 << 20), 0, /*equalize_tier2=*/false,
+                                /*async_cst=*/false, /*whole_layer_evict=*/false,
+                                /*restore_dspark_decode_w=*/false, /*skip_sync=*/true);
         }
         if (!is_core_full_resident() && pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
         in_decode_phase = false;
@@ -5355,7 +5471,9 @@ struct Engine {
                 std::vector<int> order((size_t) ne);
                 for (int e = 0; e < ne; ++e) order[(size_t) e] = e;
                 std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-                    if (L.score[(size_t) a] != L.score[(size_t) b]) return L.score[(size_t) a] > L.score[(size_t) b];
+                    const double sa = effective_score(L, a);
+                    const double sb = effective_score(L, b);
+                    if (sa != sb) return sa > sb;
                     return (L.slot_of[(size_t) a] >= 0) > (L.slot_of[(size_t) b] >= 0);
                 });
                 keep.assign(order.begin(), order.begin() + target_slots);
@@ -8900,11 +9018,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                                         tier1_hblobs_need > 0 &&
                                         (tier1_hblobs_need + tier2_hblobs_need <= max_pin_bytes));
 
+    const float* place_prior_ptr = strata::inkling2::inkling2_mini_decode_prior(hp.n_phys, ne);
     for (int ip : alloc_order) {
         PhysLayer& L = m.layers[(size_t) ip];
         int s = slots[(size_t) ip];
         L.slot_of.assign((size_t) ne, -1);
         L.score.assign((size_t) ne, 0.0);
+        if (place_prior_ptr) {
+            L.prior_score.assign(place_prior_ptr + (size_t) ip * ne, place_prior_ptr + (size_t) (ip + 1) * ne);
+        } else {
+            L.prior_score.clear();
+        }
         if (!L.d_hits) {
             CK(cudaMalloc(&L.d_hits, (size_t) ne * sizeof(uint32_t)));
             CK(cudaMemset(L.d_hits, 0, (size_t) ne * sizeof(uint32_t)));
@@ -8982,8 +9106,33 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         }
 
         if (s > 0) {
+            std::vector<int> init_exp((size_t) s);
+            if (s < ne && !L.prior_score.empty()) {
+                std::vector<int> ord((size_t) ne);
+                for (int e = 0; e < ne; ++e) ord[(size_t) e] = e;
+                std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+                    return L.prior_score[(size_t) a] > L.prior_score[(size_t) b];
+                });
+                init_exp.assign(ord.begin(), ord.begin() + s);
+                std::sort(init_exp.begin(), init_exp.end());
+            } else {
+                for (int k = 0; k < s; ++k) init_exp[(size_t) k] = k;
+            }
             if (L.hblobs) {
-                CK(cudaMemcpyAsync(L.d_blobs, L.hblobs, (size_t) s * L.stride, cudaMemcpyHostToDevice, E.st));
+                if (s == ne || L.prior_score.empty()) {
+                    CK(cudaMemcpyAsync(L.d_blobs, L.hblobs, (size_t) s * L.stride, cudaMemcpyHostToDevice, E.st));
+                } else {
+                    for (int k = 0; k < s; ) {
+                        int k1 = k + 1;
+                        while (k1 < s && init_exp[(size_t) k1] == init_exp[(size_t) k] + (k1 - k)) ++k1;
+                        const int cnt = k1 - k;
+                        const size_t bytes = (size_t) (cnt - 1) * L.stride + L.L.bytes;
+                        CK(cudaMemcpyAsync(L.d_blobs + (size_t) k * L.stride,
+                                           L.hblobs + (size_t) init_exp[(size_t) k] * L.stride,
+                                           bytes, cudaMemcpyHostToDevice, E.st));
+                        k = k1;
+                    }
+                }
             } else if (has_place_pin && L.stride <= max_no_hblobs_stride) {
                 int bi = 0;
                 for (int k0 = 0; k0 < s; k0 += kPlaceBatch, bi ^= 1) {
@@ -8998,14 +9147,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                             const int a = wi * per, b = std::min(kn, a + per);
                             if (a >= b) break;
                             ths.emplace_back([&, a, b, k0, bi]() {
-                                for (int j = a; j < b; ++j) build_expert_blob(L, k0 + j, pbuf[bi] + (size_t) j * L.stride);
+                                for (int j = a; j < b; ++j) build_expert_blob(L, init_exp[(size_t) (k0 + j)], pbuf[bi] + (size_t) j * L.stride);
                             });
                         }
                         const int b0 = std::min(kn, per);
-                        for (int j = 0; j < b0; ++j) build_expert_blob(L, k0 + j, pbuf[bi] + (size_t) j * L.stride);
+                        for (int j = 0; j < b0; ++j) build_expert_blob(L, init_exp[(size_t) (k0 + j)], pbuf[bi] + (size_t) j * L.stride);
                         for (auto& th : ths) th.join();
                     } else {
-                        for (int j = 0; j < kn; ++j) build_expert_blob(L, k0 + j, pbuf[bi] + (size_t) j * L.stride);
+                        for (int j = 0; j < kn; ++j) build_expert_blob(L, init_exp[(size_t) (k0 + j)], pbuf[bi] + (size_t) j * L.stride);
                     }
                     CK(cudaMemcpyAsync(L.d_blobs + (size_t) k0 * L.stride, pbuf[bi],
                                        (size_t) kn * L.stride, cudaMemcpyHostToDevice, E.st));
@@ -9015,13 +9164,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             } else {
                 tmp.resize(L.L.bytes);
                 for (int k = 0; k < s; ++k) {
-                    build_expert_blob(L, k, tmp.data());
+                    build_expert_blob(L, init_exp[(size_t) k], tmp.data());
                     CK(cudaMemcpy(L.d_blobs + (size_t) k * L.stride, tmp.data(), L.L.bytes, cudaMemcpyHostToDevice));
                 }
             }
             for (int k = 0; k < s; ++k) {
-                L.slot_of[(size_t) k] = k;
-                L.exp_in_slot[(size_t) k] = k;
+                const int e = init_exp[(size_t) k];
+                L.slot_of[(size_t) e] = k;
+                L.exp_in_slot[(size_t) k] = e;
             }
             E.upload_slot_of(ip, E.st);
             CK(cudaStreamSynchronize(E.st));

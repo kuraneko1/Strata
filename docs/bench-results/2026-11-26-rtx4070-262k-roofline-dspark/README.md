@@ -45,7 +45,7 @@ $$T_{\min} = \frac{\text{GPU non-MoE (Dense + LM Head + KV)}}{461.2\text{ GB/s}}
 | **`128K`** (Hit `86.0%`) | `9.38 ms` | `2.80 ms` | `9.05 ms` (`302 MB`) | **`47.1 t/s`** (`48.9 t/s` @ 504) | **`37.7 t/s`** | **80%** |
 | **`256K`** (Hit `65.2%`) | `14.30 ms` | `~5.90 ms` (`168 MB` miss) | `14.78 ms` (`494 MB`) | **`28.6 t/s`** (`29.7 t/s` @ 504) | **`27.5 t/s`** | **96%** |
 
-At `8K–64K`, `T=1` already achieves **~89–92%** (and **~98%** on high-hit prose) of the physical STREAM limit; at **`256K`**, it reaches **95–97%** of the absolute hardware ceiling (`28.6 t/s` @ `461.2 GB/s` STREAM, `29.7 t/s` @ `504 GB/s` catalog). Further `T=1` scheduling improvements without hardware or precision changes have `< 5%` physical headroom at `256K` (and ~`10–15%` around `128K`).
+At `8K–64K`, `T=1` already achieves **~89–92%** (and **~98%** on high-hit prose) of the physical STREAM limit; at **`256K`** under baseline hit (`65.2%`), it reaches **95–97%** of the absolute hardware ceiling (`28.6 t/s` @ `461.2 GB/s` STREAM, `29.7 t/s` @ `504 GB/s` catalog) — proving why raising the decode hit rate via frequency-prior Knapsack placement (`65.2% → 71.4%`, Section 5) directly lifts `256K` `T=1` beyond that fixed-hit ceiling (`27.5 → 31.7 t/s`).
 
 ---
 
@@ -53,8 +53,8 @@ At `8K–64K`, `T=1` already achieves **~89–92%** (and **~98%** on high-hit pr
 
 ### Theoretical Roofline with DSpark (`--draft-max 3`, `T=4` Verify)
 Speculative decoding amortizes GPU Non-MoE reads (`Dense + LM Head + KV`: `4.75 ms` @ `8K`, `14.30 ms` @ `256K`) across multiple verified tokens, while trading off ~`3×` more unique CPU MoE misses on misses in hybrid memory:
-* **`8K` (`draft-max 3`)**: Verify step floor ≈ `30–33 ms` → **`~65–75 t/s`** at typical real-code acceptance (`2.0–2.3 tok/step`, measured **`56.5–75.1 t/s`**) and **`~120–130 t/s`** at 100% PLD/verbatim acceptance (measured **`124.3 t/s`** at `96.3%` accept).
-* **`256K` (`draft-max 3`)**: Verify step floor ≈ `75 ms` (`1.9 GB` unique DDR4 misses ≈ `57 ms`) → **`~30–33 t/s`** at real-code acceptance (measured **`32.9 t/s`**), **`~52 t/s`** at 100% acceptance.
+* **`8K` (`draft-max 3`)**: Verify step floor ≈ `30–33 ms` → **`~65–75 t/s`** at typical real-code acceptance (`2.0–2.3 tok/step`, measured `56.5–75.1 t/s`) and **`~120–130 t/s`** at 100% PLD/verbatim acceptance (measured **`124.3 t/s`** at `96.3%` accept).
+* **`256K` (`draft-max 3`)**: Verify step floor ≈ `75 ms` (`1.9 GB` unique DDR4 misses ≈ `57 ms`) → **`~30–33 t/s`** at baseline real-code acceptance (rising to **`36.4 t/s`** with Phase-Decode Cross-Layer Knapsack), **`~52 t/s`** at 100% acceptance.
 
 ### `--draft-max` Ablation at `65K` Context (`OFF / 3 / 5 / 6`, 256 Tokens Generated)
 
@@ -76,18 +76,26 @@ Measured across `edit_rag` (code verbatim edit), `code` (C++/CUDA generation), `
 | `prose` (English Prose) | `68.50 t/s` | **`69.06 t/s`** | `58.35 t/s` | **`-15.5%`** (`-14.8%` vs OFF) |
 | `japanese` (Japanese Tech) | **`66.28 t/s`** | `62.72 t/s` | `44.74 t/s` | **`-28.7%`** (`-32.5%` vs OFF) |
 
-#### Sampling Confidence Gate + 1-Hot PLD (`temperature=1.0, top_p=0.95, top_k=40, seed=42`, Distribution-Preserving)
-Adding deterministic-peak `draft_sampled_confident` (`tau0=0.25` / `0.30` in `tight_hybrid`, `alpha_min=0.25`) + exact rejection-sampled 1-hot `PromptSuffixDrafter` (`PLD`) + adaptive cooldown preserves exact target distributions while eliminating the `65K` Japanese regression (`-5.4%` → `+0.5%`):
+#### Sampling Confidence Gate + 1-Hot PLD & Decode Frequency-Prior Knapsack (`temperature=1.0, top_p=0.95, top_k=40`)
+Adding deterministic-peak `draft_sampled_confident` (`tau0=0.25` / `0.30` in `tight_hybrid`, `alpha_min=0.25`) + exact rejection-sampled 1-hot `PromptSuffixDrafter` (`PLD`) + Static Decode Frequency Prior (`inkling2_expert_prior.cuh`) + Phase-Decode Outer Knapsack preserves exact target distributions while lifting `65K` sampling across all workloads (zero Japanese regression):
 
-| Context / Workload | DSpark OFF | `--draft-max 3` (Conf Gate + 1-Hot PLD) | Delta |
+##### `65K` Sampling (`temperature=1.0, top_p=0.95, top_k=40`, 256 Tokens)
+| Workload (`65K`) | DSpark OFF | `--draft-max 3` | Delta |
 | :--- | ---: | ---: | ---: |
-| `65K` `edit_rag` (`256 tok`) | `61.97 t/s` | **`81.57 t/s`** | **`+31.6%`** |
-| `65K` `code` (`256 tok`) | `60.96 t/s` | **`71.60 t/s`** | **`+17.5%`** |
-| `65K` `prose` (`256 tok`) | `66.02 t/s` | **`80.68 t/s`** | **`+22.2%`** |
-| `65K` `japanese` (`256 tok`) | `65.55 t/s` | **`65.89 t/s`** | **`+0.5%`** |
-| `262K` `edit_rag` (`128 tok`) | `58.25 t/s` | **`63.69 t/s`** | **`+9.3%`** |
-| `262K` `code` (`128 tok`) | `55.33 t/s` | `47.02 t/s` | `-15.0%` |
-| `262K` `japanese` (`128 tok`) | `57.37 t/s` | `54.49 t/s` | `-5.0%` |
+| `edit_rag` (`256 tok`) | `68.51 t/s` | **`88.42 t/s`** | **`+29.1%`** |
+| `code` (`256 tok`) | `71.54 t/s` | **`75.45 t/s`** | **`+5.5%`** |
+| `prose` (`256 tok`) | `72.93 t/s` | **`86.18 t/s`** | **`+18.2%`** |
+| `japanese` (`256 tok`) | `72.13 t/s` | **`74.61 t/s`** | **`+3.4%`** |
+
+##### `65K` Greedy (`temperature=0`, 256 Tokens, w/ Frequency Prior + Outer Knapsack)
+| Workload (`65K`) | DSpark OFF | `--draft-max 3` | Delta |
+| :--- | ---: | ---: | ---: |
+| `edit_rag` (`256 tok`) | `70.46 t/s` | **`80.73 t/s`** | **`+14.6%`** |
+| `code` (`256 tok`) | `72.92 t/s` | **`80.81 t/s`** | **`+10.8%`** |
+| `prose` (`256 tok`) | `73.11 t/s` | **`85.09 t/s`** | **`+16.4%`** |
+| `japanese` (`256 tok`) | `72.39 t/s` | `69.33 t/s` | `-4.2%` |
+
+*(Raw CSV: [rtx4070-65k-knapsack.csv](rtx4070-65k-knapsack.csv))*
 
 **Why `--draft-max 3` wins on 12 GB hybrid GPUs (`--draft-max 6` hits VRAM spill)**:
 1. Larger Verify batches (`T=6..7` at `dm=5..6`) invoke many more distinct CPU-resident experts per step on a DDR4-bound bus, increasing verify step cost faster than expected accepted length grows — especially under Sampling where `PLD` and greedy confidence gating are bypassed.
@@ -102,29 +110,33 @@ Adding deterministic-peak `draft_sampled_confident` (`tau0=0.25` / `0.30` in `ti
 </p>
 
 <p align="center">
-  <img src="bench-rtx4070-dspark.png" width="940" alt="RTX 4070 65K 131K 262K DSpark ON vs NODRAFT">
+  <img src="bench-rtx4070-dspark.png" width="940" alt="RTX 4070 65K 131K 262K DSpark ON vs NODRAFT (Pre-Knapsack 3-Profile Reference)">
 </p>
+<p align="center"><sub><i>Pre-Knapsack 3-profile comparison (<code>65K / 131K / 262K</code> DSpark ON vs <code>262K</code> NODRAFT baseline). Latest single-profile <code>262K</code> Knapsack results are shown in the Before vs After chart and table below.</i></sub></p>
 
-1. **Zero-Copy AVX2 CPU MoE (`q5k_ktile` / `q8_0_ktile`)**: Pre-transposes `blk.20..23` CPU experts (`Q5_K`/`Q8_0`) once into cache-friendly tiles, eliminating per-token `dequant + h2f` overhead.
-2. **Decode `L.score` Normalization (`prior=4.0`) + GPU Top-K Sampling Fix**: Stabilizes hybrid expert LRU hot-set retention during decode across `8K–256K` and fixes `row_off` indexing in GPU Top-K repeat-penalty sampling.
-3. **Confidence-Gated DSpark + `PromptSuffixDrafter` (`PLD`)**: Combines zero-spill `k_dspark_argmax_prob_stage{1,2}` early stopping with suffix matching for verbatim code/RAG spans (`96.3%` accept / `124.3 t/s` on `65K` edit tasks).
-4. **Upfront Tier-1 Host Blob Pre-Building (`>=131K`)**: Pre-builds and pins Tier-1 Core `L.hblobs` at model placement when `MemAvailable` budget permits (`tier1 + tier2 <= max_pin_bytes`), eliminating the `12–13 s` synchronous `cudaHostAlloc` mid-prefill stall at `96K` (OFF) and `160K` (ON) and raising `256K` Prefill from **`2,753.7 → 3,009.7 t/s`** (DSpark ON) and **`2,586.2 → 3,062.8 t/s`** (DSpark OFF), while pushing **`8K` fresh Prefill cleanly past `8,000 t/s` on both modes (`8,016.1` ON / `8,012.8` OFF)** via multi-layer Core borrow (`blk.6..7`), overlapped `aux_st` DSpark feature accumulation + LM head, and `set_phase_prefill` sync deduplication.
+1. **Static Decode Frequency Prior + Bayesian `rebalance()` + Phase-Decode Cross-Layer Knapsack (`inkling2_expert_prior.cuh`)**: Seeds VRAM slots using measured decode routing frequencies, protects core prior experts during LRU rebalancing (`prior_w=2.5`), and runs a cross-layer knapsack at `set_phase_decode()` (`Core=128` + Outer knapsack when Core fits at `65K–128K`; global 24-layer knapsack under tight `160K–256K` VRAM) before restoring Core experts on `set_phase_prefill()`. Lifts `262K` Decode from `25.1 → 36.4 t/s` (`+45%` ON) and `26.3 → 31.7 t/s` (`+21%` OFF), while `16K` peaks at `68.1 t/s` ON and `64K` reaches `60.5 t/s` ON.
+2. **Zero-Copy AVX2 CPU MoE (`q5k_ktile` / `q8_0_ktile`)**: Pre-transposes `blk.20..23` CPU experts (`Q5_K`/`Q8_0`) once into cache-friendly tiles, eliminating per-token `dequant + h2f` overhead.
+3. **Decode `L.score` Normalization (`prior=4.0`) + GPU Top-K Sampling Fix**: Stabilizes hybrid expert LRU hot-set retention during decode across `8K–256K` and fixes `row_off` indexing in GPU Top-K repeat-penalty sampling.
+4. **Distribution-Preserving Confidence-Gated DSpark + 1-Hot `PromptSuffixDrafter` (`PLD`)**: Combines zero-spill `k_dspark_argmax_prob_stage{1,2}` early stopping, deterministic-peak sampling confidence gating (`draft_sampled_confident`), and exact rejection-sampled 1-hot suffix drafting (`88.42 t/s` on `65K` `edit_rag` sampling, zero Japanese regression).
+5. **Upfront Tier-1 Host Blob Pre-Building (`>=131K`)**: Pre-builds and pins Tier-1 Core `L.hblobs` at model placement when `MemAvailable` budget permits (`tier1 + tier2 <= max_pin_bytes`), eliminating the `12–13 s` synchronous `cudaHostAlloc` mid-prefill stall at `96K` (OFF) and `160K` (ON) and pushing `256K` Prefill to **`3,100.6 t/s`** (`+19.9%` vs `2,586.2`) DSpark OFF / **`2,934.6 t/s`** (`+6.6%` vs `2,753.7`) DSpark ON, with `8K` Prefill reaching **`8,051.9 t/s`** (OFF) / **`8,009.5 t/s`** cool single-turn (`7,874.3 t/s` warm back-to-back ON).
 
 | Depth | DSpark ON PP (Before → After) | DSpark OFF PP (Before → After) | DSpark ON Dec (Before → After) | DSpark OFF Dec (Before → After) |
 | ---: | ---: | ---: | ---: | ---: |
-| `8K` | `8,004.5` → **`8,016.1 t/s`** | `7,993.5` → **`8,012.8 t/s`** | `49.1` → **`57.1 t/s`** | `49.2` → **`50.3 t/s`** |
-| `16K` | `6,842.5` → `6,704.2 t/s` | `6,762.3` → `6,515.2 t/s` | `55.7` → **`59.0 t/s`** | `45.6` → **`47.9 t/s`** |
-| `32K` | `6,473.6` → `6,371.9 t/s` | `5,216.9` → **`6,317.1 t/s`** (+21.1%) | `46.8` → **`55.2 t/s`** | `45.0` → **`49.7 t/s`** |
-| `48K` | `5,656.7` → **`5,785.6 t/s`** | `4,627.0` → **`5,990.6 t/s`** (+29.5%) | `46.6` → **`52.7 t/s`** | `42.3` → **`45.5 t/s`** |
-| `64K` | `5,489.6` → **`5,567.3 t/s`** | `4,732.9` → **`5,709.3 t/s`** (+20.6%) | `45.5` → **`51.8 t/s`** | `41.0` → **`43.8 t/s`** |
-| `96K` | `4,805.0` → **`4,839.9 t/s`** | `2,732.8` → **`4,923.8 t/s`** (+80.2%) | `50.1` → **`51.3 t/s`** | `37.0` → **`40.6 t/s`** |
-| `128K` | `4,236.0` → **`4,253.5 t/s`** | `2,848.1` → **`4,312.8 t/s`** (+51.4%) | `37.6` → **`39.2 t/s`** | `33.6` → **`37.7 t/s`** |
-| `160K` | `3,207.2` → **`3,812.8 t/s`** (+18.9%) | `2,822.1` → **`3,869.8 t/s`** (+37.1%) | `35.7` → **`39.6 t/s`** | `31.0` → **`34.9 t/s`** |
-| `192K` | `3,068.8` → **`3,510.2 t/s`** (+14.4%) | `2,752.7` → **`3,540.8 t/s`** (+28.6%) | `31.5` → **`34.5 t/s`** | `30.3` → `29.4 t/s` |
-| `224K` | `2,882.7` → **`3,211.9 t/s`** (+11.4%) | `2,665.6` → **`3,268.4 t/s`** (+22.6%) | `25.0` → **`32.0 t/s`** (+28.0%) | `27.8` → **`28.1 t/s`** |
-| **`256K`** | **`2,753.7` → `3,009.7 t/s`** (**+9.3%**) | **`2,586.2` → `3,062.8 t/s`** (**+18.4%**) | **`25.1` → `32.9 t/s`** (**+31.1%**) | **`26.3` → `27.5 t/s`** |
+| `8K` | **`8,004.5`** → `7,874.3 t/s`¹ | `7,993.5` → **`8,051.9 t/s`** | `49.1` → **`64.7 t/s`** (+31.9%) | `49.2` → **`65.2 t/s`** (+32.5%) |
+| `16K` | `6,842.5` → `6,557.3 t/s` | `6,762.3` → `6,612.9 t/s` | `55.7` → **`68.1 t/s`** (+22.3%) | `45.6` → **`60.9 t/s`** (+33.7%) |
+| `32K` | `6,473.6` → `6,276.0 t/s` | `5,216.9` → **`6,365.5 t/s`** (+22.0%) | `46.8` → **`58.1 t/s`** (+24.2%) | `45.0` → **`61.2 t/s`** (+36.1%) |
+| `48K` | `5,656.7` → `5,587.6 t/s` | `4,627.0` → **`6,014.0 t/s`** (+30.0%) | `46.6` → **`56.3 t/s`** (+20.8%) | `42.3` → **`53.8 t/s`** (+27.1%) |
+| `64K` | `5,489.6` → `5,424.3 t/s` | `4,732.9` → **`5,753.5 t/s`** (+21.6%) | `45.5` → **`60.5 t/s`** (+32.8%) | `41.0` → **`53.9 t/s`** (+31.2%) |
+| `96K` | `4,805.0` → `4,694.8 t/s` | `2,732.8` → **`4,999.2 t/s`** (+82.9%) | `50.1` → **`53.8 t/s`** (+7.6%) | `37.0` → **`48.3 t/s`** (+30.5%) |
+| `128K` | `4,236.0` → `4,116.0 t/s` | `2,848.1` → **`4,425.7 t/s`** (+55.4%) | `37.6` → **`43.5 t/s`** (+15.6%) | `33.6` → **`42.0 t/s`** (+24.8%) |
+| `160K` | `3,207.2` → **`3,716.1 t/s`** (+15.9%) | `2,822.1` → **`3,955.5 t/s`** (+40.2%) | `35.7` → **`48.2 t/s`** (+35.1%) | `31.0` → **`37.3 t/s`** (+20.4%) |
+| `192K` | `3,068.8` → **`3,396.2 t/s`** (+10.7%) | `2,752.7` → **`3,605.1 t/s`** (+31.0%) | `31.5` → **`42.3 t/s`** (+34.6%) | `30.3` → **`37.4 t/s`** (+23.2%) |
+| `224K` | `2,882.7` → **`3,135.4 t/s`** (+8.8%) | `2,665.6` → **`3,325.1 t/s`** (+24.7%) | `25.0` → **`35.4 t/s`** (+41.6%) | `27.8` → **`32.4 t/s`** (+16.7%) |
+| **`256K`** | **`2,753.7` → `2,934.6 t/s`** (**+6.6%**) | **`2,586.2` → `3,100.6 t/s`** (**+19.9%**) | **`25.1` → `36.4 t/s`** (**+44.9%**) | **`26.3` → `31.7 t/s`** (**+20.7%**) |
 
-Raw CSVs: [rtx4070-262k-dspark-on.csv](rtx4070-262k-dspark-on.csv) | [rtx4070-262k-dspark-off.csv](rtx4070-262k-dspark-off.csv)
+<p><sub>¹ Cool single-turn <code>8K</code> DSpark ON prefill also measures <code>8,009.5 t/s</code> (<code>7,874.3 t/s</code> shown in the ladder row is the warm back-to-back run).</sub></p>
+
+Raw CSVs: [rtx4070-262k-dspark-on.csv](rtx4070-262k-dspark-on.csv) | [rtx4070-262k-dspark-off.csv](rtx4070-262k-dspark-off.csv) | [rtx4070-65k-knapsack.csv](rtx4070-65k-knapsack.csv)
 
 ---
 
@@ -143,5 +155,5 @@ Raw CSVs: [rtx4070-262k-dspark-on.csv](rtx4070-262k-dspark-on.csv) | [rtx4070-26
 ## 7. Verification Gates Passed
 
 * `sm_89` Release build + clean `sm_70` CUDA 12.9 Release build (`SM70_RC=0`).
-* `compute-sanitizer --tool memcheck` at `262K` (`--kv-q8 --expert-vram 5`, DSpark ON): **`0 errors`**.
-* `test_kq_ktile_parity` (`bad=0`) & `nvfp4_avx512_parity` (`bad=0`); `65K` edit parity DSpark ON vs OFF (`64/64` exact match).
+* `compute-sanitizer --tool memcheck --report-api-errors no` at `262K` (Case A) AND multi-turn `set_phase_decode` <-> `set_phase_prefill` under `--vram-reserve-mib 4096` (Case B global knapsack, DSpark ON): **`0 errors`**.
+* `test_kq_ktile_parity` (`bad=0`) & `nvfp4_avx512_parity` (`bad=0`); `65K` `edit` & `japanese` DSpark ON vs OFF (`64/64` exact greedy match).
