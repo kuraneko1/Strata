@@ -185,18 +185,21 @@ g++ -std=c++20 -O2 -Wall -Wextra -Iengine/include \
 
 ## Quick Start
 
-### 1. Server Mode (OpenAI / Anthropic API + Web UI)
+### 1. Server Mode (Fastest Recommended Configuration + OpenAI / Anthropic API + Web UI)
 
-Create a JSON config (e.g. `inkling2.json`). Simply change `--max-context` to switch tiers — the profile, chunk size, and KV policy adapt automatically:
+Create a JSON config (e.g. `inkling2.json`). Simply include `--draft ... --draft-max 3` and `--kv-q8` alongside `--max-context` — Decode Frequency Prior, Cross-Layer Knapsack, AVX2 ktile MoE, and Sampling Confidence-Gated DSpark + 1-Hot PLD are all enabled automatically with zero environment variables required:
 
 ```json
 {
   "arch": "inkling2",
   "model_name": "Inkling-2-Mini-UD-Q4_K_M",
-  "exe": "/path/to/Strata/engine/build/strata-inkling2",
+  "exe": "/path/to/Strata/engine/build-sm89/strata-inkling2",
   "args": [
     "--model", "/path/to/Inkling-2-Mini-UD-Q4_K_M.gguf",
-    "--max-context", "262144",
+    "--draft", "/path/to/dspark-Inkling-2-Mini-Q8_0.gguf",
+    "--draft-max", "3",
+    "--max-context", "65536",
+    "--kv-q8",
     "--serve"
   ],
   "tokenizer": "/path/to/strata_tokenizer",
@@ -210,11 +213,13 @@ Create a JSON config (e.g. `inkling2.json`). Simply change `--max-context` to sw
 }
 ```
 
-Recommended `--max-context` presets:
-- **RTX 4070 12 GB — fastest daily coding (`65K`)**: `"--max-context", "65536"`
-- **RTX 4070 12 GB — balanced long context (`131K`)**: `"--max-context", "131072"`
-- **RTX 4070 12 GB — max context (`262K`)**: `"--max-context", "262144"`
-- **Tesla V100 32 GB — 819K + DSpark**: `"--max-context", "819200", "--draft", "/path/to/Inkling-2-Mini-DSpark.gguf", "--draft-max", "3"`
+> **Multimodal Vision + 12 GB VRAM Tip**: To add image support (`mmproj-F16`) on 12 GB GPUs, append `"--vision", "--vram-elastic"` to `"args"` and include `"vram_elastic": true` + the `"vision"` config block (see [docs/INKLING2.md](docs/INKLING2.md)). On 12 GB GPUs, closing VRAM-heavy browser/GUI sessions maximizes auto-allocated expert cache slots (`1,913` / `1,874` slots at `65K`).
+
+Recommended `--max-context` presets (all fastest with `--draft ... --draft-max 3 --kv-q8`):
+- **RTX 4070 12 GB — fastest daily coding (`65K`)**: `"--max-context", "65536", "--draft", "/path/to/dspark-Inkling-2-Mini-Q8_0.gguf", "--draft-max", "3", "--kv-q8"` (up to **`89.5 t/s`** @ `temp=1.0`)
+- **RTX 4070 12 GB — balanced long context (`131K`)**: `"--max-context", "131072", "--draft", "/path/to/dspark-Inkling-2-Mini-Q8_0.gguf", "--draft-max", "3", "--kv-q8"` (`Core=128` resident + Outer Knapsack)
+- **RTX 4070 12 GB — max context (`262K`)**: `"--max-context", "262144", "--draft", "/path/to/dspark-Inkling-2-Mini-Q8_0.gguf", "--draft-max", "3", "--kv-q8"` (`64.7–69.7 t/s @ 8K` → `33.6–36.4 t/s @ 256K`)
+- **Tesla V100 32 GB — `819K` + DSpark**: `"--max-context", "819200", "--draft", "/path/to/Inkling-2-Mini-DSpark.gguf", "--draft-max", "3", "--kv-q8"` (`135–167 t/s @ 64K–256K`, `89.9 t/s @ 800K`)
 
 Start the server:
 
@@ -230,42 +235,42 @@ PYTHONPATH=./terminal python3 -m serve.server \
 Startup logs print the active profile line so you can verify what was selected:
 
 ```text
-[inkling2] profile: arch=sm89 regime=tight_hybrid (cc=8.9, sm=46, free=10.4 GiB) -> chunk=2048 kv_grow=dynamic stage_mb=64 need_free=112MiB want_sp=5 d_hits=on
+strata-inkling2: profile=sm89+tight_hybrid (cc=8.9 sm=46 vram=11.7GiB free=9.6GiB ctx=262144 chunk=2048 kv_init=16384 want_sp=4 stage=3x64MiB d_hits=on)
 ```
 
 Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCode, etc.) at `http://localhost:8085`.
 
-### 2. Launch Command Examples
+### 2. Launch Command Examples (Fastest `--draft-max 3` + `--kv-q8` Presets)
 
-Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the engine auto-selects the matching profile, chunk size, and KV strategy.
+Change `--max-context` and add `--draft ... --draft-max 3` + `--kv-q8` for fastest decode on both 12 GB and 32 GB GPUs — the engine auto-selects the matching profile, chunk size, expert placement, and KV strategy.
 
 ```bash
-# RTX 4070 12 GB — 65K daily coding (68.5–72.9 OFF / 74.6–88.4 t/s DSpark ON @ temp=1.0)
-./engine/build/strata-inkling2 \
+# RTX 4070 12 GB — 65K fastest daily coding (70.7–72.3 OFF / 75.1–89.5 t/s DSpark ON @ temp=1.0)
+./engine/build-sm89/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
-  --max-context 65536 --bench --max-new 128
+  --max-context 65536 --kv-q8 --bench --max-new 128
 
 # RTX 4070 12 GB — 131K balanced (Core 128/128 resident + Outer Knapsack)
-./engine/build/strata-inkling2 \
+./engine/build-sm89/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
-  --max-context 131072 --bench --max-new 128
+  --max-context 131072 --kv-q8 --bench --max-new 128
 
-# RTX 4070 12 GB — 262K max context (8,052->3,101 PP OFF; 64.7–68.1->36.4 t/s Dec ON)
-./engine/build/strata-inkling2 \
+# RTX 4070 12 GB — 262K max context (8,052–8,076->3,101–3,227 PP/Dec OFF; 68.1–71.3->33.6–36.4 t/s Dec ON)
+./engine/build-sm89/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf --draft-max 3 \
-  --max-context 262144 --bench --max-new 128
+  --max-context 262144 --kv-q8 --bench --max-new 128
 
 # RTX 4070 12 GB — 262K API Server + Elastic Vision (OpenAI/Anthropic on :8085)
-# Add "--vision", "--vram-elastic", "--kv-q8" and a "vision" block in your config JSON
+# Add "--vision", "--vram-elastic", "--kv-q8" (and optional "--draft ... --draft-max 3") + a "vision" block in your config JSON
 
 # Tesla V100 32 GB — 819K + DSpark (auto: sm70 + full_vram, chunk=1024, 135–167 t/s @ 64K–256K, 89.9 t/s @ 800K)
 ./engine/build-sm70/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
   --draft /path/to/Inkling-2-Mini-DSpark.gguf --draft-max 3 \
-  --max-context 819200 --bench --max-new 128
+  --max-context 819200 --kv-q8 --bench --max-new 128
 ```
 
 Quick API smoke test once `serve.server` is running on port `8085`:

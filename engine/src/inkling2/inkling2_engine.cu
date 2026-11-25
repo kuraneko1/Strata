@@ -4213,7 +4213,8 @@ struct Engine {
                 cands.push_back(Cand{diff * weight, li, s, hot_cand, y});
                 ++v_idx;
             }
-            for (int x = 0; x < ne; ++x) L.score[(size_t) x] *= 0.8;
+            const double decay = in_decode_phase ? 0.92 : 0.80;
+            for (int x = 0; x < ne; ++x) L.score[(size_t) x] *= decay;
         }
         if (cands.empty()) return;
         std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.gain > b.gain; });
