@@ -344,6 +344,7 @@ struct PhysLayer {
 #endif
     uint8_t* hblobs = nullptr;           // [n_expert][L.bytes] on host (lazy or pre-built)
     bool hblobs_pinned = false;          // true if hblobs was allocated with cudaHostAlloc
+    std::vector<uint8_t*> sparse_hblobs; // [n_expert] lazy per-expert pageable buffers when hblobs == nullptr
     uint8_t* d_blobs = nullptr;          // [n_slots][stride] in VRAM
     bool d_blobs_from_pool = false;      // Wave 6: true if d_blobs was allocated from Engine::phase_pool
     size_t stride = 0;
@@ -372,7 +373,13 @@ struct Model : GpuWeightStore {
 
     std::vector<PhysLayer> layers;
 
-    ~Model() override { free_store(); }
+    ~Model() override {
+        for (auto& ly : layers) {
+            for (uint8_t* p : ly.sparse_hblobs) std::free(p);
+            ly.sparse_hblobs.clear();
+        }
+        free_store();
+    }
 
     const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const override {
         size_t shard = 0;
@@ -577,6 +584,29 @@ void build_all_expert_blobs(const PhysLayer& L, int ne, uint8_t* dst_base) {
         });
     }
     for (auto& th : ths) th.join();
+}
+
+inline void drop_mmap_pages_interior(const void* ptr, size_t bytes) {
+#if defined(__linux__)
+    if (!ptr || bytes == 0) return;
+    const long pgsz = sysconf(_SC_PAGESIZE);
+    if (pgsz <= 0) return;
+    const uintptr_t p0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t p_start = (p0 + (uintptr_t) pgsz - 1u) & ~(uintptr_t) ((size_t) pgsz - 1u);
+    const uintptr_t p_end = (p0 + bytes) & ~(uintptr_t) ((size_t) pgsz - 1u);
+    if (p_end > p_start) {
+        (void) madvise(reinterpret_cast<void*>(p_start), (size_t) (p_end - p_start), MADV_DONTNEED);
+    }
+#else
+    (void) ptr; (void) bytes;
+#endif
+}
+
+inline void drop_layer_mmap_pages(const PhysLayer& L, int n_expert) {
+    const size_t gu_bytes = (size_t) n_expert * (size_t) (2 * L.L.n_ff) * L.gu_row;
+    const size_t d_bytes = (size_t) n_expert * (size_t) L.L.n_embd * L.d_row;
+    drop_mmap_pages_interior(L.h_gate_up, gu_bytes);
+    drop_mmap_pages_interior(L.h_down, d_bytes);
 }
 
 bool load_model(const std::string& path, Model& m, std::string& err) {
@@ -1138,6 +1168,7 @@ struct Engine {
     SwaLayerPtrs swa_ptrs{};
     uint8_t* swa_bak = nullptr;
     float* d_conv_trace = nullptr;   // [verify_max_t][n_layer][layer_conv_floats]
+    bool d_conv_trace_from_pool = false;
     float* d_tgt_feat[4] = {};       // [tmax * N] captured at dspark.target_layers
     float* h_tgt_feat_pin[4] = {};   // non-null when d_tgt_feat is zero-copy mapped pinned RAM (Hybrid VRAM save)
     float* ds_acc_swa0 = nullptr;    // Wave 5: [min(cap_t, n_swa+1) * N] running VRAM acc for DSpark SWA L0
@@ -1289,6 +1320,11 @@ struct Engine {
     size_t pinned_used = 0;
     size_t max_pin_bytes = (size_t) 7168 << 20;
     int cpu_threads_req = 0;
+    static constexpr size_t kH2dStageSlotBytes = (size_t) 8 << 20; // 2 x 8 MiB = 16 MiB reusable H2D staging
+    uint8_t* h2d_stage_pin[2] = {nullptr, nullptr};
+    cudaEvent_t ev_h2d_stage[2] = {nullptr, nullptr};
+    bool h2d_stage_busy[2] = {false, false};
+    int h2d_stage_next = 0;
 
     // Double-buffered PCIe GPU streaming for prefill on hybrid layers
     struct PpRun {
@@ -1416,11 +1452,11 @@ struct Engine {
     // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM,
     // plus per-layer pre-route graphs (attn + mix + ffn_norm + route).
     cudaGraphExec_t core_graph = nullptr;
-    cudaGraphExec_t verify_core_graph[9] = {};
-    // Full 48-layer + swa_bak + head + argmax/softcap graphs for Full-VRAM (T=1..8, capture_dspark, want_softcap, want_argmax)
-    cudaGraphExec_t full_decode_graph[9][2][2][2] = {};
+    cudaGraphExec_t verify_core_graph[10] = {};
+    // Full 48-layer + swa_bak + head + argmax/softcap graphs for Full-VRAM (T=1..9, capture_dspark, want_softcap, want_argmax)
+    cudaGraphExec_t full_decode_graph[10][2][2][2] = {};
     std::vector<cudaGraphExec_t> layer_pre_graph;
-    std::vector<cudaGraphExec_t> verify_pre_graph[9];
+    std::vector<cudaGraphExec_t> verify_pre_graph[10];
     std::vector<cudaGraphExec_t> deferred_graphs_destroy;
     uint32_t* h_hits_pin = nullptr;
     bool core_all_gpu = false;
@@ -1650,6 +1686,203 @@ struct Engine {
             CK(cudaStreamSynchronize(st));
             CK(cudaMemPoolTrimTo(phase_pool, min_bytes));
         }
+    }
+
+    void alloc_conv_trace() {
+        if (d_conv_trace || !m || verify_max_t <= 1) return;
+        const size_t total_conv = (size_t) m->hp.n_layer * layer_conv_floats;
+        const size_t bytes = (size_t) verify_max_t * total_conv * sizeof(float);
+        if (use_phase_pool && phase_pool) {
+            if (pool_alloc((void**) &d_conv_trace, bytes) == cudaSuccess && d_conv_trace) {
+                d_conv_trace_from_pool = true;
+                return;
+            }
+            (void) cudaGetLastError();
+            d_conv_trace = nullptr;
+        }
+        CK(cudaMalloc(&d_conv_trace, bytes));
+        d_conv_trace_from_pool = false;
+    }
+
+    void free_conv_trace() {
+        if (!d_conv_trace) return;
+        if (d_conv_trace_from_pool) {
+            pool_free(d_conv_trace);
+        } else {
+            cudaFree(d_conv_trace);
+        }
+        d_conv_trace = nullptr;
+        d_conv_trace_from_pool = false;
+    }
+
+    static void free_sparse_hblobs(PhysLayer& L) {
+        for (uint8_t* p : L.sparse_hblobs) std::free(p);
+        L.sparse_hblobs.clear();
+    }
+
+    static uint8_t* get_or_build_expert_hblob(PhysLayer& L, int e, int ne) {
+        if (L.hblobs) return L.hblobs + (size_t) e * L.stride;
+        if ((int) L.sparse_hblobs.size() < ne) L.sparse_hblobs.assign((size_t) ne, nullptr);
+        uint8_t*& ptr = L.sparse_hblobs[(size_t) e];
+        if (!ptr) {
+            ptr = (uint8_t*) std::malloc(L.stride);
+            if (!ptr) {
+                std::fprintf(stderr, "strata-inkling2: sparse_hblobs malloc failed for expert %d\n", e);
+                std::exit(1);
+            }
+            build_expert_blob(L, e, ptr);
+        }
+        return ptr;
+    }
+
+    void snapshot_evicted_sparse_hblobs(PhysLayer& L, const std::vector<int>& keep, int ne, bool only_evicted) {
+        if (L.hblobs || L.d_blobs == nullptr || L.n_slots <= 0) return;
+        std::vector<uint8_t> kept((size_t) ne, 0);
+        if (only_evicted) {
+            for (int e : keep) kept[(size_t) e] = 1;
+        }
+        if ((int) L.sparse_hblobs.size() < ne) L.sparse_hblobs.assign((size_t) ne, nullptr);
+        struct D2hItem { int e; int s; uint8_t* dst; };
+        std::vector<D2hItem> todo;
+        todo.reserve((size_t) L.n_slots);
+        for (int e = 0; e < ne; ++e) {
+            if (only_evicted && kept[(size_t) e]) continue;
+            const int s = L.slot_of[(size_t) e];
+            if (s < 0 || L.sparse_hblobs[(size_t) e] != nullptr) continue;
+            uint8_t* ptr = (uint8_t*) std::malloc(L.stride);
+            if (!ptr) {
+                std::fprintf(stderr, "strata-inkling2: sparse_hblobs malloc failed during snapshot\n");
+                std::exit(1);
+            }
+            L.sparse_hblobs[(size_t) e] = ptr;
+            todo.push_back(D2hItem{e, s, ptr});
+        }
+        if (todo.empty()) return;
+        ensure_h2d_stage_bufs();
+        if (h2d_stage_pin[0] && h2d_stage_pin[1] && L.L.bytes <= kH2dStageSlotBytes) {
+            for (int bi = 0; bi < 2; ++bi) {
+                if (h2d_stage_busy[bi]) {
+                    CK(cudaEventSynchronize(ev_h2d_stage[bi]));
+                    h2d_stage_busy[bi] = false;
+                }
+            }
+            const int n_todo = (int) todo.size();
+            for (int i = 0; i < n_todo; ++i) {
+                const int bi = i & 1;
+                if (i == 0) {
+                    CK(cudaMemcpyAsync(h2d_stage_pin[0], L.d_blobs + (size_t) todo[0].s * L.stride,
+                                       L.L.bytes, cudaMemcpyDeviceToHost, st));
+                    CK(cudaEventRecord(ev_h2d_stage[0], st));
+                }
+                if (i + 1 < n_todo) {
+                    const int nbi = (i + 1) & 1;
+                    CK(cudaMemcpyAsync(h2d_stage_pin[nbi], L.d_blobs + (size_t) todo[(size_t) (i + 1)].s * L.stride,
+                                       L.L.bytes, cudaMemcpyDeviceToHost, st));
+                    CK(cudaEventRecord(ev_h2d_stage[nbi], st));
+                }
+                CK(cudaEventSynchronize(ev_h2d_stage[bi]));
+                std::memcpy(todo[(size_t) i].dst, h2d_stage_pin[bi], L.L.bytes);
+            }
+        } else {
+            for (const D2hItem& it : todo) {
+                CK(cudaMemcpyAsync(it.dst, L.d_blobs + (size_t) it.s * L.stride,
+                                   L.L.bytes, cudaMemcpyDeviceToHost, st));
+            }
+            CK(cudaStreamSynchronize(st));
+        }
+    }
+
+    static bool layer_allow_pin_hblobs(const PhysLayer& L) {
+        if (std::getenv("STRATA_NO_PIN_EXPERTS") != nullptr) return false;
+        // Keep Q5_K/BF16 tail layers (e.g. blk.20..23, ~3.16 GiB) in pageable malloc and stage async H2D via 16 MiB bounce buffer.
+        static const bool pin_q5k = (std::getenv("STRATA_PIN_Q5K_HBLOBS") != nullptr);
+        if (!pin_q5k && (L.gu_type == 13 || L.gu_type == 30)) return false;
+        return true;
+    }
+
+    void ensure_h2d_stage_bufs() {
+        if (h2d_stage_pin[0] && h2d_stage_pin[1]) return;
+        if (cudaMallocHost(&h2d_stage_pin[0], kH2dStageSlotBytes) == cudaSuccess &&
+            cudaMallocHost(&h2d_stage_pin[1], kH2dStageSlotBytes) == cudaSuccess) {
+            CK(cudaEventCreateWithFlags(&ev_h2d_stage[0], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ev_h2d_stage[1], cudaEventDisableTiming));
+        } else {
+            (void) cudaGetLastError();
+            if (h2d_stage_pin[0]) { cudaFreeHost(h2d_stage_pin[0]); h2d_stage_pin[0] = nullptr; }
+            if (h2d_stage_pin[1]) { cudaFreeHost(h2d_stage_pin[1]); h2d_stage_pin[1] = nullptr; }
+        }
+    }
+
+    void copy_h2d_staged(void* dst_dev, const uint8_t* src_host, size_t bytes, bool src_pinned, cudaStream_t stream) {
+        if (bytes == 0) return;
+        if (src_pinned) {
+            CK(cudaMemcpyAsync(dst_dev, src_host, bytes, cudaMemcpyHostToDevice, stream));
+            return;
+        }
+        ensure_h2d_stage_bufs();
+        if (!h2d_stage_pin[0] || !h2d_stage_pin[1]) {
+            CK(cudaMemcpyAsync(dst_dev, src_host, bytes, cudaMemcpyHostToDevice, stream));
+            return;
+        }
+        size_t off = 0;
+        while (off < bytes) {
+            const int bi = h2d_stage_next;
+            h2d_stage_next ^= 1;
+            if (h2d_stage_busy[bi]) {
+                CK(cudaEventSynchronize(ev_h2d_stage[bi]));
+                h2d_stage_busy[bi] = false;
+            }
+            const size_t chunk = std::min(bytes - off, kH2dStageSlotBytes);
+            std::memcpy(h2d_stage_pin[bi], src_host + off, chunk);
+            CK(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(dst_dev) + off, h2d_stage_pin[bi], chunk,
+                               cudaMemcpyHostToDevice, stream));
+            CK(cudaEventRecord(ev_h2d_stage[bi], stream));
+            h2d_stage_busy[bi] = true;
+            off += chunk;
+        }
+    }
+
+    size_t non_expert_pinned_bytes() const {
+        if (!m) return 0;
+        const auto& hp = m->hp;
+        const int64_t N = hp.n_embd;
+        size_t b = 0;
+        if (dspark && dspark->dm && dspark->dm->decode_w_pin_cuda) b += dspark->dm->decode_w_bytes;
+        for (int k = 0; k < 4; ++k) {
+            if (h_tgt_feat_pin[k]) b += (size_t) tmax * (size_t) N * sizeof(float);
+        }
+        if (h_tok_buf) b += (size_t) meta_tmax * (size_t) N * sizeof(float);
+        if (h_tok_raw_pin) b += h_tok_raw_bytes;
+        if (h_tok_idx_pin) b += (size_t) meta_tmax * sizeof(int32_t);
+        if (h_is_img_pin) b += (size_t) meta_tmax * sizeof(uint8_t);
+        if (h_slot_pin) b += (size_t) hp.n_phys * (size_t) hp.n_expert * sizeof(int32_t);
+        if (h_hits_pin) b += (size_t) hp.n_phys * (size_t) hp.n_expert * sizeof(uint32_t);
+        if (h_ids) b += (size_t) meta_tmax * (size_t) hp.n_expert_used * sizeof(int32_t);
+        if (h_ewts) b += (size_t) meta_tmax * (size_t) hp.n_expert_used * sizeof(float);
+        if (h_cpu_sum) b += (size_t) std::max(verify_max_t, 8) * (size_t) N * sizeof(float);
+        if (h_h) b += (size_t) cpu_buf_cap * (size_t) N * sizeof(float);
+        if (cpu_out) b += (size_t) cpu_buf_cap * (size_t) hp.n_expert_used * (size_t) N * sizeof(float);
+        if (h_miss) b += (size_t) cpu_buf_cap * (size_t) hp.n_expert_used * sizeof(int32_t);
+        if (h_topk_val_pin) b += (size_t) verify_max_t * 256 * sizeof(float);
+        if (h_topk_idx_pin) b += (size_t) verify_max_t * 256 * sizeof(int32_t);
+        if (h_topk_cnt_pin) b += (size_t) verify_max_t * sizeof(int32_t);
+        if (h_pick_pin) b += (size_t) verify_max_t * sizeof(int32_t);
+        if (h_pos_pin) b += (size_t) pos0_sub_cap * sizeof(int32_t);
+        b += (size_t) 2 * kH2dStageSlotBytes;
+        if (ckpt_pin_cap > 0) {
+            b += ckpt_pin_cap;
+        } else {
+            size_t ck = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
+            for (int il = 0; il < hp.n_layer; ++il) {
+                if (!hp.is_swa(il)) continue;
+                const size_t n = (size_t) hp.n_swa;
+                ck += kv_q8 ? (n * (size_t) hp.kv_dim * 2 + n * (size_t) hp.n_head_kv * sizeof(__half) * 2)
+                            : (n * (size_t) hp.kv_dim * sizeof(__half) * 2);
+            }
+            if (dspark) ck += dspark->checkpoint_bytes();
+            b += ck;
+        }
+        return b;
     }
 
     void free_layer_blobs(PhysLayer& L) {
@@ -1917,7 +2150,9 @@ struct Engine {
             ? overlay_a_bytes
             : (L.reg0_bytes + L.reg1_bytes + reg2_ctrl_core + L.sz_N);
         const size_t logits_bytes = a256((size_t) verify_max_t * (size_t) hp.vocab_unpadded * sizeof(float));
-        const size_t dspark_arena_min = (verify_max_t > 1) ? ((size_t) 28 << 20) : 0;
+        const size_t dspark_arena_min = (verify_max_t > 1)
+            ? (logits_bytes + (dspark ? dspark->tail_bytes(kDecodePhaseCap) : ((size_t) 12 << 20)))
+            : 0;
 
         L.arena_bytes = std::max({overlay_a_bytes, overlay_b_bytes, overlay_a_ctrl_inffn, logits_bytes, dspark_arena_min});
         return L;
@@ -2162,7 +2397,7 @@ struct Engine {
         if (swa_kv_pool) { pool_free(swa_kv_pool); swa_kv_pool = nullptr; }
         cudaFree(conv_hist_pool);
         cudaFree(swa_bak);
-        cudaFree(d_conv_trace);
+        free_conv_trace();
         for (int k = 0; k < 4; ++k) {
             if (h_tgt_feat_pin[k]) cudaFreeHost(h_tgt_feat_pin[k]);
             else cudaFree(d_tgt_feat[k]);
@@ -2231,6 +2466,11 @@ struct Engine {
             dspark->evict_decode_weights(phase_pool, st);
         }
         if (st) cudaStreamSynchronize(st);
+        if (cst) cudaStreamSynchronize(cst);
+        for (int bi = 0; bi < 2; ++bi) {
+            if (ev_h2d_stage[bi]) cudaEventDestroy(ev_h2d_stage[bi]);
+            if (h2d_stage_pin[bi]) cudaFreeHost(h2d_stage_pin[bi]);
+        }
         if (phase_pool) {
             cudaMemPoolTrimTo(phase_pool, 0);
             cudaMemPoolDestroy(phase_pool);
@@ -2370,7 +2610,6 @@ struct Engine {
         auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
         norm_blk_cnt = (hp.core_start == 6 && hp.core_end == 18 && hp.attn_res_block_size == 6 && hp.num_loops == 3) ? 5 : 9;
         d_f32(&qgr_t1, (size_t) (2 * hp.q_dim + hp.n_rel * hp.n_head + 2 * hp.kv_dim + 2 * hp.n_conv * hp.n_head_kv));
-        attn_split_slots = verify_max_t * kAttnSplitMax;
         bf16_x_f16 = gemm.bf16_converts_x() || profile.force_bf16_x_f16;
         int64_t max_bf16_w = 0;
         {
@@ -2396,6 +2635,25 @@ struct Engine {
         }
         attn_split_t1_full = std::clamp((sm_count * profile.t1_full_split_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
         attn_split_t1_swa = std::clamp((sm_count * profile.t1_swa_split_mult) / std::max(1, (int) hp.n_head_kv), 8, 32);
+        {
+            const int n_hkv = std::max(1, (int) hp.n_head_kv);
+            const int max_t_split = std::min(std::max(verify_max_t, 1), 15);
+            int max_slots = std::max(attn_split_t1_full, attn_split_t1_swa);
+            for (int t = 2; t <= max_t_split; ++t) {
+                int sp_t = 1;
+                if (t <= 5) {
+                    const int sp_swa = std::clamp((sm_count + n_hkv - 1) / n_hkv, 4, 16);
+                    const int sp_full = std::clamp((sm_count * 24) / n_hkv, 40, kAttnSplitMax);
+                    sp_t = std::max(sp_swa, sp_full);
+                } else {
+                    const int sp_swa = std::clamp((sm_count * 2) / (n_hkv * t), 4, 24);
+                    const int sp_full = std::clamp((sm_count * 16) / (n_hkv * t), 16, kAttnSplitMax);
+                    sp_t = std::max(sp_swa, sp_full);
+                }
+                max_slots = std::max(max_slots, t * sp_t);
+            }
+            attn_split_slots = max_slots;
+        }
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
         // Gate high-SMEM FA2 kernels on cudaDevAttrMaxSharedMemoryPerBlockOptin so Turing (sm_75, 64 KB cap) cleanly falls back to pp_wmma (29 KB).
         auto try_set_smem = [&](const void* fn, int bytes) -> bool {
@@ -2609,7 +2867,7 @@ struct Engine {
         CK(cudaMallocHost(&h_ewts, (size_t) max_ent * sizeof(float)));
         CK(cudaMallocHost(&h_cpu_sum, (size_t) std::max(verify_max_t, 8) * (size_t) N * sizeof(float)));
         CK(cudaMallocHost(&h_hits_pin, (size_t) hp.n_phys * (size_t) hp.n_expert * sizeof(uint32_t)));
-        for (int t = 0; t < 9; ++t) verify_pre_graph[t].assign((size_t) hp.n_layer, nullptr);
+        for (int t = 0; t < 10; ++t) verify_pre_graph[t].assign((size_t) hp.n_layer, nullptr);
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         for (int i = 0; i < kMaxRebalLayers; ++i) {
             CK(cudaEventCreateWithFlags(&ev_rebal_layer[i], cudaEventDisableTiming));
@@ -2741,8 +2999,10 @@ struct Engine {
                 }
             }
         }
-        const size_t total_conv = (size_t) hp.n_layer * layer_conv_floats;
-        if (!d_conv_trace) CK(cudaMalloc(&d_conv_trace, (size_t) verify_max_t * total_conv * sizeof(float)));
+        const bool defer_conv_trace = (use_phase_pool && phase_pool != nullptr &&
+                                       profile.regime != strata::inkling2::VramRegime::FullVram &&
+                                       tmax >= 1024 && std::getenv("STRATA_NO_PHASE_SPLIT") == nullptr);
+        if (!defer_conv_trace) alloc_conv_trace();
         swa_bak_slots = std::max(1, verify_max_t - 1);
         const size_t slot_bytes = kv_q8
             ? ((size_t) hp.kv_dim * 2 + (size_t) hp.n_head_kv * 2 * sizeof(__half))
@@ -3360,9 +3620,9 @@ struct Engine {
             }
             for (const PpRun& r : tk.runs) {
                 const size_t nbytes = (size_t) (r.cnt - 1) * L.stride + L.L.bytes;
-                CK(cudaMemcpyAsync(pp_buf_ptr[b] + (size_t) r.dst_off * L.stride,
-                                   L.hblobs + (size_t) r.e0 * L.stride,
-                                   nbytes, cudaMemcpyHostToDevice, cst));
+                copy_h2d_staged(pp_buf_ptr[b] + (size_t) r.dst_off * L.stride,
+                                L.hblobs + (size_t) r.e0 * L.stride,
+                                nbytes, L.hblobs_pinned, cst);
             }
             CK(cudaEventRecord(ev_pp_copy[b], cst));
             ++pp_kick_idx;
@@ -3471,9 +3731,9 @@ struct Engine {
             if (sent >= split_exps) break;
             const int take = std::min<int>((int) r.cnt, split_exps - sent);
             const size_t nbytes = (size_t) (take - 1) * L.stride + L.L.bytes;
-            CK(cudaMemcpyAsync(pp_buf_ptr[b] + (size_t) r.dst_off * L.stride,
-                               L.hblobs + (size_t) r.e0 * L.stride,
-                               nbytes, cudaMemcpyHostToDevice, cst));
+            copy_h2d_staged(pp_buf_ptr[b] + (size_t) r.dst_off * L.stride,
+                            L.hblobs + (size_t) r.e0 * L.stride,
+                            nbytes, L.hblobs_pinned, cst);
             sent += take;
         }
         tk.kicked_exps = sent;
@@ -3499,9 +3759,9 @@ struct Engine {
                 const int off_in_run = (tk.kicked_exps > skipped) ? (tk.kicked_exps - skipped) : 0;
                 const int rem_cnt = (int) r.cnt - off_in_run;
                 const size_t nbytes = (size_t) (rem_cnt - 1) * L.stride + L.L.bytes;
-                CK(cudaMemcpyAsync(pp_buf_ptr[b] + (size_t) ((int) r.dst_off + off_in_run) * L.stride,
-                                   L.hblobs + (size_t) ((int) r.e0 + off_in_run) * L.stride,
-                                   nbytes, cudaMemcpyHostToDevice, cst));
+                copy_h2d_staged(pp_buf_ptr[b] + (size_t) ((int) r.dst_off + off_in_run) * L.stride,
+                                L.hblobs + (size_t) ((int) r.e0 + off_in_run) * L.stride,
+                                nbytes, L.hblobs_pinned, cst);
                 skipped = r_end;
             }
             tk.kicked_exps = tk.n_staged;
@@ -3682,7 +3942,7 @@ struct Engine {
 
         const auto tp_moe_r0 = Clock::now();
         if (!pre_routed_t1) {
-            if (need_cpu && T >= 1 && T <= 8 && !pp_streaming) {
+            if (need_cpu && T >= 1 && T <= std::max(verify_max_t, 8) && !pp_streaming) {
                 if (T > cpu_buf_cap) init_cpu_bufs(T);
                 CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
@@ -3940,7 +4200,7 @@ struct Engine {
             if (T > cpu_buf_cap) init_cpu_bufs(T);
             if (!pre_routed_t1) {
                 CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
-                if (T >= 1 && T <= 8) {
+                if (T >= 1 && T <= std::max(verify_max_t, 8)) {
                     CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) n_ent * sizeof(float), cudaMemcpyDeviceToHost, st));
                 } else {
                     CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToHost, st));
@@ -3994,7 +4254,7 @@ struct Engine {
                     if (!h_miss[e]) continue;
                     ++n_miss;
                     C::ExpertJobMulti j;
-                    j.blob = L.hblobs + (size_t) x * L.stride;
+                    j.blob = get_or_build_expert_hblob(L, x, (int) hp.n_expert);
                     j.nact[0] = act0;
                     j.out[0] = cpu_out + (size_t) e * N;
                     j.nt = 1;
@@ -4021,7 +4281,7 @@ struct Engine {
                     int jidx = open_job[x];
                     if (jidx < 0 || jobs[(size_t) jidx].nt == C::MAXT) {
                         C::ExpertJobMulti j;
-                        j.blob = L.hblobs + (size_t) x * L.stride;
+                        j.blob = get_or_build_expert_hblob(L, x, (int) hp.n_expert);
                         jidx = (int) jobs.size();
                         jobs.push_back(j);
                         open_job[x] = jidx;
@@ -4042,7 +4302,7 @@ struct Engine {
             }
             if (n_miss > 0) {
                 static const int l2_pf_min = [] { const char* v = std::getenv("STRATA_L2_PF_MIN"); return v ? std::atoi(v) : 0; }();
-                if (l2_pf_min > 0 && n_miss >= l2_pf_min && hybrid && T <= 8 && il + 1 < hp.n_layer) {
+                if (l2_pf_min > 0 && n_miss >= l2_pf_min && hybrid && T <= std::max(verify_max_t, 8) && il + 1 < hp.n_layer) {
                     // F2: Free L2 prefetch of the next layer's dense weights on GPU while CPU computes missed experts!
                     const int ip_next = hp.loop_layer(il + 1);
                     const PhysLayer& Ln = m->layers[(size_t) ip_next];
@@ -4141,7 +4401,7 @@ struct Engine {
             if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
             return false;
         }
-        if (post_conv && post_conv->w_conv && T <= 8) {
+        if (post_conv && post_conv->w_conv && T <= std::max(verify_max_t, 8)) {
             k_combine_experts_shortconv<<<(unsigned) ((N + 31) / 32), 32, 0, st>>>(
                 eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
                 N, Kp, post_conv->hist_offset, T, post_conv->hist_trace, post_conv->hist_trace_stride);
@@ -4230,8 +4490,9 @@ struct Engine {
                 L.slot_of[(size_t) c.cold_y] = -1;
                 L.slot_of[(size_t) c.hot_x] = c.slot;
                 L.exp_in_slot[(size_t) c.slot] = c.hot_x;
-                CK(cudaMemcpyAsync(L.d_blobs + (size_t) c.slot * L.stride, L.hblobs + (size_t) c.hot_x * L.stride,
-                                   L.L.bytes, cudaMemcpyHostToDevice, cst));
+                const uint8_t* src_hot = get_or_build_expert_hblob(L, c.hot_x, (int) ne);
+                copy_h2d_staged(L.d_blobs + (size_t) c.slot * L.stride, src_hot,
+                                L.L.bytes, L.hblobs_pinned, cst);
             }
             if (h_slot_pin) {
                 int32_t* sp = h_slot_pin + li * (size_t) ne;
@@ -4252,14 +4513,14 @@ struct Engine {
             if (g) { deferred_graphs_destroy.push_back(g); g = nullptr; }
         };
         defer(core_graph);
-        for (int t = 0; t < 9; ++t) defer(verify_core_graph[t]);
-        for (int t = 0; t < 9; ++t)
+        for (int t = 0; t < 10; ++t) defer(verify_core_graph[t]);
+        for (int t = 0; t < 10; ++t)
             for (int c = 0; c < 2; ++c)
                 for (int s = 0; s < 2; ++s)
                     for (int a = 0; a < 2; ++a)
                         defer(full_decode_graph[t][c][s][a]);
         for (auto& g : layer_pre_graph) defer(g);
-        for (int t = 0; t < 9; ++t) {
+        for (int t = 0; t < 10; ++t) {
             for (auto& g : verify_pre_graph[t]) defer(g);
         }
         graph_oom = false;
@@ -4284,7 +4545,7 @@ struct Engine {
     void resize_experts_vram(size_t target_free_bytes, size_t guard_override = 0, bool equalize_tier2 = false,
                              bool async_cst = false, bool whole_layer_evict = false, bool restore_dspark_decode_w = false,
                              bool skip_sync = false, size_t known_fr = 0, size_t known_tot = 0,
-                             bool knapsack_decode = false) {
+                             bool knapsack_decode = false, bool tier1_only = false) {
         const auto t0 = Clock::now();
         const auto& hp = m->hp;
         const int ne = (int) hp.n_expert;
@@ -4328,7 +4589,7 @@ struct Engine {
         auto ensure_hblobs = [&](PhysLayer& L, bool is_tier1) {
             if (L.hblobs) return;
             const size_t hb_bytes = (size_t) ne * L.stride;
-            const bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr);
+            const bool want_pin = layer_allow_pin_hblobs(L);
             if (want_pin && pinned_used + hb_bytes > max_pin_bytes && is_tier1) demote_tier2_pin(hb_bytes);
             if (want_pin && pinned_used + hb_bytes <= max_pin_bytes &&
                 cudaHostAlloc(&L.hblobs, hb_bytes, cudaHostAllocDefault) == cudaSuccess) {
@@ -4351,6 +4612,7 @@ struct Engine {
                 CK(cudaStreamSynchronize(st));
             } else {
                 build_all_expert_blobs(L, ne, L.hblobs);
+                drop_layer_mmap_pages(L, ne);
             }
         };
 
@@ -4411,11 +4673,32 @@ struct Engine {
                 int e;
                 size_t stride;
             };
+            const bool allow_core_spill = [] {
+                const char* v = std::getenv("STRATA_KNAP_ALLOW_CORE_SPILL");
+                return (v && v[0]) ? (std::atoi(v) != 0) : false;
+            }();
+            const bool knap_concave = [&] {
+                const char* v = std::getenv("STRATA_KNAP_CONCAVE");
+                return (v && v[0]) ? (std::atoi(v) != 0) : allow_core_spill;
+            }();
+            const double T_knap = [&] {
+                const char* v = std::getenv("STRATA_KNAP_T");
+                if (v && v[0]) return (double) std::clamp(std::atoi(v), 1, 16);
+                return (double) std::clamp(verify_max_t >= 2 ? verify_max_t : 1, 4, 8);
+            }();
+            auto knap_val = [&](int ip, double score_e) -> double {
+                const PhysLayer& L = m->layers[(size_t) ip];
+                if (!knap_concave || L.stride == 0) return score_e;
+                const bool is_core = (ip >= hp.core_start && ip < hp.core_end);
+                const double loops = is_core ? (double) hp.num_loops : 1.0;
+                const double q_e = std::clamp(score_e / loops, 0.0, 1.0);
+                return loops * (1.0 - std::pow(1.0 - q_e, T_knap)) * ((double) L.L.bytes / (double) L.stride);
+            };
             if (avail_total >= t1_t2_full_b) {
                 for (int ip : tier1) target_slots[(size_t) ip] = ne;
                 for (int ip : tier2) target_slots[(size_t) ip] = ne;
                 knapsack_decode_active = false;
-            } else if (avail_total >= tier1_full_b) {
+            } else if (!allow_core_spill && avail_total >= tier1_full_b) {
                 for (int ip : tier1) target_slots[(size_t) ip] = ne;
                 for (int ip : tier2) target_slots[(size_t) ip] = 0;
                 for (int ip : tier3) target_slots[(size_t) ip] = 0;
@@ -4425,7 +4708,7 @@ struct Engine {
                 for (int ip : tier2) {
                     const size_t st_b = m->layers[(size_t) ip].stride;
                     for (int e = 0; e < ne; ++e) {
-                        items.push_back(KnapItem{blended_scores[(size_t) ip * ne + e], ip, e, st_b});
+                        items.push_back(KnapItem{knap_val(ip, blended_scores[(size_t) ip * ne + e]), ip, e, st_b});
                     }
                 }
                 std::sort(items.begin(), items.end(), [](const KnapItem& a, const KnapItem& b) {
@@ -4451,7 +4734,7 @@ struct Engine {
                     const PhysLayer& L = m->layers[(size_t) ip];
                     if (L.gu_type == 30) continue;
                     for (int e = 0; e < ne; ++e) {
-                        items.push_back(KnapItem{blended_scores[(size_t) ip * ne + e], ip, e, L.stride});
+                        items.push_back(KnapItem{knap_val(ip, blended_scores[(size_t) ip * ne + e]), ip, e, L.stride});
                     }
                 }
                 std::sort(items.begin(), items.end(), [](const KnapItem& a, const KnapItem& b) {
@@ -4597,13 +4880,15 @@ struct Engine {
                 virt_fr = (virt_fr > used_b) ? (virt_fr - used_b) : 0;
             };
             plan_grow_tier(tier1);
-            if (pin_blk0) {
-                plan_grow_tier(tier2_pin);
-                plan_grow_tier(tier2_rest);
-            } else {
-                plan_grow_tier(tier2);
+            if (!tier1_only) {
+                if (pin_blk0) {
+                    plan_grow_tier(tier2_pin);
+                    plan_grow_tier(tier2_rest);
+                } else {
+                    plan_grow_tier(tier2);
+                }
+                plan_grow_tier(tier3);
             }
-            plan_grow_tier(tier3);
         }
 
         struct H2dRun { int e0; int cnt; int dst_off; };
@@ -4623,7 +4908,8 @@ struct Engine {
             layer_resized[(size_t) ip] = true;
             const bool is_tier1 = (ip >= hp.core_start && ip < hp.core_end);
             const bool use_pool_for_layer = (!is_tier1 && pool_active);
-            ensure_hblobs(L, is_tier1);
+            const bool use_sparse = (is_tier1 && !L.hblobs);
+            if (!use_sparse) ensure_hblobs(L, is_tier1);
 
             if (tgt > 0) {
                 std::vector<int> order((size_t) ne);
@@ -4641,8 +4927,18 @@ struct Engine {
             // Fast GPU-to-GPU D2D shrink: keeps resident experts at 500 GB/s (~0.8 ms) instead of 35 ms PCIe H2D!
             if (tgt > 0 && tgt < L.n_slots && L.d_blobs != nullptr) {
                 CK(cudaMemGetInfo(&fr, &tot));
-                const size_t avail_d2d = fr + (use_pool_for_layer ? pool_cached_free_bytes() : 0);
+                size_t avail_d2d = fr + (use_pool_for_layer ? pool_cached_free_bytes() : 0);
                 const size_t need_d2d = (size_t) tgt * L.stride;
+                if (use_sparse && !use_pool_for_layer && avail_d2d < need_d2d + ((size_t) 64 << 20) &&
+                    pool_cached_free_bytes() > ((size_t) 8 << 20)) {
+                    trim_phase_pool(0);
+                    CK(cudaMemGetInfo(&fr, &tot));
+                    avail_d2d = fr;
+                }
+                if (use_sparse) {
+                    const bool will_d2d = (avail_d2d >= need_d2d + ((size_t) 64 << 20));
+                    snapshot_evicted_sparse_hblobs(L, keep_list[(size_t) ip], ne, /*only_evicted=*/will_d2d);
+                }
                 if (avail_d2d >= need_d2d + ((size_t) 64 << 20)) {
                     void* ndb = nullptr;
                     bool ndb_from_pool = false;
@@ -4692,7 +4988,10 @@ struct Engine {
                             }
                         }
                         if (any_d2d && !L.d_blobs_from_pool) CK(cudaStreamSynchronize(st));
-                        if (!L.d_blobs_from_pool && L.d_blobs != nullptr) any_raw_vram_op = true;
+                        if (use_sparse && tgt == 0 && L.d_blobs != nullptr) {
+                snapshot_evicted_sparse_hblobs(L, keep_list[(size_t) ip], ne, /*only_evicted=*/false);
+            }
+            if (!L.d_blobs_from_pool && L.d_blobs != nullptr) any_raw_vram_op = true;
                         free_layer_blobs(L);
                         L.d_blobs = new_blobs;
                         L.d_blobs_from_pool = ndb_from_pool;
@@ -4712,6 +5011,9 @@ struct Engine {
                 }
             }
 
+            if (use_sparse && tgt == 0 && L.d_blobs != nullptr) {
+                snapshot_evicted_sparse_hblobs(L, keep_list[(size_t) ip], ne, /*only_evicted=*/false);
+            }
             if (!L.d_blobs_from_pool && L.d_blobs != nullptr) any_raw_vram_op = true;
             free_layer_blobs(L);
             L.n_slots = 0;
@@ -4835,10 +5137,18 @@ struct Engine {
             if (h2d.empty()) continue;
             PhysLayer& L = m->layers[(size_t) ip];
             for (const H2dRun& r : h2d) {
-                const size_t bytes = (size_t) (r.cnt - 1) * L.stride + L.L.bytes;
-                CK(cudaMemcpyAsync(L.d_blobs + (size_t) r.dst_off * L.stride,
-                                   L.hblobs + (size_t) r.e0 * L.stride,
-                                   bytes, cudaMemcpyHostToDevice, h2d_stream));
+                if (L.hblobs) {
+                    const size_t bytes = (size_t) (r.cnt - 1) * L.stride + L.L.bytes;
+                    copy_h2d_staged(L.d_blobs + (size_t) r.dst_off * L.stride,
+                                    L.hblobs + (size_t) r.e0 * L.stride,
+                                    bytes, L.hblobs_pinned, h2d_stream);
+                } else {
+                    for (int j = 0; j < r.cnt; ++j) {
+                        const uint8_t* src_e = get_or_build_expert_hblob(L, r.e0 + j, ne);
+                        copy_h2d_staged(L.d_blobs + (size_t) (r.dst_off + j) * L.stride,
+                                        src_e, L.L.bytes, false, h2d_stream);
+                    }
+                }
             }
             if (do_async_cst && ip < kMaxRebalLayers) {
                 CK(cudaEventRecord(ev_rebal_layer[ip], cst));
@@ -4939,6 +5249,7 @@ struct Engine {
         // 2. Shrink ephemeral activation scratch (active_pp_cap -> kDecodePhaseCap)
         free_ephemeral_bufs();
         decode_ephemeral_bytes = alloc_ephemeral_bufs(kDecodePhaseCap);
+        alloc_conv_trace();
 
         // 3. EX-4A / Wave 9: Compact SWA KV ring only when shared-scratch SWA is disabled (otherwise ring stays fixed at swa_ring_cap!)
         if (!use_shared_swa_scratch) {
@@ -4960,6 +5271,7 @@ struct Engine {
         resize_experts_vram(vram_reserve_bytes, dec_guard, /*equalize_tier2=*/true, /*async_cst=*/true,
                             /*whole_layer_evict=*/false, /*restore_dspark_decode_w=*/(dspark != nullptr),
                             /*skip_sync=*/false, 0, 0, /*knapsack_decode=*/!no_dec_knapsack);
+        if (pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
         normalize_decode_scores();
     }
 
@@ -4979,6 +5291,7 @@ struct Engine {
 
         // 1. EX-4A + Wave 6: Evict DSpark decode-only weights FIRST (+358 MiB immediately back into phase_pool!)
         if (dspark) dspark->evict_decode_weights(use_phase_pool ? phase_pool : nullptr, st);
+        free_conv_trace();
 
         // 2. EX-5 Idea C + Wave 6: Zero-H2D whole-layer evict of tail Tier-2 experts enough to fit peak(SWA, eph + net_swa + stage)
         int tgt_cap = active_pp_cap;
@@ -4991,7 +5304,19 @@ struct Engine {
         const size_t target_swa_bytes = use_shared_swa_scratch ? 0 : swa_kv_pool_size_for(prefill_swa_kv_cap);
         const size_t net_swa = (!use_shared_swa_scratch && target_swa_bytes > swa_kv_pool_bytes)
             ? (target_swa_bytes - swa_kv_pool_bytes) : 0;
-        if (!is_core_full_resident() && (saved_pp_stage_bytes > ((size_t) 66 << 20) || saved_pp_stage_cnt > 2)) {
+        size_t core_restore_b = 0;
+        if (was_knapsack_dec && profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid) {
+            const int ne_c = (int) m->hp.n_expert;
+            for (int ip = (int) m->hp.core_start; ip < (int) m->hp.core_end && ip < (int) m->hp.n_phys; ++ip) {
+                const PhysLayer& L = m->layers[(size_t) ip];
+                if (L.gu_type != 30 && L.n_slots < ne_c) {
+                    core_restore_b += (size_t) (ne_c - L.n_slots) * L.stride;
+                }
+            }
+        }
+        const bool core_will_be_full = is_core_full_resident() ||
+            (was_knapsack_dec && profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
+        if (!core_will_be_full && (saved_pp_stage_bytes > ((size_t) 66 << 20) || saved_pp_stage_cnt > 2)) {
             size_t compact_bytes = (size_t) 64 << 20;
             for (int ip = 0; ip < (int) m->layers.size(); ++ip) {
                 const auto& L = m->layers[(size_t) ip];
@@ -5036,11 +5361,11 @@ struct Engine {
                 }
             }
         }
-        const size_t peak_growth = std::max(target_swa_bytes, extra_eph + net_swa + stage_need);
+        const size_t peak_growth = std::max(target_swa_bytes, extra_eph + net_swa + stage_need) + core_restore_b;
         size_t need_free = vram_reserve_bytes + peak_growth + ((size_t) 64 << 20);
         // Reclaim scattered non-blk.0 Tier-2 slots on CoreResidentHybrid (>=4K prefill) so Turn 2
         // maybe_alloc_transient_pp_stages() gets trans = 3 (NEVER touches blk.0 128/128, Core 1536/1536, or TightHybrid/262K).
-        if (is_core_full_resident() &&
+        if (core_will_be_full &&
             tgt_cap >= 4096 && use_phase_pool && phase_pool != nullptr && saved_pp_stage_bytes > 0) {
             if (!have_mem_info) {
                 CK(cudaMemGetInfo(&fr_sp, &tot_sp));
@@ -5073,7 +5398,7 @@ struct Engine {
 
         // 4. Restore active_pp_cap prefill scratch & DSpark arena via stream-ordered phase_pool
         free_ephemeral_bufs();
-        const bool did_trim_post = (tgt_cap > 8192 || (!is_core_full_resident() && tgt_cap >= 4096));
+        const bool did_trim_post = (tgt_cap > 8192 || (!core_will_be_full && tgt_cap >= 4096));
         if (did_trim_post) trim_phase_pool(0);
         if (tgt_cap > tmax) {
             const size_t slab_pad = (size_t) 80 << 20;
@@ -5143,14 +5468,18 @@ struct Engine {
                 }
             }
         }
+        in_decode_phase = false;
         if (was_knapsack_dec && !is_core_full_resident()) {
-            // Restore Core 3x-loop layers first from pinned hblobs before Prefill pp_streaming begins.
+            // Restore Core 3x-loop layers first from pinned/sparse hblobs before Prefill pp_streaming begins.
             resize_experts_vram(vram_reserve_bytes + ((size_t) 64 << 20), 0, /*equalize_tier2=*/false,
                                 /*async_cst=*/false, /*whole_layer_evict=*/false,
-                                /*restore_dspark_decode_w=*/false, /*skip_sync=*/true);
+                                /*restore_dspark_decode_w=*/false, /*skip_sync=*/true,
+                                0, 0, /*knapsack_decode=*/false, /*tier1_only=*/true);
+        }
+        for (PhysLayer& L : m->layers) {
+            if (L.n_slots >= (int) m->hp.n_expert) free_sparse_hblobs(L);
         }
         if (!is_core_full_resident() && pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
-        in_decode_phase = false;
     }
 
     /// Wave 5 + Wave 11 Path B: 4-tier prompt-adaptive prefill slab capacity {24, 4096, 8192, 12288}.
@@ -5167,7 +5496,10 @@ struct Engine {
         for (int ip = (int) hp.core_start; ip < (int) hp.core_end && ip < hp.n_phys; ++ip) {
             core_experts_res += m->layers[(size_t) ip].n_slots;
         }
-        const bool core_full_ok = core_all_gpu && (core_experts_total <= 0 || core_experts_res >= core_experts_total);
+        const bool core_res_hy_knap = (in_decode_phase && knapsack_decode_active &&
+                                       profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
+        const bool core_full_ok = (core_all_gpu && (core_experts_total <= 0 || core_experts_res >= core_experts_total)) ||
+                                  core_res_hy_knap;
         int target_cap = std::clamp(want_cap, tmax, meta_tmax);
         if (!core_full_ok) {
             target_cap = std::max(tmax, std::min(target_cap, 4096));
@@ -5219,7 +5551,18 @@ struct Engine {
             const size_t dspark_evict_b = (dspark && dspark->dm &&
                                            dspark->dm->decode_w_offloadable && dspark->dm->decode_w_resident)
                                           ? dspark->dm->decode_w_bytes : 0;
-            const size_t avail_no_core = fr + pool_cached_free_bytes() + tier2_bytes + dspark_evict_b;
+            size_t core_restore_b = 0;
+            if (core_res_hy_knap) {
+                const int ne_c = (int) hp.n_expert;
+                for (int ip = (int) hp.core_start; ip < (int) hp.core_end && ip < hp.n_phys; ++ip) {
+                    const PhysLayer& L = m->layers[(size_t) ip];
+                    if (L.gu_type != 30 && L.n_slots < ne_c) {
+                        core_restore_b += (size_t) (ne_c - L.n_slots) * L.stride;
+                    }
+                }
+            }
+            const size_t avail_no_core = (fr + pool_cached_free_bytes() + tier2_bytes + dspark_evict_b > core_restore_b)
+                ? (fr + pool_cached_free_bytes() + tier2_bytes + dspark_evict_b - core_restore_b) : 0;
             const size_t extra_margin = (kv_delta > 0)
                 ? ((size_t) std::max(64, profile.kv_grow_reserve_mib) << 20)
                 : ((size_t) 80 << 20);
@@ -5425,7 +5768,7 @@ struct Engine {
         auto ensure_hblobs = [&](PhysLayer& L, bool is_tier1) {
             if (L.hblobs) return;
             const size_t hb_bytes = (size_t) ne * L.stride;
-            bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr);
+            bool want_pin = layer_allow_pin_hblobs(L);
             if (want_pin && pinned_used + hb_bytes > max_pin_bytes && is_tier1) {
                 demote_tier2_pin(hb_bytes);
             }
@@ -5457,6 +5800,7 @@ struct Engine {
                 CK(cudaStreamSynchronize(st));
             } else {
                 build_all_expert_blobs(L, ne, L.hblobs);
+                drop_layer_mmap_pages(L, ne);
             }
         };
 
@@ -5501,8 +5845,8 @@ struct Engine {
                     L.exp_in_slot.assign((size_t) s, -1);
                     for (int k = 0; k < s; ++k) {
                         const int e = keep[(size_t) k];
-                        CK(cudaMemcpyAsync(L.d_blobs + (size_t) k * L.stride, L.hblobs + (size_t) e * L.stride,
-                                           L.L.bytes, cudaMemcpyHostToDevice, st));
+                        copy_h2d_staged(L.d_blobs + (size_t) k * L.stride, L.hblobs + (size_t) e * L.stride,
+                                        L.L.bytes, L.hblobs_pinned, st);
                         L.slot_of[(size_t) e] = k;
                         L.exp_in_slot[(size_t) k] = e;
                     }
@@ -6019,13 +6363,14 @@ struct Engine {
             maybe_alloc_transient_pp_stages(avail_known_min);
             pp_kick_partial_first(use_gpu_embd ? ((size_t) 8 << 20) : ((size_t) 48 << 20));
         }
+        if (verify_k_save > 0 && !d_conv_trace) alloc_conv_trace();
         const bool compute_logits = need_logits || copy_logits || all_row_logits || out_picks != nullptr;
         const int rows = (all_row_logits || out_picks != nullptr) ? T : 1;
         const bool want_softcap = (copy_logits && hp.softcap > 0.0f);
         const bool want_argmax = !copy_logits || (out_picks != nullptr);
         const bool can_full_graph = (!hybrid && core_all_gpu && full_kv_cap == ctx && !prof && !prof_detail && !graph_oom &&
                                      img_embs == nullptr &&
-                                     T >= 1 && T <= 8 && T <= verify_max_t && compute_logits && rows == T &&
+                                     T >= 1 && T <= std::min(verify_max_t, 9) && compute_logits && rows == T &&
                                      h_tok_buf != nullptr && h_pos_pin != nullptr && h_pick_pin != nullptr &&
                                      (!copy_logits || defer_logits_d2h) &&
                                      ((T == 1 && verify_k_save == 0) || (T >= 2 && verify_k_save == T - 1)));
@@ -8199,7 +8544,7 @@ struct Engine {
             const bool is_hy = (L.n_slots < hp.n_expert);
             const bool xq_ffn_ready = (T <= 8 && (N & 31) == 0);
             const bool f16_ffn_ready = (T >= 16 && (N & 3) == 0);
-            const bool fuse_comb_conv = (!is_hy && T <= 8);
+            const bool fuse_comb_conv = (!is_hy && T <= std::max(verify_max_t, 8));
             const PostConvSpec hy_conv{L.ffn_post_conv, hst, ffn_inp, cur, 2 * (int) kv_dim + N, h_tr, total_conv_floats};
             const bool want_pp_comb_conv = (T >= 32 && !save_conv_trace && (N & 3) == 0 && (!is_hy || pp_streaming));
             static const bool no_vert_fuse = (std::getenv("STRATA_NO_VERT_FUSE") != nullptr);
@@ -8239,7 +8584,7 @@ struct Engine {
             }
             const bool post_conv_done = run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv,
                                                 f16_ffn_ready,
-                                                can_defer_postffn ? nullptr : (((is_hy && T <= 8 && !pp_streaming) || want_pp_comb_conv) ? &hy_conv : nullptr),
+                                                can_defer_postffn ? nullptr : (((is_hy && T <= std::max(verify_max_t, 8) && !pp_streaming) || want_pp_comb_conv) ? &hy_conv : nullptr),
                                                 pre_routed_pp_cur, capturing_full_graph);
             pre_routed_pp_cur = false;
             const auto tp_mp0 = Clock::now();
@@ -8269,7 +8614,7 @@ struct Engine {
         const int core_end_virt = (int) (hp.core_start + hp.num_loops * n_core);
         for (int il = 0; il < hp.n_layer; ++il) {
             const bool use_t1_core = (!capturing_full_graph && !prof && T == 1 && !capture_dspark);
-            const bool use_vf_core = (!capturing_full_graph && !prof && T >= 1 && T <= 8 && T <= verify_max_t &&
+            const bool use_vf_core = (!capturing_full_graph && !prof && T >= 1 && T <= std::min(verify_max_t, 9) &&
                                       capture_dspark && ((T == 1 && !save_conv_trace) || (T >= 2 && save_conv_trace)));
             if ((use_t1_core || use_vf_core) && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
                 // EX-5 Idea D: Drain any pending async cst rebal events on core layers BEFORE entering stream capture!
@@ -8326,7 +8671,12 @@ struct Engine {
             }
             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
             const bool use_t1_pre_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming && !capture_dspark);
-            const bool use_vf_pre_graph = (T >= 1 && T <= 8 && T <= verify_max_t && hybrid &&
+            // Capture verify_pre_graph[T] up to T=9 by default (override via STRATA_VERIFY_PRE_GRAPH_MAX_T).
+            static const int vf_pre_max_t = [] {
+                const char* v = std::getenv("STRATA_VERIFY_PRE_GRAPH_MAX_T");
+                return (v && v[0]) ? std::clamp(std::atoi(v), 1, 9) : 9;
+            }();
+            const bool use_vf_pre_graph = (T >= 1 && T <= vf_pre_max_t && T <= verify_max_t && hybrid &&
                                            (is_outer || !core_all_gpu) && !prof_detail && !pp_streaming &&
                                            capture_dspark && ((T == 1 && !save_conv_trace) || (T >= 2 && save_conv_trace)));
             const bool use_pre_graph = use_t1_pre_graph || use_vf_pre_graph;
@@ -8932,7 +9282,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     bool need_cpu = false;
     int total_vram_experts = 0;
     size_t actual_used = 0;
-    size_t pinned_used = 0;
+    size_t pinned_used = E.non_expert_pinned_bytes();
     size_t max_pin_bytes = (size_t) 7168 << 20;
 #if !defined(_WIN32)
     {
@@ -8940,7 +9290,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         const long psize = sysconf(_SC_PAGESIZE);
         if (pages > 0 && psize > 0) {
             const size_t phys_ram = (size_t) pages * (size_t) psize;
-            max_pin_bytes = std::clamp<size_t>((phys_ram * 2) / 5, (size_t) 7168 << 20, (size_t) 12288 << 20);
+            max_pin_bytes = std::clamp<size_t>((phys_ram * 2) / 5, (size_t) 2048 << 20, (size_t) 12288 << 20);
         }
         if (std::FILE* mf = std::fopen("/proc/meminfo", "r")) {
             char line[256];
@@ -8948,10 +9298,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                 unsigned long long avail_kb = 0;
                 if (std::sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) {
                     const size_t avail_b = (size_t) avail_kb * 1024ULL;
-                    const size_t head_b = (size_t) 5120 << 20;
+                    const size_t head_b = (size_t) 6144 << 20;
                     if (avail_b > head_b) {
-                        const size_t safe_pin = avail_b - head_b;
-                        max_pin_bytes = std::clamp<size_t>(safe_pin, (size_t) 4096 << 20, (size_t) 14336 << 20);
+                        max_pin_bytes = std::min<size_t>(avail_b - head_b, (size_t) 14336 << 20);
+                    } else {
+                        max_pin_bytes = (avail_b > ((size_t) 1024 << 20)) ? (avail_b / 2) : 0;
                     }
                     break;
                 }
@@ -9000,13 +9351,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     for (int tip : tier1) if (slots[(size_t) tip] < ne) tier1_planned_all_gpu = false;
     size_t tier2_hblobs_need = 0;
     for (int tip : tier2) {
-        if (slots[(size_t) tip] < ne || (frontload_en && will_need_cpu)) {
-            tier2_hblobs_need += (size_t) ne * m.layers[(size_t) tip].stride;
+        const PhysLayer& TL = m.layers[(size_t) tip];
+        if ((slots[(size_t) tip] < ne || (frontload_en && will_need_cpu)) && Engine::layer_allow_pin_hblobs(TL)) {
+            tier2_hblobs_need += (size_t) ne * TL.stride;
         }
     }
     size_t tier1_hblobs_need = 0;
     for (int tip : tier1) {
-        tier1_hblobs_need += (size_t) ne * m.layers[(size_t) tip].stride;
+        const PhysLayer& TL = m.layers[(size_t) tip];
+        if (Engine::layer_allow_pin_hblobs(TL)) tier1_hblobs_need += (size_t) ne * TL.stride;
     }
     static const bool no_prebuild_tier1 = [] {
         const char* v = std::getenv("STRATA_NO_PREBUILD_TIER1");
@@ -9017,7 +9370,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                                         E.profile.regime != strata::inkling2::VramRegime::FullVram &&
                                         E.ctx >= 131072 &&
                                         tier1_hblobs_need > 0 &&
-                                        (tier1_hblobs_need + tier2_hblobs_need <= max_pin_bytes));
+                                        (pinned_used + tier1_hblobs_need + tier2_hblobs_need <= max_pin_bytes));
 
     const float* place_prior_ptr = strata::inkling2::inkling2_mini_decode_prior(hp.n_phys, ne);
     for (int ip : alloc_order) {
@@ -9065,7 +9418,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
 
         const bool is_tier1_ip = (ip >= hp.core_start && ip < hp.core_end) && L.gu_type != 30;
         const bool is_tier2_ip = (ip < hp.core_start || ip >= hp.core_end) && L.gu_type != 30;
-        const bool want_core_borrow_pin = (!no_core_borrow_place &&
+        static const bool force_core_borrow_pin = [] {
+            const char* v = std::getenv("STRATA_FORCE_CORE_BORROW_PIN");
+            return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
+        }();
+        const bool want_core_borrow_pin = (force_core_borrow_pin && !no_core_borrow_place &&
                                            E.profile.regime != strata::inkling2::VramRegime::FullVram &&
                                            tier1_planned_all_gpu && will_need_cpu &&
                                            hp.num_loops > 1 && hp.core_start < hp.core_end &&
@@ -9074,7 +9431,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         if (s < ne || (frontload_en && will_need_cpu && is_tier2_ip) || (prebuild_tier1_hblobs && is_tier1_ip)) {
             if (s < ne) need_cpu = true;
             const size_t hb_bytes = (size_t) ne * L.stride;
-            const bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr) && (pinned_used + hb_bytes <= max_pin_bytes);
+            const bool want_pin = Engine::layer_allow_pin_hblobs(L) && (pinned_used + hb_bytes <= max_pin_bytes);
             if (want_pin && cudaHostAlloc(&L.hblobs, hb_bytes, cudaHostAllocDefault) == cudaSuccess) {
                 m.host_pinned_allocs.push_back(L.hblobs);
                 L.hblobs_pinned = true;
@@ -9090,15 +9447,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                 m.host_allocs.push_back(L.hblobs);
             }
             build_all_expert_blobs(L, ne, L.hblobs);
+            drop_layer_mmap_pages(L, ne);
         } else if (want_core_borrow_pin && !L.hblobs) {
             const size_t hb_bytes = (size_t) ne * L.stride;
-            const bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr) &&
+            const bool want_pin = Engine::layer_allow_pin_hblobs(L) &&
                                   (pinned_used + tier2_hblobs_need + hb_bytes <= max_pin_bytes);
             if (want_pin && cudaHostAlloc(&L.hblobs, hb_bytes, cudaHostAllocDefault) == cudaSuccess) {
                 m.host_pinned_allocs.push_back(L.hblobs);
                 L.hblobs_pinned = true;
                 pinned_used += hb_bytes;
                 build_all_expert_blobs(L, ne, L.hblobs);
+                drop_layer_mmap_pages(L, ne);
             } else {
                 (void) cudaGetLastError();
                 L.hblobs = nullptr;
@@ -9176,6 +9535,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             }
             E.upload_slot_of(ip, E.st);
             CK(cudaStreamSynchronize(E.st));
+            if (s == ne && !L.hblobs) drop_layer_mmap_pages(L, ne);
             total_vram_experts += s;
         }
         if (s < ne) E.hybrid = true;
@@ -9530,12 +9890,17 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         const char* v = std::getenv(k);
         return (v && v[0]) ? (float) std::atof(v) : def;
     };
+    auto env_i = [](const char* k, int def) -> int {
+        const char* v = std::getenv(k);
+        return (v && v[0]) ? std::atoi(v) : def;
+    };
     const bool tight_hy = (E.hybrid && !E.core_all_gpu);
     const float tau_min0 = env_f("STRATA_DSPARK_TAU0", tight_hy ? 0.15f : 0.0f);
     const float tau_step = env_f("STRATA_DSPARK_TAU_STEP", tight_hy ? 0.50f : 0.45f);
     const float tau_cum  = env_f("STRATA_DSPARK_TAU_CUM", tight_hy ? 0.30f : 0.25f);
-    const float tau_ext  = env_f("STRATA_DSPARK_TAU_EXT", 0.90f);
-    const float tau_cum_ext = env_f("STRATA_DSPARK_TAU_CUM_EXT", 0.72f);
+    const float tau_ext  = env_f("STRATA_DSPARK_TAU_EXT", E.hybrid ? 0.78f : 0.90f);
+    const float tau_cum_ext = env_f("STRATA_DSPARK_TAU_CUM_EXT", E.hybrid ? 0.58f : 0.72f);
+    const int base_k_cfg = std::clamp(env_i("STRATA_DSPARK_BASE_K", (E.hybrid && draft_max >= 4) ? 3 : draft_max), 1, 7);
     const int max_ext_cfg = [&] {
         const char* v = std::getenv("STRATA_DSPARK_MAX_EXT");
         return (v && v[0]) ? std::clamp(std::atoi(v), 1, 7) : draft_max;
@@ -9653,9 +10018,10 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
 
             if (!sample_on && adaptive_dspark && conf_gate) {
                 const int base_k = std::min(draft_max, rem - 1);
+                const int eff_base_k = std::min(base_k, base_k_cfg);
                 const int ext_lim = (draft_max >= 3) ? std::max(draft_max, max_ext_cfg) : draft_max;
                 const int max_k = std::min(std::min(E.verify_max_t - 1, ext_lim), rem - 1);
-                dspark->draft_confident(E, anchor, base_k, max_k,
+                dspark->draft_confident(E, anchor, eff_base_k, max_k,
                                         tau_min0, tau_step, tau_cum, tau_ext, tau_cum_ext, d_toks);
                 if (d_toks.empty()) {
                     feed_single(anchor);
@@ -9665,12 +10031,14 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
                 }
             } else if (sample_on && adaptive_dspark && conf_gate) {
                 const int base_k = std::min(draft_max, rem - 1);
-                const int max_k = std::min(std::min(E.verify_max_t - 1, base_k), rem - 1);
+                const int eff_base_k = std::min(base_k, base_k_cfg);
+                const int ext_lim = (draft_max >= 3) ? std::max(draft_max, max_ext_cfg) : draft_max;
+                const int max_k = std::min(std::min(E.verify_max_t - 1, ext_lim), rem - 1);
                 const size_t tail_keep = (!use_gpu_topk && smp.pen_last_n > 0) ? (size_t) smp.pen_last_n : 0;
                 const size_t h_start = hist.size() > tail_keep ? (hist.size() - tail_keep) : 0;
                 q_dists.clear();
                 dspark->draft_sampled_confident(
-                    E, anchor, base_k, max_k,
+                    E, anchor, eff_base_k, max_k,
                     tau_step_s, tau_cum_s, tau_ext, tau_cum_ext,
                     d_toks, use_gpu_topk ? nullptr : &d_logits,
                     [&](int step_i, std::vector<float>& row_lg, float& out_pmax) -> int32_t {
@@ -9989,7 +10357,7 @@ int run(int argc, char** argv) {
     }
     if (dm) {
         dspark = std::make_unique<DsparkEngine>();
-        dspark->init(*dm, max_ctx, chunk, E.full_kv_cap, E.layer_arena, E.layer_arena_bytes);
+        dspark->init(*dm, max_ctx, chunk, E.full_kv_cap, E.layer_arena, E.layer_arena_bytes, E.verify_max_t);
         E.enable_dspark(dspark.get());
         E.reset_state();
         // EX-4A: On Hybrid GPUs with chunk >= 1024, evict DSpark Decode-only weights (~358 MiB) during Prefill

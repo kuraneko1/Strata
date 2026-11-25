@@ -2119,6 +2119,7 @@ struct DsparkEngine {
     DsparkModel* dm = nullptr;
     int ctx = 0;
     int tmax = 0;
+    int verify_max_t = 8;
     int pos = 0;
 
     // Context Q8 KV cache per layer
@@ -2283,6 +2284,23 @@ struct DsparkEngine {
         restore_decode_weights(st, pool, pool_st);
     }
 
+    size_t arena_base_bytes() const {
+        if (!dm) return (size_t) 16 << 20;
+        const size_t raw = (size_t) std::max(1, verify_max_t) * (size_t) dm->hp.vocab_unpadded * sizeof(float);
+        return (raw + 255u) & ~size_t(255u);
+    }
+
+    size_t tail_bytes(int cur_tmax) const {
+        if (!dm) return (size_t) 12 << 20;
+        const auto& hp = dm->hp;
+        auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
+        const int eff_t = std::max(cur_tmax, 16);
+        const size_t sz_ctx = align256((size_t) eff_t * hp.n_embd * sizeof(float))
+                            + 2 * align256((size_t) eff_t * hp.kv_dim * sizeof(float));
+        const size_t sz_sp = align256((size_t) hp.block_size * split_full * hp.n_head * 130 * sizeof(float));
+        return std::max(sz_ctx, sz_sp);
+    }
+
     /// Rebind aliased arena buffers (ctx_norm/k/v and split_out) when Engine switches Prefill <-> Decode arena.
     void rebind_arena(uint8_t* ext_arena, size_t ext_arena_bytes, int cur_tmax) {
         defer_destroy_kv_graphs();
@@ -2290,7 +2308,7 @@ struct DsparkEngine {
         if (!ctx_aliased && !split_aliased) return;
         const auto& hp = dm->hp;
         auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
-        constexpr size_t kArenaBase = (size_t) 16 << 20;
+        const size_t kArenaBase = arena_base_bytes();
         const int eff_t = std::max(cur_tmax, 16);
         const size_t sz_cn = align256((size_t) eff_t * hp.n_embd * sizeof(float));
         const size_t sz_ck = align256((size_t) eff_t * hp.kv_dim * sizeof(float));
@@ -2359,10 +2377,12 @@ struct DsparkEngine {
     }
 
     void init(DsparkModel& model, int max_ctx, int max_t,
-              int init_full_cap = 0, uint8_t* ext_arena = nullptr, size_t ext_arena_bytes = 0) {
+              int init_full_cap = 0, uint8_t* ext_arena = nullptr, size_t ext_arena_bytes = 0,
+              int max_verify_t = 8) {
         dm = &model;
         ctx = max_ctx;
         tmax = std::max(max_t, 16);
+        verify_max_t = std::max(1, max_verify_t);
         const auto& hp = dm->hp;
         kq.resize((size_t) hp.n_layer, nullptr);
         vq.resize((size_t) hp.n_layer, nullptr);
@@ -2381,7 +2401,7 @@ struct DsparkEngine {
         auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
         auto align256 = [](size_t x) -> size_t { return (x + 255u) & ~size_t(255u); };
         const int B = hp.block_size;
-        constexpr size_t kArenaBase = (size_t) 16 << 20;  // keep clear of E.logits at arena offset 0
+        const size_t kArenaBase = arena_base_bytes();  // keep clear of E.logits at arena offset 0
         const size_t sz_cn = align256((size_t) tmax * hp.n_embd * sizeof(float));
         const size_t sz_ck = align256((size_t) tmax * hp.kv_dim * sizeof(float));
         const size_t sz_cv = align256((size_t) tmax * hp.kv_dim * sizeof(float));
@@ -2946,6 +2966,7 @@ struct DsparkEngine {
         const auto& hp = dm->hp;
         const int N = hp.n_embd;
         const int rank = hp.markov_rank;
+        const int eff_base = std::max(1, base_k);
         const int eff_max = std::clamp(max_k, 1, std::min(7, hp.block_size - 1));
         out_tokens.clear();
 
@@ -3025,7 +3046,7 @@ struct DsparkEngine {
             }
             out_tokens.push_back(tok_i);
             if (i + 1 >= eff_max) break;
-            if (i + 1 < base_k) {
+            if (i + 1 < eff_base) {
                 if (p_i < tau_step || p_cum < tau_cum) break;
             } else {
                 if (p_i < tau_ext || p_cum < tau_cum_ext) break;
@@ -3056,6 +3077,7 @@ struct DsparkEngine {
         const auto& hp = dm->hp;
         const int N = hp.n_embd;
         const int rank = hp.markov_rank;
+        const int eff_base = std::max(1, base_k);
         const int eff_max = std::clamp(max_k, 1, std::min(7, hp.block_size - 1));
         out_tokens.clear();
         if (out_logits) out_logits->clear();
@@ -3096,7 +3118,7 @@ struct DsparkEngine {
             out_tokens.push_back(prev_id);
             p_cum *= p_i;
             if (i + 1 >= eff_max) break;
-            if (i + 1 < base_k) {
+            if (i + 1 < eff_base) {
                 if (p_i < tau_step || p_cum < tau_cum) break;
             } else {
                 if (p_i < tau_ext || p_cum < tau_cum_ext) break;

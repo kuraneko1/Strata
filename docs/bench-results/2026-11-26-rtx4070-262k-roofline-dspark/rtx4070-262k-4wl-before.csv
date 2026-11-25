@@ -1,0 +1,13 @@
+max_ctx,draft_max,mode,workload,prompt_len,fresh,emitted,pp_ms,tg_ms,tg_tps,hit_pct,peak_rss_mib,placed
+262144,0,sampling,edit_rag,2762,2762,256,615.74,4215.03,60.5,89.4,26238.4,"strata-inkling2: placed 1965/3072 experts in VRAM (8.20 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=234 MiB) in 21.63 s"
+262144,0,sampling,code,5854,5854,256,1389.44,4310.29,59.16,87.4,26238.4,"strata-inkling2: placed 1965/3072 experts in VRAM (8.20 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=234 MiB) in 21.63 s"
+262144,0,sampling,prose,3653,3653,256,596.79,3802.39,67.06,88.7,26238.4,"strata-inkling2: placed 1965/3072 experts in VRAM (8.20 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=234 MiB) in 21.63 s"
+262144,0,sampling,japanese,6109,6109,256,827.43,4294.57,59.38,87.0,26238.4,"strata-inkling2: placed 1965/3072 experts in VRAM (8.20 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=234 MiB) in 21.63 s"
+262144,3,sampling,edit_rag,2762,2762,256,633.5,3110.6,81.98,88.9,25329.1,"strata-inkling2: placed 1939/3072 experts in VRAM (8.09 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=236 MiB) in 19.82 s"
+262144,3,sampling,code,5854,5854,256,1451.04,3426.89,74.41,86.4,25329.1,"strata-inkling2: placed 1939/3072 experts in VRAM (8.09 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=236 MiB) in 19.82 s"
+262144,3,sampling,prose,3653,3653,256,606.27,3354.25,76.02,87.8,25329.1,"strata-inkling2: placed 1939/3072 experts in VRAM (8.09 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=236 MiB) in 19.82 s"
+262144,3,sampling,japanese,6109,6109,256,836.58,4793.37,53.2,86.5,25329.1,"strata-inkling2: placed 1939/3072 experts in VRAM (8.09 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=236 MiB) in 19.82 s"
+262144,6,sampling,edit_rag,2762,2762,256,637.58,3382.62,75.39,88.8,26991.3,"strata-inkling2: placed 1931/3072 experts in VRAM (8.06 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=237 MiB) in 16.54 s"
+262144,6,sampling,code,5854,5854,256,1570.41,4228.89,60.3,86.3,26995.0,"strata-inkling2: placed 1931/3072 experts in VRAM (8.06 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=237 MiB) in 16.54 s"
+262144,6,sampling,prose,3653,3653,256,623.05,3712.04,68.7,87.7,26995.0,"strata-inkling2: placed 1931/3072 experts in VRAM (8.06 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=237 MiB) in 16.54 s"
+262144,6,sampling,japanese,6109,6109,256,846.08,4185.36,60.93,86.5,26995.0,"strata-inkling2: placed 1931/3072 experts in VRAM (8.06 GiB, tier1=128/128/layer, tier2=0..128/128/layer, stage=4x162MiB, free=237 MiB) in 16.54 s"

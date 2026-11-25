@@ -618,7 +618,7 @@ template <int NT>
 void ktile_q5k_gu_t(const uint8_t* blob, int n, const void* const* act, float* const* ff,
                     int r0, int r1, float beta, float lb) {
     constexpr size_t kTileBytes = 22528;
-    constexpr int kStrip = (NT == 1) ? 64 : ((NT == 2) ? 32 : 16);
+    constexpr int kStrip = (NT == 1) ? 64 : ((NT == 2) ? 32 : ((NT <= 4) ? 16 : 8));
     const int k_sbs = n / QK_K;
     const block_q8_K* yt[NT];
     __m128i q8s_pre[NT][kMaxQ5kSbs];
@@ -699,7 +699,7 @@ void ktile_q5k_gu_t(const uint8_t* blob, int n, const void* const* act, float* c
 template <int NT>
 void ktile_q8_0_down_t(const uint8_t* w, int n, const void* const* act, float* const* out, int r0, int r1) {
     constexpr size_t kTileBytes = 8704;
-    constexpr int kStrip = (NT == 1) ? 128 : ((NT == 2) ? 64 : 32);
+    constexpr int kStrip = (NT == 1) ? 128 : ((NT == 2) ? 64 : ((NT <= 4) ? 32 : 16));
     const int k_64 = n / 64;
     const block_q8_0* yt[NT];
     float dy_pre[NT][kMaxQ80Pairs * 2];
@@ -770,26 +770,34 @@ void ktile_q8_0_down_t(const uint8_t* w, int n, const void* const* act, float* c
 
 void kq256_ktile_gu_rows_situ(const uint8_t* blob, int n, const void* const* act, int nt, float* const* ff,
                               int r0, int r1, float beta, float lb) {
-    for (int t0 = 0; t0 < nt; t0 += 4) {
-        const int k = nt - t0 < 4 ? nt - t0 : 4;
+    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+        const int k = nt - t0 < MAXT ? nt - t0 : MAXT;
         switch (k) {
             case 1: ktile_q5k_gu_t<1>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
             case 2: ktile_q5k_gu_t<2>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
             case 3: ktile_q5k_gu_t<3>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
-            default: ktile_q5k_gu_t<4>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            case 4: ktile_q5k_gu_t<4>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            case 5: ktile_q5k_gu_t<5>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            case 6: ktile_q5k_gu_t<6>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            case 7: ktile_q5k_gu_t<7>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
+            default: ktile_q5k_gu_t<8>(blob, n, act + t0, ff + t0, r0, r1, beta, lb); break;
         }
     }
 }
 
 void kq256_ktile_rows(const uint8_t* w, int n, const void* const* act, int nt, float* const* out,
                       int r0, int r1) {
-    for (int t0 = 0; t0 < nt; t0 += 4) {
-        const int k = nt - t0 < 4 ? nt - t0 : 4;
+    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+        const int k = nt - t0 < MAXT ? nt - t0 : MAXT;
         switch (k) {
             case 1: ktile_q8_0_down_t<1>(w, n, act + t0, out + t0, r0, r1); break;
             case 2: ktile_q8_0_down_t<2>(w, n, act + t0, out + t0, r0, r1); break;
             case 3: ktile_q8_0_down_t<3>(w, n, act + t0, out + t0, r0, r1); break;
-            default: ktile_q8_0_down_t<4>(w, n, act + t0, out + t0, r0, r1); break;
+            case 4: ktile_q8_0_down_t<4>(w, n, act + t0, out + t0, r0, r1); break;
+            case 5: ktile_q8_0_down_t<5>(w, n, act + t0, out + t0, r0, r1); break;
+            case 6: ktile_q8_0_down_t<6>(w, n, act + t0, out + t0, r0, r1); break;
+            case 7: ktile_q8_0_down_t<7>(w, n, act + t0, out + t0, r0, r1); break;
+            default: ktile_q8_0_down_t<8>(w, n, act + t0, out + t0, r0, r1); break;
         }
     }
 }

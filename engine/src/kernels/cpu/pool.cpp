@@ -1457,10 +1457,14 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         narithmetic_ = arithmetic;
         if (dep_on_ && numa_n_ == 0 && n_ > 1 && !q2_native_kernels(f.gu_type) && !q2_native_kernels(f.d_type)) {
             // BW-G (STRATA_POOL_DEP=1): the whole layer call as one batch, no barrier between the phases (DepExpert, pool.hpp)
+            const int threads = n_ + (host_works_ ? 1 : 0);
             const int per_phase = phase_tasks((int64_t) nb * f.n_ff);
+            const int per_phase_dn = phase_tasks((int64_t) nb * f.n_embd);
+            const int min_k_gu = (nb >= per_phase && nb % threads != 0) ? 2 : 1;
+            const int min_k_dn = (nb >= per_phase_dn && nb % threads != 0) ? 2 : 1;
             dep_nb_ = nb;
-            dep_k_gu_ = (std::max)(1, (std::min)((int) f.n_ff, (per_phase + nb - 1) / nb));
-            dep_k_dn_ = (std::max)(1, (std::min)((int) f.n_embd, (phase_tasks((int64_t) nb * f.n_embd) + nb - 1) / nb));
+            dep_k_gu_ = (std::max)(1, (std::min)((int) f.n_ff, (std::max)(min_k_gu, (per_phase + nb - 1) / nb)));
+            dep_k_dn_ = (std::max)(1, (std::min)((int) f.n_embd, (std::max)(min_k_dn, (per_phase_dn + nb - 1) / nb)));
             for (int e = 0; e < nb; ++e) {
                 dep_[(size_t) e].gu_left.store(dep_k_gu_, std::memory_order_relaxed);
                 dep_[(size_t) e].quant.store(0, std::memory_order_relaxed);
