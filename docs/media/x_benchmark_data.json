@@ -1,37 +1,8 @@
 {
-  "title": "Strata · Inkling-2-Mini (UD-Q4_K_M) on RTX 4070 12 GB",
-  "subtitle": "262K Real-Code Ladder · Confidence-Gated DSpark Draft-3 + Suffix PLD · Upfront Tier-1 Pinning · Zero Precision Loss",
-  "footer": "RTX 4070 12 GB (461.2 GB/s STREAM) + Ryzen 7 5700X (33.4 GB/s DDR4) · Real-Code Corpus (261.5K max) · Edit x_benchmark_data.json or pass --on-csv / --off-csv to regenerate",
-  "badges": [
-    {
-      "label": "DSpark",
-      "value": "Draft-3 (--draft-max 3 + PLD)",
-      "bg": "#EFF6FF",
-      "border": "#93C5FD",
-      "color": "#1D4ED8"
-    },
-    {
-      "label": "KV Cache",
-      "value": "Q8_0 (4.33 GiB @ 256K)",
-      "bg": "#ECFDF5",
-      "border": "#6EE7B7",
-      "color": "#047857"
-    },
-    {
-      "label": "Vision",
-      "value": "Elastic F16 (1.4 GiB peak / 0 B idle)",
-      "bg": "#F5F3FF",
-      "border": "#C4B5FD",
-      "color": "#6D28D9"
-    },
-    {
-      "label": "Roofline",
-      "value": "95–97% Physical Limit @ 256K",
-      "bg": "#F8FAFC",
-      "border": "#CBD5E1",
-      "color": "#334155"
-    }
-  ],
+  "title": "Inkling-2-Mini on RTX 4070 12 GB",
+  "subtitle": "UD-Q4_K_M  ·  Q8_0 KV (4.33 GiB @ 256K)  ·  DSpark Draft-3  ·  Vision F16 (Elastic)",
+  "footer_left": "Strata Engine  ·  Real-Code Corpus (8K–256K)  ·  Zero Precision Loss",
+  "footer_right": "RTX 4070 12 GB + Ryzen 7 5700X",
   "depths_k": [
     8.192,
     16.384,
@@ -99,13 +70,8 @@
   ],
   "labels": {
     "on": "DSpark ON (Draft-3)",
-    "off": "DSpark OFF (T=1)",
+    "off": "DSpark OFF",
     "prefill_ylim": 9000,
-    "decode_ylim": 72,
-    "kpi_notes": {
-      "pp_8k": "Smooth 8K–256K curve · zero mid-prefill stalls",
-      "pp_256k": "Up from 2,754 / 2,586 t/s (+9.3% / +18.4%)",
-      "decode": "Beats DSpark OFF at every depth (8K → 256K)"
-    }
+    "decode_ylim": 70
   }
 }

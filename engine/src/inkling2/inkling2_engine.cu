@@ -9389,6 +9389,16 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         const char* v = std::getenv("STRATA_DSPARK_MAX_EXT");
         return (v && v[0]) ? std::clamp(std::atoi(v), 1, 7) : draft_max;
     }();
+    const bool sample_pld = [] {
+        const char* v = std::getenv("STRATA_DSPARK_SAMPLE_PLD");
+        return !(v && v[0] == '0');
+    }();
+    const float tau_min0_s = env_f("STRATA_DSPARK_SAMPLE_TAU0", E.hybrid ? (tight_hy ? 0.30f : 0.25f) : 0.15f);
+    const float tau_step_s = env_f("STRATA_DSPARK_SAMPLE_TAU_STEP", E.hybrid ? (tight_hy ? 0.50f : 0.48f) : 0.45f);
+    const float tau_cum_s  = env_f("STRATA_DSPARK_SAMPLE_TAU_CUM",  E.hybrid ? (tight_hy ? 0.30f : 0.25f) : 0.25f);
+    const float sample_alpha_min = env_f("STRATA_DSPARK_SAMPLE_ALPHA_MIN", E.hybrid ? 0.25f : 0.18f);
+    const bool use_conf_cd = conf_gate && (tight_hy || (sample_on && E.hybrid));
+    int consec_abort = 0;
     const int pld_base_min = [] (size_t init_n, bool th) {
         const char* v = std::getenv("STRATA_DSPARK_PLD_MIN_MATCH");
         if (v && v[0]) return std::clamp(std::atoi(v), 4, 12);
@@ -9466,16 +9476,23 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         const int32_t anchor = next_tok;
         bool used_pld = false;
         d_toks.clear();
-        if (!sample_on && pld_enabled) {
+        if (pld_enabled && (!sample_on || sample_pld)) {
             E.pld.sync(live_tokens);
             const int pld_max_k = std::min(std::min(E.verify_max_t - 1, std::max(draft_max, tight_hy ? 4 : 5)), rem - 1);
             if (pld_max_k >= 1 && E.pld.try_draft(live_tokens, anchor, pld_max_k, pld_min_match, d_toks)) {
                 used_pld = true;
+                if (sample_on) {
+                    q_dists.resize(d_toks.size());
+                    for (size_t r = 0; r < d_toks.size(); ++r) {
+                        q_dists[r].idx = {d_toks[r]};
+                        q_dists[r].probs = {1.0f};
+                    }
+                }
             }
         }
 
         if (!used_pld) {
-            if (adaptive_dspark && ((!conf_gate && cur_dm == 0) || (conf_gate && tight_hy)) && skip_cd > 0) {
+            if (adaptive_dspark && ((!conf_gate && cur_dm == 0) || use_conf_cd) && skip_cd > 0) {
                 feed_single_cd(next_tok);
                 --skip_cd;
                 if (E.hybrid && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 8, 2, false);
@@ -9495,6 +9512,45 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
                     if (E.hybrid && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 8, 2, false);
                     continue;
                 }
+            } else if (sample_on && adaptive_dspark && conf_gate) {
+                const int base_k = std::min(draft_max, rem - 1);
+                const int max_k = std::min(std::min(E.verify_max_t - 1, base_k), rem - 1);
+                const size_t tail_keep = (!use_gpu_topk && smp.pen_last_n > 0) ? (size_t) smp.pen_last_n : 0;
+                const size_t h_start = hist.size() > tail_keep ? (hist.size() - tail_keep) : 0;
+                q_dists.clear();
+                dspark->draft_sampled_confident(
+                    E, anchor, base_k, max_k,
+                    tau_step_s, tau_cum_s, tau_ext, tau_cum_ext,
+                    d_toks, use_gpu_topk ? nullptr : &d_logits,
+                    [&](int step_i, std::vector<float>& row_lg, float& out_pmax) -> int32_t {
+                        SamplingDist q;
+                        if (use_gpu_topk) {
+                            build_sampling_dists_gpu(E, 1, hist, d_toks.data(), step_i, smp, tmp_dists);
+                            q = std::move(tmp_dists[0]);
+                        } else {
+                            std::vector<int32_t> tmp_hist(hist.begin() + (ptrdiff_t) h_start, hist.end());
+                            tmp_hist.insert(tmp_hist.end(), d_toks.begin(), d_toks.begin() + step_i);
+                            q = build_sampling_dist(row_lg.data(), V, tmp_hist, smp);
+                        }
+                        out_pmax = q.probs.empty() ? 0.0f : q.probs[0];
+                        if (step_i == 0 && out_pmax < tau_min0_s) return -1;
+                        const int32_t tok = sample_from_dist(q, rng);
+                        q_dists.push_back(std::move(q));
+                        return tok;
+                    },
+                    use_gpu_topk);
+                if (d_toks.empty()) {
+                    ++consec_abort;
+                    if (use_conf_cd && consec_abort >= 3) {
+                        skip_cd = 8;
+                        consec_abort = 0;
+                    }
+                    feed_single(anchor);
+                    if (pld_cooldown > 0 && --pld_cooldown == 0) pld_min_match = std::max(pld_base_min, pld_min_match - 1);
+                    if (E.hybrid && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 8, 2, false);
+                    continue;
+                }
+                consec_abort = 0;
             } else {
                 const int use_dm = (adaptive_dspark && !conf_gate) ? std::max(1, cur_dm) : draft_max;
                 const int max_k = std::min(use_dm, rem - 1);
@@ -9606,7 +9662,7 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
             if (pld_cooldown > 0 && --pld_cooldown == 0) pld_min_match = std::max(pld_base_min, pld_min_match - 1);
         }
         dspark->inject(E, pos_pre, 1 + m);
-        if (adaptive_dspark && !used_pld && K >= 1 && (!conf_gate || tight_hy)) {
+        if (adaptive_dspark && !used_pld && K >= 1 && (!conf_gate || use_conf_cd)) {
             const int trials = std::min(K, m + 1);
             alpha_num = 0.85f * alpha_num + (float) m;
             alpha_den = 0.85f * alpha_den + (float) trials;
@@ -9634,9 +9690,10 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
                     else { cur_dm = 0; skip_cd = cd_backoff; cd_backoff = std::min(48, cd_backoff * 2); }
                 }
             } else {
+                const float a_thr = sample_on ? sample_alpha_min : 0.18f;
                 if (m >= 1) {
                     cd_backoff = 12;
-                } else if (alpha_den >= 4.0f && alpha < 0.18f) {
+                } else if (alpha_den >= 4.0f && alpha < a_thr) {
                     skip_cd = cd_backoff;
                     cd_backoff = std::min(48, cd_backoff * 2);
                 }

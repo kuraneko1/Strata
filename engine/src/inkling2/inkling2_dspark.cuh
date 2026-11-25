@@ -3038,6 +3038,77 @@ struct DsparkEngine {
         if (E.prof) draft_ms += ms_since(t0);
     }
 
+    /// Confidence-gated sampled DSpark draft (0..max_k tokens) with exact distribution preservation.
+    /// `sample_fn(step_i, row_lg, out_pmax)` builds q_dist[step_i], sets `out_pmax = max_v q_i(v)`
+    /// (deterministic given prefix, independent of the random draw!), and returns:
+    ///   -1 if `step_i == 0 && out_pmax < tau_min0` (caller aborts before drawing / pushing q_dist),
+    ///   otherwise the sampled token id >= 0 (after pushing q_dist[step_i]).
+    template <typename EngineT, typename SampleFn>
+    void draft_sampled_confident(EngineT& E, int32_t anchor, int base_k, int max_k,
+                                 float tau_step, float tau_cum,
+                                 float tau_ext, float tau_cum_ext,
+                                 std::vector<int32_t>& out_tokens,
+                                 std::vector<std::vector<float>>* out_logits,
+                                 SampleFn&& sample_fn, bool gpu_sampled = false) {
+        ensure_decode_weights_resident(E.st);
+        wait_decode_weights_ready(E.st);
+        const auto t0 = Clock::now();
+        const auto& hp = dm->hp;
+        const int N = hp.n_embd;
+        const int rank = hp.markov_rank;
+        const int eff_max = std::clamp(max_k, 1, std::min(7, hp.block_size - 1));
+        out_tokens.clear();
+        if (out_logits) out_logits->clear();
+
+        run_dflare(E, anchor);
+
+        const int joint_tot = 2 * rank + 2 * N;
+        int32_t prev_id = anchor;
+        float p_cum = 1.0f;
+        for (int i = 0; i < eff_max; ++i) {
+            const float* hi = block_cur + (size_t) (i + 1) * N;
+            dspark_detail::k_dspark_prep_joint<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
+                rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N);
+            E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+            dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
+                joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
+            E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
+            dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
+                h_pred, hi, rnn_corr, dm->hidden_out_b, N);
+            E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
+            if (hp.softcap > 0.0f) {
+                k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
+                    E.logits, hp.vocab_unpadded, hp.softcap);
+            }
+            float p_i = 0.0f;
+            if (gpu_sampled) {
+                std::vector<float> dummy_lg;
+                prev_id = sample_fn(i, dummy_lg, p_i);
+            } else {
+                std::vector<float> row_lg((size_t) hp.vocab_unpadded);
+                CK(cudaMemcpyAsync(row_lg.data(), E.logits, (size_t) hp.vocab_unpadded * sizeof(float),
+                                   cudaMemcpyDeviceToHost, E.st));
+                CK(cudaStreamSynchronize(E.st));
+                prev_id = sample_fn(i, row_lg, p_i);
+                if (out_logits && prev_id >= 0) out_logits->push_back(std::move(row_lg));
+            }
+            if (prev_id < 0) break;
+            out_tokens.push_back(prev_id);
+            p_cum *= p_i;
+            if (i + 1 >= eff_max) break;
+            if (i + 1 < base_k) {
+                if (p_i < tau_step || p_cum < tau_cum) break;
+            } else {
+                if (p_i < tau_ext || p_cum < tau_cum_ext) break;
+            }
+        }
+        if (!out_tokens.empty()) {
+            ++n_draft_calls;
+            n_drafted += (int64_t) out_tokens.size();
+        }
+        if (E.prof) draft_ms += ms_since(t0);
+    }
+
     /// Draft `n_draft` (1..7) speculative tokens from `anchor` (placed at `pos`, seeing context `0..pos-1`).
     /// When `out_logits != nullptr` (`n_draft` rows of `vocab_unpadded`), uses `sample_fn(row_vec)` for each draft step.
     template <typename EngineT, typename SampleFn>

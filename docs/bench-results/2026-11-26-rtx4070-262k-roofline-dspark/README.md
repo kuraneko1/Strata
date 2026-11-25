@@ -76,6 +76,19 @@ Measured across `edit_rag` (code verbatim edit), `code` (C++/CUDA generation), `
 | `prose` (English Prose) | `68.50 t/s` | **`69.06 t/s`** | `58.35 t/s` | **`-15.5%`** (`-14.8%` vs OFF) |
 | `japanese` (Japanese Tech) | **`66.28 t/s`** | `62.72 t/s` | `44.74 t/s` | **`-28.7%`** (`-32.5%` vs OFF) |
 
+#### Sampling Confidence Gate + 1-Hot PLD (`temperature=1.0, top_p=0.95, top_k=40, seed=42`, Distribution-Preserving)
+Adding deterministic-peak `draft_sampled_confident` (`tau0=0.25` / `0.30` in `tight_hybrid`, `alpha_min=0.25`) + exact rejection-sampled 1-hot `PromptSuffixDrafter` (`PLD`) + adaptive cooldown preserves exact target distributions while eliminating the `65K` Japanese regression (`-5.4%` → `+0.5%`):
+
+| Context / Workload | DSpark OFF | `--draft-max 3` (Conf Gate + 1-Hot PLD) | Delta |
+| :--- | ---: | ---: | ---: |
+| `65K` `edit_rag` (`256 tok`) | `61.97 t/s` | **`81.57 t/s`** | **`+31.6%`** |
+| `65K` `code` (`256 tok`) | `60.96 t/s` | **`71.60 t/s`** | **`+17.5%`** |
+| `65K` `prose` (`256 tok`) | `66.02 t/s` | **`80.68 t/s`** | **`+22.2%`** |
+| `65K` `japanese` (`256 tok`) | `65.55 t/s` | **`65.89 t/s`** | **`+0.5%`** |
+| `262K` `edit_rag` (`128 tok`) | `58.25 t/s` | **`63.69 t/s`** | **`+9.3%`** |
+| `262K` `code` (`128 tok`) | `55.33 t/s` | `47.02 t/s` | `-15.0%` |
+| `262K` `japanese` (`128 tok`) | `57.37 t/s` | `54.49 t/s` | `-5.0%` |
+
 **Why `--draft-max 3` wins on 12 GB hybrid GPUs (`--draft-max 6` hits VRAM spill)**:
 1. Larger Verify batches (`T=6..7` at `dm=5..6`) invoke many more distinct CPU-resident experts per step on a DDR4-bound bus, increasing verify step cost faster than expected accepted length grows — especially under Sampling where `PLD` and greedy confidence gating are bypassed.
 2. `--draft-max 6` raises `verify_max_t = 7` scratch/graph VRAM allocations enough (`11,656 MiB` GPU used + host/swap spill to `~26 GiB` RAM / `4.4 GiB` swap on a 12 GB desktop GPU) to stall on RTX 4070 `65K`. **`--draft-max 3` is therefore the sweet spot for both coding and general prose on 12 GB GPUs.**

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a clean 16:9 (1920x1080) X/Twitter benchmark card from JSON or ladder CSVs.
+"""Generate a clean 16:9 (1920x1080) AI-lab-style X/Twitter benchmark card from JSON or ladder CSVs.
 
 Usage:
   1) Render from JSON (default docs/media/x_benchmark_data.json -> docs/media/bench-rtx4070-x.png):
@@ -19,25 +19,32 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
-from matplotlib.patches import FancyBboxPatch
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_DATA = HERE / "x_benchmark_data.json"
 DEFAULT_OUT = HERE / "bench-rtx4070-x.png"
 
-plt.rcParams.update({
-    "font.family": "DejaVu Sans",
-    "axes.edgecolor": "#CBD5E1",
-    "axes.linewidth": 1.0,
-    "xtick.color": "#334155",
-    "ytick.color": "#334155",
-    "text.color": "#0F172A",
-})
-
 C_ON = "#2563EB"
-C_OFF = "#10B981"
-C_GRID = "#E2E8F0"
-HALO = [pe.withStroke(linewidth=3.0, foreground="#FFFFFF")]
+C_OFF = "#94A3B8"
+C_OFF_TXT = "#475569"
+C_INK = "#0F172A"
+C_MUTED = "#64748B"
+C_LIGHT = "#94A3B8"
+C_GRID = "#EEF2F6"
+C_RULE = "#E2E8F0"
+C_AXIS = "#CBD5E1"
+HALO = [pe.withStroke(linewidth=3.2, foreground="#FFFFFF")]
+
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Lato", "Noto Sans", "DejaVu Sans"],
+    "axes.edgecolor": C_AXIS,
+    "axes.linewidth": 1.0,
+    "xtick.color": C_MUTED,
+    "ytick.color": C_MUTED,
+    "text.color": C_INK,
+})
 
 
 def load_csv_ladder(path: Path, profile: str = "262k"):
@@ -56,38 +63,60 @@ def load_csv_ladder(path: Path, profile: str = "262k"):
     return depths_k, pp, tg
 
 
-def draw_rounded_box(ax, x, y, w, h, fc, ec, lw=1.0, rad=0.012, zorder=2):
-    patch = FancyBboxPatch(
-        (x, y), w, h,
-        boxstyle=f"round,pad=0,rounding_size={rad}",
-        facecolor=fc, edgecolor=ec, linewidth=lw,
-        transform=ax.transAxes, zorder=zorder,
-    )
-    ax.add_patch(patch)
-
-
-def style_plot_ax(ax, ylabel: str, ylim: float):
+def style_plot_ax(ax, title: str, unit_note: str, ylim: float, comma_y: bool = False):
     ax.set_facecolor("#FFFFFF")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.yaxis.grid(True, color=C_GRID, linewidth=0.85, zorder=0)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_color(C_AXIS)
+    ax.spines["bottom"].set_linewidth(1.0)
+    ax.yaxis.grid(True, color=C_GRID, linewidth=0.95, zorder=0)
     ax.set_axisbelow(True)
-    ax.tick_params(axis="both", labelsize=10.0, length=0, pad=6)
+    ax.tick_params(axis="both", labelsize=10.2, length=0, pad=8)
     ax.set_xticks([8.192, 65.536, 131.072, 196.608, 261.5])
     ax.set_xticklabels(["8K", "64K", "128K", "192K", "256K"])
-    ax.set_xlim(-8, 276)
+    ax.set_xlim(-10, 276)
     ax.set_ylim(0, ylim)
-    ax.set_xlabel("Context Depth", fontsize=10.2, fontweight="bold", color="#475569", labelpad=6)
-    ax.set_ylabel(ylabel, fontsize=10.2, fontweight="bold", color="#475569")
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
+    if comma_y:
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{int(v):,}"))
+    ax.set_xlabel("Context Depth", fontsize=10.5, color=C_MUTED, labelpad=10)
+    ax.set_title(title, fontsize=14.5, fontweight="bold", loc="left", pad=14, color=C_INK)
+    ax.text(
+        1.0, 1.032, unit_note,
+        transform=ax.transAxes, ha="right", va="bottom",
+        fontsize=9.8, color=C_MUTED,
+    )
 
 
-def ann(ax, x, y, txt, color, dx=0, dy=8, ha="center", va="bottom", fs=9.8):
+def ann(ax, x, y, txt, color, dx=0, dy=8, ha="center", va="bottom", fs=10.2, weight="bold"):
     t = ax.annotate(
         txt, (x, y),
         textcoords="offset points", xytext=(dx, dy), ha=ha, va=va,
-        fontsize=fs, fontweight="bold", color=color, zorder=10,
+        fontsize=fs, fontweight=weight, color=color, zorder=10,
     )
     t.set_path_effects(HALO)
+
+
+def draw_header_legend_item(bg, x_line_start: float, y: float, label: str, color: str, ls: str, lw: float, ms: float):
+    x_line_end = x_line_start + 0.026
+    x_mid = 0.5 * (x_line_start + x_line_end)
+    bg.plot(
+        [x_line_start, x_line_end], [y, y],
+        linestyle=ls, linewidth=lw, color=color,
+        solid_capstyle="round", zorder=4,
+    )
+    bg.plot(
+        [x_mid], [y],
+        marker="o", markersize=ms, color=color,
+        markeredgecolor="#FFFFFF", markeredgewidth=1.1, zorder=5,
+    )
+    bg.text(
+        x_line_end + 0.009, y, label,
+        fontsize=10.2, fontweight="bold" if ls == "-" else "normal",
+        color=C_INK if ls == "-" else C_OFF_TXT,
+        ha="left", va="center",
+    )
 
 
 def render(cfg: dict, out_path: Path):
@@ -98,133 +127,95 @@ def render(cfg: dict, out_path: Path):
     tg_off = cfg["decode_off"]
     labels = cfg.get("labels", {})
     on_label = labels.get("on", "DSpark ON (Draft-3)")
-    off_label = labels.get("off", "DSpark OFF (T=1)")
+    off_label = labels.get("off", "DSpark OFF")
 
     fig = plt.figure(figsize=(12.8, 7.2), dpi=150, facecolor="#FFFFFF")
 
-    # Full-figure background canvas for header badges & KPI cards
+    # Full-figure background canvas for header, hairline divider, shared legend & footer
     bg = fig.add_axes([0.0, 0.0, 1.0, 1.0], frameon=False)
     bg.set_xticks([])
     bg.set_yticks([])
     bg.set_xlim(0, 1)
     bg.set_ylim(0, 1)
 
-    # Subtle top accent bar
-    draw_rounded_box(bg, 0.0, 0.990, 1.0, 0.010, fc=C_ON, ec="none", lw=0, rad=0.0, zorder=1)
+    # Editorial Header (left: title + compact spec line; right: single shared legend)
+    bg.text(0.055, 0.918, cfg["title"], fontsize=20.5, fontweight="bold", color=C_INK, va="center")
+    bg.text(0.055, 0.866, cfg["subtitle"], fontsize=10.6, color=C_MUTED, va="center")
 
-    # Title & subtitle
-    bg.text(0.04, 0.940, cfg["title"], fontsize=17.0, fontweight="bold", color="#0F172A", va="center")
-    bg.text(0.04, 0.896, cfg["subtitle"], fontsize=10.2, color="#475569", va="center")
+    draw_header_legend_item(bg, 0.775, 0.916, on_label, C_ON, "-", 2.6, 6.0)
+    draw_header_legend_item(bg, 0.775, 0.870, off_label, C_OFF, "--", 2.0, 4.8)
 
-    # Spec badges row (4 pills across x=0.04..0.96)
-    badges = cfg.get("badges", [])
-    if badges:
-        n_b = len(badges)
-        gap = 0.014
-        tot_w = 0.92
-        bw = (tot_w - gap * (n_b - 1)) / n_b
-        y_b, h_b = 0.816, 0.052
-        for i, b in enumerate(badges):
-            bx = 0.04 + i * (bw + gap)
-            draw_rounded_box(bg, bx, y_b, bw, h_b, fc=b["bg"], ec=b["border"], lw=1.1, rad=0.010)
-            cx = bx + bw * 0.5
-            bg.text(cx, y_b + h_b * 0.67, b["label"].upper(), fontsize=7.6, fontweight="bold", color=b["color"], ha="center", va="center", alpha=0.85)
-            bg.text(cx, y_b + h_b * 0.30, b["value"], fontsize=9.1, fontweight="bold", color="#0F172A", ha="center", va="center")
+    # Minimal hairline divider
+    bg.plot([0.055, 0.945], [0.820, 0.820], color=C_RULE, linewidth=0.9, zorder=1)
 
-    # 3 Hero KPI cards (auto-computed from series arrays!)
-    kpi_notes = labels.get("kpi_notes", {})
-    kpis = [
-        (
-            "8K FRESH PREFILL",
-            f"{pp_on[0]:,.0f} ON  ·  {pp_off[0]:,.0f} OFF  t/s",
-            kpi_notes.get("pp_8k", "Smooth 8K–256K curve"),
-            C_ON,
-        ),
-        (
-            "256K CUMULATIVE PREFILL",
-            f"{pp_on[-1]:,.0f} ON  ·  {pp_off[-1]:,.0f} OFF  t/s",
-            kpi_notes.get("pp_256k", "No host-pinning cliffs"),
-            C_OFF,
-        ),
-        (
-            "REAL-CODE DECODE (DSPARK ON)",
-            f"{tg_on[0]:.1f}  →  {tg_on[-1]:.1f}  t/s",
-            kpi_notes.get("decode", "Beats DSpark OFF across 8K–256K"),
-            "#1D4ED8",
-        ),
-    ]
-    k_gap = 0.016
-    kw = (0.92 - 2 * k_gap) / 3.0
-    ky, kh = 0.696, 0.098
-    for i, (k_title, k_val, k_sub, k_col) in enumerate(kpis):
-        kx = 0.04 + i * (kw + k_gap)
-        draw_rounded_box(bg, kx, ky, kw, kh, fc="#F8FAFC", ec="#E2E8F0", lw=1.0, rad=0.010)
-        bg.text(kx + 0.014, ky + kh * 0.77, k_title, fontsize=8.0, fontweight="bold", color="#64748B", va="center")
-        bg.text(kx + 0.014, ky + kh * 0.46, k_val, fontsize=13.0, fontweight="bold", color=k_col, va="center")
-        bg.text(kx + 0.014, ky + kh * 0.17, k_sub, fontsize=8.2, color="#475569", va="center")
-
-    # Side-by-side plot axes
-    ax_pp = fig.add_axes([0.068, 0.132, 0.412, 0.485])
-    ax_tg = fig.add_axes([0.553, 0.132, 0.412, 0.485])
+    # Side-by-side spacious plot axes
+    ax_pp = fig.add_axes([0.082, 0.145, 0.388, 0.575])
+    ax_tg = fig.add_axes([0.558, 0.145, 0.388, 0.575])
 
     idx_map = {round(v, 3): i for i, v in enumerate(depths)}
 
     # --- Left: Prefill ---
-    style_plot_ax(ax_pp, "tok / s", labels.get("prefill_ylim", 9000))
-    ax_pp.plot(depths, pp_off, "--o", color=C_OFF, linewidth=2.2, markersize=4.8, alpha=0.90, zorder=3, label=off_label)
-    ax_pp.plot(depths, pp_on, "-o", color=C_ON, linewidth=2.8, markersize=5.8, zorder=4, label=on_label)
-    ax_pp.fill_between(depths, 0, pp_on, color=C_ON, alpha=0.07, zorder=1)
+    style_plot_ax(ax_pp, "Prefill", "tok / s · cumulative", labels.get("prefill_ylim", 9000), comma_y=True)
+    ax_pp.plot(
+        depths, pp_off, "--o", color=C_OFF, linewidth=2.0, markersize=4.6,
+        markeredgecolor="#FFFFFF", markeredgewidth=1.0, zorder=3,
+    )
+    ax_pp.plot(
+        depths, pp_on, "-o", color=C_ON, linewidth=2.6, markersize=6.0,
+        markeredgecolor="#FFFFFF", markeredgewidth=1.3, zorder=4,
+    )
+    ax_pp.fill_between(depths, 0, pp_on, color=C_ON, alpha=0.045, zorder=1)
 
-    ann(ax_pp, depths[0], max(pp_on[0], pp_off[0]), f"{pp_on[0]:,.0f}", C_ON, dx=8, dy=4, ha="left")
+    ann(ax_pp, depths[0], max(pp_on[0], pp_off[0]), f"{pp_on[0]:,.0f}", C_ON, dx=9, dy=3, ha="left", va="bottom", fs=10.8)
     if 65.536 in idx_map:
         i64 = idx_map[65.536]
-        ann(ax_pp, depths[i64], pp_on[i64], f"{pp_on[i64]:,.0f}", C_ON, dx=-4, dy=-14, ha="right", va="top")
+        ann(ax_pp, depths[i64], pp_on[i64], f"{pp_on[i64]:,.0f}", C_ON, dx=-6, dy=-14, ha="right", va="top", fs=10.2)
     if 131.072 in idx_map:
         i128 = idx_map[131.072]
-        ann(ax_pp, depths[i128], max(pp_on[i128], pp_off[i128]), f"{pp_on[i128]:,.0f}", C_ON, dx=2, dy=11, ha="left", va="bottom")
+        ann(ax_pp, depths[i128], max(pp_on[i128], pp_off[i128]), f"{pp_on[i128]:,.0f}", C_ON, dx=4, dy=11, ha="left", va="bottom", fs=10.2)
 
-    # Place higher 256K Prefill above and lower below so they never collide
     if pp_off[-1] >= pp_on[-1]:
-        ann(ax_pp, depths[-1], pp_off[-1], f"{pp_off[-1]:,.0f} OFF", C_OFF, dx=-2, dy=11, ha="right", va="bottom")
-        ann(ax_pp, depths[-1], pp_on[-1], f"{pp_on[-1]:,.0f} ON", C_ON, dx=-2, dy=-13, ha="right", va="top")
+        ann(ax_pp, depths[-1], pp_off[-1], f"{pp_off[-1]:,.0f}", C_OFF_TXT, dx=-2, dy=11, ha="right", va="bottom", fs=9.8, weight="normal")
+        ann(ax_pp, depths[-1], pp_on[-1], f"{pp_on[-1]:,.0f}", C_ON, dx=-2, dy=-14, ha="right", va="top", fs=10.8)
     else:
-        ann(ax_pp, depths[-1], pp_on[-1], f"{pp_on[-1]:,.0f} ON", C_ON, dx=-2, dy=11, ha="right", va="bottom")
-        ann(ax_pp, depths[-1], pp_off[-1], f"{pp_off[-1]:,.0f} OFF", C_OFF, dx=-2, dy=-13, ha="right", va="top")
-
-    ax_pp.set_title("Prefill Throughput (Cumulative Effective)", fontsize=11.5, fontweight="bold", loc="left", pad=10, color="#1E293B")
-    ax_pp.legend(frameon=False, fontsize=9.4, loc="upper right")
+        ann(ax_pp, depths[-1], pp_on[-1], f"{pp_on[-1]:,.0f}", C_ON, dx=-2, dy=11, ha="right", va="bottom", fs=10.8)
+        ann(ax_pp, depths[-1], pp_off[-1], f"{pp_off[-1]:,.0f}", C_OFF_TXT, dx=-2, dy=-14, ha="right", va="top", fs=9.8, weight="normal")
 
     # --- Right: Decode ---
-    style_plot_ax(ax_tg, "tok / s", labels.get("decode_ylim", 72))
-    ax_tg.plot(depths, tg_off, "--o", color=C_OFF, linewidth=2.2, markersize=4.8, alpha=0.90, zorder=3, label=off_label)
-    ax_tg.plot(depths, tg_on, "-o", color=C_ON, linewidth=2.8, markersize=5.8, zorder=4, label=on_label)
-    ax_tg.fill_between(depths, tg_off, tg_on, color=C_ON, alpha=0.09, zorder=1)
+    style_plot_ax(ax_tg, "Decode", "tok / s · steady-state", labels.get("decode_ylim", 70), comma_y=False)
+    ax_tg.plot(
+        depths, tg_off, "--o", color=C_OFF, linewidth=2.0, markersize=4.6,
+        markeredgecolor="#FFFFFF", markeredgewidth=1.0, zorder=3,
+    )
+    ax_tg.plot(
+        depths, tg_on, "-o", color=C_ON, linewidth=2.6, markersize=6.0,
+        markeredgecolor="#FFFFFF", markeredgewidth=1.3, zorder=4,
+    )
+    ax_tg.fill_between(depths, tg_off, tg_on, color=C_ON, alpha=0.075, zorder=1)
 
-    ann(ax_tg, depths[0], tg_on[0], f"{tg_on[0]:.1f}", C_ON, dx=-2, dy=9, ha="right", va="bottom")
-    ann(ax_tg, depths[0], tg_off[0], f"{tg_off[0]:.1f}", C_OFF, dx=6, dy=-13, ha="left", va="top")
+    ann(ax_tg, depths[0], tg_on[0], f"{tg_on[0]:.1f}", C_ON, dx=-1, dy=11, ha="center", va="bottom", fs=10.8)
+    ann(ax_tg, depths[0], tg_off[0], f"{tg_off[0]:.1f}", C_OFF_TXT, dx=-1, dy=-15, ha="center", va="top", fs=9.8, weight="normal")
     if 65.536 in idx_map:
         i64 = idx_map[65.536]
-        ann(ax_tg, depths[i64], tg_on[i64], f"{tg_on[i64]:.1f}", C_ON, dx=4, dy=9, ha="left", va="bottom")
+        ann(ax_tg, depths[i64], tg_on[i64], f"{tg_on[i64]:.1f}", C_ON, dx=0, dy=11, ha="center", va="bottom", fs=10.2)
     if 131.072 in idx_map:
         i128 = idx_map[131.072]
-        ann(ax_tg, depths[i128], tg_on[i128], f"{tg_on[i128]:.1f}", C_ON, dx=0, dy=10, ha="center", va="bottom")
-        ann(ax_tg, depths[i128], tg_off[i128], f"{tg_off[i128]:.1f}", C_OFF, dx=0, dy=-13, ha="center", va="top")
-    if 196.608 in idx_map:
-        i192 = idx_map[196.608]
-        ann(ax_tg, depths[i192], tg_on[i192], f"{tg_on[i192]:.1f}", C_ON, dx=0, dy=10, ha="center", va="bottom")
+        ann(ax_tg, depths[i128], tg_on[i128], f"{tg_on[i128]:.1f}", C_ON, dx=0, dy=11, ha="center", va="bottom", fs=10.2)
 
     if tg_on[-1] >= tg_off[-1]:
-        ann(ax_tg, depths[-1], tg_on[-1], f"{tg_on[-1]:.1f}", C_ON, dx=-4, dy=10, ha="right", va="bottom")
-        ann(ax_tg, depths[-1], tg_off[-1], f"{tg_off[-1]:.1f}", C_OFF, dx=-4, dy=-12, ha="right", va="top")
+        ann(ax_tg, depths[-1], tg_on[-1], f"{tg_on[-1]:.1f}", C_ON, dx=-2, dy=11, ha="right", va="bottom", fs=10.8)
+        ann(ax_tg, depths[-1], tg_off[-1], f"{tg_off[-1]:.1f}", C_OFF_TXT, dx=-2, dy=-14, ha="right", va="top", fs=9.8, weight="normal")
     else:
-        ann(ax_tg, depths[-1], tg_off[-1], f"{tg_off[-1]:.1f}", C_OFF, dx=-4, dy=10, ha="right", va="bottom")
-        ann(ax_tg, depths[-1], tg_on[-1], f"{tg_on[-1]:.1f}", C_ON, dx=-4, dy=-12, ha="right", va="top")
+        ann(ax_tg, depths[-1], tg_off[-1], f"{tg_off[-1]:.1f}", C_OFF_TXT, dx=-2, dy=11, ha="right", va="bottom", fs=9.8, weight="normal")
+        ann(ax_tg, depths[-1], tg_on[-1], f"{tg_on[-1]:.1f}", C_ON, dx=-2, dy=-14, ha="right", va="top", fs=10.8)
 
-    ax_tg.set_title("Decode Throughput (Steady-State)", fontsize=11.5, fontweight="bold", loc="left", pad=10, color="#1E293B")
-    ax_tg.legend(frameon=False, fontsize=9.4, loc="upper right")
-
-    # Footer
-    bg.text(0.04, 0.032, cfg.get("footer", ""), fontsize=8.4, color="#64748B", va="center")
+    # Quiet Footer
+    footer_left = cfg.get("footer_left", cfg.get("footer", ""))
+    footer_right = cfg.get("footer_right", "")
+    if footer_left:
+        bg.text(0.055, 0.042, footer_left, fontsize=8.8, color=C_LIGHT, ha="left", va="center")
+    if footer_right:
+        bg.text(0.945, 0.042, footer_right, fontsize=8.8, color=C_LIGHT, ha="right", va="center")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, facecolor="#FFFFFF")
