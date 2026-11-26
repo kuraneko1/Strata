@@ -13823,11 +13823,12 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
         float* __restrict__ split_out,
         int n_head, int n_head_kv, int cap, int n_ext, const int32_t* __restrict__ pos0, float kq_scale, int split_n) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
+    // Volta sm_70 native PTX HMMA.884 path: STRIDE=144 (18,432 B = 4 blk/SM, 0-bank-conflict LDS.64),
+    // overlapped V-prefetch before QK^T + next-K prefetch before P*V (matching dspark/verify4), STACK:0!
     constexpr int STRIDE = 144;
     extern __shared__ __align__(16) char smem_raw[];
     __half* sQ = reinterpret_cast<__half*>(smem_raw);            // 32 * 144 * 2 = 9,216 B
-    __half* sKV_all = sQ + 32 * STRIDE;                          // 2 * 16 * 144 * 2 = 9,216 B
-    int* s_need_v = reinterpret_cast<int*>(smem_raw + 18432);    // 4 * 4 = 16 B (total = 18,448 B)
+    __half* sKV_all = sQ + 32 * STRIDE;                          // 2 * 16 * 144 * 2 = 9,216 B (total = 18,432 B)
 
     const int hkv = blockIdx.x, sp = blockIdx.y;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -13933,6 +13934,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
         const float ns0 = load_nsink(r0), ns1 = load_nsink(r1);
         if (rm0 > -1e20f) rm0 -= ns0;
         if (rm1 > -1e20f) rm1 -= ns1;
+
         for (; jb <= bulk_end - 16; jb += 32) {
             const int j = jb + kr;
             const int hj = hkv * cap + j;
@@ -13953,6 +13955,12 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
             }
             asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
 
+            // Overlap V HBM2 fetch with 128-K QK^T HMMA (matching dspark; 18-24 active query rows -> V almost always needed).
+            const __half2 dv2 = __half2half2(__ldg(&vs[hj]));
+            const int8_t* vp = vq + (size_t) hj * 128 + kc0;
+            const uint4 vr0 = *reinterpret_cast<const uint4*>(vp);
+            const uint4 vr1 = *reinterpret_cast<const uint4*>(vp + 16);
+
             float fc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll 1
             for (int k = 0; k < 128; k += 8) {
@@ -13961,41 +13969,24 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
                 mma_rc(fc, q0.x, q0.y, k0.x, k0.y);
                 mma_rc(fc, q0.z, q0.w, k0.z, k0.w);
             }
+            asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
+
+            {
+                const __half2 vb = __hmul2(neg1152, dv2);
+                __half* dst = sKV + kr * STRIDE + kc0;
+                __half2 h2[8];
+                i8x4_to_h2x2_fma(vr0.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr0.y, dv2, vb, h2[2], h2[3]);
+                i8x4_to_h2x2_fma(vr0.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr0.w, dv2, vb, h2[6], h2[7]);
+                *reinterpret_cast<uint4*>(dst)      = *reinterpret_cast<const uint4*>(h2);
+                *reinterpret_cast<uint4*>(dst + 8)  = *reinterpret_cast<const uint4*>(h2 + 4);
+                i8x4_to_h2x2_fma(vr1.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr1.y, dv2, vb, h2[2], h2[3]);
+                i8x4_to_h2x2_fma(vr1.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr1.w, dv2, vb, h2[6], h2[7]);
+                *reinterpret_cast<uint4*>(dst + 16) = *reinterpret_cast<const uint4*>(h2);
+                *reinterpret_cast<uint4*>(dst + 24) = *reinterpret_cast<const uint4*>(h2 + 4);
+            }
 
             const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc[0], fc[1]), fmaxf(fc[4], fc[5])));
             const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc[2], fc[3]), fmaxf(fc[6], fc[7])));
-            const bool need0 = (r0 < kQRows) && (rm0 <= -1e20f || (mx0 - rm0) > -26.0f);
-            const bool need1 = (r1 < kQRows) && (rm1 <= -1e20f || (mx1 - rm1) > -26.0f);
-            const int need_w = __any_sync(0xffffffffu, need0 || need1) ? 1 : 0;
-            if (lane == 0) s_need_v[kw * 2 + rt] = need_w;
-            asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
-
-            if (!(s_need_v[kw * 2] | s_need_v[kw * 2 + 1])) {
-                const float p00 = fast_exp2f_hw(fc[0] - rm0), p01 = fast_exp2f_hw(fc[1] - rm0);
-                const float p04 = fast_exp2f_hw(fc[4] - rm0), p05 = fast_exp2f_hw(fc[5] - rm0);
-                const float p12 = fast_exp2f_hw(fc[2] - rm1), p13 = fast_exp2f_hw(fc[3] - rm1);
-                const float p16 = fast_exp2f_hw(fc[6] - rm1), p17 = fast_exp2f_hw(fc[7] - rm1);
-                rl0 += wmma_row_sum_16((p00 + p01) + (p04 + p05));
-                rl1 += wmma_row_sum_16((p12 + p13) + (p16 + p17));
-                continue;
-            }
-
-            {
-                const __half2 dv2 = __half2half2(__ldg(&vs[hj]));
-                const __half2 vb = __hmul2(neg1152, dv2);
-                const int8_t* vp = vq + (size_t) hj * 128 + kc0;
-                __half* dst = sKV + kr * STRIDE + kc0;
-#pragma unroll
-                for (int i = 0; i < 2; ++i) {
-                    const uint4 vr = *reinterpret_cast<const uint4*>(vp + i * 16);
-                    __half2 h2[8];
-                    i8x4_to_h2x2_fma(vr.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr.y, dv2, vb, h2[2], h2[3]);
-                    i8x4_to_h2x2_fma(vr.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr.w, dv2, vb, h2[6], h2[7]);
-                    *reinterpret_cast<uint4*>(dst + i * 16)     = *reinterpret_cast<const uint4*>(h2);
-                    *reinterpret_cast<uint4*>(dst + i * 16 + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
-                }
-            }
-
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
             const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
             const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
