@@ -5335,7 +5335,13 @@ __global__ void k_gemm_f16_smallT_warp(const uint16_t* __restrict__ W, const flo
 /// Supports optional PAIR=true (fused 2-matrix launch on shared xq, e.g. Q+Gate, K+V, DSpark Gate+Up).
 /// Requires (K_in % 256) == 0, 4-byte aligned W (and W2 when PAIR), and (n_out1 % 4) == 0 when PAIR.
 template <int MT, bool EXACT_T, bool PAIR, int WPB = 4>
-__global__ void __launch_bounds__(WPB * 32, (WPB == 1) ? 16 : ((WPB == 2) ? 16 : ((MT <= 4) ? 12 : 8))) k_mmvq_q8_0_smallT(
+__global__ void __launch_bounds__(WPB * 32, (WPB == 1) ? 16 : ((WPB == 2) ? 16 : ((MT <= 4) ?
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    10
+#else
+    12
+#endif
+    : 8))) k_mmvq_q8_0_smallT(
     const uint8_t* __restrict__ w1, const uint32_t* __restrict__ xq_u32, float* __restrict__ y1,
     int n_in, int n_out1, int T,
     const uint8_t* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr, int n_out2 = 0) {
@@ -14091,17 +14097,6 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
         }
         __syncwarp();
 
-        uint4 vr0 = make_uint4(0, 0, 0, 0), vr1 = vr0, vr2 = vr0, vr3 = vr0;
-        __half2 dv2 = __half2half2(__float2half(0.0f));
-        if (valid_j) {
-            dv2 = __half2half2(__ldg(&vs[(size_t) slot * n_head_kv + hkv]));
-            const int8_t* vp = vq + (size_t) slot * kv_dim + hkv * 128 + wc0;
-            vr0 = *reinterpret_cast<const uint4*>(vp);
-            vr1 = *reinterpret_cast<const uint4*>(vp + 16);
-            vr2 = *reinterpret_cast<const uint4*>(vp + 32);
-            vr3 = *reinterpret_cast<const uint4*>(vp + 48);
-        }
-
         float fc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll 1
         for (int k = 0; k < 128; k += 8) {
@@ -14109,31 +14104,6 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
             const uint4 k0 = *reinterpret_cast<const uint4*>(sKV + kb_off + k);
             mma_rc(fc, q0.x, q0.y, k0.x, k0.y);
             mma_rc(fc, q0.z, q0.w, k0.z, k0.w);
-        }
-        __syncwarp();
-
-        {
-            __half* dst = sKV + wr * STRIDE + wc0;
-            if (valid_j) {
-                const __half2 vb = __hmul2(neg1152, dv2);
-                __half2 h2[8];
-                i8x4_to_h2x2_fma(vr0.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr0.y, dv2, vb, h2[2], h2[3]);
-                i8x4_to_h2x2_fma(vr0.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr0.w, dv2, vb, h2[6], h2[7]);
-                *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(h2); *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
-                i8x4_to_h2x2_fma(vr1.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr1.y, dv2, vb, h2[2], h2[3]);
-                i8x4_to_h2x2_fma(vr1.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr1.w, dv2, vb, h2[6], h2[7]);
-                *reinterpret_cast<uint4*>(dst + 16) = *reinterpret_cast<const uint4*>(h2); *reinterpret_cast<uint4*>(dst + 24) = *reinterpret_cast<const uint4*>(h2 + 4);
-                i8x4_to_h2x2_fma(vr2.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr2.y, dv2, vb, h2[2], h2[3]);
-                i8x4_to_h2x2_fma(vr2.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr2.w, dv2, vb, h2[6], h2[7]);
-                *reinterpret_cast<uint4*>(dst + 32) = *reinterpret_cast<const uint4*>(h2); *reinterpret_cast<uint4*>(dst + 40) = *reinterpret_cast<const uint4*>(h2 + 4);
-                i8x4_to_h2x2_fma(vr3.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr3.y, dv2, vb, h2[2], h2[3]);
-                i8x4_to_h2x2_fma(vr3.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr3.w, dv2, vb, h2[6], h2[7]);
-                *reinterpret_cast<uint4*>(dst + 48) = *reinterpret_cast<const uint4*>(h2); *reinterpret_cast<uint4*>(dst + 56) = *reinterpret_cast<const uint4*>(h2 + 4);
-            } else {
-                const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll
-                for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
-            }
         }
 
         const int j0 = jb + acc_c0, j1 = jb + acc_c1;
@@ -14144,6 +14114,47 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
 
         const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc[0], fc[1]), fmaxf(fc[4], fc[5])));
         const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc[2], fc[3]), fmaxf(fc[6], fc[7])));
+        // Bit-exact FP16-zero V-skip + deferred V load (eliminates 16-reg vr0..vr3 spill -> STACK: 0 on sm_70!).
+        const bool need0 = (acc_r0 < kQRows) && (mx0 > -1e20f) && (rm0 <= -1e20f || (mx0 - rm0) > -26.0f);
+        const bool need1 = (acc_r1 < kQRows) && (mx1 > -1e20f) && (rm1 <= -1e20f || (mx1 - rm1) > -26.0f);
+        if (!__any_sync(0xffffffffu, need0 || need1)) {
+            const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - rm0) : 0.0f;
+            const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - rm0) : 0.0f;
+            const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - rm0) : 0.0f;
+            const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - rm0) : 0.0f;
+            const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - rm1) : 0.0f;
+            const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - rm1) : 0.0f;
+            const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - rm1) : 0.0f;
+            const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - rm1) : 0.0f;
+            rl0 += wmma_row_sum_16((p00 + p01) + (p04 + p05));
+            rl1 += wmma_row_sum_16((p12 + p13) + (p16 + p17));
+            __syncwarp();
+            continue;
+        }
+        __syncwarp();
+
+        {
+            __half* dst = sKV + wr * STRIDE + wc0;
+            if (valid_j) {
+                const __half2 dv2 = __half2half2(__ldg(&vs[(size_t) slot * n_head_kv + hkv]));
+                const __half2 vb = __hmul2(neg1152, dv2);
+                const int8_t* vp = vq + (size_t) slot * kv_dim + hkv * 128 + wc0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint4 vr = *reinterpret_cast<const uint4*>(vp + i * 16);
+                    __half2 h2[8];
+                    i8x4_to_h2x2_fma(vr.x, dv2, vb, h2[0], h2[1]); i8x4_to_h2x2_fma(vr.y, dv2, vb, h2[2], h2[3]);
+                    i8x4_to_h2x2_fma(vr.z, dv2, vb, h2[4], h2[5]); i8x4_to_h2x2_fma(vr.w, dv2, vb, h2[6], h2[7]);
+                    *reinterpret_cast<uint4*>(dst + i * 16)     = *reinterpret_cast<const uint4*>(h2);
+                    *reinterpret_cast<uint4*>(dst + i * 16 + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
+                }
+            } else {
+                const uint4 z = make_uint4(0, 0, 0, 0);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
+            }
+        }
+
         const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
         const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
         const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
@@ -17047,7 +17058,7 @@ __global__ void __launch_bounds__(128, 3) k_router_sgemm_f32_pp(
 /// true register double-buffering a[2][8]/b[2][8], compact float4 fast epilogue -> REG <= 128, STACK: 0!
 /// Caller guarantees (K % 16) == 0 and (K / 16) % split_k == 0.
 /// Launch: dim3((M + 127) / 128, (T + 63) / 64, split_k), Block: 128.
-__global__ void __launch_bounds__(128, 4) k_router_sgemm_f32_pp_splitk(
+__global__ void __launch_bounds__(128, 3) k_router_sgemm_f32_pp_splitk(
         const float* __restrict__ X, const float* __restrict__ W, float* __restrict__ Y_out,
         int T, int M, int K, int split_k) {
     constexpr int BM_T = 64, BN_E = 128, BK = 16;
