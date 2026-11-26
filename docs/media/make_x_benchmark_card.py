@@ -179,7 +179,10 @@ def render(cfg: dict, out_path: Path):
         ann(ax_pp, depths[i64], pp_on[i64], f"{pp_on[i64]:,.0f}", C_ON, dx=-6, dy=-14, ha="right", va="top", fs=10.2)
     if 131.072 in idx_map:
         i128 = idx_map[131.072]
-        ann(ax_pp, depths[i128], max(pp_on[i128], pp_off[i128]), f"{pp_on[i128]:,.0f}", C_ON, dx=4, dy=11, ha="left", va="bottom", fs=10.2)
+        if pp_on[i128] >= pp_off[i128]:
+            ann(ax_pp, depths[i128], pp_on[i128], f"{pp_on[i128]:,.0f}", C_ON, dx=4, dy=11, ha="left", va="bottom", fs=10.2)
+        else:
+            ann(ax_pp, depths[i128], pp_on[i128], f"{pp_on[i128]:,.0f}", C_ON, dx=-4, dy=-13, ha="right", va="top", fs=10.2)
 
     if pp_off[-1] >= pp_on[-1]:
         ann(ax_pp, depths[-1], pp_off[-1], f"{pp_off[-1]:,.0f}", C_OFF_TXT, dx=-2, dy=11, ha="right", va="bottom", fs=9.8, weight="normal")
@@ -200,11 +203,8 @@ def render(cfg: dict, out_path: Path):
     )
     ax_tg.fill_between(depths, tg_off, tg_on, color=C_ON, alpha=0.075, zorder=1)
 
-    if 16.384 in idx_map:
-        i16 = idx_map[16.384]
-        ann(ax_tg, depths[i16], tg_on[i16], f"{tg_on[i16]:.1f}", C_ON, dx=2, dy=11, ha="left", va="bottom", fs=10.8)
-    else:
-        ann(ax_tg, depths[0], tg_on[0], f"{tg_on[0]:.1f}", C_ON, dx=-1, dy=11, ha="center", va="bottom", fs=10.8)
+    peak_i = max(range(min(4, len(tg_on))), key=lambda i: tg_on[i])
+    ann(ax_tg, depths[peak_i], tg_on[peak_i], f"{tg_on[peak_i]:.1f}", C_ON, dx=2, dy=10, ha="center", va="bottom", fs=10.8)
     ann(ax_tg, depths[0], tg_off[0], f"{tg_off[0]:.1f}", C_OFF_TXT, dx=-1, dy=-14, ha="center", va="top", fs=9.8, weight="normal")
     if 65.536 in idx_map:
         i64 = idx_map[65.536]

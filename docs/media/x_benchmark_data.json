@@ -1,6 +1,6 @@
 {
   "title": "Inkling-2-Mini on RTX 4070 12 GB",
-  "subtitle": "UD-Q4_K_M  ·  Q8_0 KV (4.33 GiB @ 256K)  ·  DSpark Draft-3  ·  Vision F16 (Elastic)",
+  "subtitle": "UD-Q4_K_M  ·  Q8_0 KV (4.33 GiB @ 256K)  ·  DSpark Draft-6  ·  Vision F16 (Elastic)",
   "footer_left": "Strata Engine  ·  Real-Code Corpus (8K–256K)  ·  Zero Precision Loss",
   "footer_right": "RTX 4070 12 GB + Ryzen 7 5700X",
   "depths_k": [
@@ -17,17 +17,17 @@
     261.5
   ],
   "prefill_on": [
-    7874.3,
-    6557.3,
-    6276.0,
-    5587.6,
-    5424.3,
-    4694.8,
-    4116.0,
-    3716.1,
-    3396.2,
-    3135.4,
-    2934.6
+    6343.9,
+    5616.3,
+    5499.9,
+    5168.5,
+    5000.4,
+    4261.0,
+    3824.3,
+    3482.9,
+    3201.2,
+    2963.3,
+    2785.4
   ],
   "prefill_off": [
     8051.9,
@@ -43,17 +43,17 @@
     3100.6
   ],
   "decode_on": [
-    64.74,
-    68.1,
-    58.11,
-    56.3,
-    60.45,
-    53.84,
-    43.52,
-    48.16,
-    42.33,
-    35.35,
-    36.36
+    66.18,
+    59.79,
+    67.77,
+    56.6,
+    54.32,
+    47.74,
+    41.59,
+    49.45,
+    36.98,
+    36.43,
+    40.16
   ],
   "decode_off": [
     65.18,
@@ -69,7 +69,7 @@
     31.68
   ],
   "labels": {
-    "on": "DSpark ON (Draft-3)",
+    "on": "DSpark ON (Draft-6)",
     "off": "DSpark OFF",
     "prefill_ylim": 9000,
     "decode_ylim": 80
