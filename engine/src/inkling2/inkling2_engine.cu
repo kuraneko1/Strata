@@ -6621,12 +6621,12 @@ struct Engine {
             }
             uint16_t& fg_hits = full_decode_graph_hits[T][capture_dspark ? 1 : 0][want_softcap ? 1 : 0][want_argmax ? 1 : 0][fg_sp_b];
             if (fg_hits < 65535u) ++fg_hits;
-            // Break-even 700-node cudaGraphInstantiate policy (~2.3 ms instantiate vs ~0.83 ms HostGap saved per replay -> break-even >= 4 calls):
-            // capture primary hot sizes on hit #1 (T=1 OFF, T=4 when dm<=5, T=7 when dm>=6), and defer rare T or T=1 dspark until hit #4.
+            // Break-even 700-node cudaGraphInstantiate policy (~4.0 ms Inst+Destroy vs ~0.83 ms HostGap saved/replay -> break-even = 5 replays):
+            // capture primary hot sizes on hit #1 (T=1 OFF, T=4 when dm<=5, T=7 when dm>=6), and defer rare T or T=1 dspark until hit #6.
             const bool want_capture_fg = (T == 1 && !capture_dspark) ||
                                          (T == 4 && verify_max_t <= 5) ||
                                          (T == 7 && verify_max_t >= 7) ||
-                                         (fg_hits >= 4);
+                                         (fg_hits >= 6);
             if (want_capture_fg) {
                 if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
                     capturing_full_graph = true;
@@ -9019,7 +9019,7 @@ struct Engine {
                     if (vc_hits < 65535u) ++vc_hits;
                     want_capture_cg = (T == 4 && verify_max_t <= 5) ||
                                       (T == 7 && verify_max_t >= 7) ||
-                                      (vc_hits >= 4);
+                                      (vc_hits >= 6);
                 }
                 if (!cg && want_capture_cg && !graph_oom) {
                     const auto saved_nb = norm_blocks;
@@ -9091,7 +9091,7 @@ struct Engine {
                 if (vp_hits < 65535u) ++vp_hits;
                 want_capture_pre = (T == 4 && verify_max_t <= 5) ||
                                    (T == 7 && verify_max_t >= 7) ||
-                                   (vp_hits >= 4);
+                                   (vp_hits >= 6);
             }
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (pre_vec[(size_t) il] || (want_capture_pre && !graph_oom))) {
