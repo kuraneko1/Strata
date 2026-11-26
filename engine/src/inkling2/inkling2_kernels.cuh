@@ -1852,6 +1852,170 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_
     if (xq0) q8_1_sub8_store(o, xq0, blk_idx, sub_lane);
 }
 
+/// Dual-CTA batched pre-attn mix_normed for decode has_msg layers (T=1..8, N==2304):
+/// Launches 1 kernel with grid(T, 2), block 576:
+///   blockIdx.y == 0: msg0, msg3, msg1, msg2 (NQ=4, NORM_LAST=false) from norm_bank
+///   blockIdx.y == 1: in_q[, in_k, in_v] (NQ=NQ_CUR, NORM_LAST=true) from norm_blocks + cur_in
+/// Eliminates 24 launches/step AND overlaps msg + cur mixes across 2*T SMs!
+template <int NQ_CUR>
+__global__ void __launch_bounds__(576, 1) k_mix_normed_fused_1pass_dual(
+    NormMixPtrs ptrs_m, int D_m, const float* __restrict__ qm0, const float* __restrict__ qm1, MixOuts4 out_m,
+    NormMixPtrs ptrs_c, int D_c, const float* __restrict__ qc0, MixOuts4 out_c, int swa_broadcast,
+    int N, float inv_sqrt_n, float rms_eps) {
+    __shared__ float s_dot[4][8][18];
+    __shared__ float s_w[4][8];
+    __shared__ float s_ss[18];
+    const int t = blockIdx.x;
+    const int which = blockIdx.y;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+
+    if (which == 0) {
+        float4 cv[8];
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            if (d < D_m) {
+                const float4 v = reinterpret_cast<const float4*>(ptrs_m.p[d] + (size_t) t * N)[tid];
+                cv[d] = v;
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float4* q_ptr = reinterpret_cast<const float4*>(
+                        (q >= 2) ? (qm1 + (size_t) (q - 2) * N) : (qm0 + (size_t) q * N));
+                    const float4 qv = __ldg(q_ptr + tid);
+                    float dot = v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+                    if (lane == 0) s_dot[q][d][warp] = dot;
+                }
+            }
+        }
+        __syncthreads();
+        if (warp < 4) {
+            const int q = warp;
+            float wv = -1e30f;
+            if (lane < D_m) {
+                float s = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) s += s_dot[q][lane][w];
+                wv = s * inv_sqrt_n;
+            }
+            float m = wv;
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+            const float ev = (lane < D_m) ? __expf(wv - m) : 0.0f;
+            float sum = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float ed = __shfl_sync(0xffffffffu, ev, d);
+                if (d < D_m) sum += ed;
+            }
+            if (lane < D_m) s_w[q][lane] = ev * __fdividef(1.0f, sum);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                if (d < D_m) {
+                    const float wd = s_w[q][d];
+                    ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+                }
+            }
+            reinterpret_cast<float4*>(out_m.p[q] + (size_t) t * N)[tid] = make_float4(ax, ay, az, aw);
+        }
+        return;
+    }
+
+    float4 cv[8];
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D_c) {
+            const float4 v = reinterpret_cast<const float4*>(ptrs_c.p[d] + (size_t) t * N)[tid];
+            cv[d] = v;
+            if (d == D_c - 1) {
+                float ss = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+                if (lane == 0) s_ss[warp] = ss;
+            }
+#pragma unroll
+            for (int q = 0; q < NQ_CUR; ++q) {
+                const float4 qv = __ldg(reinterpret_cast<const float4*>(qc0 + (size_t) q * N) + tid);
+                float dot = v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+                if (lane == 0) s_dot[q][d][warp] = dot;
+            }
+        }
+    }
+    __syncthreads();
+    if (warp < NQ_CUR) {
+        const int q = warp;
+        float wv = -1e30f;
+        float inv_rms_local = 1.0f;
+        if (lane < D_c) {
+            float s = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 18; ++w) s += s_dot[q][lane][w];
+            if (lane == D_c - 1) {
+                float ss = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) ss += s_ss[w];
+                inv_rms_local = rsqrtf(ss / (float) N + rms_eps);
+                s *= inv_rms_local;
+            }
+            wv = s * inv_sqrt_n;
+        }
+        float m = wv;
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        const float ev = (lane < D_c) ? __expf(wv - m) : 0.0f;
+        float sum = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            const float ed = __shfl_sync(0xffffffffu, ev, d);
+            if (d < D_c) sum += ed;
+        }
+        if (lane < D_c) {
+            float res = ev * __fdividef(1.0f, sum);
+            if (lane == D_c - 1) res *= inv_rms_local;
+            s_w[q][lane] = res;
+        }
+    }
+    __syncthreads();
+    if constexpr (NQ_CUR == 1) {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            if (d < D_c) {
+                const float wd = s_w[0][d];
+                ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+            }
+        }
+        const float4 r = make_float4(ax, ay, az, aw);
+        reinterpret_cast<float4*>(out_c.p[0] + (size_t) t * N)[tid] = r;
+        if (swa_broadcast) {
+            reinterpret_cast<float4*>(out_c.p[1] + (size_t) t * N)[tid] = r;
+            reinterpret_cast<float4*>(out_c.p[2] + (size_t) t * N)[tid] = r;
+        }
+    } else {
+#pragma unroll
+        for (int q = 0; q < NQ_CUR; ++q) {
+            float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                if (d < D_c) {
+                    const float wd = s_w[q][d];
+                    ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+                }
+            }
+            reinterpret_cast<float4*>(out_c.p[q] + (size_t) t * N)[tid] = make_float4(ax, ay, az, aw);
+        }
+    }
+}
+
 /// Fuses post-attn k_shortconv_pp(wo -> ffn_inp, res = do_push ? nullptr : cur) + optional do_push rms_norm(ffn_inp -> ndst)
 /// + pre-FFN k_mix_normed_fused_1pass[_f16]<1>(blocks[0..B-1], last=ffn_inp -> out_f32, optional out_f16, optional inv_rms)!
 /// Eliminates reading ffn_inp (36 MB x 48 = 1.72 GB) and ndst (8 x 36 MB = 0.29 GB) back from HBM!

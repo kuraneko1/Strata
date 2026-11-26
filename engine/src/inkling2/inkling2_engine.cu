@@ -6708,6 +6708,12 @@ struct Engine {
             float* ir_c2 = ctrl_inv_rms ? (ctrl_inv_rms + (size_t) 6 * T) : nullptr;
             bool has_msg_ir = false;
             bool use_vmsg_layer = false;
+            bool defer_msg_mix_dual = false;
+            NormMixPtrs dual_np_msg{};
+            int dual_D_msg = 0;
+            const float* dual_qm0 = nullptr;
+            const float* dual_qm1 = nullptr;
+            MixOuts4 dual_mo4_msg{};
             // EX-4C Wave 2: When T > 8 and all attention projections consume FP16, skip dead FP32 in_q/in_k/in_v writes
             // AND emit f16_v directly into disjoint pre_attn_f16_v (eliminates 5.2 GB HBM writes + 24x launch_f32_to_f16(in_v)!).
             const bool attn_f16_only_ok = (T > 8 && act_bf16 != nullptr && pre_attn_f16_v != nullptr &&
@@ -6840,7 +6846,16 @@ struct Engine {
                         np.p[B] = bank_last_norm;
                         MixOuts4 mo4{};
                         mo4.p[0] = msg0; mo4.p[1] = msg3; mo4.p[2] = msg1; mo4.p[3] = msg2;
-                        if (T >= 1 && N == 2304 && B + 1 <= 8) {
+                        if (T >= 1 && T <= 8 && N == 2304 && B + 1 <= 8 &&
+                            !deferred_postffn.active && L.attn_res_query != nullptr && (int) norm_blocks.size() + 1 <= 8) {
+                            // Batch msg0..3 mix with pre-attn cur mix in 1 dual-CTA launch (grid(T,2))!
+                            defer_msg_mix_dual = true;
+                            dual_np_msg = np;
+                            dual_D_msg = B + 1;
+                            dual_qm0 = q_attn;
+                            dual_qm1 = q_kv;
+                            dual_mo4_msg = mo4;
+                        } else if (T >= 1 && N == 2304 && B + 1 <= 8) {
                             MixInvRms4 ir_m4{{nullptr, nullptr, nullptr, nullptr}};
                             if (T >= 32 && can_ctrl_down_wmma && ir_m0) {
                                 ir_m4 = MixInvRms4{{ir_m0, ir_m3, ir_m1, ir_m2}};
@@ -7279,7 +7294,26 @@ struct Engine {
                         run_control(in_v, msg2, L, 2, in_v, T, ir_c2, ir_m2);
                     }
                 } else {
-                run_mix_normed(norm_blocks, cur_in, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
+                if (defer_msg_mix_dual) {
+                    const int Bc = (int) norm_blocks.size();
+                    NormMixPtrs np_c{};
+                    for (int i = 0; i < Bc; ++i) np_c.p[i] = norm_blocks[(size_t) (Bc - 1 - i)];
+                    np_c.p[Bc] = cur_in;
+                    MixOuts4 mo4_c{{in_q, in_k, in_v, nullptr}};
+                    const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
+                    if (is_swa) {
+                        k_mix_normed_fused_1pass_dual<1><<<dim3((unsigned) T, 2), 576, 0, st>>>(
+                            dual_np_msg, dual_D_msg, dual_qm0, dual_qm1, dual_mo4_msg,
+                            np_c, Bc + 1, L.attn_res_query, mo4_c, 1, N, inv_sqrt_n, hp.rms_eps);
+                    } else {
+                        k_mix_normed_fused_1pass_dual<3><<<dim3((unsigned) T, 2), 576, 0, st>>>(
+                            dual_np_msg, dual_D_msg, dual_qm0, dual_qm1, dual_mo4_msg,
+                            np_c, Bc + 1, L.attn_res_query, mo4_c, 0, N, inv_sqrt_n, hp.rms_eps);
+                    }
+                    defer_msg_mix_dual = false;
+                } else {
+                    run_mix_normed(norm_blocks, cur_in, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
+                }
                 if (has_msg) {
                     const bool can_ctrl3 = (T >= 1 && T <= 8 && (N & 3) == 0 && hp.loop_gate_rank == 64 &&
                                             L.loop_down[0].type == 0 && L.loop_down[1].type == 0 && L.loop_down[2].type == 0 &&
