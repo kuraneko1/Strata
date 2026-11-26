@@ -9243,6 +9243,47 @@ __device__ __forceinline__ void dq_nvfp4_sub16_store_sc(uint32_t w0, uint32_t w1
     dq_nvfp4_sub16_store_sc2(w0, w1, __half2half2(sc), dst);
 }
 
+// Bit-exact (0/4,096 E2M1xUE4M3 mismatches) UE4M3_halved * 256 in FP16 + Byte-SWAR NVFP4 16-elem unpack for sm_70 WMMA
+// (fold * 128.0f in FP32 epilogue; eliminates iq_nvfp4_ktile_unperm_u32 + 8x e2m1_pair_to_h2 -> ~85 fewer ALU insns/step).
+__device__ __forceinline__ __half2 ue4m3_to_h2_x256(uint8_t x) {
+    if (x == 0x7Fu) return __float2half2_rn(0.0f);
+    const uint32_t raw = ((uint32_t) (x & 0x7Fu)) << 7;
+    const uint32_t raw2 = raw | (raw << 16);
+    const uint32_t c_2p15 = 0x78007800u;
+    uint32_t out;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(out) : "r"(raw2), "r"(c_2p15));
+    return *reinterpret_cast<const __half2*>(&out);
+}
+template <bool KTILE_PERM>
+__device__ __forceinline__ void dq_nvfp4_sub16_store_swar_sc2(uint32_t w0, uint32_t w1, __half2 sc2, __half* dst) {
+    uint32_t wl0, wl1, wh0, wh1;
+    if constexpr (KTILE_PERM) {
+        wl0 = w0 & 0x8E8E8E8Eu;
+        wl1 = w1 & 0x8E8E8E8Eu;
+        wh0 = ((w0 << 7) & 0x80808080u) | ((w0 >> 3) & 0x0E0E0E0Eu);
+        wh1 = ((w1 << 7) & 0x80808080u) | ((w1 >> 3) & 0x0E0E0E0Eu);
+    } else {
+        wl0 = ((w0 << 4) & 0x80808080u) | ((w0 << 1) & 0x0E0E0E0Eu);
+        wl1 = ((w1 << 4) & 0x80808080u) | ((w1 << 1) & 0x0E0E0E0Eu);
+        wh0 = (w0 & 0x80808080u) | ((w0 >> 3) & 0x0E0E0E0Eu);
+        wh1 = (w1 & 0x80808080u) | ((w1 >> 3) & 0x0E0E0E0Eu);
+    }
+    auto mul_h2 = [sc2](uint32_t raw_u) -> uint32_t {
+        const __half2 h = __hmul2(*reinterpret_cast<const __half2*>(&raw_u), sc2);
+        return *reinterpret_cast<const uint32_t*>(&h);
+    };
+    *reinterpret_cast<uint4*>(dst) = make_uint4(
+        mul_h2(__byte_perm(wl0, 0u, 0x1404u)),
+        mul_h2(__byte_perm(wl0, 0u, 0x3424u)),
+        mul_h2(__byte_perm(wl1, 0u, 0x1404u)),
+        mul_h2(__byte_perm(wl1, 0u, 0x3424u)));
+    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(
+        mul_h2(__byte_perm(wh0, 0u, 0x1404u)),
+        mul_h2(__byte_perm(wh0, 0u, 0x3424u)),
+        mul_h2(__byte_perm(wh1, 0u, 0x1404u)),
+        mul_h2(__byte_perm(wh1, 0u, 0x3424u)));
+}
+
 #if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void iq_cp_async_cg_16(void* smem_ptr, const void* glob_ptr, bool pred) {
     const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -10635,7 +10676,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
     __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
     const int tid = threadIdx.x, warp = tid >> 5;
     if constexpr (WT == 40) {
-        s_ue4m3[tid] = __half2half2(ue4m3_to_half_halved((uint8_t) tid));
+        s_ue4m3[tid] = ue4m3_to_h2_x256((uint8_t) tid);
         __syncthreads();
     }
 #elif __CUDA_ARCH__ >= 800
@@ -10827,20 +10868,20 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
         {
             __half* sx0 = smem;
             __half* sw0 = smem + BM * LD;
-            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? *reinterpret_cast<const uint4*>(xp)     : make_uint4(0, 0, 0, 0);
-            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? *reinterpret_cast<const uint4*>(xp + 8) : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
             uint32_t w0, w1;
             uint8_t db;
             if constexpr (KTILE) {
                 const uint2 q = __ldg(reinterpret_cast<const uint2*>(we_row + 512u + (size_t) tid * 8u));
-                w0 = iq_nvfp4_ktile_unperm_u32(q.x); w1 = iq_nvfp4_ktile_unperm_u32(q.y);
-                db = we_row[(size_t) wr * 4u + sb2];
+                w0 = q.x; w1 = q.y;
+                db = __ldg(we_row + (size_t) wr * 4u + sb2);
             } else {
-                w0 = *reinterpret_cast<const uint32_t*>(we_row + 4 + sb2 * 8);
-                w1 = *reinterpret_cast<const uint32_t*>(we_row + 8 + sb2 * 8);
-                db = we_row[sb2];
+                w0 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 4 + sb2 * 8));
+                w1 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 8 + sb2 * 8));
+                db = __ldg(we_row + sb2);
             }
-            dq_nvfp4_sub16_store_sc2(w0, w1, s_ue4m3[db], sw0 + wr * LD + xc);
+            dq_nvfp4_sub16_store_swar_sc2<KTILE>(w0, w1, s_ue4m3[db], sw0 + wr * LD + xc);
             __syncthreads();
         }
 
@@ -10852,24 +10893,26 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                 const bool has_next = (k0 + 32 < K);
                 uint32_t nw0 = 0, nw1 = 0;
                 uint8_t ndb = 0;
+                uint4 nx0 = make_uint4(0, 0, 0, 0), nx1 = make_uint4(0, 0, 0, 0);
                 if (has_next) {
                     const int nk = k0 + 32;
                     const __half* nxp = xp + nk;
-                    __half* sx_n = smem + nxt * STAGE_ELEMS;
-                    *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = x_ok ? *reinterpret_cast<const uint4*>(nxp)     : make_uint4(0, 0, 0, 0);
-                    *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = x_ok ? *reinterpret_cast<const uint4*>(nxp + 8) : make_uint4(0, 0, 0, 0);
+                    if (x_ok) {
+                        nx0 = __ldg(reinterpret_cast<const uint4*>(nxp));
+                        nx1 = __ldg(reinterpret_cast<const uint4*>(nxp + 8));
+                    }
                     const int half = (nk >> 5) & 1;
                     const int sb = (half << 1) | sb2;
                     if constexpr (KTILE) {
                         const uint8_t* kp = we_row + (size_t) (nk >> 6) * 4608u;
                         const uint2 q = __ldg(reinterpret_cast<const uint2*>(kp + 512u + (size_t) half * 2048u + (size_t) tid * 8u));
-                        nw0 = iq_nvfp4_ktile_unperm_u32(q.x); nw1 = iq_nvfp4_ktile_unperm_u32(q.y);
-                        ndb = kp[(size_t) wr * 4u + sb];
+                        nw0 = q.x; nw1 = q.y;
+                        ndb = __ldg(kp + (size_t) wr * 4u + sb);
                     } else {
                         const uint8_t* wn_p = we_row + (size_t) (nk >> 6) * 36;
-                        nw0 = *reinterpret_cast<const uint32_t*>(wn_p + 4 + sb * 8);
-                        nw1 = *reinterpret_cast<const uint32_t*>(wn_p + 8 + sb * 8);
-                        ndb = wn_p[sb];
+                        nw0 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 4 + sb * 8));
+                        nw1 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 8 + sb * 8));
+                        ndb = __ldg(wn_p + sb);
                     }
                 }
 
@@ -10882,18 +10925,23 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                 for (int kk = 0; kk < 32; kk += 8) {
                     const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
                     const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+                    uint4 a_cur = *reinterpret_cast<const uint4*>(sx_r + kk);
 #pragma unroll
                     for (int mr = 0; mr < MR_RUN; ++mr) {
-                        const uint4 a = *reinterpret_cast<const uint4*>(sx_r + mr * 16 * LD + kk);
-                        hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
-                        hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
-                        hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
-                        hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                        uint4 a_nxt;
+                        if (mr + 1 < MR_RUN) a_nxt = *reinterpret_cast<const uint4*>(sx_r + (mr + 1) * 16 * LD + kk);
+                        hmma_rc(acc[mr][0], a_cur.x, a_cur.y, b0.x, b0.y);
+                        hmma_rc(acc[mr][1], a_cur.x, a_cur.y, b1.x, b1.y);
+                        hmma_rc(acc[mr][0], a_cur.z, a_cur.w, b0.z, b0.w);
+                        hmma_rc(acc[mr][1], a_cur.z, a_cur.w, b1.z, b1.w);
+                        if (mr + 1 < MR_RUN) a_cur = a_nxt;
                     }
                 }
                 if (has_next) {
-                    __half* sw_n = smem + nxt * STAGE_ELEMS + BM * LD;
-                    dq_nvfp4_sub16_store_sc2(nw0, nw1, s_ue4m3[ndb], sw_n + wr * LD + xc);
+                    __half* sx_n = smem + nxt * STAGE_ELEMS;
+                    *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = nx0;
+                    *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = nx1;
+                    dq_nvfp4_sub16_store_swar_sc2<KTILE>(nw0, nw1, s_ue4m3[ndb], sx_n + BM * LD + wr * LD + xc);
                     __syncthreads();
                 }
             }
@@ -12007,7 +12055,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
         }
     }
 #elif __CUDA_ARCH__ < 750
-    const float nv_mul = 1.0f;
+    const float nv_mul = (WT == 40) ? 128.0f : 1.0f;
     const uint8_t* e_blob = L.tail_off ? (const uint8_t*) grp_ptr[tile_g[blockIdx.y]] : nullptr;
     const float sc_g = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[0] : 1.0f) * nv_mul;
     const float sc_u = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[1] : 1.0f) * nv_mul;
@@ -12878,7 +12926,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
     const int tid = threadIdx.x;
     if constexpr (WT == 40) {
-        s_ue4m3[tid] = __half2half2(ue4m3_to_half_halved((uint8_t) tid));
+        s_ue4m3[tid] = ue4m3_to_h2_x256((uint8_t) tid);
         __syncthreads();
     }
 #elif __CUDA_ARCH__ >= 800
@@ -13116,20 +13164,20 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 {
                     __half* sx0 = smem;
                     __half* sw0 = smem + BM * LD;
-                    *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? *reinterpret_cast<const uint4*>(xp)     : make_uint4(0, 0, 0, 0);
-                    *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? *reinterpret_cast<const uint4*>(xp + 8) : make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
                     uint32_t w0, w1;
                     uint8_t db;
                     if constexpr (KTILE) {
                         const uint2 q = __ldg(reinterpret_cast<const uint2*>(we_row + 512u + (size_t) q_idx_kt * 8u));
-                        w0 = iq_nvfp4_ktile_unperm_u32(q.x); w1 = iq_nvfp4_ktile_unperm_u32(q.y);
-                        db = we_row[(size_t) r_kt * 4u + sb2];
+                        w0 = q.x; w1 = q.y;
+                        db = __ldg(we_row + (size_t) r_kt * 4u + sb2);
                     } else {
-                        w0 = *reinterpret_cast<const uint32_t*>(we_row + 4 + sb2 * 8);
-                        w1 = *reinterpret_cast<const uint32_t*>(we_row + 8 + sb2 * 8);
-                        db = we_row[sb2];
+                        w0 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 4 + sb2 * 8));
+                        w1 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 8 + sb2 * 8));
+                        db = __ldg(we_row + sb2);
                     }
-                    dq_nvfp4_sub16_store_sc2(w0, w1, s_ue4m3[db], sw0 + xr * LD + xc);
+                    dq_nvfp4_sub16_store_swar_sc2<KTILE>(w0, w1, s_ue4m3[db], sw0 + xr * LD + xc);
                     __syncthreads();
                 }
 
@@ -13141,24 +13189,32 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                         const bool has_next = (k0 + 32 < K);
                         uint32_t nw0 = 0, nw1 = 0;
                         uint8_t ndb = 0;
+                        uint4 nx0 = make_uint4(0, 0, 0, 0), nx1 = make_uint4(0, 0, 0, 0);
                         if (has_next) {
                             const int nk = k0 + 32;
                             const __half* nxp = xp + nk;
-                            __half* sx_n = smem + nxt * STAGE_ELEMS;
-                            *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = x_ok ? *reinterpret_cast<const uint4*>(nxp)     : make_uint4(0, 0, 0, 0);
-                            *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = x_ok ? *reinterpret_cast<const uint4*>(nxp + 8) : make_uint4(0, 0, 0, 0);
+                            if constexpr (USE_TILES) {
+                                if (x_ok) {
+                                    nx0 = __ldg(reinterpret_cast<const uint4*>(nxp));
+                                    nx1 = __ldg(reinterpret_cast<const uint4*>(nxp + 8));
+                                }
+                            } else {
+                                __half* sx_n = smem + nxt * STAGE_ELEMS;
+                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp))     : make_uint4(0, 0, 0, 0);
+                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
+                            }
                             const int half = (nk >> 5) & 1;
                             const int sb = (half << 1) | sb2;
                             if constexpr (KTILE) {
                                 const uint8_t* kp = we_row + (size_t) (nk >> 6) * 4608u;
                                 const uint2 q = __ldg(reinterpret_cast<const uint2*>(kp + 512u + (size_t) half * 2048u + (size_t) q_idx_kt * 8u));
-                                nw0 = iq_nvfp4_ktile_unperm_u32(q.x); nw1 = iq_nvfp4_ktile_unperm_u32(q.y);
-                                ndb = kp[(size_t) r_kt * 4u + sb];
+                                nw0 = q.x; nw1 = q.y;
+                                ndb = __ldg(kp + (size_t) r_kt * 4u + sb);
                             } else {
                                 const uint8_t* wn_p = we_row + (size_t) (nk >> 6) * 36;
-                                nw0 = *reinterpret_cast<const uint32_t*>(wn_p + 4 + sb * 8);
-                                nw1 = *reinterpret_cast<const uint32_t*>(wn_p + 8 + sb * 8);
-                                ndb = wn_p[sb];
+                                nw0 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 4 + sb * 8));
+                                nw1 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 8 + sb * 8));
+                                ndb = __ldg(wn_p + sb);
                             }
                         }
 
@@ -13171,18 +13227,25 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                         for (int kk = 0; kk < 32; kk += 8) {
                             const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
                             const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
+                            uint4 a_cur = *reinterpret_cast<const uint4*>(sx_r + kk);
 #pragma unroll
                             for (int mr = 0; mr < MR_RUN; ++mr) {
-                                const uint4 a = *reinterpret_cast<const uint4*>(sx_r + mr * 16 * LD + kk);
-                                hmma_rc(acc[mr][0], a.x, a.y, b0.x, b0.y);
-                                hmma_rc(acc[mr][1], a.x, a.y, b1.x, b1.y);
-                                hmma_rc(acc[mr][0], a.z, a.w, b0.z, b0.w);
-                                hmma_rc(acc[mr][1], a.z, a.w, b1.z, b1.w);
+                                uint4 a_nxt;
+                                if (mr + 1 < MR_RUN) a_nxt = *reinterpret_cast<const uint4*>(sx_r + (mr + 1) * 16 * LD + kk);
+                                hmma_rc(acc[mr][0], a_cur.x, a_cur.y, b0.x, b0.y);
+                                hmma_rc(acc[mr][1], a_cur.x, a_cur.y, b1.x, b1.y);
+                                hmma_rc(acc[mr][0], a_cur.z, a_cur.w, b0.z, b0.w);
+                                hmma_rc(acc[mr][1], a_cur.z, a_cur.w, b1.z, b1.w);
+                                if (mr + 1 < MR_RUN) a_cur = a_nxt;
                             }
                         }
                         if (has_next) {
-                            __half* sw_n = smem + nxt * STAGE_ELEMS + BM * LD;
-                            dq_nvfp4_sub16_store_sc2(nw0, nw1, s_ue4m3[ndb], sw_n + xr * LD + xc);
+                            __half* sx_n = smem + nxt * STAGE_ELEMS;
+                            if constexpr (USE_TILES) {
+                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = nx0;
+                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = nx1;
+                            }
+                            dq_nvfp4_sub16_store_swar_sc2<KTILE>(nw0, nw1, s_ue4m3[ndb], sx_n + BM * LD + xr * LD + xc);
                             __syncthreads();
                         }
                     }
@@ -14568,7 +14631,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
             if constexpr (!USE_TILES) __syncthreads();
             }
 #elif __CUDA_ARCH__ < 750
-            const float nv_mul = 1.0f;
+            const float nv_mul = (WT == 40) ? 128.0f : 1.0f;
             int e_g = g;
             if constexpr (USE_TILES) e_g = tile_g[blockIdx.y];
             const uint8_t* e_blob = L.tail_off ? (const uint8_t*) grp_ptr[e_g] : nullptr;
