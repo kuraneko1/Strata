@@ -9879,6 +9879,76 @@ __device__ __forceinline__ void dq_nvfp4_sub16_store_swar_sc2(uint32_t w0, uint3
         mul_h2(__byte_perm(wh1, 0u, 0x3424u)));
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+// Volta sm_70 zero-bank-conflict XOR swizzle for 128x32 __half (64 B/row = 16 banks/row):
+// Verified 1-way (4 cycles ideal vs 8 cycles on LD=40) for qa_row A LDS.128, kb_row B LDS.128, and all STS.128,
+// and r+16 invariant (+0x400 B per 16 rows). Shrinks 2-stage SMEM from 41,984 B -> 32,768 B (+45% more L1 cache).
+__device__ __forceinline__ int iq_swz32_volta(int row, int col8) {
+    const int swz = ((row >> 1) & 1) | ((row >> 2) & 2);
+    return (row << 5) + ((col8 ^ swz) << 3);
+}
+__device__ __forceinline__ uint32_t iq_shf_l_u32_sm70(uint32_t x, uint32_t shift) {
+    uint32_t out;
+    asm("shf.l.clamp.b32 %0, 0, %1, %2;" : "=r"(out) : "r"(x), "r"(shift));
+    return out;
+}
+template <bool KTILE_PERM>
+__device__ __forceinline__ uint32_t iq_nvfp4_swar_lo_sm70(uint32_t w) {
+    if constexpr (KTILE_PERM) {
+        return w & 0x8E8E8E8Eu;
+    } else {
+        return (iq_shf_l_u32_sm70(w, 4u) & 0x80808080u) | (iq_shf_l_u32_sm70(w, 1u) & 0x0E0E0E0Eu);
+    }
+}
+template <bool KTILE_PERM>
+__device__ __forceinline__ uint32_t iq_nvfp4_swar_hi_sm70(uint32_t w) {
+    if constexpr (KTILE_PERM) {
+        return (iq_shf_l_u32_sm70(w, 7u) & 0x80808080u) | ((w >> 3) & 0x0E0E0E0Eu);
+    } else {
+        return (w & 0x80808080u) | ((w >> 3) & 0x0E0E0E0Eu);
+    }
+}
+__device__ __forceinline__ uint32_t iq_nvfp4_hmul2_u32_sm70(uint32_t raw_u, __half2 sc2) {
+    const __half2 h = __hmul2(*reinterpret_cast<const __half2*>(&raw_u), sc2);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+template <uint32_t IMM = 0>
+__device__ __forceinline__ uint4 iq_lds128_u32_sm70(uint32_t addr) {
+    uint4 v;
+    if constexpr (IMM == 0) {
+        asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+    } else {
+        asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4 + %5];\n"
+                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr), "n"(IMM));
+    }
+    return v;
+}
+template <uint32_t IMM = 0>
+__device__ __forceinline__ void iq_sts128_u32_sm70(uint32_t addr, uint4 v) {
+    if constexpr (IMM == 0) {
+        asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};\n"
+                     :: "r"(addr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+    } else {
+        asm volatile("st.shared.v4.u32 [%0 + %1], {%2, %3, %4, %5};\n"
+                     :: "r"(addr), "n"(IMM), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+    }
+}
+template <bool HAS_LB>
+__device__ __forceinline__ float wmma_situ_eval_prescaled_sm70(
+    float g, float u, float sg_inv_b, float neg_sc_g, float su_inv_lb, float out_scale) {
+    const float xc = fmaxf(-9.0f, fminf(9.0f, g * sg_inv_b));
+    const float th_g = __fdividef(2.0f, 1.0f + __expf(-2.0f * xc)) - 1.0f;
+    const float sig = __fdividef(1.0f, 1.0f + __expf(g * neg_sc_g));
+    float tu = u;
+    if constexpr (HAS_LB) {
+        const float xu = fmaxf(-9.0f, fminf(9.0f, u * su_inv_lb));
+        tu = __fdividef(2.0f, 1.0f + __expf(-2.0f * xu)) - 1.0f;
+    }
+    return __fmul_rn(__fmul_rn(out_scale, th_g), __fmul_rn(sig, tu));
+}
+#endif
+
 #if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void iq_cp_async_cg_16(void* smem_ptr, const void* glob_ptr, bool pred) {
     const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -11264,14 +11334,14 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
     constexpr int BM = 128;
 #if __CUDA_ARCH__ < 750
     constexpr int WK = (WT == 40) ? 32 : 64;
-    constexpr int LD = (WT == 40) ? 40 : 72;
+    constexpr int LD = (WT == 40) ? 32 : 72;
     constexpr int STAGES = (WT == 40) ? 2 : 1;
     constexpr int STAGE_ELEMS = (BM + 128) * LD;
-    __shared__ __align__(16) __half smem[STAGES * STAGE_ELEMS];
+    __shared__ __align__(128) __half smem[STAGES * STAGE_ELEMS];
     __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
     const int tid = threadIdx.x, warp = tid >> 5;
     if constexpr (WT == 40) {
-        s_ue4m3[tid] = ue4m3_to_h2_x256((uint8_t) tid);
+        s_ue4m3[tid] = __float2half2_rn(ue4m3_to_f32_half_branchless((uint8_t) tid) * 256.0f);
         __syncthreads();
     }
 #elif __CUDA_ARCH__ >= 800
@@ -11416,11 +11486,13 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
     const bool has_hi = (rows > 64);
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
 #if __CUDA_ARCH__ < 750
-    float acc[4][2][8];
+    float acc[(WT == 40) ? 1 : 4][2][8];
+    if constexpr (WT != 40) {
 #pragma unroll
-    for (int mr = 0; mr < 4; ++mr) {
+        for (int mr = 0; mr < 4; ++mr) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+            for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+        }
     }
 #elif __CUDA_ARCH__ >= 800
     float acc[USE_PACKED ? 1 : 4][2][8];
@@ -11442,8 +11514,10 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
 
     if constexpr (WT == 40) {
 #if __CUDA_ARCH__ < 750
-        // S1 (Volta sm_70): 2-stage WK=32 (LD=40) double-buffered SMEM (41,984 B -> 2 blk/SM).
-        // Direct sx_n write into inactive stage smem[nxt] BEFORE HMMA saves 8 regs -> STACK:0!
+        // Volta sm_70 deep opt (WT==40):
+        // 1) Zero-bank-conflict LD=32 swz_volta 2-stage SMEM (32,768 B + 1,024 B s_ue4m3 = 33,792 B -> 2 blk/SM!)
+        // 2) Bit-exact s_ue4m3[256] (*256 prescaled) + SHF.L SWAR nibble unpack (STACK: 0)
+        // 3) K+=64 compile-time-stage loop with MR_RUN in {2,4}, HMMA-interleaved decode (MR=2 / !KTILE), & coalesced SiTU epilogue!
         const int xr = tid >> 1;      // 0..127
         const int sb2 = tid & 1;      // 0..1
         const int xc = sb2 * 16;      // 0 or 16
@@ -11459,101 +11533,331 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                 ? (blob + (size_t) (col0 + wr) * row_stride)
                 : (blob + L.up_off + (size_t) (col0 + (wr - 64)) * row_stride);
         }
+        const uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+        const uint32_t dst_x0_lo = smem_base + (uint32_t) (iq_swz32_volta(xr, sb2 * 2) * 2);
+        const uint32_t sw_b0_0   = smem_base + 0x2000u + (uint32_t) (iq_swz32_volta(wn * 16 + kb_row, 0) * 2);
 
+        uint32_t sc_d16;
         {
-            __half* sx0 = smem;
-            __half* sw0 = smem + BM * LD;
-            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
-            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
+            const uint4 x0 = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
+            const uint4 x1 = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
             uint32_t w0, w1;
-            uint8_t db;
             if constexpr (KTILE) {
+                const uint32_t d4 = __ldg(reinterpret_cast<const uint32_t*>(we_row + (size_t) wr * 4u));
+                sc_d16 = iq_prmt_raw(d4, 0u, sb2 ? 0x4431u : 0x4420u);
                 const uint2 q = __ldg(reinterpret_cast<const uint2*>(we_row + 512u + (size_t) tid * 8u));
                 w0 = q.x; w1 = q.y;
-                db = __ldg(we_row + (size_t) wr * 4u + sb2);
             } else {
+                sc_d16 = (uint32_t) __ldg(we_row + sb2) | ((uint32_t) __ldg(we_row + 2u + sb2) << 8);
                 w0 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 4 + sb2 * 8));
                 w1 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 8 + sb2 * 8));
-                db = __ldg(we_row + sb2);
             }
-            dq_nvfp4_sub16_store_swar_sc2<KTILE>(w0, w1, s_ue4m3[db], sw0 + wr * LD + xc);
+            iq_sts128_u32_sm70(dst_x0_lo, x0);
+            iq_sts128_u32_sm70(dst_x0_lo ^ 0x10u, x1);
+            const __half2 sc2 = s_ue4m3[sc_d16 & 0xFFu];
+            uint32_t wl = iq_nvfp4_swar_lo_sm70<KTILE>(w0);
+            const uint32_t lo0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+            const uint32_t lo1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+            wl = iq_nvfp4_swar_lo_sm70<KTILE>(w1);
+            const uint32_t lo2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+            const uint32_t lo3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+            iq_sts128_u32_sm70<0x2000u>(dst_x0_lo, make_uint4(lo0, lo1, lo2, lo3));
+            uint32_t wh = iq_nvfp4_swar_hi_sm70<KTILE>(w0);
+            const uint32_t hi0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+            const uint32_t hi1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+            wh = iq_nvfp4_swar_hi_sm70<KTILE>(w1);
+            const uint32_t hi2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+            const uint32_t hi3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+            iq_sts128_u32_sm70<0x2000u>(dst_x0_lo ^ 0x10u, make_uint4(hi0, hi1, hi2, hi3));
             __syncthreads();
         }
 
-        auto run_loop = [&](auto mr_tag) {
+        auto run_gu_epilogue_sm70 = [&](auto mr_tag, const auto& acc_mr) {
             constexpr int MR_RUN = decltype(mr_tag)::value;
-            int stage = 0;
-            for (int k0 = 0; k0 < K; k0 += 32, stage ^= 1) {
-                const int nxt = stage ^ 1;
-                const bool has_next = (k0 + 32 < K);
-                uint32_t nw0 = 0, nw1 = 0;
-                uint8_t ndb = 0;
-                uint4 nx0 = make_uint4(0, 0, 0, 0), nx1 = make_uint4(0, 0, 0, 0);
-                if (has_next) {
-                    const int nk = k0 + 32;
-                    const __half* nxp = xp + nk;
-                    if (x_ok) {
-                        nx0 = __ldg(reinterpret_cast<const uint4*>(nxp));
-                        nx1 = __ldg(reinterpret_cast<const uint4*>(nxp + 8));
-                    }
-                    const int half = (nk >> 5) & 1;
-                    const int sb = (half << 1) | sb2;
-                    if constexpr (KTILE) {
-                        const uint8_t* kp = we_row + (size_t) (nk >> 6) * 4608u;
-                        const uint2 q = __ldg(reinterpret_cast<const uint2*>(kp + 512u + (size_t) half * 2048u + (size_t) tid * 8u));
-                        nw0 = q.x; nw1 = q.y;
-                        ndb = __ldg(kp + (size_t) wr * 4u + sb);
-                    } else {
-                        const uint8_t* wn_p = we_row + (size_t) (nk >> 6) * 36;
-                        nw0 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 4 + sb * 8));
-                        nw1 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 8 + sb * 8));
-                        ndb = __ldg(wn_p + sb);
-                    }
-                }
-
-                const __half* sx_c = smem + stage * STAGE_ELEMS;
-                const __half* sw_c = sx_c + BM * LD;
-                const __half* sx_r = sx_c + (wm * (MR_RUN * 16) + qa_row) * LD;
-                const __half* sw_r0 = sw_c + (wn * 16 + kb_row) * LD;
-                const __half* sw_r1 = sw_c + (64 + wn * 16 + kb_row) * LD;
+            // Volta sm_70 compact prescaled SiTU + 128B coalesced STG.E.128 epilogue via idle stage 0 (0x0000..0x3FFF, 0 pre-barrier)!
+            // Reload tile scalars with asm barrier so ptxas never carries epilogue regs across the K-loop -> STACK: 0!
+            int e_by = (int) blockIdx.y;
+            int e_tid = (int) threadIdx.x;
+            asm volatile("" : "+r"(e_by), "+r"(e_tid));
+            const int e_g = tile_g[e_by];
+            const int e_c0 = tile_c0[e_by];
+            const int e_rows = min(BM, grp_start[e_g + 1] - e_c0);
+            const uint8_t* ep_blob = L.tail_off ? (const uint8_t*) grp_ptr[e_g] : nullptr;
+            const float ep_sc_g = (L.tail_off ? ((const float*) (ep_blob + L.tail_off))[0] : 1.0f) * 128.0f;
+            const float ep_sc_u = (L.tail_off ? ((const float*) (ep_blob + L.tail_off))[1] : 1.0f) * 128.0f;
+            const float sg_inv_b = ep_sc_g * __fdividef(1.0f, beta);
+            const float neg_sc_g = -ep_sc_g;
+            const float su_inv_lb = HAS_LB ? (ep_sc_u * __fdividef(1.0f, lb)) : 0.0f;
+            const float out_scale = HAS_LB ? (beta * lb) : (beta * ep_sc_u);
+            const int ep_warp = e_tid >> 5, ep_lane = e_tid & 31;
+            const int ep_wm = ep_warp >> 2, ep_wn = ep_warp & 3;
+            const int ep_acc_r0 = ((ep_lane & 16) >> 2) + ((ep_lane & 4) << 1) + (ep_lane & 1);
+            const int ep_acc_r1 = ep_acc_r0 + 2;
+            const int ep_wm_base = ep_wm * (MR_RUN * 16);
+            const uint32_t ep_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+            const int c8 = ep_wn * 2 + ((ep_lane >> 3) & 1);
+            const uint32_t c_sub = (uint32_t) (ep_lane & 2) * 2u;
+            const uint32_t swz_r0 = ((uint32_t) (c8 ^ (ep_acc_r0 & 7)) << 4) + c_sub;
+            const uint32_t swz_r1 = ((uint32_t) (c8 ^ (ep_acc_r1 & 7)) << 4) + c_sub;
+            constexpr int mh_lim = MR_RUN * 2;
 #pragma unroll 1
-                for (int kk = 0; kk < 32; kk += 8) {
-                    const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
-                    const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
-                    uint4 a0 = *reinterpret_cast<const uint4*>(sx_r + kk);
-                    uint4 a1 = *reinterpret_cast<const uint4*>(sx_r + 16 * LD + kk);
-                    hmma_rc(acc[0][0], a0.x, a0.y, b0.x, b0.y);
-                    hmma_rc(acc[0][1], a0.x, a0.y, b1.x, b1.y);
-                    hmma_rc(acc[1][0], a1.x, a1.y, b0.x, b0.y);
-                    hmma_rc(acc[1][1], a1.x, a1.y, b1.x, b1.y);
-                    hmma_rc(acc[0][0], a0.z, a0.w, b0.z, b0.w);
-                    hmma_rc(acc[0][1], a0.z, a0.w, b1.z, b1.w);
-                    if constexpr (MR_RUN == 4) a0 = *reinterpret_cast<const uint4*>(sx_r + 32 * LD + kk);
-                    hmma_rc(acc[1][0], a1.z, a1.w, b0.z, b0.w);
-                    hmma_rc(acc[1][1], a1.z, a1.w, b1.z, b1.w);
-                    if constexpr (MR_RUN == 4) {
-                        a1 = *reinterpret_cast<const uint4*>(sx_r + 48 * LD + kk);
-                        hmma_rc(acc[2][0], a0.x, a0.y, b0.x, b0.y);
-                        hmma_rc(acc[2][1], a0.x, a0.y, b1.x, b1.y);
-                        hmma_rc(acc[3][0], a1.x, a1.y, b0.x, b0.y);
-                        hmma_rc(acc[3][1], a1.x, a1.y, b1.x, b1.y);
-                        hmma_rc(acc[2][0], a0.z, a0.w, b0.z, b0.w);
-                        hmma_rc(acc[2][1], a0.z, a0.w, b1.z, b1.w);
-                        hmma_rc(acc[3][0], a1.z, a1.w, b0.z, b0.w);
-                        hmma_rc(acc[3][1], a1.z, a1.w, b1.z, b1.w);
+            for (int mh = 0; mh < mh_lim; ++mh) {
+                const int mr = mh >> 1;
+                const int hi = mh & 1;
+                const int r = ep_wm_base + mr * 16 + (hi ? ep_acc_r1 : ep_acc_r0);
+                if (r >= e_rows) continue;
+                float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+                float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+                if constexpr (MR_RUN == 2) {
+                    switch (mh) {
+                        case 0: g0=acc_mr[0][0][0]; g1=acc_mr[0][0][1]; g2=acc_mr[0][0][4]; g3=acc_mr[0][0][5];
+                                u0=acc_mr[0][1][0]; u1=acc_mr[0][1][1]; u2=acc_mr[0][1][4]; u3=acc_mr[0][1][5]; break;
+                        case 1: g0=acc_mr[0][0][2]; g1=acc_mr[0][0][3]; g2=acc_mr[0][0][6]; g3=acc_mr[0][0][7];
+                                u0=acc_mr[0][1][2]; u1=acc_mr[0][1][3]; u2=acc_mr[0][1][6]; u3=acc_mr[0][1][7]; break;
+                        case 2: g0=acc_mr[1][0][0]; g1=acc_mr[1][0][1]; g2=acc_mr[1][0][4]; g3=acc_mr[1][0][5];
+                                u0=acc_mr[1][1][0]; u1=acc_mr[1][1][1]; u2=acc_mr[1][1][4]; u3=acc_mr[1][1][5]; break;
+                        default: g0=acc_mr[1][0][2]; g1=acc_mr[1][0][3]; g2=acc_mr[1][0][6]; g3=acc_mr[1][0][7];
+                                 u0=acc_mr[1][1][2]; u1=acc_mr[1][1][3]; u2=acc_mr[1][1][6]; u3=acc_mr[1][1][7]; break;
+                    }
+                } else {
+                    switch (mh) {
+                        case 0: g0=acc_mr[0][0][0]; g1=acc_mr[0][0][1]; g2=acc_mr[0][0][4]; g3=acc_mr[0][0][5];
+                                u0=acc_mr[0][1][0]; u1=acc_mr[0][1][1]; u2=acc_mr[0][1][4]; u3=acc_mr[0][1][5]; break;
+                        case 1: g0=acc_mr[0][0][2]; g1=acc_mr[0][0][3]; g2=acc_mr[0][0][6]; g3=acc_mr[0][0][7];
+                                u0=acc_mr[0][1][2]; u1=acc_mr[0][1][3]; u2=acc_mr[0][1][6]; u3=acc_mr[0][1][7]; break;
+                        case 2: g0=acc_mr[1][0][0]; g1=acc_mr[1][0][1]; g2=acc_mr[1][0][4]; g3=acc_mr[1][0][5];
+                                u0=acc_mr[1][1][0]; u1=acc_mr[1][1][1]; u2=acc_mr[1][1][4]; u3=acc_mr[1][1][5]; break;
+                        case 3: g0=acc_mr[1][0][2]; g1=acc_mr[1][0][3]; g2=acc_mr[1][0][6]; g3=acc_mr[1][0][7];
+                                u0=acc_mr[1][1][2]; u1=acc_mr[1][1][3]; u2=acc_mr[1][1][6]; u3=acc_mr[1][1][7]; break;
+                        case 4: g0=acc_mr[2][0][0]; g1=acc_mr[2][0][1]; g2=acc_mr[2][0][4]; g3=acc_mr[2][0][5];
+                                u0=acc_mr[2][1][0]; u1=acc_mr[2][1][1]; u2=acc_mr[2][1][4]; u3=acc_mr[2][1][5]; break;
+                        case 5: g0=acc_mr[2][0][2]; g1=acc_mr[2][0][3]; g2=acc_mr[2][0][6]; g3=acc_mr[2][0][7];
+                                u0=acc_mr[2][1][2]; u1=acc_mr[2][1][3]; u2=acc_mr[2][1][6]; u3=acc_mr[2][1][7]; break;
+                        case 6: g0=acc_mr[3][0][0]; g1=acc_mr[3][0][1]; g2=acc_mr[3][0][4]; g3=acc_mr[3][0][5];
+                                u0=acc_mr[3][1][0]; u1=acc_mr[3][1][1]; u2=acc_mr[3][1][4]; u3=acc_mr[3][1][5]; break;
+                        default: g0=acc_mr[3][0][2]; g1=acc_mr[3][0][3]; g2=acc_mr[3][0][6]; g3=acc_mr[3][0][7];
+                                 u0=acc_mr[3][1][2]; u1=acc_mr[3][1][3]; u2=acc_mr[3][1][6]; u3=acc_mr[3][1][7]; break;
                     }
                 }
-                if (has_next) {
-                    __half* sx_n = smem + nxt * STAGE_ELEMS;
-                    *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = nx0;
-                    *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = nx1;
-                    dq_nvfp4_sub16_store_swar_sc2<KTILE>(nw0, nw1, s_ue4m3[ndb], sx_n + BM * LD + wr * LD + xc);
-                    __syncthreads();
+                const __half2 h0 = __floats2half2_rn(
+                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g0, u0, sg_inv_b, neg_sc_g, su_inv_lb, out_scale),
+                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g1, u1, sg_inv_b, neg_sc_g, su_inv_lb, out_scale));
+                const __half2 h1 = __floats2half2_rn(
+                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g2, u2, sg_inv_b, neg_sc_g, su_inv_lb, out_scale),
+                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g3, u3, sg_inv_b, neg_sc_g, su_inv_lb, out_scale));
+                const uint32_t u_h0 = *reinterpret_cast<const uint32_t*>(&h0);
+                const uint32_t u_h1 = *reinterpret_cast<const uint32_t*>(&h1);
+                const uint32_t s_addr = ep_base + ((uint32_t) r << 7) + (hi ? swz_r1 : swz_r0);
+                asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(s_addr),      "r"(u_h0) : "memory");
+                asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(s_addr + 8u), "r"(u_h1) : "memory");
+            }
+            __syncthreads();
+            const int st_r = e_tid >> 3;
+            const int st_c8 = e_tid & 7;
+            int e_col0 = ((int) blockIdx.z * (int) gridDim.x + (int) blockIdx.x) * 64;
+            asm volatile("" : "+r"(e_col0));
+            __half* const h16_col8 = h16 + (size_t) (e_col0 + st_c8 * 8);
+            const uint32_t ld_swz = ((uint32_t) (st_c8 ^ (st_r & 7)) << 4);
+#pragma unroll
+            for (int rb = 0; rb < MR_RUN * 32; rb += 32) {
+                const int r = rb + st_r;
+                if (r < e_rows) {
+                    const uint4 v = iq_lds128_u32_sm70(ep_base + ((uint32_t) r << 7) + ld_swz);
+                    *reinterpret_cast<uint4*>(h16_col8 + (size_t) (e_c0 + r) * (size_t) L.n_ff) = v;
                 }
             }
         };
+        auto run_loop = [&](auto mr_tag) {
+            constexpr int MR_RUN = decltype(mr_tag)::value;
+            float acc_mr[MR_RUN][2][8];
+#pragma unroll
+            for (int mr = 0; mr < MR_RUN; ++mr) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { acc_mr[mr][0][i] = 0.0f; acc_mr[mr][1][i] = 0.0f; }
+            }
+            const uint32_t sx_a0_0 = smem_base + (uint32_t) (iq_swz32_volta(wm * (MR_RUN * 16) + qa_row, 0) * 2);
+            auto mma_step = [&](auto st_rd_tag, uint32_t a_addr, uint32_t b0_addr, auto hook_mid) {
+                constexpr uint32_t ST_RD = decltype(st_rd_tag)::value;
+                const uint4 b0 = iq_lds128_u32_sm70<ST_RD>(b0_addr);
+                const uint4 b1 = iq_lds128_u32_sm70<ST_RD + 0x1000u>(b0_addr);
+                uint4 a0 = iq_lds128_u32_sm70<ST_RD>(a_addr);
+                hmma_rc(acc_mr[0][0], a0.x, a0.y, b0.x, b0.y);
+                hmma_rc(acc_mr[0][1], a0.x, a0.y, b1.x, b1.y);
+                hmma_rc(acc_mr[0][0], a0.z, a0.w, b0.z, b0.w);
+                hmma_rc(acc_mr[0][1], a0.z, a0.w, b1.z, b1.w);
+                hook_mid();
+                uint4 a1 = iq_lds128_u32_sm70<ST_RD + 0x400u>(a_addr);
+                hmma_rc(acc_mr[1][0], a1.x, a1.y, b0.x, b0.y);
+                hmma_rc(acc_mr[1][1], a1.x, a1.y, b1.x, b1.y);
+                hmma_rc(acc_mr[1][0], a1.z, a1.w, b0.z, b0.w);
+                hmma_rc(acc_mr[1][1], a1.z, a1.w, b1.z, b1.w);
+                if constexpr (MR_RUN == 4) {
+                    a0 = iq_lds128_u32_sm70<ST_RD + 0x800u>(a_addr);
+                    hmma_rc(acc_mr[2][0], a0.x, a0.y, b0.x, b0.y);
+                    hmma_rc(acc_mr[2][1], a0.x, a0.y, b1.x, b1.y);
+                    hmma_rc(acc_mr[2][0], a0.z, a0.w, b0.z, b0.w);
+                    hmma_rc(acc_mr[2][1], a0.z, a0.w, b1.z, b1.w);
+                    a1 = iq_lds128_u32_sm70<ST_RD + 0xC00u>(a_addr);
+                    hmma_rc(acc_mr[3][0], a1.x, a1.y, b0.x, b0.y);
+                    hmma_rc(acc_mr[3][1], a1.x, a1.y, b1.x, b1.y);
+                    hmma_rc(acc_mr[3][0], a1.z, a1.w, b0.z, b0.w);
+                    hmma_rc(acc_mr[3][1], a1.z, a1.w, b1.z, b1.w);
+                }
+            };
+            auto do_half = [&](auto decode_sc_tag, auto st_rd_tag, auto st_wr_tag, bool do_store,
+                               const __half* nxp, const uint8_t* wbase_h) {
+                constexpr bool DECODE_SC = decltype(decode_sc_tag)::value;
+                constexpr uint32_t ST_WR = decltype(st_wr_tag)::value;
+                constexpr bool INTERLEAVE_SW = (KTILE && MR_RUN == 2);
+                uint32_t a_b = sx_a0_0;
+                uint32_t b_b = sw_b0_0;
+                uint32_t dst_x = dst_x0_lo;
+                asm volatile("" : "+r"(a_b), "+r"(b_b), "+r"(dst_x));
+                if constexpr (!INTERLEAVE_SW) {
+                    if (do_store) {
+                        iq_sts128_u32_sm70<ST_WR>(dst_x, x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp)) : make_uint4(0, 0, 0, 0));
+                        iq_sts128_u32_sm70<ST_WR>(dst_x ^ 0x10u, x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0));
+                    }
+                    mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                    a_b ^= 0x10u; b_b ^= 0x10u;
+                    asm volatile("" : "+r"(a_b), "+r"(b_b));
+                    mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                    a_b ^= 0x30u; b_b ^= 0x30u;
+                    asm volatile("" : "+r"(a_b), "+r"(b_b));
+                    mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                    a_b ^= 0x10u; b_b ^= 0x10u;
+                    asm volatile("" : "+r"(a_b), "+r"(b_b));
+                    mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                    if (do_store) {
+                        uint32_t nw0, nw1;
+                        if constexpr (DECODE_SC) {
+                            if constexpr (KTILE) {
+                                const uint32_t nd4 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + (size_t) wr * 4u));
+                                sc_d16 = iq_prmt_raw(nd4, 0u, (tid & 1) ? 0x4431u : 0x4420u);
+                                const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 512u + (size_t) tid * 8u));
+                                nw0 = q.x; nw1 = q.y;
+                            } else {
+                                const uint32_t nd4 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h));
+                                sc_d16 = iq_prmt_raw(nd4, 0u, (tid & 1) ? 0x4431u : 0x4420u);
+                                const uint32_t q_off = (tid & 1) ? 8u : 0u;
+                                nw0 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 4u + q_off));
+                                nw1 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 8u + q_off));
+                            }
+                        } else {
+                            if constexpr (KTILE) {
+                                const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 2560u + (size_t) tid * 8u));
+                                nw0 = q.x; nw1 = q.y;
+                            } else {
+                                const uint32_t q_off = (tid & 1) ? 8u : 0u;
+                                nw0 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 20u + q_off));
+                                nw1 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 24u + q_off));
+                            }
+                        }
+                        const __half2 sc2 = s_ue4m3[DECODE_SC ? (sc_d16 & 0xFFu) : (sc_d16 >> 8)];
+                        uint32_t wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw0);
+                        const uint32_t lo0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                        const uint32_t lo1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                        wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw1);
+                        const uint32_t lo2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                        const uint32_t lo3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                        iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x, make_uint4(lo0, lo1, lo2, lo3));
+                        uint32_t wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw0);
+                        const uint32_t hi0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                        const uint32_t hi1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                        wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw1);
+                        const uint32_t hi2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                        const uint32_t hi3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                        iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x ^ 0x10u, make_uint4(hi0, hi1, hi2, hi3));
+                    }
+                    return;
+                }
+                uint4 nx = make_uint4(0, 0, 0, 0);
+                if (do_store && x_ok) nx = __ldg(reinterpret_cast<const uint4*>(nxp));
+                uint32_t nw0 = 0u, nw1 = 0u;
+                mma_step(st_rd_tag, a_b, b_b, [&]() {
+                    if (do_store) {
+                        iq_sts128_u32_sm70<ST_WR>(dst_x, nx);
+                        asm volatile("" : "+l"(nxp));
+                        nx = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
+                    }
+                });
+                a_b ^= 0x10u; b_b ^= 0x10u;
+                asm volatile("" : "+r"(a_b), "+r"(b_b));
+                mma_step(st_rd_tag, a_b, b_b, [&]() {
+                    if (do_store) {
+                        iq_sts128_u32_sm70<ST_WR>(dst_x ^ 0x10u, nx);
+                        if constexpr (DECODE_SC) {
+                            if constexpr (KTILE) {
+                                const uint32_t nd4 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + (size_t) wr * 4u));
+                                sc_d16 = iq_prmt_raw(nd4, 0u, (tid & 1) ? 0x4431u : 0x4420u);
+                                const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 512u + (size_t) tid * 8u));
+                                nw0 = q.x; nw1 = q.y;
+                            } else {
+                                sc_d16 = (uint32_t) __ldg(wbase_h + (tid & 1)) | ((uint32_t) __ldg(wbase_h + 2u + (tid & 1)) << 8);
+                                const uint32_t q_off = (tid & 1) ? 8u : 0u;
+                                nw0 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 4u + q_off));
+                                nw1 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 8u + q_off));
+                            }
+                        } else {
+                            if constexpr (KTILE) {
+                                const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 2560u + (size_t) tid * 8u));
+                                nw0 = q.x; nw1 = q.y;
+                            } else {
+                                const uint32_t q_off = (tid & 1) ? 8u : 0u;
+                                nw0 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 20u + q_off));
+                                nw1 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 24u + q_off));
+                            }
+                        }
+                    }
+                });
+                a_b ^= 0x30u; b_b ^= 0x30u;
+                asm volatile("" : "+r"(a_b), "+r"(b_b));
+                mma_step(st_rd_tag, a_b, b_b, [&]() {
+                    if (do_store) {
+                        const __half2 sc2 = s_ue4m3[DECODE_SC ? (sc_d16 & 0xFFu) : (sc_d16 >> 8)];
+                        uint32_t wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw0);
+                        const uint32_t lo0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                        const uint32_t lo1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                        wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw1);
+                        const uint32_t lo2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                        const uint32_t lo3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                        iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x, make_uint4(lo0, lo1, lo2, lo3));
+                    }
+                });
+                a_b ^= 0x10u; b_b ^= 0x10u;
+                asm volatile("" : "+r"(a_b), "+r"(b_b));
+                mma_step(st_rd_tag, a_b, b_b, [&]() {
+                    if (do_store) {
+                        const __half2 sc2 = s_ue4m3[DECODE_SC ? (sc_d16 & 0xFFu) : (sc_d16 >> 8)];
+                        uint32_t wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw0);
+                        const uint32_t hi0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                        const uint32_t hi1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                        wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw1);
+                        const uint32_t hi2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                        const uint32_t hi3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                        iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x ^ 0x10u, make_uint4(hi0, hi1, hi2, hi3));
+                    }
+                });
+            };
+            const uint8_t* kp = we_row;
+            const __half* cxp = xp;
+#pragma unroll 1
+            for (int k0 = 0; k0 < K; k0 += 64) {
+                do_half(std::false_type{}, std::integral_constant<uint32_t, 0u>{}, std::integral_constant<uint32_t, 0x4000u>{}, true, cxp + 32, kp);
+                __syncthreads();
+                kp  += KTILE ? 4608u : 36u;
+                cxp += 64;
+                asm volatile("" : "+l"(kp), "+l"(cxp));
+                const bool has_next = (k0 + 64 < K);
+                do_half(std::true_type{}, std::integral_constant<uint32_t, 0x4000u>{}, std::integral_constant<uint32_t, 0u>{}, has_next, cxp, kp);
+                if (has_next) __syncthreads();
+            }
+            run_gu_epilogue_sm70(mr_tag, acc_mr);
+        };
         if (has_hi) run_loop(std::integral_constant<int, 4>{});
         else run_loop(std::integral_constant<int, 2>{});
+        if (zero_moe_out) iq_zero_moe_tail(zero_moe_out, zero_moe_floats);
+        return;
 #elif __CUDA_ARCH__ >= 800
         // Wave 9 Cand-D2 (sm_80+): 40.0 KB WK=32 3-stage sx + 2-stage sw cooperative FP16 (sx[3][128][32] + sw[2][128][32]) +
         // anchored wait_group 1 + branchless has_next + LDG.E.CONSTANT + zero-IMAD SHF.L UE4M3/NVFP4 unpack (STACK: 0)!
@@ -12661,37 +12965,38 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
         }
     }
 #elif __CUDA_ARCH__ < 750
-    const float nv_mul = (WT == 40) ? 128.0f : 1.0f;
-    const uint8_t* e_blob = L.tail_off ? (const uint8_t*) grp_ptr[tile_g[blockIdx.y]] : nullptr;
-    const float sc_g = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[0] : 1.0f) * nv_mul;
-    const float sc_u = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[1] : 1.0f) * nv_mul;
-    const float inv_b = __fdividef(1.0f, beta);
-    const float inv_lb = HAS_LB ? __fdividef(1.0f, lb) : 0.0f;
-    const int e_wn = wn;
-    const int mr_lim = has_hi ? 4 : 2;
-    const int wm_base = has_hi ? (wm * 64) : (wm * 32);
+    if constexpr (WT != 40) {
+        const uint8_t* e_blob = L.tail_off ? (const uint8_t*) grp_ptr[tile_g[blockIdx.y]] : nullptr;
+        const float sc_g = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[0] : 1.0f);
+        const float sc_u = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[1] : 1.0f);
+        const float inv_b = __fdividef(1.0f, beta);
+        const float inv_lb = HAS_LB ? __fdividef(1.0f, lb) : 0.0f;
+        const int e_wn = wn;
+        const int mr_lim = has_hi ? 4 : 2;
+        const int wm_base = has_hi ? (wm * 64) : (wm * 32);
 #pragma unroll
-    for (int mr = 0; mr < 4; ++mr) {
-        if (mr >= mr_lim) break;
-        const int r0 = wm_base + mr * 16 + acc_r0;
-        const int r1 = wm_base + mr * 16 + acc_r1;
-        if (r0 < rows) {
-            __half* dst0 = h16 + (size_t) (c0 + r0) * N_out + col0 + e_wn * 16;
-            *reinterpret_cast<__half2*>(dst0 + acc_c0) = __floats2half2_rn(
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][0], sc_g), __fmul_rn(acc[mr][1][0], sc_u), beta, inv_b, lb, inv_lb),
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][1], sc_g), __fmul_rn(acc[mr][1][1], sc_u), beta, inv_b, lb, inv_lb));
-            *reinterpret_cast<__half2*>(dst0 + acc_c1) = __floats2half2_rn(
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][4], sc_g), __fmul_rn(acc[mr][1][4], sc_u), beta, inv_b, lb, inv_lb),
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][5], sc_g), __fmul_rn(acc[mr][1][5], sc_u), beta, inv_b, lb, inv_lb));
-        }
-        if (r1 < rows) {
-            __half* dst1 = h16 + (size_t) (c0 + r1) * N_out + col0 + e_wn * 16;
-            *reinterpret_cast<__half2*>(dst1 + acc_c0) = __floats2half2_rn(
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][2], sc_g), __fmul_rn(acc[mr][1][2], sc_u), beta, inv_b, lb, inv_lb),
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][3], sc_g), __fmul_rn(acc[mr][1][3], sc_u), beta, inv_b, lb, inv_lb));
-            *reinterpret_cast<__half2*>(dst1 + acc_c1) = __floats2half2_rn(
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][6], sc_g), __fmul_rn(acc[mr][1][6], sc_u), beta, inv_b, lb, inv_lb),
-                wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][7], sc_g), __fmul_rn(acc[mr][1][7], sc_u), beta, inv_b, lb, inv_lb));
+        for (int mr = 0; mr < 4; ++mr) {
+            if (mr >= mr_lim) break;
+            const int r0 = wm_base + mr * 16 + acc_r0;
+            const int r1 = wm_base + mr * 16 + acc_r1;
+            if (r0 < rows) {
+                __half* dst0 = h16 + (size_t) (c0 + r0) * N_out + col0 + e_wn * 16;
+                *reinterpret_cast<__half2*>(dst0 + acc_c0) = __floats2half2_rn(
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][0], sc_g), __fmul_rn(acc[mr][1][0], sc_u), beta, inv_b, lb, inv_lb),
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][1], sc_g), __fmul_rn(acc[mr][1][1], sc_u), beta, inv_b, lb, inv_lb));
+                *reinterpret_cast<__half2*>(dst0 + acc_c1) = __floats2half2_rn(
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][4], sc_g), __fmul_rn(acc[mr][1][4], sc_u), beta, inv_b, lb, inv_lb),
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][5], sc_g), __fmul_rn(acc[mr][1][5], sc_u), beta, inv_b, lb, inv_lb));
+            }
+            if (r1 < rows) {
+                __half* dst1 = h16 + (size_t) (c0 + r1) * N_out + col0 + e_wn * 16;
+                *reinterpret_cast<__half2*>(dst1 + acc_c0) = __floats2half2_rn(
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][2], sc_g), __fmul_rn(acc[mr][1][2], sc_u), beta, inv_b, lb, inv_lb),
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][3], sc_g), __fmul_rn(acc[mr][1][3], sc_u), beta, inv_b, lb, inv_lb));
+                *reinterpret_cast<__half2*>(dst1 + acc_c1) = __floats2half2_rn(
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][6], sc_g), __fmul_rn(acc[mr][1][6], sc_u), beta, inv_b, lb, inv_lb),
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(acc[mr][0][7], sc_g), __fmul_rn(acc[mr][1][7], sc_u), beta, inv_b, lb, inv_lb));
+            }
         }
     }
 #else
@@ -13512,27 +13817,25 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     // E4: Early-exit ghost CTAs BEFORE s_ue4m3 init & __syncthreads()!
-    const int n_tile = USE_TILES ? ((int) blockIdx.z * (int) gridDim.x + (int) blockIdx.x) : (int) blockIdx.x;
-    const int nt_m = USE_TILES ? *n_tiles : 0;
     if constexpr (USE_TILES) {
-        if ((int) blockIdx.y >= nt_m) return;
+        const int n_tile = (int) blockIdx.z * (int) gridDim.x + (int) blockIdx.x;
+        if ((int) blockIdx.y >= *n_tiles) return;
         if (n_tile * 128 >= (int) (IS_DOWN ? L.n_embd : (2 * L.n_ff))) return;
-    }
-    if constexpr (!USE_TILES) {
+    } else {
         if ((int) blockIdx.z >= *n_groups) return;
     }
-    (void) n_tile;
     constexpr int BM = 128, BN = 128;
 #if __CUDA_ARCH__ < 750
     constexpr int WK = (WT == 40) ? 32 : 64;
-    constexpr int LD = (WT == 40) ? 40 : 72;
+    constexpr int LD = (WT == 40) ? 32 : 72;
     constexpr int STAGES = (WT == 40) ? 2 : 1;
     constexpr int STAGE_ELEMS = (BM + BN) * LD;
-    __shared__ __align__(16) __half smem[STAGES * STAGE_ELEMS];
+    __shared__ __align__(128) __half smem[STAGES * STAGE_ELEMS];
     __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
+    __shared__ volatile int s_tile_args[(WT == 40 && !USE_TILES) ? 4 : 1];
     const int tid = threadIdx.x;
     if constexpr (WT == 40) {
-        s_ue4m3[tid] = ue4m3_to_h2_x256((uint8_t) tid);
+        s_ue4m3[tid] = __float2half2_rn(ue4m3_to_f32_half_branchless((uint8_t) tid) * 256.0f);
         __syncthreads();
     }
 #elif __CUDA_ARCH__ >= 800
@@ -13601,7 +13904,14 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
         const int b_lane_row = ((lane >> 4) << 3) | (lane & 7);
         const int b_lane_col = ((lane >> 3) & 1) << 3;
 #else
-        const int rt_ntile = n_tile;
+        int rt_ntile = USE_TILES ? ((int) blockIdx.z * (int) gridDim.x + (int) blockIdx.x) : (int) blockIdx.x;
+#if __CUDA_ARCH__ < 750
+        uint32_t rt_c0_zero = 0u;
+        if constexpr (WT == 40 && !USE_TILES) {
+            asm("and.b32 %0, %1, 0;" : "=r"(rt_c0_zero) : "r"(c0));
+            rt_ntile += (int) rt_c0_zero;
+        }
+#endif
 #endif
         const int col0_all = rt_ntile * BN;
         const bool is_up = !IS_DOWN && (col0_all >= (int) L.n_ff);
@@ -13729,11 +14039,13 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 }
             };
 #elif __CUDA_ARCH__ < 750
-            float acc[4][2][8];
+            float acc[(WT == 40) ? 1 : 4][2][8];
+            if constexpr (WT != 40) {
 #pragma unroll
-            for (int mr = 0; mr < 4; ++mr) {
+                for (int mr = 0; mr < 4; ++mr) {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+                    for (int i = 0; i < 8; ++i) { acc[mr][0][i] = 0.0f; acc[mr][1][i] = 0.0f; }
+                }
             }
 #else
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
@@ -13746,16 +14058,18 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
 
             if constexpr (WT == 40) {
 #if __CUDA_ARCH__ < 750
-                // S1 (Volta sm_70): 2-stage WK=32 (LD=40) double-buffered SMEM (41,984 B -> 2 blk/SM).
-                // Direct sx_n write into inactive stage smem[nxt] BEFORE HMMA saves 8 regs -> STACK:0!
+                // Volta sm_70 deep opt (WT==40):
+                // 1) Zero-bank-conflict LD=32 swz_volta 2-stage SMEM (32,768 B + 1,024 B s_ue4m3 = 33,792 B -> 2 blk/SM!)
+                // 2) Bit-exact s_ue4m3[256] (*256 prescaled) + SHF.L SWAR nibble unpack (STACK: 0)
+                // 3) K+=64 compile-time-stage loop + warp-staged coalesced RED.E.ADD epilogue!
                 const int xr = tid >> 1;      // 0..127
                 const int sb2 = tid & 1;      // 0..1
                 const int xc = sb2 * 16;      // 0 or 16
                 const bool x_ok = (xr < rows);
                 const int in_row = x_ok ? (IS_DOWN ? (c0 + xr) : ent_idx[c0 + xr]) : 0;
                 const __half* xp = X + (size_t) in_row * K + xc;
-                const int r_kt = IS_DOWN ? xr : ((is_up ? 64 : 0) + ((col0 + xr) & 63));
-                const int q_idx_kt = IS_DOWN ? tid : (r_kt * 2 + sb2);
+                const uint32_t kt_q_idx = (uint32_t) (IS_DOWN ? tid : (((is_up ? 64 : 0) + ((col0 + xr) & 63)) * 2 + sb2));
+                const uint32_t kt_r = kt_q_idx >> 1;
                 const uint8_t* we_row = nullptr;
                 if constexpr (KTILE) {
                     if constexpr (IS_DOWN) {
@@ -13766,123 +14080,487 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 } else {
                     we_row = blob + role_off + (size_t) (col0 + xr) * row_stride;
                 }
+                uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+                if constexpr (!USE_TILES) {
+                    smem_base += rt_c0_zero;
+                }
+                const uint32_t dst_x0_lo = smem_base + (uint32_t) (iq_swz32_volta(xr, sb2 * 2) * 2);
+                const uint32_t sw_b0_0   = smem_base + 0x2000u + (uint32_t) (iq_swz32_volta(wn * 32 + kb_row, 0) * 2);
 
+                uint32_t sc_d16;
                 {
-                    __half* sx0 = smem;
-                    __half* sw0 = smem + BM * LD;
-                    *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
-                    *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
+                    iq_sts128_u32_sm70(dst_x0_lo, x_ok ? __ldg(reinterpret_cast<const uint4*>(xp)) : make_uint4(0, 0, 0, 0));
+                    iq_sts128_u32_sm70(dst_x0_lo ^ 0x10u, x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0));
                     uint32_t w0, w1;
-                    uint8_t db;
                     if constexpr (KTILE) {
-                        const uint2 q = __ldg(reinterpret_cast<const uint2*>(we_row + 512u + (size_t) q_idx_kt * 8u));
+                        const uint32_t d4 = __ldg(reinterpret_cast<const uint32_t*>(we_row + (size_t) kt_r * 4u));
+                        sc_d16 = iq_prmt_raw(d4, 0u, sb2 ? 0x4431u : 0x4420u);
+                        const uint2 q = __ldg(reinterpret_cast<const uint2*>(we_row + 512u + (size_t) kt_q_idx * 8u));
                         w0 = q.x; w1 = q.y;
-                        db = __ldg(we_row + (size_t) r_kt * 4u + sb2);
                     } else {
+                        const uint32_t d4 = __ldg(reinterpret_cast<const uint32_t*>(we_row));
+                        sc_d16 = iq_prmt_raw(d4, 0u, sb2 ? 0x4431u : 0x4420u);
                         w0 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 4 + sb2 * 8));
                         w1 = __ldg(reinterpret_cast<const uint32_t*>(we_row + 8 + sb2 * 8));
-                        db = __ldg(we_row + sb2);
                     }
-                    dq_nvfp4_sub16_store_swar_sc2<KTILE>(w0, w1, s_ue4m3[db], sw0 + xr * LD + xc);
+                    const __half2 sc2 = s_ue4m3[sc_d16 & 0xFFu];
+                    uint32_t wl = iq_nvfp4_swar_lo_sm70<KTILE>(w0);
+                    const uint32_t lo0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                    const uint32_t lo1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                    wl = iq_nvfp4_swar_lo_sm70<KTILE>(w1);
+                    const uint32_t lo2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                    const uint32_t lo3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                    iq_sts128_u32_sm70<0x2000u>(dst_x0_lo, make_uint4(lo0, lo1, lo2, lo3));
+                    uint32_t wh = iq_nvfp4_swar_hi_sm70<KTILE>(w0);
+                    const uint32_t hi0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                    const uint32_t hi1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                    wh = iq_nvfp4_swar_hi_sm70<KTILE>(w1);
+                    const uint32_t hi2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                    const uint32_t hi3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                    iq_sts128_u32_sm70<0x2000u>(dst_x0_lo ^ 0x10u, make_uint4(hi0, hi1, hi2, hi3));
                     __syncthreads();
                 }
 
-                auto run_loop = [&](auto mr_tag) {
+                auto run_128_epilogue_sm70 = [&](auto mr_tag, const auto& acc_mr) {
                     constexpr int MR_RUN = decltype(mr_tag)::value;
-                    int stage = 0;
-                    for (int k0 = 0; k0 < K; k0 += 32, stage ^= 1) {
-                        const int nxt = stage ^ 1;
-                        const bool has_next = (k0 + 32 < K);
-                        uint32_t nw0 = 0, nw1 = 0;
-                        uint8_t ndb = 0;
-                        uint4 nx0 = make_uint4(0, 0, 0, 0), nx1 = make_uint4(0, 0, 0, 0);
-                        if (has_next) {
-                            const int nk = k0 + 32;
-                            const __half* nxp = xp + nk;
-                            if constexpr (USE_TILES) {
-                                if (x_ok) {
-                                    nx0 = __ldg(reinterpret_cast<const uint4*>(nxp));
-                                    nx1 = __ldg(reinterpret_cast<const uint4*>(nxp + 8));
-                                }
-                            } else {
-                                __half* sx_n = smem + nxt * STAGE_ELEMS;
-                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp))     : make_uint4(0, 0, 0, 0);
-                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
-                            }
-                            const int half = (nk >> 5) & 1;
-                            const int sb = (half << 1) | sb2;
-                            if constexpr (KTILE) {
-                                const uint8_t* kp = we_row + (size_t) (nk >> 6) * 4608u;
-                                const uint2 q = __ldg(reinterpret_cast<const uint2*>(kp + 512u + (size_t) half * 2048u + (size_t) q_idx_kt * 8u));
-                                nw0 = q.x; nw1 = q.y;
-                                ndb = __ldg(kp + (size_t) r_kt * 4u + sb);
-                            } else {
-                                const uint8_t* wn_p = we_row + (size_t) (nk >> 6) * 36;
-                                nw0 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 4 + sb * 8));
-                                nw1 = __ldg(reinterpret_cast<const uint32_t*>(wn_p + 8 + sb * 8));
-                                ndb = __ldg(wn_p + sb);
-                            }
-                        }
-
-                        const __half* sx_c = smem + stage * STAGE_ELEMS;
-                        const __half* sw_c = sx_c + BM * LD;
-                        const __half* sx_r = sx_c + (wm * (MR_RUN * 16) + qa_row) * LD;
-                        const __half* sw_r0 = sw_c + (wn * 32 + kb_row) * LD;
-                        const __half* sw_r1 = sw_c + (wn * 32 + 16 + kb_row) * LD;
+                    int ep_g, ep_c0, ep_rows;
+                    if constexpr (USE_TILES) {
+                        int ep_by = (int) blockIdx.y;
+                        asm volatile("" : "+r"(ep_by));
+                        ep_g = tile_g[ep_by];
+                        ep_c0 = tile_c0[ep_by];
+                        ep_rows = min(BM, grp_start[ep_g + 1] - ep_c0);
+                    } else {
+                        ep_g = s_tile_args[0];
+                        ep_c0 = s_tile_args[1];
+                        const int ep_e1 = s_tile_args[2];
+                        ep_rows = min(BM, ep_e1 - ep_c0);
+                    }
+                    int ep_tid = (int) threadIdx.x;
+                    asm volatile("" : "+r"(ep_tid));
+                    const int ep_warp = ep_tid >> 5, ep_lane = ep_tid & 31;
+                    const int ep_wm = ep_warp >> 2, ep_wn = ep_warp & 3;
+                    const int ep_acc_r0 = ((ep_lane & 16) >> 2) + ((ep_lane & 4) << 1) + (ep_lane & 1);
+                    const int ep_acc_r1 = ep_acc_r0 + 2;
+                    const int ep_acc_c0 = (ep_lane & 8) + (ep_lane & 2);
+                    const int ep_wm_base = ep_wm * (MR_RUN * 16);
+                    int ep_ntile = USE_TILES ? ((int) blockIdx.z * (int) gridDim.x + (int) blockIdx.x) : (int) blockIdx.x;
+                    if constexpr (USE_TILES) asm volatile("" : "+r"(ep_ntile));
+                    const int ep_col0_all = ep_ntile * BN;
+                    const bool ep_is_up = !IS_DOWN && (ep_col0_all >= (int) L.n_ff);
+                    const int ep_col0 = IS_DOWN ? ep_col0_all : (ep_is_up ? (ep_col0_all - (int) L.n_ff) : ep_col0_all);
+                    const int ep_n_out = IS_DOWN ? (int) L.n_embd : (int) L.n_ff;
+                    float* const ep_dst_mat = IS_DOWN ? out0 : (ep_is_up ? out1 : out0);
+                    const uint8_t* ep_blob = L.tail_off ? (const uint8_t*) grp_ptr[ep_g] : nullptr;
+                    const float ep_sc = (L.tail_off ? ((const float*) (ep_blob + L.tail_off))[IS_DOWN ? 2 : (ep_is_up ? 1 : 0)] : 1.0f) * 128.0f;
+                    if constexpr (IS_DOWN) {
+                        if (ent_weights) {
+                            // Volta sm_70 warp-staged 100% coalesced 128B RED.E.ADD epilogue using idle stage 0 (8x2KB = 16KB, 0 pre-barrier)!
+                            float (*s_out_w)[32] = reinterpret_cast<float (*)[32]>(
+                                reinterpret_cast<uint8_t*>(smem) + (size_t) ep_warp * 2048u);
+                            const int ep_col_base = ep_col0 + ep_wn * 32;
+                            const bool col_ok = (ep_col_base + ep_lane < ep_n_out);
+                            const uint64_t out_lane_base = reinterpret_cast<uint64_t>(ep_dst_mat + (size_t) (ep_col_base + ep_lane));
+                            const uint32_t row_bytes = (uint32_t) ep_n_out << 2;
+                            const int sc0_r0 = ep_acc_c0 ^ ((ep_acc_r0 & 3) << 3);
+                            const int sc0_r1 = sc0_r0 ^ 16;
 #pragma unroll 1
-                        for (int kk = 0; kk < 32; kk += 8) {
-                            const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
-                            const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
-                            if constexpr (USE_TILES) {
-                                uint4 a0 = *reinterpret_cast<const uint4*>(sx_r + kk);
-                                uint4 a1 = *reinterpret_cast<const uint4*>(sx_r + 16 * LD + kk);
-                                hmma_rc(acc[0][0], a0.x, a0.y, b0.x, b0.y);
-                                hmma_rc(acc[0][1], a0.x, a0.y, b1.x, b1.y);
-                                hmma_rc(acc[1][0], a1.x, a1.y, b0.x, b0.y);
-                                hmma_rc(acc[1][1], a1.x, a1.y, b1.x, b1.y);
-                                hmma_rc(acc[0][0], a0.z, a0.w, b0.z, b0.w);
-                                hmma_rc(acc[0][1], a0.z, a0.w, b1.z, b1.w);
-                                if constexpr (MR_RUN == 4) a0 = *reinterpret_cast<const uint4*>(sx_r + 32 * LD + kk);
-                                hmma_rc(acc[1][0], a1.z, a1.w, b0.z, b0.w);
-                                hmma_rc(acc[1][1], a1.z, a1.w, b1.z, b1.w);
-                                if constexpr (MR_RUN == 4) {
-                                    a1 = *reinterpret_cast<const uint4*>(sx_r + 48 * LD + kk);
-                                    hmma_rc(acc[2][0], a0.x, a0.y, b0.x, b0.y);
-                                    hmma_rc(acc[2][1], a0.x, a0.y, b1.x, b1.y);
-                                    hmma_rc(acc[3][0], a1.x, a1.y, b0.x, b0.y);
-                                    hmma_rc(acc[3][1], a1.x, a1.y, b1.x, b1.y);
-                                    hmma_rc(acc[2][0], a0.z, a0.w, b0.z, b0.w);
-                                    hmma_rc(acc[2][1], a0.z, a0.w, b1.z, b1.w);
-                                    hmma_rc(acc[3][0], a1.z, a1.w, b0.z, b0.w);
-                                    hmma_rc(acc[3][1], a1.z, a1.w, b1.z, b1.w);
+                            for (int mr = 0; mr < MR_RUN; ++mr) {
+                                const int base_r = ep_wm_base + mr * 16;
+                                const int r_lim = min(16, max(0, ep_rows - base_r));
+                                if (r_lim <= 0) break;
+                                const bool lane_in_r = (ep_lane < r_lim);
+                                const float my_w = lane_in_r ? (__ldg(ent_weights + __ldg(ent_idx + ep_c0 + base_r + ep_lane)) * ep_sc) : 0.0f;
+                                const uint32_t my_tok = lane_in_r ? (uint32_t) __ldg(ent_tok + ep_c0 + base_r + ep_lane) : 0u;
+                                const float w0 = __shfl_sync(0xffffffffu, my_w, ep_acc_r0);
+                                const float w1 = __shfl_sync(0xffffffffu, my_w, ep_acc_r1);
+                                float a00, a01, a02, a03, a04, a05, a06, a07;
+                                float a10, a11, a12, a13, a14, a15, a16, a17;
+                                if constexpr (MR_RUN == 2) {
+                                    if (mr == 0) {
+                                        a00=acc_mr[0][0][0]; a01=acc_mr[0][0][1]; a02=acc_mr[0][0][2]; a03=acc_mr[0][0][3];
+                                        a04=acc_mr[0][0][4]; a05=acc_mr[0][0][5]; a06=acc_mr[0][0][6]; a07=acc_mr[0][0][7];
+                                        a10=acc_mr[0][1][0]; a11=acc_mr[0][1][1]; a12=acc_mr[0][1][2]; a13=acc_mr[0][1][3];
+                                        a14=acc_mr[0][1][4]; a15=acc_mr[0][1][5]; a16=acc_mr[0][1][6]; a17=acc_mr[0][1][7];
+                                    } else {
+                                        a00=acc_mr[1][0][0]; a01=acc_mr[1][0][1]; a02=acc_mr[1][0][2]; a03=acc_mr[1][0][3];
+                                        a04=acc_mr[1][0][4]; a05=acc_mr[1][0][5]; a06=acc_mr[1][0][6]; a07=acc_mr[1][0][7];
+                                        a10=acc_mr[1][1][0]; a11=acc_mr[1][1][1]; a12=acc_mr[1][1][2]; a13=acc_mr[1][1][3];
+                                        a14=acc_mr[1][1][4]; a15=acc_mr[1][1][5]; a16=acc_mr[1][1][6]; a17=acc_mr[1][1][7];
+                                    }
+                                } else {
+                                    switch (mr) {
+                                        case 0:
+                                            a00=acc_mr[0][0][0]; a01=acc_mr[0][0][1]; a02=acc_mr[0][0][2]; a03=acc_mr[0][0][3];
+                                            a04=acc_mr[0][0][4]; a05=acc_mr[0][0][5]; a06=acc_mr[0][0][6]; a07=acc_mr[0][0][7];
+                                            a10=acc_mr[0][1][0]; a11=acc_mr[0][1][1]; a12=acc_mr[0][1][2]; a13=acc_mr[0][1][3];
+                                            a14=acc_mr[0][1][4]; a15=acc_mr[0][1][5]; a16=acc_mr[0][1][6]; a17=acc_mr[0][1][7]; break;
+                                        case 1:
+                                            a00=acc_mr[1][0][0]; a01=acc_mr[1][0][1]; a02=acc_mr[1][0][2]; a03=acc_mr[1][0][3];
+                                            a04=acc_mr[1][0][4]; a05=acc_mr[1][0][5]; a06=acc_mr[1][0][6]; a07=acc_mr[1][0][7];
+                                            a10=acc_mr[1][1][0]; a11=acc_mr[1][1][1]; a12=acc_mr[1][1][2]; a13=acc_mr[1][1][3];
+                                            a14=acc_mr[1][1][4]; a15=acc_mr[1][1][5]; a16=acc_mr[1][1][6]; a17=acc_mr[1][1][7]; break;
+                                        case 2:
+                                            a00=acc_mr[2][0][0]; a01=acc_mr[2][0][1]; a02=acc_mr[2][0][2]; a03=acc_mr[2][0][3];
+                                            a04=acc_mr[2][0][4]; a05=acc_mr[2][0][5]; a06=acc_mr[2][0][6]; a07=acc_mr[2][0][7];
+                                            a10=acc_mr[2][1][0]; a11=acc_mr[2][1][1]; a12=acc_mr[2][1][2]; a13=acc_mr[2][1][3];
+                                            a14=acc_mr[2][1][4]; a15=acc_mr[2][1][5]; a16=acc_mr[2][1][6]; a17=acc_mr[2][1][7]; break;
+                                        default:
+                                            a00=acc_mr[3][0][0]; a01=acc_mr[3][0][1]; a02=acc_mr[3][0][2]; a03=acc_mr[3][0][3];
+                                            a04=acc_mr[3][0][4]; a05=acc_mr[3][0][5]; a06=acc_mr[3][0][6]; a07=acc_mr[3][0][7];
+                                            a10=acc_mr[3][1][0]; a11=acc_mr[3][1][1]; a12=acc_mr[3][1][2]; a13=acc_mr[3][1][3];
+                                            a14=acc_mr[3][1][4]; a15=acc_mr[3][1][5]; a16=acc_mr[3][1][6]; a17=acc_mr[3][1][7]; break;
+                                    }
                                 }
-                            } else {
-                                uint4 a_cur = *reinterpret_cast<const uint4*>(sx_r + kk);
-#pragma unroll
-                                for (int mr = 0; mr < MR_RUN; ++mr) {
-                                    uint4 a_nxt;
-                                    if (mr + 1 < MR_RUN) a_nxt = *reinterpret_cast<const uint4*>(sx_r + (mr + 1) * 16 * LD + kk);
-                                    hmma_rc(acc[mr][0], a_cur.x, a_cur.y, b0.x, b0.y);
-                                    hmma_rc(acc[mr][1], a_cur.x, a_cur.y, b1.x, b1.y);
-                                    hmma_rc(acc[mr][0], a_cur.z, a_cur.w, b0.z, b0.w);
-                                    hmma_rc(acc[mr][1], a_cur.z, a_cur.w, b1.z, b1.w);
-                                    if (mr + 1 < MR_RUN) a_cur = a_nxt;
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r0][sc0_r0])      = make_float2(a00 * w0, a01 * w0);
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r0][sc0_r0 ^ 4])  = make_float2(a04 * w0, a05 * w0);
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r0][sc0_r0 ^ 16]) = make_float2(a10 * w0, a11 * w0);
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r0][sc0_r0 ^ 20]) = make_float2(a14 * w0, a15 * w0);
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r1][sc0_r1])      = make_float2(a02 * w1, a03 * w1);
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r1][sc0_r1 ^ 4])  = make_float2(a06 * w1, a07 * w1);
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r1][sc0_r1 ^ 16]) = make_float2(a12 * w1, a13 * w1);
+                                *reinterpret_cast<float2*>(&s_out_w[ep_acc_r1][sc0_r1 ^ 20]) = make_float2(a16 * w1, a17 * w1);
+                                __syncwarp();
+                                if (col_ok) {
+                                    int r = 0;
+#pragma unroll 1
+                                    for (; r + 4 <= r_lim; r += 4) {
+                                        const uint32_t t0 = __shfl_sync(0xffffffffu, my_tok, r + 0);
+                                        const uint32_t t1 = __shfl_sync(0xffffffffu, my_tok, r + 1);
+                                        const uint32_t t2 = __shfl_sync(0xffffffffu, my_tok, r + 2);
+                                        const uint32_t t3 = __shfl_sync(0xffffffffu, my_tok, r + 3);
+                                        const float v0 = s_out_w[r + 0][ep_lane];
+                                        const float v1 = s_out_w[r + 1][ep_lane ^ 8];
+                                        const float v2 = s_out_w[r + 2][ep_lane ^ 16];
+                                        const float v3 = s_out_w[r + 3][ep_lane ^ 24];
+                                        iq_red_global_add_f32(out_lane_base + (uint64_t) t0 * (uint64_t) row_bytes, v0);
+                                        iq_red_global_add_f32(out_lane_base + (uint64_t) t1 * (uint64_t) row_bytes, v1);
+                                        iq_red_global_add_f32(out_lane_base + (uint64_t) t2 * (uint64_t) row_bytes, v2);
+                                        iq_red_global_add_f32(out_lane_base + (uint64_t) t3 * (uint64_t) row_bytes, v3);
+                                    }
+#pragma unroll 1
+                                    for (; r < r_lim; ++r) {
+                                        const uint32_t tok = __shfl_sync(0xffffffffu, my_tok, r);
+                                        const float v = s_out_w[r][ep_lane ^ ((r & 3) << 3)];
+                                        iq_red_global_add_f32(out_lane_base + (uint64_t) tok * (uint64_t) row_bytes, v);
+                                    }
+                                }
+                                __syncwarp();
+                            }
+                        } else {
+                            const int ep_acc_c1 = ep_acc_c0 + 4;
+                            float* const dst_col = ep_dst_mat + (size_t) (ep_col0 + ep_wn * 32);
+#pragma unroll 1
+                            for (int mr = 0; mr < MR_RUN; ++mr) {
+                                const int r0 = ep_wm_base + mr * 16 + ep_acc_r0;
+                                const int r1 = ep_wm_base + mr * 16 + ep_acc_r1;
+                                float a00,a01,a02,a03,a04,a05,a06,a07,a10,a11,a12,a13,a14,a15,a16,a17;
+                                if constexpr (MR_RUN == 2) {
+                                    if (mr == 0) {
+                                        a00=acc_mr[0][0][0]; a01=acc_mr[0][0][1]; a02=acc_mr[0][0][2]; a03=acc_mr[0][0][3];
+                                        a04=acc_mr[0][0][4]; a05=acc_mr[0][0][5]; a06=acc_mr[0][0][6]; a07=acc_mr[0][0][7];
+                                        a10=acc_mr[0][1][0]; a11=acc_mr[0][1][1]; a12=acc_mr[0][1][2]; a13=acc_mr[0][1][3];
+                                        a14=acc_mr[0][1][4]; a15=acc_mr[0][1][5]; a16=acc_mr[0][1][6]; a17=acc_mr[0][1][7];
+                                    } else {
+                                        a00=acc_mr[1][0][0]; a01=acc_mr[1][0][1]; a02=acc_mr[1][0][2]; a03=acc_mr[1][0][3];
+                                        a04=acc_mr[1][0][4]; a05=acc_mr[1][0][5]; a06=acc_mr[1][0][6]; a07=acc_mr[1][0][7];
+                                        a10=acc_mr[1][1][0]; a11=acc_mr[1][1][1]; a12=acc_mr[1][1][2]; a13=acc_mr[1][1][3];
+                                        a14=acc_mr[1][1][4]; a15=acc_mr[1][1][5]; a16=acc_mr[1][1][6]; a17=acc_mr[1][1][7];
+                                    }
+                                } else {
+                                    switch (mr) {
+                                        case 0:
+                                            a00=acc_mr[0][0][0]; a01=acc_mr[0][0][1]; a02=acc_mr[0][0][2]; a03=acc_mr[0][0][3];
+                                            a04=acc_mr[0][0][4]; a05=acc_mr[0][0][5]; a06=acc_mr[0][0][6]; a07=acc_mr[0][0][7];
+                                            a10=acc_mr[0][1][0]; a11=acc_mr[0][1][1]; a12=acc_mr[0][1][2]; a13=acc_mr[0][1][3];
+                                            a14=acc_mr[0][1][4]; a15=acc_mr[0][1][5]; a16=acc_mr[0][1][6]; a17=acc_mr[0][1][7]; break;
+                                        case 1:
+                                            a00=acc_mr[1][0][0]; a01=acc_mr[1][0][1]; a02=acc_mr[1][0][2]; a03=acc_mr[1][0][3];
+                                            a04=acc_mr[1][0][4]; a05=acc_mr[1][0][5]; a06=acc_mr[1][0][6]; a07=acc_mr[1][0][7];
+                                            a10=acc_mr[1][1][0]; a11=acc_mr[1][1][1]; a12=acc_mr[1][1][2]; a13=acc_mr[1][1][3];
+                                            a14=acc_mr[1][1][4]; a15=acc_mr[1][1][5]; a16=acc_mr[1][1][6]; a17=acc_mr[1][1][7]; break;
+                                        case 2:
+                                            a00=acc_mr[2][0][0]; a01=acc_mr[2][0][1]; a02=acc_mr[2][0][2]; a03=acc_mr[2][0][3];
+                                            a04=acc_mr[2][0][4]; a05=acc_mr[2][0][5]; a06=acc_mr[2][0][6]; a07=acc_mr[2][0][7];
+                                            a10=acc_mr[2][1][0]; a11=acc_mr[2][1][1]; a12=acc_mr[2][1][2]; a13=acc_mr[2][1][3];
+                                            a14=acc_mr[2][1][4]; a15=acc_mr[2][1][5]; a16=acc_mr[2][1][6]; a17=acc_mr[2][1][7]; break;
+                                        default:
+                                            a00=acc_mr[3][0][0]; a01=acc_mr[3][0][1]; a02=acc_mr[3][0][2]; a03=acc_mr[3][0][3];
+                                            a04=acc_mr[3][0][4]; a05=acc_mr[3][0][5]; a06=acc_mr[3][0][6]; a07=acc_mr[3][0][7];
+                                            a10=acc_mr[3][1][0]; a11=acc_mr[3][1][1]; a12=acc_mr[3][1][2]; a13=acc_mr[3][1][3];
+                                            a14=acc_mr[3][1][4]; a15=acc_mr[3][1][5]; a16=acc_mr[3][1][6]; a17=acc_mr[3][1][7]; break;
+                                    }
+                                }
+                                if (r0 < ep_rows) {
+                                    float* dst0 = dst_col + (size_t) ent_idx[ep_c0 + r0] * ep_n_out;
+                                    *reinterpret_cast<float2*>(dst0 + ep_acc_c0)      = make_float2(a00 * ep_sc, a01 * ep_sc);
+                                    *reinterpret_cast<float2*>(dst0 + ep_acc_c1)      = make_float2(a04 * ep_sc, a05 * ep_sc);
+                                    *reinterpret_cast<float2*>(dst0 + 16 + ep_acc_c0) = make_float2(a10 * ep_sc, a11 * ep_sc);
+                                    *reinterpret_cast<float2*>(dst0 + 16 + ep_acc_c1) = make_float2(a14 * ep_sc, a15 * ep_sc);
+                                }
+                                if (r1 < ep_rows) {
+                                    float* dst1 = dst_col + (size_t) ent_idx[ep_c0 + r1] * ep_n_out;
+                                    *reinterpret_cast<float2*>(dst1 + ep_acc_c0)      = make_float2(a02 * ep_sc, a03 * ep_sc);
+                                    *reinterpret_cast<float2*>(dst1 + ep_acc_c1)      = make_float2(a06 * ep_sc, a07 * ep_sc);
+                                    *reinterpret_cast<float2*>(dst1 + 16 + ep_acc_c0) = make_float2(a12 * ep_sc, a13 * ep_sc);
+                                    *reinterpret_cast<float2*>(dst1 + 16 + ep_acc_c1) = make_float2(a16 * ep_sc, a17 * ep_sc);
                                 }
                             }
                         }
-                        if (has_next) {
-                            __half* sx_n = smem + nxt * STAGE_ELEMS;
-                            if constexpr (USE_TILES) {
-                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = nx0;
-                                *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = nx1;
+                    } else {
+                        const int ep_acc_c1 = ep_acc_c0 + 4;
+                        float* const dst_col = ep_dst_mat + (size_t) (ep_col0 + ep_wn * 32);
+#pragma unroll 1
+                        for (int mr = 0; mr < MR_RUN; ++mr) {
+                            const int r0 = ep_wm_base + mr * 16 + ep_acc_r0;
+                            const int r1 = ep_wm_base + mr * 16 + ep_acc_r1;
+                            float a00,a01,a02,a03,a04,a05,a06,a07,a10,a11,a12,a13,a14,a15,a16,a17;
+                            if constexpr (MR_RUN == 2) {
+                                if (mr == 0) {
+                                    a00=acc_mr[0][0][0]; a01=acc_mr[0][0][1]; a02=acc_mr[0][0][2]; a03=acc_mr[0][0][3];
+                                    a04=acc_mr[0][0][4]; a05=acc_mr[0][0][5]; a06=acc_mr[0][0][6]; a07=acc_mr[0][0][7];
+                                    a10=acc_mr[0][1][0]; a11=acc_mr[0][1][1]; a12=acc_mr[0][1][2]; a13=acc_mr[0][1][3];
+                                    a14=acc_mr[0][1][4]; a15=acc_mr[0][1][5]; a16=acc_mr[0][1][6]; a17=acc_mr[0][1][7];
+                                } else {
+                                    a00=acc_mr[1][0][0]; a01=acc_mr[1][0][1]; a02=acc_mr[1][0][2]; a03=acc_mr[1][0][3];
+                                    a04=acc_mr[1][0][4]; a05=acc_mr[1][0][5]; a06=acc_mr[1][0][6]; a07=acc_mr[1][0][7];
+                                    a10=acc_mr[1][1][0]; a11=acc_mr[1][1][1]; a12=acc_mr[1][1][2]; a13=acc_mr[1][1][3];
+                                    a14=acc_mr[1][1][4]; a15=acc_mr[1][1][5]; a16=acc_mr[1][1][6]; a17=acc_mr[1][1][7];
+                                }
+                            } else {
+                                switch (mr) {
+                                    case 0:
+                                        a00=acc_mr[0][0][0]; a01=acc_mr[0][0][1]; a02=acc_mr[0][0][2]; a03=acc_mr[0][0][3];
+                                        a04=acc_mr[0][0][4]; a05=acc_mr[0][0][5]; a06=acc_mr[0][0][6]; a07=acc_mr[0][0][7];
+                                        a10=acc_mr[0][1][0]; a11=acc_mr[0][1][1]; a12=acc_mr[0][1][2]; a13=acc_mr[0][1][3];
+                                        a14=acc_mr[0][1][4]; a15=acc_mr[0][1][5]; a16=acc_mr[0][1][6]; a17=acc_mr[0][1][7]; break;
+                                    case 1:
+                                        a00=acc_mr[1][0][0]; a01=acc_mr[1][0][1]; a02=acc_mr[1][0][2]; a03=acc_mr[1][0][3];
+                                        a04=acc_mr[1][0][4]; a05=acc_mr[1][0][5]; a06=acc_mr[1][0][6]; a07=acc_mr[1][0][7];
+                                        a10=acc_mr[1][1][0]; a11=acc_mr[1][1][1]; a12=acc_mr[1][1][2]; a13=acc_mr[1][1][3];
+                                        a14=acc_mr[1][1][4]; a15=acc_mr[1][1][5]; a16=acc_mr[1][1][6]; a17=acc_mr[1][1][7]; break;
+                                    case 2:
+                                        a00=acc_mr[2][0][0]; a01=acc_mr[2][0][1]; a02=acc_mr[2][0][2]; a03=acc_mr[2][0][3];
+                                        a04=acc_mr[2][0][4]; a05=acc_mr[2][0][5]; a06=acc_mr[2][0][6]; a07=acc_mr[2][0][7];
+                                        a10=acc_mr[2][1][0]; a11=acc_mr[2][1][1]; a12=acc_mr[2][1][2]; a13=acc_mr[2][1][3];
+                                        a14=acc_mr[2][1][4]; a15=acc_mr[2][1][5]; a16=acc_mr[2][1][6]; a17=acc_mr[2][1][7]; break;
+                                    default:
+                                        a00=acc_mr[3][0][0]; a01=acc_mr[3][0][1]; a02=acc_mr[3][0][2]; a03=acc_mr[3][0][3];
+                                        a04=acc_mr[3][0][4]; a05=acc_mr[3][0][5]; a06=acc_mr[3][0][6]; a07=acc_mr[3][0][7];
+                                        a10=acc_mr[3][1][0]; a11=acc_mr[3][1][1]; a12=acc_mr[3][1][2]; a13=acc_mr[3][1][3];
+                                        a14=acc_mr[3][1][4]; a15=acc_mr[3][1][5]; a16=acc_mr[3][1][6]; a17=acc_mr[3][1][7]; break;
+                                }
                             }
-                            dq_nvfp4_sub16_store_swar_sc2<KTILE>(nw0, nw1, s_ue4m3[ndb], sx_n + BM * LD + xr * LD + xc);
-                            __syncthreads();
+                            if (r0 < ep_rows) {
+                                float* dst0 = dst_col + (size_t) (ep_c0 + r0) * ep_n_out;
+                                *reinterpret_cast<float2*>(dst0 + ep_acc_c0)      = make_float2(a00 * ep_sc, a01 * ep_sc);
+                                *reinterpret_cast<float2*>(dst0 + ep_acc_c1)      = make_float2(a04 * ep_sc, a05 * ep_sc);
+                                *reinterpret_cast<float2*>(dst0 + 16 + ep_acc_c0) = make_float2(a10 * ep_sc, a11 * ep_sc);
+                                *reinterpret_cast<float2*>(dst0 + 16 + ep_acc_c1) = make_float2(a14 * ep_sc, a15 * ep_sc);
+                            }
+                            if (r1 < ep_rows) {
+                                float* dst1 = dst_col + (size_t) (ep_c0 + r1) * ep_n_out;
+                                *reinterpret_cast<float2*>(dst1 + ep_acc_c0)      = make_float2(a02 * ep_sc, a03 * ep_sc);
+                                *reinterpret_cast<float2*>(dst1 + ep_acc_c1)      = make_float2(a06 * ep_sc, a07 * ep_sc);
+                                *reinterpret_cast<float2*>(dst1 + 16 + ep_acc_c0) = make_float2(a12 * ep_sc, a13 * ep_sc);
+                                *reinterpret_cast<float2*>(dst1 + 16 + ep_acc_c1) = make_float2(a16 * ep_sc, a17 * ep_sc);
+                            }
                         }
                     }
+                    if constexpr (!USE_TILES) __syncthreads();
                 };
-                if (has_hi) run_loop(std::integral_constant<int, 4>{});
-                else run_loop(std::integral_constant<int, 2>{});
+                auto run_loop = [&](auto mr_tag) {
+                    constexpr int MR_RUN = decltype(mr_tag)::value;
+                    float acc_mr[MR_RUN][2][8];
+#pragma unroll
+                    for (int mr = 0; mr < MR_RUN; ++mr) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { acc_mr[mr][0][i] = 0.0f; acc_mr[mr][1][i] = 0.0f; }
+                    }
+                    const uint32_t sx_a0_0 = smem_base + (uint32_t) (iq_swz32_volta(wm * (MR_RUN * 16) + qa_row, 0) * 2);
+                    auto mma_step = [&](auto st_rd_tag, uint32_t a_addr, uint32_t b0_addr, auto hook_mid) {
+                        constexpr uint32_t ST_RD = decltype(st_rd_tag)::value;
+                        const uint4 b0 = iq_lds128_u32_sm70<ST_RD>(b0_addr);
+                        const uint4 b1 = iq_lds128_u32_sm70<ST_RD + 0x400u>(b0_addr);
+                        uint4 a0 = iq_lds128_u32_sm70<ST_RD>(a_addr);
+                        hmma_rc(acc_mr[0][0], a0.x, a0.y, b0.x, b0.y);
+                        hmma_rc(acc_mr[0][1], a0.x, a0.y, b1.x, b1.y);
+                        hmma_rc(acc_mr[0][0], a0.z, a0.w, b0.z, b0.w);
+                        hmma_rc(acc_mr[0][1], a0.z, a0.w, b1.z, b1.w);
+                        hook_mid();
+                        uint4 a1 = iq_lds128_u32_sm70<ST_RD + 0x400u>(a_addr);
+                        hmma_rc(acc_mr[1][0], a1.x, a1.y, b0.x, b0.y);
+                        hmma_rc(acc_mr[1][1], a1.x, a1.y, b1.x, b1.y);
+                        hmma_rc(acc_mr[1][0], a1.z, a1.w, b0.z, b0.w);
+                        hmma_rc(acc_mr[1][1], a1.z, a1.w, b1.z, b1.w);
+                        if constexpr (MR_RUN == 4) {
+                            a0 = iq_lds128_u32_sm70<ST_RD + 0x800u>(a_addr);
+                            hmma_rc(acc_mr[2][0], a0.x, a0.y, b0.x, b0.y);
+                            hmma_rc(acc_mr[2][1], a0.x, a0.y, b1.x, b1.y);
+                            hmma_rc(acc_mr[2][0], a0.z, a0.w, b0.z, b0.w);
+                            hmma_rc(acc_mr[2][1], a0.z, a0.w, b1.z, b1.w);
+                            a1 = iq_lds128_u32_sm70<ST_RD + 0xC00u>(a_addr);
+                            hmma_rc(acc_mr[3][0], a1.x, a1.y, b0.x, b0.y);
+                            hmma_rc(acc_mr[3][1], a1.x, a1.y, b1.x, b1.y);
+                            hmma_rc(acc_mr[3][0], a1.z, a1.w, b0.z, b0.w);
+                            hmma_rc(acc_mr[3][1], a1.z, a1.w, b1.z, b1.w);
+                        }
+                    };
+                    auto do_half = [&](auto decode_sc_tag, auto st_rd_tag, auto st_wr_tag, bool do_store,
+                                       const __half* nxp, const uint8_t* wbase_h) {
+                        constexpr bool DECODE_SC = decltype(decode_sc_tag)::value;
+                        constexpr uint32_t ST_WR = decltype(st_wr_tag)::value;
+                        constexpr bool INTERLEAVE_SW = (KTILE && USE_TILES && MR_RUN == 2);
+                        uint32_t a_b = sx_a0_0;
+                        uint32_t b_b = sw_b0_0;
+                        uint32_t dst_x = dst_x0_lo;
+                        asm volatile("" : "+r"(a_b), "+r"(b_b), "+r"(dst_x));
+                        if constexpr (!INTERLEAVE_SW) {
+                            if (do_store) {
+                                iq_sts128_u32_sm70<ST_WR>(dst_x, x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp)) : make_uint4(0, 0, 0, 0));
+                                iq_sts128_u32_sm70<ST_WR>(dst_x ^ 0x10u, x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0));
+                            }
+                            if constexpr (!USE_TILES) {
+#pragma unroll 1
+                                for (int kk = 0; kk < 4; ++kk) {
+                                    mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                                    const uint32_t sxor = (kk == 1) ? 0x30u : 0x10u;
+                                    a_b ^= sxor; b_b ^= sxor;
+                                }
+                            } else {
+                                mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                                a_b ^= 0x10u; b_b ^= 0x10u;
+                                asm volatile("" : "+r"(a_b), "+r"(b_b));
+                                mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                                a_b ^= 0x30u; b_b ^= 0x30u;
+                                asm volatile("" : "+r"(a_b), "+r"(b_b));
+                                mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                                a_b ^= 0x10u; b_b ^= 0x10u;
+                                asm volatile("" : "+r"(a_b), "+r"(b_b));
+                                mma_step(st_rd_tag, a_b, b_b, [&]() {});
+                            }
+                            if (do_store) {
+                                uint32_t nw0, nw1;
+                                const uint32_t q_idx = IS_DOWN ? (uint32_t) threadIdx.x : kt_q_idx;
+                                if constexpr (DECODE_SC) {
+                                    if constexpr (KTILE) {
+                                        const uint32_t nd4 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + (size_t) (q_idx >> 1) * 4u));
+                                        sc_d16 = iq_prmt_raw(nd4, 0u, (threadIdx.x & 1) ? 0x4431u : 0x4420u);
+                                        const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 512u + (size_t) q_idx * 8u));
+                                        nw0 = q.x; nw1 = q.y;
+                                    } else {
+                                        const uint32_t nd4 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h));
+                                        sc_d16 = iq_prmt_raw(nd4, 0u, (threadIdx.x & 1) ? 0x4431u : 0x4420u);
+                                        const uint32_t q_off = (threadIdx.x & 1) ? 8u : 0u;
+                                        nw0 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 4u + q_off));
+                                        nw1 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 8u + q_off));
+                                    }
+                                } else {
+                                    if constexpr (KTILE) {
+                                        const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 2560u + (size_t) q_idx * 8u));
+                                        nw0 = q.x; nw1 = q.y;
+                                    } else {
+                                        const uint32_t q_off = (threadIdx.x & 1) ? 8u : 0u;
+                                        nw0 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 20u + q_off));
+                                        nw1 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + 24u + q_off));
+                                    }
+                                }
+                                const __half2 sc2 = s_ue4m3[DECODE_SC ? (sc_d16 & 0xFFu) : (sc_d16 >> 8)];
+                                uint32_t wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw0);
+                                const uint32_t lo0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                                const uint32_t lo1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                                wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw1);
+                                const uint32_t lo2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                                const uint32_t lo3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                                iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x, make_uint4(lo0, lo1, lo2, lo3));
+                                uint32_t wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw0);
+                                const uint32_t hi0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                                const uint32_t hi1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                                wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw1);
+                                const uint32_t hi2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                                const uint32_t hi3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                                iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x ^ 0x10u, make_uint4(hi0, hi1, hi2, hi3));
+                            }
+                            return;
+                        }
+                        uint4 nx = make_uint4(0, 0, 0, 0);
+                        if (do_store && x_ok) nx = __ldg(reinterpret_cast<const uint4*>(nxp));
+                        uint32_t nw0 = 0u, nw1 = 0u;
+                        mma_step(st_rd_tag, a_b, b_b, [&]() {
+                            if (do_store) {
+                                iq_sts128_u32_sm70<ST_WR>(dst_x, nx);
+                                asm volatile("" : "+l"(nxp));
+                                nx = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
+                            }
+                        });
+                        a_b ^= 0x10u; b_b ^= 0x10u;
+                        asm volatile("" : "+r"(a_b), "+r"(b_b));
+                        mma_step(st_rd_tag, a_b, b_b, [&]() {
+                            if (do_store) {
+                                iq_sts128_u32_sm70<ST_WR>(dst_x ^ 0x10u, nx);
+                                const uint32_t q_idx = IS_DOWN ? (uint32_t) threadIdx.x : kt_q_idx;
+                                if constexpr (DECODE_SC) {
+                                    const uint32_t nd4 = __ldg(reinterpret_cast<const uint32_t*>(wbase_h + (size_t) (q_idx >> 1) * 4u));
+                                    sc_d16 = iq_prmt_raw(nd4, 0u, (q_idx & 1u) ? 0x4431u : 0x4420u);
+                                    const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 512u + (size_t) q_idx * 8u));
+                                    nw0 = q.x; nw1 = q.y;
+                                } else {
+                                    const uint2 q = __ldg(reinterpret_cast<const uint2*>(wbase_h + 2560u + (size_t) q_idx * 8u));
+                                    nw0 = q.x; nw1 = q.y;
+                                }
+                            }
+                        });
+                        a_b ^= 0x30u; b_b ^= 0x30u;
+                        asm volatile("" : "+r"(a_b), "+r"(b_b));
+                        mma_step(st_rd_tag, a_b, b_b, [&]() {
+                            if (do_store) {
+                                const __half2 sc2 = s_ue4m3[DECODE_SC ? (sc_d16 & 0xFFu) : (sc_d16 >> 8)];
+                                uint32_t wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw0);
+                                const uint32_t lo0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                                const uint32_t lo1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                                wl = iq_nvfp4_swar_lo_sm70<KTILE>(nw1);
+                                const uint32_t lo2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x1404u), sc2);
+                                const uint32_t lo3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wl, 0u, 0x3424u), sc2);
+                                iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x, make_uint4(lo0, lo1, lo2, lo3));
+                            }
+                        });
+                        a_b ^= 0x10u; b_b ^= 0x10u;
+                        asm volatile("" : "+r"(a_b), "+r"(b_b));
+                        mma_step(st_rd_tag, a_b, b_b, [&]() {
+                            if (do_store) {
+                                const __half2 sc2 = s_ue4m3[DECODE_SC ? (sc_d16 & 0xFFu) : (sc_d16 >> 8)];
+                                uint32_t wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw0);
+                                const uint32_t hi0 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                                const uint32_t hi1 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                                wh = iq_nvfp4_swar_hi_sm70<KTILE>(nw1);
+                                const uint32_t hi2 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x1404u), sc2);
+                                const uint32_t hi3 = iq_nvfp4_hmul2_u32_sm70(__byte_perm(wh, 0u, 0x3424u), sc2);
+                                iq_sts128_u32_sm70<ST_WR + 0x2000u>(dst_x ^ 0x10u, make_uint4(hi0, hi1, hi2, hi3));
+                            }
+                        });
+                    };
+                    const uint8_t* kp = we_row;
+                    const __half* cxp = xp;
+#pragma unroll 1
+                    for (int k0 = 0; k0 < K; k0 += 64) {
+                        do_half(std::false_type{}, std::integral_constant<uint32_t, 0u>{}, std::integral_constant<uint32_t, 0x4000u>{}, true, cxp + 32, kp);
+                        __syncthreads();
+                        kp  += KTILE ? 4608u : 36u;
+                        cxp += 64;
+                        if constexpr (KTILE && USE_TILES) asm volatile("" : "+l"(kp), "+l"(cxp));
+                        const bool has_next = (k0 + 64 < K);
+                        do_half(std::true_type{}, std::integral_constant<uint32_t, 0x4000u>{}, std::integral_constant<uint32_t, 0u>{}, has_next, cxp, kp);
+                        if (has_next) __syncthreads();
+                    }
+                    run_128_epilogue_sm70(mr_tag, acc_mr);
+                };
+                if constexpr (USE_TILES) {
+                    if (has_hi) run_loop(std::integral_constant<int, 4>{});
+                    else run_loop(std::integral_constant<int, 2>{});
+                } else {
+                    run_loop(std::integral_constant<int, 4>{});
+                }
+                return;
 #elif __CUDA_ARCH__ >= 800
                 // Wave 9 Cand-D2 (sm_80+): 40.0 KB WK=32 3-stage sx + 2-stage sw cooperative FP16 (sx[3][128][32] + sw[2][128][32]) +
                 // anchored wait_group 1 + branchless has_next + LDG.E.CONSTANT + zero-IMAD SHF.L UE4M3/NVFP4 unpack (STACK: 0)!
@@ -15262,32 +15940,39 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
             if constexpr (!USE_TILES) __syncthreads();
             }
 #elif __CUDA_ARCH__ < 750
-            const float nv_mul = (WT == 40) ? 128.0f : 1.0f;
-            int e_g = g;
-            if constexpr (USE_TILES) e_g = tile_g[blockIdx.y];
-            const uint8_t* e_blob = L.tail_off ? (const uint8_t*) grp_ptr[e_g] : nullptr;
-            const float sc = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[IS_DOWN ? 2 : (is_up ? 1 : 0)] : 1.0f) * nv_mul;
-            const int mr_lim = has_hi ? 4 : 2;
-            const int wm_base = has_hi ? (wm * 64) : (wm * 32);
+            if constexpr (WT != 40) {
+                int e_g = g;
+                if constexpr (USE_TILES) e_g = tile_g[blockIdx.y];
+                const uint8_t* e_blob = L.tail_off ? (const uint8_t*) grp_ptr[e_g] : nullptr;
+                const float sc = (L.tail_off ? ((const float*) (e_blob + L.tail_off))[IS_DOWN ? 2 : (is_up ? 1 : 0)] : 1.0f);
+                const int mr_lim = has_hi ? 4 : 2;
+                const int wm_base = has_hi ? (wm * 64) : (wm * 32);
 #pragma unroll
-            for (int mr = 0; mr < 4; ++mr) {
-                if (mr >= mr_lim) break;
-                const int r0 = wm_base + mr * 16 + acc_r0;
-                const int r1 = wm_base + mr * 16 + acc_r1;
-                if (r0 < rows) {
-                    const int out_r0 = IS_DOWN ? ent_idx[c0 + r0] : (c0 + r0);
-                    if constexpr (IS_DOWN) {
-                        if (ent_weights) {
-                            const float w0 = ent_weights[out_r0] * sc;
-                            float* dst0 = dst_mat + (size_t) ent_tok[c0 + r0] * N_out + col0 + wn * 32;
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c0),          acc[mr][0][0] * w0);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c0 + 1),      acc[mr][0][1] * w0);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c1),          acc[mr][0][4] * w0);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c1 + 1),      acc[mr][0][5] * w0);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c0),     acc[mr][1][0] * w0);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c0 + 1), acc[mr][1][1] * w0);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c1),     acc[mr][1][4] * w0);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c1 + 1), acc[mr][1][5] * w0);
+                for (int mr = 0; mr < 4; ++mr) {
+                    if (mr >= mr_lim) break;
+                    const int r0 = wm_base + mr * 16 + acc_r0;
+                    const int r1 = wm_base + mr * 16 + acc_r1;
+                    if (r0 < rows) {
+                        const int out_r0 = IS_DOWN ? ent_idx[c0 + r0] : (c0 + r0);
+                        if constexpr (IS_DOWN) {
+                            if (ent_weights) {
+                                const float w0 = ent_weights[out_r0] * sc;
+                                float* dst0 = dst_mat + (size_t) ent_tok[c0 + r0] * N_out + col0 + wn * 32;
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c0),          acc[mr][0][0] * w0);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c0 + 1),      acc[mr][0][1] * w0);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c1),          acc[mr][0][4] * w0);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + acc_c1 + 1),      acc[mr][0][5] * w0);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c0),     acc[mr][1][0] * w0);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c0 + 1), acc[mr][1][1] * w0);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c1),     acc[mr][1][4] * w0);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst0 + 16 + acc_c1 + 1), acc[mr][1][5] * w0);
+                            } else {
+                                float* dst0 = dst_mat + (size_t) out_r0 * N_out + col0 + wn * 32;
+                                *reinterpret_cast<float2*>(dst0 + acc_c0)      = make_float2(acc[mr][0][0] * sc, acc[mr][0][1] * sc);
+                                *reinterpret_cast<float2*>(dst0 + acc_c1)      = make_float2(acc[mr][0][4] * sc, acc[mr][0][5] * sc);
+                                *reinterpret_cast<float2*>(dst0 + 16 + acc_c0) = make_float2(acc[mr][1][0] * sc, acc[mr][1][1] * sc);
+                                *reinterpret_cast<float2*>(dst0 + 16 + acc_c1) = make_float2(acc[mr][1][4] * sc, acc[mr][1][5] * sc);
+                            }
                         } else {
                             float* dst0 = dst_mat + (size_t) out_r0 * N_out + col0 + wn * 32;
                             *reinterpret_cast<float2*>(dst0 + acc_c0)      = make_float2(acc[mr][0][0] * sc, acc[mr][0][1] * sc);
@@ -15295,28 +15980,28 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                             *reinterpret_cast<float2*>(dst0 + 16 + acc_c0) = make_float2(acc[mr][1][0] * sc, acc[mr][1][1] * sc);
                             *reinterpret_cast<float2*>(dst0 + 16 + acc_c1) = make_float2(acc[mr][1][4] * sc, acc[mr][1][5] * sc);
                         }
-                    } else {
-                        float* dst0 = dst_mat + (size_t) out_r0 * N_out + col0 + wn * 32;
-                        *reinterpret_cast<float2*>(dst0 + acc_c0)      = make_float2(acc[mr][0][0] * sc, acc[mr][0][1] * sc);
-                        *reinterpret_cast<float2*>(dst0 + acc_c1)      = make_float2(acc[mr][0][4] * sc, acc[mr][0][5] * sc);
-                        *reinterpret_cast<float2*>(dst0 + 16 + acc_c0) = make_float2(acc[mr][1][0] * sc, acc[mr][1][1] * sc);
-                        *reinterpret_cast<float2*>(dst0 + 16 + acc_c1) = make_float2(acc[mr][1][4] * sc, acc[mr][1][5] * sc);
                     }
-                }
-                if (r1 < rows) {
-                    const int out_r1 = IS_DOWN ? ent_idx[c0 + r1] : (c0 + r1);
-                    if constexpr (IS_DOWN) {
-                        if (ent_weights) {
-                            const float w1 = ent_weights[out_r1] * sc;
-                            float* dst1 = dst_mat + (size_t) ent_tok[c0 + r1] * N_out + col0 + wn * 32;
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c0),          acc[mr][0][2] * w1);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c0 + 1),      acc[mr][0][3] * w1);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c1),          acc[mr][0][6] * w1);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c1 + 1),      acc[mr][0][7] * w1);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c0),     acc[mr][1][2] * w1);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c0 + 1), acc[mr][1][3] * w1);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c1),     acc[mr][1][6] * w1);
-                            iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c1 + 1), acc[mr][1][7] * w1);
+                    if (r1 < rows) {
+                        const int out_r1 = IS_DOWN ? ent_idx[c0 + r1] : (c0 + r1);
+                        if constexpr (IS_DOWN) {
+                            if (ent_weights) {
+                                const float w1 = ent_weights[out_r1] * sc;
+                                float* dst1 = dst_mat + (size_t) ent_tok[c0 + r1] * N_out + col0 + wn * 32;
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c0),          acc[mr][0][2] * w1);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c0 + 1),      acc[mr][0][3] * w1);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c1),          acc[mr][0][6] * w1);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + acc_c1 + 1),      acc[mr][0][7] * w1);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c0),     acc[mr][1][2] * w1);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c0 + 1), acc[mr][1][3] * w1);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c1),     acc[mr][1][6] * w1);
+                                iq_red_global_add_f32(reinterpret_cast<uint64_t>(dst1 + 16 + acc_c1 + 1), acc[mr][1][7] * w1);
+                            } else {
+                                float* dst1 = dst_mat + (size_t) out_r1 * N_out + col0 + wn * 32;
+                                *reinterpret_cast<float2*>(dst1 + acc_c0)      = make_float2(acc[mr][0][2] * sc, acc[mr][0][3] * sc);
+                                *reinterpret_cast<float2*>(dst1 + acc_c1)      = make_float2(acc[mr][0][6] * sc, acc[mr][0][7] * sc);
+                                *reinterpret_cast<float2*>(dst1 + 16 + acc_c0) = make_float2(acc[mr][1][2] * sc, acc[mr][1][3] * sc);
+                                *reinterpret_cast<float2*>(dst1 + 16 + acc_c1) = make_float2(acc[mr][1][6] * sc, acc[mr][1][7] * sc);
+                            }
                         } else {
                             float* dst1 = dst_mat + (size_t) out_r1 * N_out + col0 + wn * 32;
                             *reinterpret_cast<float2*>(dst1 + acc_c0)      = make_float2(acc[mr][0][2] * sc, acc[mr][0][3] * sc);
@@ -15324,16 +16009,10 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                             *reinterpret_cast<float2*>(dst1 + 16 + acc_c0) = make_float2(acc[mr][1][2] * sc, acc[mr][1][3] * sc);
                             *reinterpret_cast<float2*>(dst1 + 16 + acc_c1) = make_float2(acc[mr][1][6] * sc, acc[mr][1][7] * sc);
                         }
-                    } else {
-                        float* dst1 = dst_mat + (size_t) out_r1 * N_out + col0 + wn * 32;
-                        *reinterpret_cast<float2*>(dst1 + acc_c0)      = make_float2(acc[mr][0][2] * sc, acc[mr][0][3] * sc);
-                        *reinterpret_cast<float2*>(dst1 + acc_c1)      = make_float2(acc[mr][0][6] * sc, acc[mr][0][7] * sc);
-                        *reinterpret_cast<float2*>(dst1 + 16 + acc_c0) = make_float2(acc[mr][1][2] * sc, acc[mr][1][3] * sc);
-                        *reinterpret_cast<float2*>(dst1 + 16 + acc_c1) = make_float2(acc[mr][1][6] * sc, acc[mr][1][7] * sc);
                     }
                 }
+                if constexpr (!USE_TILES) __syncthreads();
             }
-            if constexpr (!USE_TILES) __syncthreads();
 #else
             const float nv_mul = 1.0f;
             int e_g = g;
@@ -15419,6 +16098,35 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
         const int e1 = grp_start[g + 1];
         if (e1 > c0) run_tile(g, c0, e1);
     } else {
+#if __CUDA_ARCH__ < 750
+        if constexpr (WT == 40) {
+            for (int gi = (int) blockIdx.z; gi < *reinterpret_cast<const volatile int32_t*>(n_groups); ) {
+                const int e0 = grp_start[gi];
+                int e1_cur = grp_start[gi + 1];
+                for (int c0 = e0 + (int) blockIdx.y * BM; c0 < e1_cur; ) {
+                    if ((int) threadIdx.x == 0) {
+                        s_tile_args[0] = gi;
+                        s_tile_args[1] = c0;
+                        s_tile_args[2] = e1_cur;
+                    }
+                    __syncthreads();
+                    run_tile(gi, c0, e1_cur);
+                    gi = s_tile_args[0];
+                    c0 = s_tile_args[1] + (int) gridDim.y * BM;
+                    e1_cur = s_tile_args[2];
+                }
+                gi += (int) gridDim.z;
+            }
+        } else {
+            const int ch_per_e = (int) gridDim.y;
+            for (int gi = (int) blockIdx.z; gi < *n_groups; gi += (int) gridDim.z) {
+                const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
+                for (int c0 = e0 + (int) blockIdx.y * BM; c0 < e1; c0 += ch_per_e * BM) {
+                    run_tile(gi, c0, e1);
+                }
+            }
+        }
+#else
         const int ch_per_e = (int) gridDim.y;
         for (int gi = (int) blockIdx.z; gi < *n_groups; gi += (int) gridDim.z) {
             const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
@@ -15426,6 +16134,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 run_tile(gi, c0, e1);
             }
         }
+#endif
     }
 #else
     (void) grp_ptr; (void) grp_start; (void) n_groups; (void) ent_idx; (void) X; (void) L; (void) out0; (void) out1;
