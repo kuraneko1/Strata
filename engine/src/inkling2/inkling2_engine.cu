@@ -1267,7 +1267,8 @@ struct Engine {
     int32_t* d_grp_part_cnt = nullptr; // Wave 5: [2 * 16 * 128] multi-CTA expert grouping scratch (hist + off)
     int32_t* d_grp_part_off = nullptr;
     uint32_t* d_hits_pool = nullptr;   // Wave 5: contiguous [n_phys * n_expert] GPU hit counters (12 KiB)
-    uint32_t* d_router_done = nullptr;
+    uint32_t* d_router_done = nullptr; // [16] self-resetting completion counters: [0]=router, [1..8]=mix_q8
+    float* d_mix_scratch = nullptr;    // [8 * 880] multi-CTA mix_normed_q8 partial/weight scratch (27.5 KiB)
     unsigned long long* grp_ptr = nullptr;
     int32_t *pos0_d = nullptr, *pick_d = nullptr;
     int pos0_sub_cap = 1;
@@ -2414,6 +2415,7 @@ struct Engine {
         cudaFree(d_core_wdown_cur_f16);
         cudaFree(d_core_wup_f16);
         cudaFree(d_router_done);
+        cudaFree(d_mix_scratch);
         cudaFree(pos0_d); cudaFree(pick_d);
         cudaFree(argmax_val); cudaFree(argmax_idx);
         cudaFree(d_topk_hist); cudaFree(d_topk_thr); cudaFree(d_topk_cnt); cudaFree(d_topk_out_cnt);
@@ -2848,8 +2850,9 @@ struct Engine {
                 m->layers[(size_t) ip].d_hits = d_hits_pool + (size_t) ip * (size_t) hp.n_expert;
             }
         }
-        CK(cudaMalloc(&d_router_done, sizeof(uint32_t)));
-        CK(cudaMemset(d_router_done, 0, sizeof(uint32_t)));
+        CK(cudaMalloc(&d_router_done, 16u * sizeof(uint32_t)));
+        CK(cudaMemset(d_router_done, 0, 16u * sizeof(uint32_t)));
+        CK(cudaMalloc(&d_mix_scratch, 8u * 880u * sizeof(float)));
         pos0_sub_cap = 1 + (meta_tmax + 255) / 256;
         CK(cudaMalloc(&pos0_d, (size_t) pos0_sub_cap * sizeof(int32_t)));
         CK(cudaMalloc(&pick_d, (size_t) meta_tmax * sizeof(int32_t)));
@@ -3399,7 +3402,15 @@ struct Engine {
         for (int i = 0; i < n_q; ++i) mo4.p[i] = outs[i];
         const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
         if (n_q == 1) {
-            k_mix_normed_fused_1pass_q8<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
+            if (T <= 8 && d_mix_scratch != nullptr && d_router_done != nullptr) {
+                k_mix_normed_q8_phase1<false><<<dim3(18u, (unsigned) T), 128, 0, st>>>(
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0,
+                    np, D, query, d_mix_scratch, d_router_done + 1, N, inv_sqrt_n, hp.rms_eps);
+                k_mix_normed_q8_phase2<<<dim3(18u, (unsigned) T), 32, 0, st>>>(
+                    np, D, d_mix_scratch, mo4.p[0], nq8.w0, nq8.xq0, N);
+            } else {
+                k_mix_normed_fused_1pass_q8<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
+            }
         } else {
             k_mix_normed_fused_1pass_q8<3><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
         }
@@ -8383,9 +8394,17 @@ struct Engine {
                 for (int i = 0; i < B; ++i) np.p[i] = norm_blocks[(size_t) (B - 1 - i)];
                 np.p[B] = ffn_inp;
                 const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
-                k_shortconv_mix_normed_fused_1pass_q8_t1<<<1, 576, 0, st>>>(
-                    wo, L.attn_post_conv, hst, cur_in, ffn_inp, 2 * (int) kv_dim,
-                    np, B + 1, L.ffn_res_query, in_ffn, L.ffn_norm, xq, N, inv_sqrt_n, hp.rms_eps);
+                if (d_mix_scratch != nullptr && d_router_done != nullptr) {
+                    k_mix_normed_q8_phase1<true><<<dim3(18u, 1u), 128, 0, st>>>(
+                        wo, L.attn_post_conv, hst, cur_in, ffn_inp, 2 * (int) kv_dim,
+                        np, B + 1, L.ffn_res_query, d_mix_scratch, d_router_done + 1, N, inv_sqrt_n, hp.rms_eps);
+                    k_mix_normed_q8_phase2<<<dim3(18u, 1u), 32, 0, st>>>(
+                        np, B + 1, d_mix_scratch, in_ffn, L.ffn_norm, xq, N);
+                } else {
+                    k_shortconv_mix_normed_fused_1pass_q8_t1<<<1, 576, 0, st>>>(
+                        wo, L.attn_post_conv, hst, cur_in, ffn_inp, 2 * (int) kv_dim,
+                        np, B + 1, L.ffn_res_query, in_ffn, L.ffn_norm, xq, N, inv_sqrt_n, hp.rms_eps);
+                }
             } else if (fuse_post_attn_ffn_pp) {
                 // Note: push_block(cur_in) pushes rms_norm(cur_in) (independent of wo->ffn_inp!), so run it first and
                 // keep ndst_out = nullptr in the fused kernel so norm_blocks matches bit-for-bit on do_push layers.

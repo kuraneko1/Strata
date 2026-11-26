@@ -1360,7 +1360,7 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass_q8(
     const int sub_lane = tid & 7;
     float4 qv[NQ];
 #pragma unroll
-    for (int q = 0; q < NQ; ++q) qv[q] = reinterpret_cast<const float4*>(q0 + (size_t) q * N)[tid];
+    for (int q = 0; q < NQ; ++q) qv[q] = __ldg(reinterpret_cast<const float4*>(q0 + (size_t) q * N) + tid);
 
     float4 cv[8];
 #pragma unroll
@@ -1385,9 +1385,10 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass_q8(
     }
     __syncthreads();
     if constexpr (NQ == 1) {
-        // D <= 8 fits completely inside warp 0: compute dot sums, inv_rms, and softmax with 0 extra __syncthreads()!
+        // D <= 8 fits completely inside warp 0: warp-parallel softmax with 0 serial lane-0 loops!
         if (warp == 0) {
             float v_w = -1e30f;
+            float inv_rms_local = 1.0f;
             if (lane < D) {
                 float s = 0.0f;
 #pragma unroll
@@ -1396,25 +1397,26 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass_q8(
                     float ss = 0.0f;
 #pragma unroll
                     for (int w = 0; w < 18; ++w) ss += s_ss[w];
-                    const float ir = rsqrtf(ss / (float) N + rms_eps);
-                    s_inv_rms = ir;
-                    s *= ir;
+                    inv_rms_local = rsqrtf(ss / (float) N + rms_eps);
+                    s *= inv_rms_local;
                 }
                 v_w = s * inv_sqrt_n;
-                s_w[0][lane] = v_w;
             }
-            __syncwarp();
-            if (lane == 0) {
-                float m = -1e30f;
-                for (int d = 0; d < D; ++d) m = fmaxf(m, s_w[0][d]);
-                float sum = 0.0f;
-                for (int d = 0; d < D; ++d) {
-                    s_w[0][d] = __expf(s_w[0][d] - m);
-                    sum += s_w[0][d];
-                }
-                const float inv = __fdividef(1.0f, sum);
-                for (int d = 0; d < D; ++d) s_w[0][d] *= inv;
-                s_w[0][D - 1] *= s_inv_rms;
+            float m = v_w;
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+            const float ev = (lane < D) ? __expf(v_w - m) : 0.0f;
+            float sum = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float ed = __shfl_sync(0xffffffffu, ev, d);
+                if (d < D) sum += ed;
+            }
+            if (lane < D) {
+                float res = ev * __fdividef(1.0f, sum);
+                if (lane == D - 1) res *= inv_rms_local;
+                s_w[0][lane] = res;
             }
         }
         __syncthreads();
@@ -1432,17 +1434,17 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass_q8(
         for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
         if (lane == 0) s_ss[warp] = ss;
         __syncthreads();
-        if (tid == 0) {
-            float tot = 0.0f;
+        if (warp == 0) {
+            float tot = (lane < 18) ? s_ss[lane] : 0.0f;
 #pragma unroll
-            for (int w = 0; w < 18; ++w) tot += s_ss[w];
-            s_inv_rms = rsqrtf(tot / (float) N + rms_eps);
+            for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, o);
+            if (lane == 0) s_inv_rms = rsqrtf(tot / (float) N + rms_eps);
         }
         __syncthreads();
         const float ir = s_inv_rms;
         float4 o;
         if (nq8.w0) {
-            const float4 ww = reinterpret_cast<const float4*>(nq8.w0)[tid];
+            const float4 ww = __ldg(reinterpret_cast<const float4*>(nq8.w0) + tid);
             o = make_float4(r.x * ir * ww.x, r.y * ir * ww.y, r.z * ir * ww.z, r.w * ir * ww.w);
         } else {
             o = make_float4(r.x * ir, r.y * ir, r.z * ir, r.w * ir);
@@ -1850,6 +1852,197 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_
     }
     reinterpret_cast<float4*>(out0)[tid] = o;
     if (xq0) q8_1_sub8_store(o, xq0, blk_idx, sub_lane);
+}
+
+/// Multi-CTA (18 CTAs/token x 128 thr = 2304 ch, 1 ch/thread) parallel Phase 1 for N == 2304 decode mix_normed + RMSNorm + Q8_1
+/// (optionally fusing post-attn T=1 shortconv + residual add with 100% coalesced hist & w_conv accesses across 18 SMs!).
+/// Computes exact query dots + symmetric Gram matrix G[a][b] = v_a . v_b across 18 SMs; last CTA via atom.acq_rel.gpu
+/// produces exact effective weights w_eff[d] = softmax_w[d] * inv_rms_out so Phase 2 runs barrier-free across 18 SMs!
+/// CUDA-Graph safe (d_done[t] self-resets to 0), STACK: 0, LOCAL: 0.
+template <bool DO_SHORTCONV>
+__global__ void __launch_bounds__(128, 8) k_mix_normed_q8_phase1(
+    const float* __restrict__ wo, const float* __restrict__ w_conv, float* __restrict__ hist,
+    const float* __restrict__ res_cur, float* __restrict__ ffn_inp_out, int hist_offset,
+    NormMixPtrs ptrs, int D, const float* __restrict__ q0,
+    float* __restrict__ scratch, uint32_t* __restrict__ d_done,
+    int N, float inv_sqrt_n, float rms_eps) {
+    __shared__ float s_v[8][128];     // 4 KiB, zero bank conflicts (thread tid accesses col tid)
+    __shared__ float s_part[4][48];   // 4 warps x up to (8 dots + 36 Gram entries)
+    __shared__ float s_tot[48];
+    __shared__ float s_w[8];
+    __shared__ int s_is_last;
+
+    const int cta = (int) blockIdx.x;
+    const int t = (int) blockIdx.y;
+    const int tid = (int) threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int c = cta * 128 + tid;
+
+    float v_last = 0.0f;
+    if constexpr (DO_SHORTCONV) {
+        float* hc = hist + (size_t) (hist_offset + c) * 3;
+        const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+        const float4 w4 = __ldg(reinterpret_cast<const float4*>(w_conv + (size_t) c * 4));
+        const float x = __ldg(wo + c);
+        const float res = __ldg(res_cur + c);
+        const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+        hc[0] = h1; hc[1] = h2; hc[2] = x;
+        v_last = (x + s) * rsqrtf(5.0f) + res;
+        ffn_inp_out[c] = v_last;
+    }
+
+    const float q = __ldg(q0 + c);
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+            const float vd = (DO_SHORTCONV && d == D - 1)
+                ? v_last
+                : __ldg(ptrs.p[d] + (size_t) t * N + c);
+            s_v[d][tid] = vd;
+            float dot = vd * q;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) s_part[warp][d] = dot;
+        }
+    }
+
+    int p = 0;
+    for (int a = 0; a < D; ++a) {
+        const float va = s_v[a][tid];
+        for (int b = a; b < D; ++b) {
+            float prod = va * s_v[b][tid];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) prod += __shfl_xor_sync(0xffffffffu, prod, o);
+            if (lane == 0) s_part[warp][D + p] = prod;
+            ++p;
+        }
+    }
+    __syncthreads();
+
+    const int n_tot = D + p;
+    float* my_scratch = scratch + (size_t) t * 880u;
+    if (tid < n_tot) {
+        const float sum4 = s_part[0][tid] + s_part[1][tid] + s_part[2][tid] + s_part[3][tid];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(my_scratch + 16 + cta * 48 + tid), "f"(sum4) : "memory");
+#else
+        *((volatile float*) (my_scratch + 16 + cta * 48 + tid)) = sum4;
+#endif
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        uint32_t prev = 0u;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(d_done + t) : "memory");
+        const int last = ((prev + 1u) == 18u) ? 1 : 0;
+        if (last) {
+            asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" :: "l"(d_done + t) : "memory");
+        }
+#else
+        __threadfence();
+        const uint32_t prev = atomicAdd(d_done + t, 1u);
+        const int last = ((prev + 1u) == 18u) ? 1 : 0;
+        if (last) {
+            *((volatile uint32_t*) (d_done + t)) = 0u;
+            __threadfence();
+        }
+#endif
+        s_is_last = last;
+    }
+    __syncthreads();
+    if (!s_is_last) return;
+
+    if (tid < n_tot) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int ci = 0; ci < 18; ++ci) {
+            float v_ci;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("ld.relaxed.gpu.global.f32 %0, [%1];" : "=f"(v_ci) : "l"(my_scratch + 16 + ci * 48 + tid) : "memory");
+#else
+            v_ci = __ldcg(my_scratch + 16 + ci * 48 + tid);
+#endif
+            acc += v_ci;
+        }
+        s_tot[tid] = acc;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        const float ir_last = rsqrtf(s_tot[n_tot - 1] / (float) N + rms_eps);
+        float v_w = -1e30f;
+        if (lane < D) {
+            float s = s_tot[lane];
+            if (lane == D - 1) s *= ir_last;
+            v_w = s * inv_sqrt_n;
+        }
+        float m = v_w;
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        const float ev = (lane < D) ? __expf(v_w - m) : 0.0f;
+        float sum = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            const float ed = __shfl_sync(0xffffffffu, ev, d);
+            if (d < D) sum += ed;
+        }
+        if (lane < D) {
+            float res = ev * __fdividef(1.0f, sum);
+            if (lane == D - 1) res *= ir_last;
+            s_w[lane] = res;
+        }
+        __syncwarp();
+        if (lane == 0) {
+            float tot_ss = 0.0f;
+            int gp = 0;
+            for (int a = 0; a < D; ++a) {
+                const float wa = s_w[a];
+                for (int b = a; b < D; ++b) {
+                    const float g = s_tot[D + gp];
+                    tot_ss += ((a == b) ? (wa * wa) : (2.0f * wa * s_w[b])) * g;
+                    ++gp;
+                }
+            }
+            const float ir_out = rsqrtf(fmaxf(0.0f, tot_ss) / (float) N + rms_eps);
+            for (int d = 0; d < D; ++d) {
+                my_scratch[d] = s_w[d] * ir_out;
+            }
+        }
+    }
+}
+
+/// Multi-CTA (18 CTAs/token x 32 thr = 1 warp/CTA, 0 __syncthreads(), 0 SMEM) barrier-free Phase 2:
+/// Applies precomputed w_eff[0..D-1] to L2-hot ptrs.p[0..D-1] * nw0 and emits FP32 out0 + Q8_1 xq0 in parallel across 18 SMs!
+__global__ void __launch_bounds__(32, 16) k_mix_normed_q8_phase2(
+    NormMixPtrs ptrs, int D, const float* __restrict__ scratch,
+    float* __restrict__ out0, const float* __restrict__ nw0, void* __restrict__ xq0, int N) {
+    const int cta = (int) blockIdx.x;
+    const int t = (int) blockIdx.y;
+    const int lane = (int) threadIdx.x;
+    const int f4_idx = cta * 32 + lane;
+    const float* w_eff = scratch + (size_t) t * 880u;
+
+    float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+            const float wd = __ldg(w_eff + d);
+            const float4 v = reinterpret_cast<const float4*>(ptrs.p[d] + (size_t) t * N)[f4_idx];
+            ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
+        }
+    }
+    float4 o;
+    if (nw0) {
+        const float4 ww = __ldg(reinterpret_cast<const float4*>(nw0) + f4_idx);
+        o = make_float4(ax * ww.x, ay * ww.y, az * ww.z, aw * ww.w);
+    } else {
+        o = make_float4(ax, ay, az, aw);
+    }
+    reinterpret_cast<float4*>(out0 + (size_t) t * N)[f4_idx] = o;
+    if (xq0) q8_1_sub8_store(o, xq0, t * 72 + cta * 4 + (lane >> 3), lane & 7);
 }
 
 /// Dual-CTA batched pre-attn mix_normed for decode has_msg layers (T=1..8, N==2304):
