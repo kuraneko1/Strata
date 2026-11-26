@@ -7460,6 +7460,7 @@ struct Engine {
                 bf16_q = act_bf16_only;
             }
             const bool fused_pre_attn_t1 = (T == 1 && kv_q8 && hp.head_dim == 128 && hp.n_rel == 16 && !save_conv_trace);
+            const bool fused_pre_attn_smallT = (T >= 2 && T <= 8 && kv_q8 && hp.head_dim == 128 && hp.n_rel == 16);
             const bool fuse_sink_pre_attn = (fused_pre_attn_t1 && L.attn_sink_proj.type == 30 && (N & 1) == 0 && (N == 2304));
             // EX-5 Wave 2: Opt-in only (STRATA_DEQUANT_SIDE=1, default OFF) — Wave 1 nsys proved overlapped
             // dequant_q8_0_kernel contends for SM/L2 with cuBLAS GEMM (+4.1 ms).
@@ -7856,6 +7857,18 @@ struct Engine {
                     (int) hp.log_scale_floor, hp.log_scale_alpha, d_splits,
                     fuse_sink_pre_attn ? (const uint16_t*) L.attn_sink_proj.d : nullptr,
                     fuse_sink_pre_attn ? in_q : nullptr, fuse_sink_pre_attn ? N : 0);
+            } else if (fused_pre_attn_smallT) {
+                const int d_splits = (max_rel > 512) ? 4 : 2;
+                const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
+                k_pre_attn_smallT_fused<<<n_ctas, 128, 0, st>>>(
+                    pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                    hst, cur_kq, cur_ks, cur_vq, cur_vs,
+                    pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
+                    L.attn_rel_bias, sink, rel_tab,
+                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, max_rel,
+                    cur_kv_cap, is_swa ? 1 : 0, hp.rms_eps, apply_tau, pos0_d,
+                    (int) hp.log_scale_floor, hp.log_scale_alpha, T, d_splits,
+                    h_tr, total_conv_floats);
             } else {
             const bool fused_kv_q8 = (T < 32 && kv_q8 && hp.head_dim == 128);
             if (fused_kv_q8) {
