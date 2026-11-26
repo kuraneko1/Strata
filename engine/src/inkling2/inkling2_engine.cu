@@ -1215,6 +1215,7 @@ struct Engine {
     int attn_split_slots = 0;        // total (t, sp) slots in attn_split; every launch MUST satisfy T * sp <= attn_split_slots
     int sm_count = 80;
     int cc_maj = 0;
+    int cc_min = 0;
     int fa2_256_bulk_smem = 87040;
     int fa2_256_tail_smem = 52224;
     int fa2_192_swa_smem = 97280;
@@ -1451,10 +1452,10 @@ struct Engine {
 
     // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM,
     // plus per-layer pre-route graphs (attn + mix + ffn_norm + route).
-    cudaGraphExec_t core_graph = nullptr;
-    cudaGraphExec_t verify_core_graph[10] = {};
-    // Full 48-layer + swa_bak + head + argmax/softcap graphs for Full-VRAM (T=1..9, capture_dspark, want_softcap, want_argmax)
-    cudaGraphExec_t full_decode_graph[10][2][2][2] = {};
+    cudaGraphExec_t core_graph[2] = {};
+    cudaGraphExec_t verify_core_graph[10][2] = {};
+    // Full 48-layer + swa_bak + head + argmax/softcap graphs for Full-VRAM (T=1..9, capture_dspark, want_softcap, want_argmax, sp_bucket)
+    cudaGraphExec_t full_decode_graph[10][2][2][2][2] = {};
     std::vector<cudaGraphExec_t> layer_pre_graph;
     std::vector<cudaGraphExec_t> verify_pre_graph[10];
     std::vector<cudaGraphExec_t> deferred_graphs_destroy;
@@ -2515,8 +2516,9 @@ struct Engine {
         CK(cudaEventCreateWithFlags(&ev_pool_ready, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_dspark_acc_src, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_dspark_acc_done, cudaEventDisableTiming));
-        int cur_dev = 0, cc_min = 0, max_smem_optin = 49152;
+        int cur_dev = 0, max_smem_optin = 49152;
         cc_maj = 0;
+        cc_min = 0;
         cudaGetDevice(&cur_dev);
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, cur_dev);
         cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, cur_dev);
@@ -2638,7 +2640,9 @@ struct Engine {
         {
             const int n_hkv = std::max(1, (int) hp.n_head_kv);
             const int max_t_split = std::min(std::max(verify_max_t, 1), 15);
-            int max_slots = std::max(attn_split_t1_full, attn_split_t1_swa);
+            const int sm70_t1_hi = (cc_maj == 7 && cc_min < 5)
+                ? std::clamp((sm_count * 16) / n_hkv, 40, kAttnSplitMax) : attn_split_t1_full;
+            int max_slots = std::max({attn_split_t1_full, sm70_t1_hi, attn_split_t1_swa});
             for (int t = 2; t <= max_t_split; ++t) {
                 int sp_t = 1;
                 if (t <= 8) {
@@ -2713,7 +2717,7 @@ struct Engine {
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192_swa_fast<true, true, true>, fa2_192_swa_smem) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192_swa_fast<true, false, true>, fa2_192_swa_smem);
         fa2_256_bulk_smem = (cc_maj == 7 && cc_min < 5) ? 92160 : 87040;
-        fa2_256_tail_smem = (cc_maj == 7 && cc_min < 5) ? 55296 : 52224;
+        fa2_256_tail_smem = (cc_maj == 7 && cc_min < 5) ? 66048 : 52224;
         can_fa2_256 =
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_256_bulk, fa2_256_bulk_smem) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_256_tail, fa2_256_tail_smem);
@@ -4554,13 +4558,15 @@ struct Engine {
         auto defer = [&](cudaGraphExec_t& g) {
             if (g) { deferred_graphs_destroy.push_back(g); g = nullptr; }
         };
-        defer(core_graph);
-        for (int t = 0; t < 10; ++t) defer(verify_core_graph[t]);
+        for (int b = 0; b < 2; ++b) defer(core_graph[b]);
+        for (int t = 0; t < 10; ++t)
+            for (int b = 0; b < 2; ++b) defer(verify_core_graph[t][b]);
         for (int t = 0; t < 10; ++t)
             for (int c = 0; c < 2; ++c)
                 for (int s = 0; s < 2; ++s)
                     for (int a = 0; a < 2; ++a)
-                        defer(full_decode_graph[t][c][s][a]);
+                        for (int b = 0; b < 2; ++b)
+                            defer(full_decode_graph[t][c][s][a][b]);
         for (auto& g : layer_pre_graph) defer(g);
         for (int t = 0; t < 10; ++t) {
             for (auto& g : verify_pre_graph[t]) defer(g);
@@ -6418,6 +6424,8 @@ struct Engine {
                                      ((T == 1 && verify_k_save == 0) || (T >= 2 && verify_k_save == T - 1)));
         bool capturing_full_graph = false;
         cudaGraphExec_t* fg_slot = nullptr;
+        const int fg_sp_b = (cc_maj == 7 && cc_min < 5)
+            ? ((T == 1) ? (pos >= 32768 ? 1 : 0) : (pos > 98304 ? 1 : 0)) : 0;
         if (can_full_graph) {
             for (int ip = 0; ip < (int) m->layers.size() && ip < kMaxRebalLayers; ++ip) {
                 if (layer_pending_rebal[ip]) {
@@ -6427,7 +6435,7 @@ struct Engine {
             }
             for (int t = 0; t < T; ++t) m->dequant_tok(tokens[t], h_tok_buf + (size_t) t * N);
             *h_pos_pin = (int32_t) pos;
-            fg_slot = &full_decode_graph[T][capture_dspark ? 1 : 0][want_softcap ? 1 : 0][want_argmax ? 1 : 0];
+            fg_slot = &full_decode_graph[T][capture_dspark ? 1 : 0][want_softcap ? 1 : 0][want_argmax ? 1 : 0][fg_sp_b];
             if (*fg_slot) {
                 CK(cudaGraphLaunch(*fg_slot, st));
                 int32_t last_pick = 0;
@@ -7479,7 +7487,11 @@ struct Engine {
             const bool use_fa2_256_path = (kv_q8 && hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128 &&
                                            can_fa2_256 && !is_swa && T >= 256 && pos >= 8192 &&
                                            pp_sp_buf && pp_sp_bytes >= (size_t) T * (size_t) hp.n_head * 130 * sizeof(float) * 2);
-            const bool sub_tile_fa2_256 = (use_fa2_256_path && T > rel_tab_cap_t && rel_tab_cap_t >= 256 && hp.n_rel == 16);
+            const size_t rel_tab_avail_bytes = (size_t) rel_tab_cap_t * (size_t) hp.n_head * (size_t) hp.n_rel_ext * sizeof(float);
+            const bool fuse_fa2_256_tail = (use_fa2_256_path && hp.n_rel == 16 && cc_maj == 7 && cc_min < 5 &&
+                                            rel_tab != nullptr &&
+                                            (size_t) T * (size_t) rel_dim * sizeof(float) <= rel_tab_avail_bytes);
+            const bool sub_tile_fa2_256 = (!fuse_fa2_256_tail && use_fa2_256_path && T > rel_tab_cap_t && rel_tab_cap_t >= 256 && hp.n_rel == 16);
             const bool want_att_f16 = (T >= 128 && act_bf16 != nullptr && q_dim <= 2 * N &&
                                        L.attn_output.type != 0 && (L.attn_output.type != 30 || bf16_x_f16));
             static const bool no_fused_qgr = (std::getenv("STRATA_NO_FUSED_QGR") != nullptr);
@@ -7798,7 +7810,7 @@ struct Engine {
             const bool moe_raw_disjoint_reg1 = (Q != nullptr) &&
                 (moe_hi_u8 <= reinterpret_cast<const uint8_t*>(Q));
             const bool attn_reads_pR = (kv_q8 && hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128 &&
-                                        (sub_tile_fa2_256 ||
+                                        (fuse_fa2_256_tail || sub_tile_fa2_256 ||
                                          (can_fa2_192 && T >= 128 && (use_fa2_192_swa_fast || (is_swa && fuse_swa_rel_pp)))));
             const uint8_t* pr_lo_u8 = reinterpret_cast<const uint8_t*>(pR);
             const size_t pr_span = (size_t) T * (size_t) (ld_r_attn > 0 ? ld_r_attn : rel_dim) * sizeof(float);
@@ -7893,7 +7905,8 @@ struct Engine {
                 if (hp.head_dim == 128 && hp.n_rel <= 32) {
                     k_clip_and_tau_qr<<<dim3((unsigned) ((hp.n_head + 3) / 4), (unsigned) T), 128, 0, st>>>(
                         pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
-                        (int) hp.n_head, (int) hp.n_rel, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                        (int) hp.n_head, (int) hp.n_rel, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha,
+                        fuse_fa2_256_tail ? rel_tab : nullptr);
                 } else {
                     k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
                         pQ, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
@@ -7916,7 +7929,7 @@ struct Engine {
                 }
             }
 
-            if (!fuse_swa_rel_pp && !fuse_full_rel_pp && !sub_tile_fa2_256) {
+            if (!fuse_swa_rel_pp && !fuse_full_rel_pp && !fuse_fa2_256_tail && !sub_tile_fa2_256) {
                 if (T >= 32 && hp.n_rel == 16) {
                     k_rel_table_t32<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 31) / 32)), kThreads, 0, st>>>(
                         pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T);
@@ -7978,7 +7991,8 @@ struct Engine {
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (T >= 2 && T <= 5 && !is_swa) {
-                        const int sp = std::min(sp_cap, std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
+                        const int vf_mult = (cc_maj == 7 && cc_min < 5 && pos <= 98304) ? 12 : 24;
+                        const int sp = std::min(sp_cap, std::clamp((sm_count * vf_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
                         if (T == 5) {
                             k_attn_q8_gqa3_verify4_wmma_split<5><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
                                 pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
@@ -8000,7 +8014,8 @@ struct Engine {
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (T >= 6 && T <= 8 && !is_swa) {
-                        const int sp = std::min(sp_cap, std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
+                        const int vf_mult = (cc_maj == 7 && cc_min < 5 && pos <= 98304) ? 12 : 24;
+                        const int sp = std::min(sp_cap, std::clamp((sm_count * vf_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
                         if (T == 8) {
                             k_attn_q8_gqa3_verify8_wmma_split<8><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
                                 pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
@@ -8018,8 +8033,13 @@ struct Engine {
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (T < 16) {
+                        const int t1_full_sp = (cc_maj == 7 && cc_min < 5)
+                            ? ((pos >= 32768)
+                                ? std::max(attn_split_t1_full, std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax))
+                                : std::min(attn_split_t1_full, std::clamp((sm_count * 8) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax)))
+                            : attn_split_t1_full;
                         const int sp = std::min(sp_cap, (T == 1)
-                            ? (is_swa ? attn_split_t1_swa : attn_split_t1_full)
+                            ? (is_swa ? attn_split_t1_swa : t1_full_sp)
                             : (is_swa ? std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv * T), 4, 24)
                                       : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax)));
                         k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp, (unsigned) T), 128, 0, st>>>(
@@ -8030,7 +8050,7 @@ struct Engine {
                         if (T <= 8) att_xq_ready = xq;
                     } else if (use_fa2_256_path) {
                         // Zero-sP, Zero-Spill 256-row FA2: pure bulk Split-KV [0, bulk_aligned) + 1 tail split [bulk_aligned, pos+T).
-                        // Uses Region 0 pp_sp_buf inside layer_arena (zero extra VRAM; disjoint from Q/att_gate/att & rel_tab).
+                        // Uses Region 0 pp_sp_buf inside layer_arena (zero extra VRAM; disjoint from Q/att_gate/att & Region 2 rel_tab).
                         const int q_tiles = (T + 255) / 256;
                         const int base_ctas = (int) hp.n_head * q_tiles;
                         const size_t per_sp_bytes = (size_t) T * (size_t) hp.n_head * 130 * sizeof(float);
@@ -8055,7 +8075,15 @@ struct Engine {
                         k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, (size_t) fa2_256_bulk_smem, st>>>(
                             pQ, cur_kq, cur_ks, cur_vq, cur_vs, sink, pp_sp_buf,
                             (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, bulk_aligned, kq_scale, T, best_sp, total_sp);
-                        if (sub_tile_fa2_256) {
+                        if (fuse_fa2_256_tail) {
+                            // Single full-chunk fused-rel tail launch (384 CTAs @ T=2048, 768 @ T=4096):
+                            // zero k_rel_table_t32, zero 48-CTA sub-tiling, and clipped R sits in disjoint Region 2 (rel_tab)!
+                            const int q_tiles_128 = (T + 127) / 128;
+                            k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles_128), (unsigned) hp.n_head_kv), 256, (size_t) fa2_256_tail_smem, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, nullptr, sink, pp_sp_buf,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp,
+                                rel_tab, L.attn_rel_bias);
+                        } else if (sub_tile_fa2_256) {
                             const int sub_step = (rel_tab_cap_t / 256) * 256;
                             for (int t_off = 0; t_off < T; t_off += sub_step) {
                                 const int cur_t = std::min(sub_step, T - t_off);
@@ -8708,7 +8736,7 @@ struct Engine {
                         layer_pending_rebal[cip] = false;
                     }
                 }
-                cudaGraphExec_t& cg = use_t1_core ? core_graph : verify_core_graph[T];
+                cudaGraphExec_t& cg = use_t1_core ? core_graph[fg_sp_b] : verify_core_graph[T][fg_sp_b];
                 if (!cg && !graph_oom) {
                     const auto saved_nb = norm_blocks;
                     const int saved_next = next_blk_buf;
