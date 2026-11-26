@@ -2012,7 +2012,7 @@ struct Engine {
         static const bool no_vmsg = (std::getenv("STRATA_NO_VMSG") != nullptr);
         static const bool no_vmsg_hoist = (std::getenv("STRATA_NO_VMSG_HOIST") != nullptr);
         const bool has_dspark_cfg = (dspark != nullptr || verify_max_t > 1);
-        const bool shrink_msg3 = (!has_dspark_cfg && !no_vmsg && cc_maj >= 8 && N == 2304 && can_vmsg_all_core);
+        const bool shrink_msg3 = (!has_dspark_cfg && !no_vmsg && cc_maj >= 7 && N == 2304 && can_vmsg_all_core);
 
         L.sz_N = a256((size_t) cap_t * (size_t) N * sizeof(float));
         L.sz_msg3 = shrink_msg3 ? a256((size_t) std::min(cap_t, 32) * (size_t) N * sizeof(float)) : L.sz_N;
@@ -2129,7 +2129,7 @@ struct Engine {
             return v != nullptr && std::atoi(v) <= 0;
         }();
         const bool compact_eparts = (!eparts_force_full && !no_moe_atomic && !env_stage_zero &&
-                                     cc_maj >= 8 && (N & 3) == 0 && all_situ_fused && !has_bf16_exp &&
+                                     cc_maj >= 7 && (N & 3) == 0 && all_situ_fused && !has_bf16_exp &&
                                      pp_stream_t <= 32);
         L.eparts_cap = compact_eparts ? std::min(cap_t, 32) : cap_t;
         L.eparts_b = a256((size_t) L.eparts_cap * (size_t) hp.n_expert_used * (size_t) N * sizeof(float));
@@ -2546,7 +2546,7 @@ struct Engine {
         }
         static const bool no_phase_pool = (std::getenv("STRATA_NO_PHASE_POOL") != nullptr);
         int pool_ok = 0;
-        if (!no_phase_pool && cc_maj >= 8 &&
+        if (!no_phase_pool &&
             cudaDeviceGetAttribute(&pool_ok, cudaDevAttrMemoryPoolsSupported, cur_dev) == cudaSuccess && pool_ok) {
             cudaMemPoolProps props{};
             props.allocType = cudaMemAllocationTypePinned;
@@ -2747,7 +2747,7 @@ struct Engine {
 
         // Wave 5: Check if all 12 core layers support virtual-message control-down & upload static 48-ptr W_down table once.
         can_vmsg_all_core = false;
-        if (cc_maj >= 8 && N == 2304 && hp.loop_gate_rank == 64 && hp.num_loops > 1 &&
+        if (cc_maj >= 7 && N == 2304 && hp.loop_gate_rank == 64 && hp.num_loops > 1 &&
             (hp.core_end - hp.core_start) == 12 && norm_blk_cnt == 5) {
             bool ok = true;
             const float* h_wdown[48] = {};
@@ -2777,7 +2777,7 @@ struct Engine {
             if (ok) {
                 CK(cudaMalloc(&d_vmsg_wdown_ptrs, 48 * sizeof(const float*)));
                 CK(cudaMemcpy(d_vmsg_wdown_ptrs, h_wdown, 48 * sizeof(const float*), cudaMemcpyHostToDevice));
-                if (cc_maj >= 8 && N == 2304) {
+                if (cc_maj >= 7 && N == 2304) {
                     CK(cudaMalloc(&d_core_wdown_msg_f16, (size_t) 48 * 64 * (size_t) N * sizeof(uint16_t)));
                     k_pack_core_wdown_msg_f16<<<dim3(48, 64), 256, 0, st>>>(d_vmsg_wdown_ptrs, d_core_wdown_msg_f16, (int) N);
                     // Wave 8.5: Pre-pack bit-exact FP16 cur-half loop_down (13.5 MiB) & loop_gain+forget (27.0 MiB).
@@ -2785,7 +2785,9 @@ struct Engine {
                     static const bool no_core_f16_pack = (std::getenv("STRATA_NO_CORE_F16_PACK") != nullptr);
                     size_t fr_pack = 0, tot_pack = 0;
                     CK(cudaMemGetInfo(&fr_pack, &tot_pack));
-                    if (!no_core_f16_pack && profile.regime != strata::inkling2::VramRegime::FullVram &&
+                    if (!no_core_f16_pack &&
+                        (profile.regime != strata::inkling2::VramRegime::FullVram ||
+                         profile.arch.id == strata::inkling2::ArchId::Sm70Volta) &&
                         fr_pack > vram_reserve_bytes + ((size_t) 512 << 20)) {
                         const size_t wdown_cur_elems = (size_t) 48 * 64u * (size_t) N;
                         const size_t wup_mat_elems = (size_t) N * 64u;
@@ -4045,10 +4047,10 @@ struct Engine {
         static const bool no_group16 = (std::getenv("STRATA_NO_GROUP16") != nullptr);
         const bool try_wmma = (T >= 16);
         const bool use_pp_stream = (pp_streaming && need_cpu && L.hblobs && pp_stage_bytes >= L.stride && pp_layer_cnt[(size_t) il] > 0);
-        const bool use_atomic_moe = (!no_moe_atomic && cc_maj >= 8 && T >= 32 && (N & 3) == 0 && !skip_combine &&
+        const bool use_atomic_moe = (!no_moe_atomic && cc_maj >= 7 && T >= 32 && (N & 3) == 0 && !skip_combine &&
                                      L.gu_type != 30 && L.d_type != 30 && K::native_expert_wmma_supported(L.L) &&
                                      (!need_cpu || use_pp_stream));
-        const bool fuse_moe_zero = (!env_no_fuse_moe_zero() && use_atomic_moe && !capturing_graph && cc_maj >= 8 && try_wmma);
+        const bool fuse_moe_zero = (!env_no_fuse_moe_zero() && use_atomic_moe && !capturing_graph && cc_maj >= 7 && try_wmma);
         const bool use_group16 = (!no_group16 && T >= 256 && hp.n_expert <= 128 && d_grp_part_cnt != nullptr);
         // Safety drain: if an async moe_raw zero was queued on aux_st but this layer does not use atomic MoE, wait now!
         if (moe_raw_zero_pending && !use_atomic_moe) {
@@ -6581,7 +6583,7 @@ struct Engine {
         static const bool no_dspark_vram_acc = (std::getenv("STRATA_NO_DSPARK_VRAM_ACC") != nullptr);
         static const bool no_vmsg_fwd = (std::getenv("STRATA_NO_VMSG") != nullptr);
         if (capture_dspark && dspark) {
-            const bool can_vram_acc = (!no_dspark_vram_acc && !no_vmsg_fwd && T >= 32 && cc_maj >= 8 &&
+            const bool can_vram_acc = (!no_dspark_vram_acc && !no_vmsg_fwd && T >= 32 && cc_maj >= 7 &&
                                        N == 2304 && hp.loop_gate_rank == 64 && n_core == 12 && can_vmsg_all_core &&
                                        ds_acc_swa0 != nullptr && ds_acc_swa2 != nullptr && msg3 != nullptr);
             if (can_vram_acc) {
@@ -6714,7 +6716,7 @@ struct Engine {
                 const size_t sz_bank_f16 = a256_v((size_t) T * (size_t) N * sizeof(uint16_t));
                 const size_t sz_bpre_f32 = a256_v((size_t) T * (size_t) 24 * 64 * sizeof(float));
                 const bool can_vmsg_cublas = (!no_vmsg_cublas && d_core_wdown_msg_f16 != nullptr &&
-                                              cc_maj >= 8 && N == 2304 && Q != nullptr &&
+                                              cc_maj >= 7 && N == 2304 && Q != nullptr &&
                                               (2 * sz_bank_f16 + 2 * sz_bpre_f32) <= reg1_bytes_cur);
                 uint8_t* reg1_u8 = reinterpret_cast<uint8_t*>(Q);
                 uint16_t* bank0_f16 = reinterpret_cast<uint16_t*>(reg1_u8);
@@ -6742,7 +6744,7 @@ struct Engine {
                         static const bool no_vmsg = (std::getenv("STRATA_NO_VMSG") != nullptr);
                         vmsg_hoist_base_l = -1;
                         vmsg_bank_f16_ready = false;
-                        if (!no_vmsg && cc_maj >= 8 && T >= 32 && N == 2304 && hp.loop_gate_rank == 64 &&
+                        if (!no_vmsg && cc_maj >= 7 && T >= 32 && N == 2304 && hp.loop_gate_rank == 64 &&
                             n_core == 12 && norm_bank.size() == 1 && vmsg_w && vmsg_inv_rms && ctrl_inv_rms) {
                             vmsg_bank0 = norm_bank[0];
                             vmsg_bank1 = bank_last_norm;
@@ -6983,7 +6985,7 @@ struct Engine {
                     const float* nw2 = is_swa ? L.attn_norm : L.attn_v_inp_norm;
                     const bool has_vmsg_hoist = (vmsg_hoist_base_l >= 0 && l_idx >= vmsg_hoist_base_l &&
                                                  l_idx < vmsg_hoist_base_l + 6 && vmsg_down_pre != nullptr);
-                    const bool use_l2_chunk_attn = (!no_l2_chunk && has_vmsg_hoist && Q != nullptr && T > 64 && cc_maj >= 8 &&
+                    const bool use_l2_chunk_attn = (!no_l2_chunk && has_vmsg_hoist && Q != nullptr && T > 64 && cc_maj >= 7 &&
                                                     N == 2304 && (int) norm_blocks.size() <= 7);
                     const bool do_push_cur = (ip % hp.attn_res_block_size == 0);
                     const int pass_cur = (il - (int) hp.core_start) / (int) n_core;
@@ -7494,7 +7496,7 @@ struct Engine {
             const size_t reg0_tmp_elems = reg0_tmp_bytes / sizeof(uint16_t);
             const size_t reg1_cap_floats = reg1_bytes_cur / sizeof(float);
             const bool can_fused_qgr_base = (!no_fused_qgr && !use_dequant_side && !save_conv_trace &&
-                                             T >= 128 && cc_maj >= 8 && kv_q8 && want_att_f16 &&
+                                             T >= 128 && cc_maj >= 7 && kv_q8 && want_att_f16 &&
                                              use_fa2_192_swa_fast && f16_q != nullptr &&
                                              L.attn_qgr.d != nullptr && L.attn_qgr.type == 8);
             static const bool qr_pad128 = [] {
@@ -7739,7 +7741,7 @@ struct Engine {
                                      swa_pp_cap >= (int) hp.n_swa + T &&
                                      (kv_q8 ? (swa_pp_kq != nullptr && swa_pp_vq != nullptr && swa_pp_ks != nullptr && swa_pp_vs != nullptr)
                                             : (swa_pp_kc != nullptr && swa_pp_vc != nullptr)));
-            const bool use_swa_pp_hm = (use_swa_pp && kv_q8 && cc_maj >= 8 && is_swa && T >= 128 &&
+            const bool use_swa_pp_hm = (use_swa_pp && kv_q8 && cc_maj >= 7 && is_swa && T >= 128 &&
                                         use_fa2_192_swa_fast && fused_kv_q8_pp &&
                                         pK_f16 != nullptr && pV_f16 != nullptr);
             const int swa_hm_j_hist = (use_swa_pp_hm && pos > 0)
@@ -7807,12 +7809,12 @@ struct Engine {
             const bool moe_raw_disjoint_attn = (moe_raw_disjoint_wo && moe_raw_disjoint_reg1 &&
                                                 moe_raw_disjoint_pR && !attn_may_use_pp_sp);
             const bool fuse_moe_zero_pre = (!env_no_fuse_moe_zero() && !no_moe_atomic_pre && !capturing_full_graph &&
-                                            !include_route_t1 && T >= 32 && cc_maj >= 8 && (N & 3) == 0 &&
+                                            !include_route_t1 && T >= 32 && cc_maj >= 7 && (N & 3) == 0 &&
                                             L.gu_type != 30 && L.d_type != 30 && K::native_expert_wmma_supported(L.L) &&
                                             (L.n_slots >= hp.n_expert ||
                                              (pp_streaming && L.hblobs && pp_stage_bytes >= L.stride && pp_layer_cnt[(size_t) il] > 0)));
             const bool want_async_moe_zero = (!fuse_moe_zero_pre && !no_async_moe_zero && !no_moe_atomic_pre && !capturing_full_graph &&
-                                              !include_route_t1 && aux_st != nullptr && T >= 32 && cc_maj >= 8 &&
+                                              !include_route_t1 && aux_st != nullptr && T >= 32 && cc_maj >= 7 &&
                                               (N & 3) == 0 && !save_conv_trace && moe_raw_disjoint_ctrl &&
                                               L.gu_type != 30 && L.d_type != 30 && K::native_expert_wmma_supported(L.L) &&
                                               (L.n_slots >= hp.n_expert ||
@@ -7821,7 +7823,7 @@ struct Engine {
                 if (!want_async_moe_zero || moe_raw_zero_pending) return;
                 CK(cudaEventRecord(ev_attn_done, st));
                 CK(cudaStreamWaitEvent(aux_st, ev_attn_done, 0));
-                if (!no_zero_f4_cs && T >= 128 && cc_maj >= 8) {
+                if (!no_zero_f4_cs && T >= 128 && cc_maj >= 7) {
                     k_zero_f4_cs<<<(unsigned) moe_zero_ctas, 256, 0, aux_st>>>(moe_raw, (size_t) T * (size_t) N);
                 } else {
                     CK(cudaMemsetAsync(moe_raw, 0, (size_t) T * (size_t) N * sizeof(float), aux_st));
@@ -8401,7 +8403,7 @@ struct Engine {
                     const int l_idx_ffn = ip - (int) hp.core_start;
                     const bool use_l2_chunk_ffn = (!no_l2_chunk && in_k != nullptr && vmsg_hoist_base_l >= 0 &&
                                                    l_idx_ffn >= vmsg_hoist_base_l && l_idx_ffn < vmsg_hoist_base_l + 6 &&
-                                                   vmsg_down_pre != nullptr && T > 64 && cc_maj >= 8);
+                                                   vmsg_down_pre != nullptr && T > 64 && cc_maj >= 7);
                     if (use_l2_chunk_ffn) {
                         const bool use_l2_router = can_l2_router_ffn;
                         const bool use_fuse_ctrl_rms_1 = (use_l2_router && use_presplit_router &&
@@ -8631,7 +8633,7 @@ struct Engine {
             const bool want_pp_comb_conv = (T >= 32 && !save_conv_trace && (N & 3) == 0 && (!is_hy || pp_streaming));
             static const bool no_vert_fuse = (std::getenv("STRATA_NO_VERT_FUSE") != nullptr);
             static const bool no_moe_atomic_post = (std::getenv("STRATA_NO_MOE_ATOMIC") != nullptr);
-            const bool will_use_atomic_moe = (!no_moe_atomic_post && cc_maj >= 8 && T >= 32 && (N & 3) == 0 && !fuse_comb_conv &&
+            const bool will_use_atomic_moe = (!no_moe_atomic_post && cc_maj >= 7 && T >= 32 && (N & 3) == 0 && !fuse_comb_conv &&
                                               L.gu_type != 30 && L.d_type != 30 && K::native_expert_wmma_supported(L.L) &&
                                               (!is_hy || (pp_streaming && L.hblobs && pp_stage_bytes >= L.stride && pp_layer_cnt[(size_t) il] > 0)));
             bool can_defer_postffn = false;
@@ -9151,7 +9153,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         size_t stage_slack = 0;
         const size_t min_stage_resv_pad = (E.tmax >= 8192) ? ((size_t) 112 << 20) : ((size_t) 64 << 20);
         if (vram_gib < 0.0 && core_res_hy && !env_stage_mb && !env_stage_cnt &&
-            E.profile.arch.id == strata::inkling2::ArchId::Sm89Ada && E.tmax >= 8192 && tier1_full_pre > 0) {
+            (E.profile.arch.id == strata::inkling2::ArchId::Sm89Ada ||
+             E.profile.arch.id == strata::inkling2::ArchId::Sm70Volta) &&
+            E.tmax >= 8192 && tier1_full_pre > 0) {
             const size_t min_prefill_resv = E.vram_reserve_bytes + min_stage_resv_pad;
             if (fr > budget + min_prefill_resv) {
                 stage_slack = fr - budget - min_prefill_resv;
@@ -9159,12 +9163,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             stage_slack += E.pool_cached_free_bytes();
         }
         const size_t stage_budget = budget + stage_slack;
-        // EX-4 + Wave 8.5: On sm_89 Hybrid with chunk >= 2048, opportunistically upgrade staging to 4x162.3 MiB
+        // EX-4 + Wave 8.5: On sm_89/sm_70 Hybrid with chunk >= 2048, opportunistically upgrade staging to 4x162.3 MiB
         // (cuts outer-layer MoE chunk splits 5->3 and pre-buffers 1.4 full Epilogue layers during Core!).
         // At chunk >= 8192 CoreResidentHybrid, check actual 4x162.3 MiB (649 MiB) / 4x128 / 4x96 / 4x64 budgets first
         // so explicit --chunk 8192 never falls back to 2x64 MiB while keeping Tier-1 128/128 resident!
         if (!env_stage_mb && !env_stage_cnt &&
-            E.profile.arch.id == strata::inkling2::ArchId::Sm89Ada && E.tmax >= 2048 && tier1_full_pre > 0) {
+            (E.profile.arch.id == strata::inkling2::ArchId::Sm89Ada ||
+             E.profile.arch.id == strata::inkling2::ArchId::Sm70Volta) &&
+            E.tmax >= 2048 && tier1_full_pre > 0) {
             if (E.tmax >= 8192 && core_res_hy) {
                 if (stage_budget > tier1_full_pre + ((size_t) 656 << 20) + ((size_t) 32 << 20)) {
                     stage_mb = 192; // snaps to 38 * nvfp4_stride (~162.3 MiB, 4x = 649 MiB, 5 chunks/Q5_K layer!)
@@ -9304,7 +9310,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     // so blk.0 runs with minimal PCIe wait while cst streams blk.1..5; STRATA_PP_FRONTLOAD=0/1 overrides).
     const char* fl_env = std::getenv("STRATA_PP_FRONTLOAD");
     const bool frontload_en = fl_env ? (std::atoi(fl_env) != 0)
-                                     : (E.profile.arch.id == strata::inkling2::ArchId::Sm89Ada && E.tmax >= 2048 && E.pp_stage_cnt > 0);
+                                     : ((E.profile.arch.id == strata::inkling2::ArchId::Sm89Ada ||
+                                         E.profile.arch.id == strata::inkling2::ArchId::Sm70Volta) &&
+                                        E.tmax >= 2048 && E.pp_stage_cnt > 0);
     if (!tier2.empty() && budget > used) {
         if (frontload_en) {
             for (int ip : tier2) {

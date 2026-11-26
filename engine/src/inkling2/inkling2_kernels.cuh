@@ -8842,7 +8842,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
     };
 
 #if __CUDA_ARCH__ < 750
-    (void) rel_bias_f16_hi; (void) rel_bias_f16_lo; (void) swa_hm_base;
+    (void) rel_bias_f16_hi; (void) rel_bias_f16_lo;
     // Prologue (sm_70): 384 threads load 192x128 Q -> sQ (with optional fused clip+tau) + 192 threads clip+tau R in-place.
 #pragma unroll 1
     for (int base_r = 0; base_r < 192; base_r += 96) {
@@ -8936,11 +8936,12 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[n][i] = 0.0f;
 
-    int slot_base = IS_SWA ? (pow2_cap ? (j_start & cap_mask) : (j_start % cap)) : 0;
-    const int8_t* kq_full_h = IS_SWA ? nullptr : (kq + (size_t) hkv * cap * 128);
-    const __half* ks_full_h = IS_SWA ? nullptr : (ks + (size_t) hkv * cap);
-    const int8_t* vq_full_h = IS_SWA ? nullptr : (vq + (size_t) hkv * cap * 128);
-    const __half* vs_full_h = IS_SWA ? nullptr : (vs + (size_t) hkv * cap);
+    int slot_base = (IS_SWA && !SWA_LINEAR_HM) ? (pow2_cap ? (j_start & cap_mask) : (j_start % cap)) : 0;
+    const int j_bias = (IS_SWA && SWA_LINEAR_HM) ? swa_hm_base : 0;
+    const int8_t* kq_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (kq + (size_t) hkv * cap * 128);
+    const __half* ks_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (ks + (size_t) hkv * cap);
+    const int8_t* vq_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (vq + (size_t) hkv * cap * 128);
+    const __half* vs_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (vs + (size_t) hkv * cap);
     for (int jb = j_start; jb < j_end; jb += 64) {
         // 1. Load & dequant K (64x128) -> sKV (single-shot 256 threads!).
         if (tid < 256) {
@@ -8950,14 +8951,15 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
             if (j < j_end) {
                 __half2 dk2;
                 const int8_t* kp;
-                if constexpr (IS_SWA) {
+                if constexpr (IS_SWA && !SWA_LINEAR_HM) {
                     int sl = slot_base + kr;
                     if (sl >= cap) sl -= cap;
                     dk2 = __half2half2(__ldg(&ks[(size_t) sl * n_head_kv + hkv]));
                     kp = kq + ((size_t) sl * n_head_kv + hkv) * 128 + kc0;
                 } else {
-                    dk2 = __half2half2(__ldg(&ks_full_h[j]));
-                    kp = kq_full_h + (size_t) j * 128 + kc0;
+                    const int j_hm = j - j_bias;
+                    dk2 = __half2half2(__ldg(&ks_full_h[j_hm]));
+                    kp = kq_full_h + (size_t) j_hm * 128 + kc0;
                 }
                 const __half2 kb = __hmul2(__half2half2(__float2half(-1152.0f)), dk2);
 #pragma unroll
@@ -9160,14 +9162,15 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
             if (j < j_end) {
                 __half2 dv2;
                 const int8_t* vp;
-                if constexpr (IS_SWA) {
+                if constexpr (IS_SWA && !SWA_LINEAR_HM) {
                     int sl = slot_base + kr;
                     if (sl >= cap) sl -= cap;
                     dv2 = __half2half2(__ldg(&vs[(size_t) sl * n_head_kv + hkv]));
                     vp = vq + ((size_t) sl * n_head_kv + hkv) * 128 + kc0;
                 } else {
-                    dv2 = __half2half2(__ldg(&vs_full_h[j]));
-                    vp = vq_full_h + (size_t) j * 128 + kc0;
+                    const int j_hm = j - j_bias;
+                    dv2 = __half2half2(__ldg(&vs_full_h[j_hm]));
+                    vp = vq_full_h + (size_t) j_hm * 128 + kc0;
                 }
                 const __half2 vb = __hmul2(__half2half2(__float2half(-1152.0f)), dv2);
 #pragma unroll
