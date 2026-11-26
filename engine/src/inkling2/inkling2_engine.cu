@@ -7511,7 +7511,24 @@ struct Engine {
                         // Reuse ctrl2N (size T*2*N floats >> 3*T*64 floats) for batched 3-module ctrl64 (0 extra VRAM).
                         if (T == 1) {
                             k_loop_down_fused_smallT_3<1, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 1, hp.rms_eps);
-                            k_control_up_combine_smallT_3<1, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 1, N);
+                            if (N == 2304 && d_router_done != nullptr && d_mix_scratch != nullptr) {
+                                CtrlUpRmsQ8Ptrs3 upr{
+                                    {(const float*) L.loop_gain[0].d, (const float*) L.loop_gain[1].d, (const float*) L.loop_gain[2].d},
+                                    {(const float*) L.loop_forget[0].d, (const float*) L.loop_forget[1].d, (const float*) L.loop_forget[2].d},
+                                    {in_q, in_k, in_v},
+                                    {msg0, msg1, msg2},
+                                    {in_q, in_k, in_v},
+                                    {is_swa ? L.attn_norm : L.attn_q_inp_norm,
+                                     is_swa ? L.attn_norm : L.attn_k_inp_norm,
+                                     is_swa ? L.attn_norm : L.attn_v_inp_norm},
+                                    {xq, xq_k, xq_v}
+                                };
+                                k_control_up_combine_rms_q8_t1<3><<<dim3(144u, 3u), 256, 0, st>>>(
+                                    upr, ctrl2N, d_mix_scratch, d_router_done + 12, hp.rms_eps, N);
+                                q8_pre_done = true;
+                            } else {
+                                k_control_up_combine_smallT_3<1, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 1, N);
+                            }
                         } else if (T == 4) {
                             k_loop_down_fused_smallT_3<4, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 4, hp.rms_eps);
                             k_control_up_combine_smallT_3<4, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 4, N);
@@ -7544,6 +7561,7 @@ struct Engine {
                     }
                 }
                 }
+                if (!q8_pre_done) {
                 if (is_swa && has_msg) {
                     if (fuse_q8_norm) {
                         k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
@@ -7585,6 +7603,7 @@ struct Engine {
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_k, L.attn_k_inp_norm, in_k, N, hp.rms_eps);
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
                     }
+                }
                 }
                 }
                 }
@@ -8848,13 +8867,31 @@ struct Engine {
                                                   hp.loop_gate_rank == 64 && can_ctrl_wmma && can_ctrl_down_wmma && ir_c0 != nullptr);
                         MixInvRms4 ir_ffn{{ir_c0, nullptr, nullptr, nullptr}};
                         run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0, ffn_ctrl_ir ? &ir_ffn : nullptr);
-                        if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T, ffn_ctrl_ir ? ir_c0 : nullptr, ffn_ctrl_ir ? ir_m3 : nullptr);
-                        if (ffn_want_q8) {
-                            k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
-                        } else if (T >= 16 && (N & 3) == 0) {
-                            k_rms_norm_f16<<<(unsigned) T, rms_f16_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
+                        if (has_msg && T == 1 && ffn_want_q8 && N == 2304 && hp.loop_gate_rank == 64 &&
+                            L.loop_down[3].type == 0 && L.loop_gain[3].type == 0 && L.loop_forget[3].type == 0 &&
+                            d_router_done != nullptr && d_mix_scratch != nullptr) {
+                            k_loop_down_fused_smallT<1, true><<<64u, 256, 0, st>>>(
+                                (const float*) L.loop_down[3].d, in_ffn, msg3, ctrl64, N, 64, 1, hp.rms_eps);
+                            CtrlUpRmsQ8Ptrs3 upr{
+                                {(const float*) L.loop_gain[3].d, nullptr, nullptr},
+                                {(const float*) L.loop_forget[3].d, nullptr, nullptr},
+                                {in_ffn, nullptr, nullptr},
+                                {msg3, nullptr, nullptr},
+                                {in_ffn, nullptr, nullptr},
+                                {L.ffn_norm, nullptr, nullptr},
+                                {xq, nullptr, nullptr}
+                            };
+                            k_control_up_combine_rms_q8_t1<1><<<dim3(144u, 1u), 256, 0, st>>>(
+                                upr, ctrl64, d_mix_scratch, d_router_done + 15, hp.rms_eps, N);
                         } else {
-                            k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+                            if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T, ffn_ctrl_ir ? ir_c0 : nullptr, ffn_ctrl_ir ? ir_m3 : nullptr);
+                            if (ffn_want_q8) {
+                                k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
+                            } else if (T >= 16 && (N & 3) == 0) {
+                                k_rms_norm_f16<<<(unsigned) T, rms_f16_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
+                            } else {
+                                k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, N, hp.rms_eps);
+                            }
                         }
                     }
                 }

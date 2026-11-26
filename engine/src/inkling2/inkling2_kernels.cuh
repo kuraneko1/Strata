@@ -5711,6 +5711,146 @@ __global__ void __launch_bounds__(256, 4) k_control_up_combine_smallT_3(CtrlUpPt
 #endif
 }
 
+struct CtrlUpRmsQ8Ptrs3 {
+    const float *wg[3];
+    const float *wf[3];
+    const float *c[3];
+    const float *m[3];
+    float *o[3];
+    const float *nw[3];
+    void *xq[3];
+};
+
+/// Fused T=1 (N=2304, R=64) control_up_combine + RMSNorm + Q8_1 quantization via release-acquire last-CTA epilogue.
+/// Eliminates k_rms_norm_3_q8_1 (N_MOD=3, pre-attn) and k_rms_norm_q8_1 (N_MOD=1, FFN) = -48 launches/token on T=1!
+/// Grid: dim3(144, N_MOD), Block: 256. Requires scratch >= N_MOD*144 floats and d_done[0..N_MOD-1] zero-initialized.
+template <int N_MOD>
+__global__ void __launch_bounds__(256, 4) k_control_up_combine_rms_q8_t1(
+        CtrlUpRmsQ8Ptrs3 cp, const float* __restrict__ ctrl64_base,
+        float* __restrict__ scratch, uint32_t* __restrict__ d_done,
+        float rms_eps, int N) {
+    const int mod = (N_MOD == 1) ? 0 : (int) blockIdx.y;
+    if (mod >= N_MOD) return;
+    __shared__ float sx[64];
+    __shared__ float s_sq[8];
+    __shared__ int s_is_last;
+    const int tid = (int) threadIdx.x;
+    const int cta = (int) blockIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const float* ctrl64 = ctrl64_base + (size_t) mod * 64u;
+    if (tid < 16) {
+        reinterpret_cast<float4*>(sx)[tid] = __ldg(reinterpret_cast<const float4*>(ctrl64) + tid);
+    }
+    __syncthreads();
+
+    const int base_o = (cta * 8 + warp) * 2;
+    const int half = lane >> 4;
+    const int i = lane & 15;
+    const float* wg = half ? cp.wf[mod] : cp.wg[mod];
+    const float* cur = cp.c[mod];
+    const float* msg = cp.m[mod];
+    float* out = cp.o[mod];
+    const float4 x0 = reinterpret_cast<const float4*>(sx)[i];
+    const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) base_o * 64u) + i);
+    const float4 w1 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 1) * 64u) + i);
+    float a0 = w0.x * x0.x + w0.y * x0.y + w0.z * x0.z + w0.w * x0.w;
+    float a1 = w1.x * x0.x + w1.y * x0.y + w1.z * x0.z + w1.w * x0.w;
+#pragma unroll
+    for (int m = 8; m > 0; m >>= 1) {
+        a0 += __shfl_xor_sync(0xffffffffu, a0, m);
+        a1 += __shfl_xor_sync(0xffffffffu, a1, m);
+    }
+    const float f0 = __shfl_sync(0xffffffffu, a0, 16);
+    const float f1 = __shfl_sync(0xffffffffu, a1, 16);
+    float val_sq = 0.0f;
+    if (lane < 2 && base_o + lane < N) {
+        const int o = base_o + lane;
+        const float a = (lane == 0) ? a0 : a1;
+        const float f_val = (lane == 0) ? f0 : f1;
+        const float v = (1.0f - fast_tanh(f_val)) * __ldg(&cur[o]) + fast_tanh(a) * __ldg(&msg[o]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(out + o), "f"(v) : "memory");
+#else
+        *((volatile float*) (out + o)) = v;
+#endif
+        val_sq = v * v;
+    }
+    val_sq += __shfl_xor_sync(0xffffffffu, val_sq, 1);
+    if (lane == 0) s_sq[warp] = val_sq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float cta_ss = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) cta_ss += s_sq[w];
+        float* d_ss = scratch + (size_t) mod * 144u + (size_t) cta;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(d_ss), "f"(cta_ss) : "memory");
+        uint32_t prev = 0u;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(d_done + mod) : "memory");
+        const int last = ((prev + 1u) == 144u) ? 1 : 0;
+        if (last) asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" :: "l"(d_done + mod) : "memory");
+#else
+        *((volatile float*) d_ss) = cta_ss;
+        __threadfence();
+        const uint32_t prev = atomicAdd(d_done + mod, 1u);
+        const int last = ((prev + 1u) == 144u) ? 1 : 0;
+        if (last) {
+            *((volatile uint32_t*) (d_done + mod)) = 0u;
+            __threadfence();
+        }
+#endif
+        s_is_last = last;
+    }
+    __syncthreads();
+    if (!s_is_last) return;
+
+    float ps = 0.0f;
+    if (tid < 144) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("ld.relaxed.gpu.global.f32 %0, [%1];" : "=f"(ps) : "l"(scratch + (size_t) mod * 144u + (size_t) tid) : "memory");
+#else
+        ps = __ldcg(scratch + (size_t) mod * 144u + (size_t) tid);
+#endif
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+    if (lane == 0) s_sq[warp] = ps;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) tot += s_sq[w];
+        s_sq[0] = rsqrtf(tot / 2304.0f + rms_eps);
+    }
+    __syncthreads();
+
+    const float ir = s_sq[0];
+    const float* nw = cp.nw[mod];
+    void* xqr = cp.xq[mod];
+    const int sub_lane = tid & 7;
+    for (int i4 = tid; i4 < 576; i4 += 256) {
+        float4 v;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("ld.relaxed.gpu.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                     : "l"(out + (size_t) i4 * 4u) : "memory");
+#else
+        v = make_float4(__ldcg(out + i4 * 4 + 0), __ldcg(out + i4 * 4 + 1),
+                        __ldcg(out + i4 * 4 + 2), __ldcg(out + i4 * 4 + 3));
+#endif
+        float4 o;
+        if (nw) {
+            const float4 ww = __ldg(reinterpret_cast<const float4*>(nw) + i4);
+            o = make_float4(v.x * ir * ww.x, v.y * ir * ww.y, v.z * ir * ww.z, v.w * ir * ww.w);
+        } else {
+            o = make_float4(v.x * ir, v.y * ir, v.z * ir, v.w * ir);
+        }
+        reinterpret_cast<float4*>(out)[i4] = o;
+        if (xqr) q8_1_sub8_store(o, xqr, i4 >> 3, sub_lane);
+    }
+}
+
 /// High-occupancy F32 GEMV for small n_out (1 CTA of 128 threads per output row).
 __global__ void k_gemv_f32_cta(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
                                int n_in, int n_out) {
