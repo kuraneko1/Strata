@@ -1487,11 +1487,13 @@ struct Engine {
     // plus per-layer pre-route graphs (attn + mix + ffn_norm + route).
     cudaGraphExec_t core_graph[2] = {};
     cudaGraphExec_t verify_core_graph[10][2] = {};
+    uint16_t verify_core_graph_hits[10][2] = {};
     // Full 48-layer + swa_bak + head + argmax/softcap graphs for Full-VRAM (T=1..9, capture_dspark, want_softcap, want_argmax, sp_bucket)
     cudaGraphExec_t full_decode_graph[10][2][2][2][2] = {};
     uint16_t full_decode_graph_hits[10][2][2][2][2] = {};
     std::vector<cudaGraphExec_t> layer_pre_graph;
     std::vector<cudaGraphExec_t> verify_pre_graph[10];
+    std::vector<uint16_t> verify_pre_graph_hits[10];
     std::vector<cudaGraphExec_t> deferred_graphs_destroy;
     uint32_t* h_hits_pin = nullptr;
     bool core_all_gpu = false;
@@ -2974,7 +2976,10 @@ struct Engine {
         CK(cudaMallocHost(&h_ewts, (size_t) max_ent * sizeof(float)));
         CK(cudaMallocHost(&h_cpu_sum, (size_t) std::max(verify_max_t, 8) * (size_t) N * sizeof(float)));
         CK(cudaMallocHost(&h_hits_pin, (size_t) hp.n_phys * (size_t) hp.n_expert * sizeof(uint32_t)));
-        for (int t = 0; t < 10; ++t) verify_pre_graph[t].assign((size_t) hp.n_layer, nullptr);
+        for (int t = 0; t < 10; ++t) {
+            verify_pre_graph[t].assign((size_t) hp.n_layer, nullptr);
+            verify_pre_graph_hits[t].assign((size_t) hp.n_layer, 0);
+        }
         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         for (int i = 0; i < kMaxRebalLayers; ++i) {
             CK(cudaEventCreateWithFlags(&ev_rebal_layer[i], cudaEventDisableTiming));
@@ -4720,7 +4725,10 @@ struct Engine {
         };
         for (int b = 0; b < 2; ++b) defer(core_graph[b]);
         for (int t = 0; t < 10; ++t)
-            for (int b = 0; b < 2; ++b) defer(verify_core_graph[t][b]);
+            for (int b = 0; b < 2; ++b) {
+                defer(verify_core_graph[t][b]);
+                verify_core_graph_hits[t][b] = 0;
+            }
         for (int t = 0; t < 10; ++t)
             for (int c = 0; c < 2; ++c)
                 for (int s = 0; s < 2; ++s)
@@ -4732,6 +4740,7 @@ struct Engine {
         for (auto& g : layer_pre_graph) defer(g);
         for (int t = 0; t < 10; ++t) {
             for (auto& g : verify_pre_graph[t]) defer(g);
+            std::fill(verify_pre_graph_hits[t].begin(), verify_pre_graph_hits[t].end(), uint16_t(0));
         }
         graph_oom = false;
     }
@@ -6612,11 +6621,12 @@ struct Engine {
             }
             uint16_t& fg_hits = full_decode_graph_hits[T][capture_dspark ? 1 : 0][want_softcap ? 1 : 0][want_argmax ? 1 : 0][fg_sp_b];
             if (fg_hits < 65535u) ++fg_hits;
-            // Break-even 700-node cudaGraphInstantiate policy: capture primary hot sizes (T=1 OFF, T=4 base_k=3) on hit #1,
-            // common verify sizes (T=2,3,7) on hit #2, and rare intermediate sizes (T=5,6,8,9 or T=1 dspark) on hit #3+!
-            const bool want_capture_fg = (T == 1 && !capture_dspark) || (T == 4) ||
-                                         ((T == 2 || T == 3 || T == 7) && fg_hits >= 2) ||
-                                         (fg_hits >= 3);
+            // Break-even 700-node cudaGraphInstantiate policy (~2.3 ms instantiate vs ~0.83 ms HostGap saved per replay -> break-even >= 4 calls):
+            // capture primary hot sizes on hit #1 (T=1 OFF, T=4 when dm<=5, T=7 when dm>=6), and defer rare T or T=1 dspark until hit #4.
+            const bool want_capture_fg = (T == 1 && !capture_dspark) ||
+                                         (T == 4 && verify_max_t <= 5) ||
+                                         (T == 7 && verify_max_t >= 7) ||
+                                         (fg_hits >= 4);
             if (want_capture_fg) {
                 if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
                     capturing_full_graph = true;
@@ -9003,7 +9013,15 @@ struct Engine {
                     }
                 }
                 cudaGraphExec_t& cg = use_t1_core ? core_graph[fg_sp_b] : verify_core_graph[T][fg_sp_b];
-                if (!cg && !graph_oom) {
+                bool want_capture_cg = true;
+                if (!use_t1_core && !cg) {
+                    uint16_t& vc_hits = verify_core_graph_hits[T][fg_sp_b];
+                    if (vc_hits < 65535u) ++vc_hits;
+                    want_capture_cg = (T == 4 && verify_max_t <= 5) ||
+                                      (T == 7 && verify_max_t >= 7) ||
+                                      (vc_hits >= 4);
+                }
+                if (!cg && want_capture_cg && !graph_oom) {
                     const auto saved_nb = norm_blocks;
                     const int saved_next = next_blk_buf;
                     const auto saved_pnb = prelude_norm_blocks;
@@ -9067,8 +9085,16 @@ struct Engine {
                 layer_pending_rebal[ip_cur] = false;
             }
             auto& pre_vec = use_t1_pre_graph ? layer_pre_graph : verify_pre_graph[T];
+            bool want_capture_pre = true;
+            if (use_vf_pre_graph && !pre_vec[(size_t) il]) {
+                uint16_t& vp_hits = verify_pre_graph_hits[T][(size_t) il];
+                if (vp_hits < 65535u) ++vp_hits;
+                want_capture_pre = (T == 4 && verify_max_t <= 5) ||
+                                   (T == 7 && verify_max_t >= 7) ||
+                                   (vp_hits >= 4);
+            }
             const auto tp_ly0 = Clock::now();
-            if (use_pre_graph && (pre_vec[(size_t) il] || !graph_oom)) {
+            if (use_pre_graph && (pre_vec[(size_t) il] || (want_capture_pre && !graph_oom))) {
                 if (!pre_vec[(size_t) il]) {
                     const auto saved_nb = norm_blocks;
                     const int saved_next = next_blk_buf;
