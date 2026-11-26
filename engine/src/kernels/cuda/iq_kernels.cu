@@ -2785,8 +2785,23 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
 constexpr int GRP_NC = 4;
 
+// Static register-only selector for small accumulator arrays (avoids runtime-indexed local stack spills on sm_70/sm_89).
+template<int NC>
+__device__ __forceinline__ float pick_reg_f(const float (&s)[NC], int idx) {
+    if constexpr (NC == 1) {
+        return s[0];
+    } else if constexpr (NC == 2) {
+        return idx == 0 ? s[0] : s[1];
+    } else if constexpr (NC == 3) {
+        return idx == 0 ? s[0] : (idx == 1 ? s[1] : s[2]);
+    } else {
+        static_assert(NC == 4, "pick_reg_f supports NC in 1..4");
+        return idx < 2 ? (idx == 0 ? s[0] : s[1]) : (idx == 2 ? s[2] : s[3]);
+    }
+}
+
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, bool SUB16 = true>
-__global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
+__global__ void __launch_bounds__(256, (SUB16 && (TG == 144 || TG == 145)) ? 1 : 2) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_tok,
@@ -2821,17 +2836,17 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                         const int off2[2] = { ent_tok[e] * 80, ent_tok[e + 1] * 80 };
                         float s2[2];
                         row_dot_160_sub8<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, t, s2, s_grid);
-                        if (t < 2) dst[(size_t) (e + t) * L.n_ff + r] = s2[t] * sc;
+                        if (t < 2) dst[(size_t) (e + t) * L.n_ff + r] = pick_reg_f(s2, t) * sc;
                     } else if (n == 3) {
                         const int off3[3] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80 };
                         float s3[3];
                         row_dot_160_sub8<TG, 3, true, STAGE_GRID>(wr, xq, off3, 3, t, s3, s_grid);
-                        if (t < 3) dst[(size_t) (e + t) * L.n_ff + r] = s3[t] * sc;
+                        if (t < 3) dst[(size_t) (e + t) * L.n_ff + r] = pick_reg_f(s3, t) * sc;
                     } else {
                         const int off4[4] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80, ent_tok[e + 3] * 80 };
                         float s4[4];
                         row_dot_160_sub8<TG, 4, true, STAGE_GRID>(wr, xq, off4, 4, t, s4, s_grid);
-                        if (t < 4) dst[(size_t) (e + t) * L.n_ff + r] = s4[t] * sc;
+                        if (t < 4) dst[(size_t) (e + t) * L.n_ff + r] = pick_reg_f(s4, t) * sc;
                     }
                 }
             }
@@ -2862,17 +2877,17 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                         const int off2[2] = { ent_tok[e] * 80, ent_tok[e + 1] * 80 };
                         float s2[2];
                         row_dot_80_sub16<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, t, s2, s_grid);
-                        if (t < 2) dst[(size_t) (e + t) * L.n_ff + r] = s2[t] * sc;
+                        if (t < 2) dst[(size_t) (e + t) * L.n_ff + r] = pick_reg_f(s2, t) * sc;
                     } else if (n == 3) {
                         const int off3[3] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80 };
                         float s3[3];
                         row_dot_80_sub16<TG, 3, true, STAGE_GRID>(wr, xq, off3, 3, t, s3, s_grid);
-                        if (t < 3) dst[(size_t) (e + t) * L.n_ff + r] = s3[t] * sc;
+                        if (t < 3) dst[(size_t) (e + t) * L.n_ff + r] = pick_reg_f(s3, t) * sc;
                     } else {
                         const int off4[4] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80, ent_tok[e + 3] * 80 };
                         float s4[4];
                         row_dot_80_sub16<TG, 4, true, STAGE_GRID>(wr, xq, off4, 4, t, s4, s_grid);
-                        if (t < 4) dst[(size_t) (e + t) * L.n_ff + r] = s4[t] * sc;
+                        if (t < 4) dst[(size_t) (e + t) * L.n_ff + r] = pick_reg_f(s4, t) * sc;
                     }
                 }
             }
@@ -2921,17 +2936,17 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                             const int off2[2] = { 0, xb };
                             float s2[2];
                             row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xs, off2, 2, nb, lane, s2, s_grid);
-                            if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = s2[lane] * sc;
+                            if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = pick_reg_f(s2, lane) * sc;
                         } else if (n == 3) {
                             const int off3[3] = { 0, xb, 2 * xb };
                             float s3[3];
                             row_dot_multi<TG, 3, true, STAGE_GRID>(wr, xs, off3, 3, nb, lane, s3, s_grid);
-                            if (lane < 3) dst[(size_t) (e + lane) * L.n_ff + r] = s3[lane] * sc;
+                            if (lane < 3) dst[(size_t) (e + lane) * L.n_ff + r] = pick_reg_f(s3, lane) * sc;
                         } else {
                             const int off4[4] = { 0, xb, 2 * xb, 3 * xb };
                             float s4[4];
                             row_dot_multi<TG, 4, true, STAGE_GRID>(wr, xs, off4, 4, nb, lane, s4, s_grid);
-                            if (lane < 4) dst[(size_t) (e + lane) * L.n_ff + r] = s4[lane] * sc;
+                            if (lane < 4) dst[(size_t) (e + lane) * L.n_ff + r] = pick_reg_f(s4, lane) * sc;
                         }
                     }
                 }
@@ -2962,17 +2977,17 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                 const int off2[2] = { ent_tok[e] * xb, ent_tok[e + 1] * xb };
                 float s2[2];
                 row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, nb, lane, s2, s_grid);
-                if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = s2[lane] * sc;
+                if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = pick_reg_f(s2, lane) * sc;
             } else if (n == 3) {
                 const int off3[3] = { ent_tok[e] * xb, ent_tok[e + 1] * xb, ent_tok[e + 2] * xb };
                 float s3[3];
                 row_dot_multi<TG, 3, true, STAGE_GRID>(wr, xq, off3, 3, nb, lane, s3, s_grid);
-                if (lane < 3) dst[(size_t) (e + lane) * L.n_ff + r] = s3[lane] * sc;
+                if (lane < 3) dst[(size_t) (e + lane) * L.n_ff + r] = pick_reg_f(s3, lane) * sc;
             } else {
                 const int off4[4] = { ent_tok[e] * xb, ent_tok[e + 1] * xb, ent_tok[e + 2] * xb, ent_tok[e + 3] * xb };
                 float s4[4];
                 row_dot_multi<TG, 4, true, STAGE_GRID>(wr, xq, off4, 4, nb, lane, s4, s_grid);
-                if (lane < 4) dst[(size_t) (e + lane) * L.n_ff + r] = s4[lane] * sc;
+                if (lane < 4) dst[(size_t) (e + lane) * L.n_ff + r] = pick_reg_f(s4, lane) * sc;
             }
         }
     }
@@ -3079,7 +3094,7 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
 
 // native_down_kernel with the entries taken GRP_NC at a time
 template<int TD, bool SUB_DOWN = true, bool STAGE_TQ = false>
-__global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
+__global__ void __launch_bounds__(256, 2) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
                                                                 const int32_t* __restrict__ ent_dst,
@@ -3122,17 +3137,17 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_sub8<TD, 2, true, STAGE_TQ>(wr, s_hq, off2, 2, t, s2, s_grid);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s2, t) * sd;
                         } else if (n == 3) {
                             const int off3[3] = { 0, 20, 40 };
                             float s3[3];
                             row_dot_sub8<TD, 3, true, STAGE_TQ>(wr, s_hq, off3, 3, t, s3, s_grid);
-                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s3, t) * sd;
                         } else {
                             const int off4[4] = { 0, 20, 40, 60 };
                             float s4[4];
                             row_dot_sub8<TD, 4, true, STAGE_TQ>(wr, s_hq, off4, 4, t, s4, s_grid);
-                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s4, t) * sd;
                         }
                     }
                 }
@@ -3168,17 +3183,17 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_sub8<TD, 2, true, STAGE_TQ>(wr, s_hq, off2, 2, t, s2, s_grid);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s2, t) * sd;
                         } else if (n == 3) {
                             const int off3[3] = { 0, 20, 40 };
                             float s3[3];
                             row_dot_sub8<TD, 3, true, STAGE_TQ>(wr, s_hq, off3, 3, t, s3, s_grid);
-                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s3, t) * sd;
                         } else {
                             const int off4[4] = { 0, 20, 40, 60 };
                             float s4[4];
                             row_dot_sub8<TD, 4, true, STAGE_TQ>(wr, s_hq, off4, 4, t, s4, s_grid);
-                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s4, t) * sd;
                         }
                     }
                 }
@@ -3213,17 +3228,17 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_20_sub16<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s2, t) * sd;
                         } else if (n == 3) {
                             const int off3[3] = { 0, 20, 40 };
                             float s3[3];
                             row_dot_20_sub16<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
-                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+                            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s3, t) * sd;
                         } else {
                             const int off4[4] = { 0, 20, 40, 60 };
                             float s4[4];
                             row_dot_20_sub16<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
-                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+                            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = pick_reg_f(s4, t) * sd;
                         }
                     }
                 }
@@ -3258,7 +3273,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                         const int off2[2] = { 0, 20 };
                         float s2[2];
                         row_dot_multi<TD, 2, true, STAGE_TQ>(wr, s_hq, off2, 2, nb, lane, s2, s_grid);
-                        if (lane < 2) out[(size_t) ent_dst[e + lane] * L.n_embd + r] = s2[lane] * sd;
+                        if (lane < 2) out[(size_t) ent_dst[e + lane] * L.n_embd + r] = pick_reg_f(s2, lane) * sd;
                     } else {
                         int off[GRP_NC];
 #pragma unroll

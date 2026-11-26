@@ -40,8 +40,9 @@ struct ArchProfile {
     bool allow_tight_chunk_2048 = false;  // Measured win on sm_89 12GB TightHybrid (halves PCIe streaming bytes/tok)
     bool allow_core_chunk_2048 = false;   // Measured win on sm_89 12GB CoreResidentHybrid when tier1 still fits 128/128
     bool allow_core_chunk_4096 = false;   // EX-4: Measured win on sm_89 12GB with SWA compaction + dynamic KV init
-    bool allow_core_chunk_8192 = false;   // Wave 4/5: Enables adaptive T=8192 upper cap on sm_89 12GB CoreResidentHybrid
+    bool allow_core_chunk_8192 = false;   // Wave 4/5: Enables adaptive T=8192 upper cap on CoreResidentHybrid
     bool allow_full_vram_chunk_2048 = false; // Measured +21-23% prefill win on sm_70 32GB FullVram (fills BM=128 tiles)
+    bool allow_full_vram_chunk_4096 = false; // Enables T=4096 on sm_70 32GB FullVram when >=512 MiB headroom remains (65K/262K; 819K stays 2048)
     int core_hybrid_kv_init = 0;          // Optional initial Full-KV cap on CoreResidentHybrid (0 = max_ctx upfront)
 };
 
@@ -58,9 +59,15 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.t1_swa_split_mult = 3;
         p.pp_stage_mb = 64;
         p.pp_stage_cnt_pref = 3;
+        p.pp_stage_cnt_core = 2;
         p.kv_grow_reserve_mib = 112;
         p.allow_tight_chunk_2048 = false;
+        p.allow_core_chunk_2048 = true;
+        p.allow_core_chunk_4096 = true;
+        p.allow_core_chunk_8192 = true;
         p.allow_full_vram_chunk_2048 = true;
+        p.allow_full_vram_chunk_4096 = true;
+        p.core_hybrid_kv_init = 131072;
         return p;
     }
     if (cc_major == 8 && cc_minor == 9) {
@@ -193,7 +200,8 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     //      min(max_ctx, 16384) so short/medium prompts keep +328..1800 MiB VRAM for adaptive 8K/12K prefill.
     //    - Non-sm89 or expert-capped TightHybrid starts at min(max_ctx, 36864).
     const bool sm89_tight_adaptive =
-        (out.regime == VramRegime::TightHybrid && out.arch.allow_core_chunk_8192 &&
+        (out.arch.id == ArchId::Sm89Ada &&
+         out.regime == VramRegime::TightHybrid && out.arch.allow_core_chunk_8192 &&
          in.kv_q8 && in.tier1_experts_bytes > 0 && cap_allows_core);
     if (sm89_tight_adaptive && out.arch.core_hybrid_kv_init > 0 && in.max_ctx > out.arch.core_hybrid_kv_init) {
         out.full_kv_init = out.arch.core_hybrid_kv_init;
@@ -207,8 +215,8 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     }
 
     // 2. Prefill chunk size (user --chunk always wins):
-    //    - FullVram promotes to 2048 when all experts + full KV fit with margin (V100 32GB).
-    //    - CoreResidentHybrid on sm_89 Q8KV promotes to 4096 (EX-4: SWA compaction reclaims +323 MiB for Decode)
+    //    - FullVram promotes to 4096 (when >=512 MiB extra margin fits, e.g. V100 32GB @ 65K/262K) or 2048 (V100 @ 819K).
+    //    - CoreResidentHybrid on sm_89 / sm_70 Q8KV promotes to 4096 (SWA compaction + dynamic KV init)
     //      when tier1 fits 128/128 with initial KV + SWA-5120 ring, else falls back cleanly to 2048 -> 1024.
     //    - TightHybrid on sm_89 Q8KV uses 2048 (SWA-3072 ring halves PCIe streaming bytes/tok).
     const size_t init_kv_bytes = (size_t) std::max(0, in.n_full_layers) * (size_t) out.full_kv_init * in.kv_bytes_per_tok;
@@ -227,12 +235,16 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     const size_t core_hybrid_4096_need = init_kv_bytes + swa_kv_4096 + engine_overhead_4096 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_4096_need + 160 * MiB;
     const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_2048_need + 160 * MiB;
     const size_t full_vram_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + in.all_experts_bytes + dspark_kv_need + 256 * MiB;
+    const size_t full_vram_4096_need = full_kv_total + swa_kv_4096 + engine_overhead_4096 + in.all_experts_bytes + dspark_kv_need + 512 * MiB;
 
     if (in.requested_chunk > 0) {
         out.chunk = std::clamp(in.requested_chunk, 1, 16384);
         out.max_adaptive_chunk = out.chunk;
     } else {
-        if (out.regime == VramRegime::FullVram && out.arch.allow_full_vram_chunk_2048 &&
+        if (out.regime == VramRegime::FullVram && out.arch.allow_full_vram_chunk_4096 &&
+            in.kv_q8 && in.vram_free_bytes >= full_vram_4096_need) {
+            out.chunk = 4096;
+        } else if (out.regime == VramRegime::FullVram && out.arch.allow_full_vram_chunk_2048 &&
             in.kv_q8 && in.vram_free_bytes >= full_vram_2048_need) {
             out.chunk = 2048;
         } else if (out.regime == VramRegime::TightHybrid && out.arch.allow_tight_chunk_2048 &&
@@ -249,12 +261,20 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
         } else {
             out.chunk = 512;
         }
-        out.max_adaptive_chunk =
-            ((out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_8192 &&
-              in.kv_q8 && out.chunk == 4096) ||
-             (sm89_tight_adaptive && out.chunk == 2048))
-                ? 12288
-                : out.chunk;
+        if (out.arch.id == ArchId::Sm89Ada) {
+            out.max_adaptive_chunk =
+                ((out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_8192 &&
+                  in.kv_q8 && out.chunk == 4096) ||
+                 (sm89_tight_adaptive && out.chunk == 2048))
+                    ? 12288
+                    : out.chunk;
+        } else {
+            out.max_adaptive_chunk =
+                (out.regime == VramRegime::CoreResidentHybrid && out.arch.allow_core_chunk_8192 &&
+                 in.kv_q8 && out.chunk == 4096)
+                    ? 8192
+                    : out.chunk;
+        }
     }
 
     // 3. Split-KV arena reserve, PCIe staging ring, and GPU routing hit counters:

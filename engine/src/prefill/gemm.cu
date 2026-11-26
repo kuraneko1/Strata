@@ -184,7 +184,7 @@ void note(cublasStatus_t s, const char* what) {
 }
 
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-// CUDA sm_80+: shape-keyed cublasLtMatmul heuristic autotuner cache for prefill Gemm::f16, Gemm::f16_f16out, and Gemm::sgemm.
+// CUDA sm_70+: shape-keyed cublasLtMatmul heuristic autotuner cache for prefill Gemm::f16, Gemm::f16_f16out, and Gemm::sgemm.
 // Strictly CUBLAS_COMPUTE_32F (FP16->FP32 accum->FP32/FP16 out for f16/f16_f16out; strict IEEE FP32->FP32 out, NO TF32 for sgemm).
 struct CudaLtKey {
     int dev;
@@ -1804,9 +1804,9 @@ bool Gemm::try_cublaslt_tune(const void* X, const void* W, void* Y, int64_t T, i
                              float beta, bool is_f32, bool out_f16) {
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     if (!lt_ || !lt_cache_ || cublaslt_tune_disabled()) return false;
-    // Prefill path on Ampere / Ada / Hopper / Blackwell (sm_80+); Volta sm_70 / Turing sm_75 / Pascal sm_60 keep cublasGemmEx / cublasSgemm.
+    // Prefill path on Volta / Turing / Ampere / Ada / Hopper / Blackwell (sm_70+); Pascal sm_60 keeps cublasGemmEx / cublasSgemm.
     if (T < 256 || N <= 0 || K <= 0 || T > INT_MAX || N > INT_MAX || K > INT_MAX || ldy < N || ldy > INT_MAX) return false;
-    if (current_cc() < 80) return false;
+    if (current_cc() < 70) return false;
     // Require 16-byte pointer alignment so any cached 128-bit vectorized kernel works across all layers / scratch buffers.
     if ((((uintptr_t) W | (uintptr_t) X | (uintptr_t) Y) & 15u) != 0u) return false;
 
@@ -1957,7 +1957,7 @@ bool Gemm::try_cublaslt_tune(const void* X, const void* W, void* Y, int64_t T, i
                 const char* v = std::getenv("STRATA_CUBLASLT_NO_EXHAUSTIVE");
                 return v && v[0] == '1';
             }();
-            if (!skip_bench && !is_f32 && !out_f16 && T >= 1024 && N >= 512 && K >= 512 && !no_exh_lt && n_cands < kMaxCands) {
+            if (current_cc() >= 80 && !skip_bench && !is_f32 && !out_f16 && T >= 1024 && N >= 512 && K >= 512 && !no_exh_lt && n_cands < kMaxCands) {
                 int algo_ids[64];
                 int n_ids = 0;
                 if (cublasLtMatmulAlgoGetIds(lt_handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,

@@ -80,16 +80,56 @@ int main() {
         check(p_tight.want_sp == 6, "V100 819K chunk=1024 uses exact want_sp=6 (best_sp=5 + 1 tail on 80 SMs)");
     }
 
-    // 2. V100 32GB @ 1,048,576 ctx (1M, DSpark OFF): overflows FullVram -> drops cleanly to CoreResidentHybrid
+    // 2. V100 32GB @ 1,048,576 ctx (1M, DSpark OFF & ON): overflows FullVram -> CoreResidentHybrid with dynamic
+    //    131,072 initial KV (2.03 GiB instead of 16.25 GiB, keeping 3072/3072 experts resident through ~512K-750K),
+    //    chunk=4096, and max_adaptive_chunk=8192 (cuts PCIe streaming bytes/tok 2-4x on PCIe Gen3 x8).
     {
-        const auto in = v100_32g(1048576, false);
-        const auto p = resolve_inkling2_profile(in);
-        std::printf("%s\n", format_profile_line(in, p).c_str());
-        check(p.regime == VramRegime::CoreResidentHybrid, "V100 1M selects CoreResidentHybrid");
-        check(p.chunk == 1024, "V100 1M keeps chunk=1024");
-        check(p.max_adaptive_chunk == p.chunk, "V100 1M keeps max_adaptive_chunk == chunk");
-        check(p.full_kv_init == 1048576, "V100 1M allocates 1M KV upfront while keeping core 128/128");
-        check(p.use_d_hits, "V100 1M hybrid enables d_hits");
+        const auto in_off = v100_32g(1048576, false);
+        const auto p_off = resolve_inkling2_profile(in_off);
+        std::printf("%s\n", format_profile_line(in_off, p_off).c_str());
+        check(p_off.arch.id == ArchId::Sm70Volta, "V100 1M OFF selects Sm70Volta");
+        check(p_off.regime == VramRegime::CoreResidentHybrid, "V100 1M OFF selects CoreResidentHybrid");
+        check(p_off.chunk == 4096, "V100 1M OFF promotes to chunk=4096");
+        check(p_off.max_adaptive_chunk == 8192, "V100 1M OFF exposes max_adaptive_chunk=8192");
+        check(p_off.full_kv_init == 131072, "V100 1M OFF starts KV at 131072 (saves 14.22 GiB upfront)");
+        check(p_off.want_sp == 4, "V100 1M OFF chunk=4096 uses want_sp=4");
+        check(p_off.pp_stage_cnt_pref == 2 && p_off.pp_stage_mb == 64, "V100 1M OFF uses 2x64 MiB staging");
+        check(p_off.use_d_hits, "V100 1M OFF hybrid enables d_hits");
+
+        auto in_on = v100_32g(1048576, true);
+        in_on.vram_free_bytes = (size_t) (28.3 * (double) GiB);
+        const auto p_on = resolve_inkling2_profile(in_on);
+        std::printf("%s\n", format_profile_line(in_on, p_on).c_str());
+        check(p_on.regime == VramRegime::CoreResidentHybrid, "V100 1M ON selects CoreResidentHybrid");
+        check(p_on.chunk == 4096, "V100 1M ON promotes to chunk=4096");
+        check(p_on.max_adaptive_chunk == 8192, "V100 1M ON exposes max_adaptive_chunk=8192");
+        check(p_on.full_kv_init == 131072, "V100 1M ON starts KV at 131072");
+        check(p_on.want_sp == 4, "V100 1M ON chunk=4096 uses want_sp=4");
+        check(p_on.use_d_hits, "V100 1M ON hybrid enables d_hits");
+
+        // V100 32GB @ 65K & 262K FullVram (DSpark OFF & ON): ample VRAM headroom -> promotes to chunk=4096 safely
+        for (int ctx : {65536, 262144}) {
+            for (bool draft : {false, true}) {
+                const auto in_fv = v100_32g(ctx, draft);
+                const auto p_fv = resolve_inkling2_profile(in_fv);
+                check(p_fv.arch.id == ArchId::Sm70Volta, "V100 65K/262K selects Sm70Volta");
+                check(p_fv.regime == VramRegime::FullVram, "V100 65K/262K selects FullVram");
+                check(p_fv.chunk == 4096, "V100 65K/262K FullVram promotes to chunk=4096");
+                check(p_fv.max_adaptive_chunk == 4096, "V100 65K/262K FullVram keeps max_adaptive_chunk == 4096");
+                check(p_fv.full_kv_init == ctx, "V100 65K/262K FullVram allocates full max_ctx KV upfront");
+                check(p_fv.want_sp == 4, "V100 65K/262K FullVram chunk=4096 uses want_sp=4");
+                check(!p_fv.use_d_hits && p_fv.pp_stage_cnt_pref == 0, "V100 65K/262K FullVram skips d_hits & staging");
+            }
+        }
+
+        // V100 forced TightHybrid fallback: keeps conservative full_kv_init=36864 (not Sm89Ada tight_adaptive)
+        auto in_th = v100_32g(1048576, true);
+        in_th.expert_vram_forced = true;
+        in_th.expert_vram_cap_bytes = (size_t) (4.5 * (double) GiB);
+        const auto p_th = resolve_inkling2_profile(in_th);
+        check(p_th.regime == VramRegime::TightHybrid, "V100 forced cap selects TightHybrid");
+        check(p_th.full_kv_init == 36864, "V100 TightHybrid keeps conservative full_kv_init=36864");
+        check(p_th.chunk == 1024 && p_th.max_adaptive_chunk == 1024, "V100 TightHybrid stays on chunk=1024");
     }
 
     // 3. RTX 4070 12GB @ 65,536 ctx: CoreResidentHybrid (core 128/128 resident, dynamic 16K->65K KV, chunk=4096 + SWA compaction)
