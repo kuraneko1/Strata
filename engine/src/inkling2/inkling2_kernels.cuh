@@ -16950,7 +16950,11 @@ __global__ void k_route_inkling2(const float* __restrict__ logits, const float* 
 /// Fused T=1 Router GEMV (64 CTAs x 192 thr, 2 rows/CTA) + Warp Top-K Route + Group (1 single launch, STACK:0, CUDA-Graph safe!).
 /// Exact 576/192=3 float4 iters for N==2304 (0 tail divergence), 6 warps/SM latency hiding, REG<=56 (down from 128),
 /// eliminates 2nd __syncthreads() (warps 1..5 exit immediately), uses v2.f32 relaxed store + v4.f32 relaxed load!
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
 __global__ void __launch_bounds__(192, 6) k_router_gemv_and_group_t1(
+#else
+__global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
+#endif
     const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ logits,
     const float* __restrict__ bias, int32_t* __restrict__ ids, float* __restrict__ ewts,
     const int32_t* __restrict__ slot_of, const uint8_t* __restrict__ blobs,
