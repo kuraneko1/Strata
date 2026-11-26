@@ -777,7 +777,19 @@ __global__ void k_stack_rms_norm(BlkPtrs ptrs, const float* __restrict__ cur,
                                  float* __restrict__ out, int D, int N, int T, float eps) {
     __shared__ float sh[32];
     const int d = blockIdx.x, t = blockIdx.y;
-    const float* src = (d == D - 1) ? (cur + (size_t) t * N) : (ptrs.p[d] + (size_t) t * N);
+    const float* base_p = nullptr;
+    switch (d) {
+        case 0: base_p = ptrs.p[0]; break;
+        case 1: base_p = ptrs.p[1]; break;
+        case 2: base_p = ptrs.p[2]; break;
+        case 3: base_p = ptrs.p[3]; break;
+        case 4: base_p = ptrs.p[4]; break;
+        case 5: base_p = ptrs.p[5]; break;
+        case 6: base_p = ptrs.p[6]; break;
+        case 7: base_p = ptrs.p[7]; break;
+        default: break;
+    }
+    const float* src = (d == D - 1) ? (cur + (size_t) t * N) : (base_p + (size_t) t * N);
     float* dst = out + ((size_t) t * D + d) * N;
     float s = 0.0f;
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
@@ -830,7 +842,8 @@ __global__ void k_mix(const float* __restrict__ stack_norm, const float* __restr
             out.p[2][(size_t) t * N + i] = acc;
         }
     } else {
-        float* dst = out.p[q] + (size_t) t * N;
+        float* out_q = (q == 0) ? out.p[0] : ((q == 1) ? out.p[1] : out.p[2]);
+        float* dst = out_q + (size_t) t * N;
         for (int i = threadIdx.x; i < N; i += blockDim.x) {
             float acc = 0.0f;
             for (int d = 0; d < D; ++d) acc += w[d] * stack_norm[((size_t) t * D + d) * N + i];
@@ -849,12 +862,15 @@ __global__ void k_mix_normed(NormMixPtrs ptrs, int D, const float* __restrict__ 
                              int n_q, int N, float inv_sqrt_n, int swa_broadcast) {
     __shared__ float sh[32];
     __shared__ float w[16];
+    __shared__ NormMixPtrs s_ptrs;
+    if (threadIdx.x == 0) s_ptrs = ptrs;
+    __syncthreads();
     const int q = blockIdx.x, t = blockIdx.y;
     const float* qv = query + (size_t) q * N;
     const int n4 = N >> 2;
     const float4* q4 = (const float4*) qv;
     for (int d = 0; d < D; ++d) {
-        const float* sv = ptrs.p[d] + (size_t) t * N;
+        const float* sv = s_ptrs.p[d] + (size_t) t * N;
         float dot = 0.0f;
         if ((N & 3) == 0) {
             const float4* s4 = (const float4*) sv;
@@ -889,7 +905,7 @@ __global__ void k_mix_normed(NormMixPtrs ptrs, int D, const float* __restrict__ 
             for (int i = threadIdx.x; i < n4; i += blockDim.x) {
                 float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
                 for (int d = 0; d < D; ++d) {
-                    const float4 v = ((const float4*) (ptrs.p[d] + (size_t) t * N))[i];
+                    const float4 v = ((const float4*) (s_ptrs.p[d] + (size_t) t * N))[i];
                     const float wd = w[d];
                     ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
                 }
@@ -897,11 +913,12 @@ __global__ void k_mix_normed(NormMixPtrs ptrs, int D, const float* __restrict__ 
                 o0[i] = r; o1[i] = r; o2[i] = r;
             }
         } else {
-            float4* dst = (float4*) (out.p[q] + (size_t) t * N);
+            float* out_q = (q == 0) ? out.p[0] : ((q == 1) ? out.p[1] : out.p[2]);
+            float4* dst = (float4*) (out_q + (size_t) t * N);
             for (int i = threadIdx.x; i < n4; i += blockDim.x) {
                 float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
                 for (int d = 0; d < D; ++d) {
-                    const float4 v = ((const float4*) (ptrs.p[d] + (size_t) t * N))[i];
+                    const float4 v = ((const float4*) (s_ptrs.p[d] + (size_t) t * N))[i];
                     const float wd = w[d];
                     ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
                 }
@@ -913,16 +930,17 @@ __global__ void k_mix_normed(NormMixPtrs ptrs, int D, const float* __restrict__ 
     if (swa_broadcast) {
         for (int i = threadIdx.x; i < N; i += blockDim.x) {
             float acc = 0.0f;
-            for (int d = 0; d < D; ++d) acc += w[d] * ptrs.p[d][(size_t) t * N + i];
+            for (int d = 0; d < D; ++d) acc += w[d] * s_ptrs.p[d][(size_t) t * N + i];
             out.p[0][(size_t) t * N + i] = acc;
             out.p[1][(size_t) t * N + i] = acc;
             out.p[2][(size_t) t * N + i] = acc;
         }
     } else {
-        float* dst = out.p[q] + (size_t) t * N;
+        float* out_q = (q == 0) ? out.p[0] : ((q == 1) ? out.p[1] : out.p[2]);
+        float* dst = out_q + (size_t) t * N;
         for (int i = threadIdx.x; i < N; i += blockDim.x) {
             float acc = 0.0f;
-            for (int d = 0; d < D; ++d) acc += w[d] * ptrs.p[d][(size_t) t * N + i];
+            for (int d = 0; d < D; ++d) acc += w[d] * s_ptrs.p[d][(size_t) t * N + i];
             dst[i] = acc;
         }
     }
@@ -937,12 +955,15 @@ __global__ void k_mix_normed_4(NormMixPtrs ptrs, int D, const float* __restrict_
                                MixOuts4 out, int N, float inv_sqrt_n) {
     __shared__ float sh[32];
     __shared__ float w[16];
+    __shared__ NormMixPtrs s_ptrs;
+    if (threadIdx.x == 0) s_ptrs = ptrs;
+    __syncthreads();
     const int q = blockIdx.x, t = blockIdx.y;
     const float* qv = (q < 2 ? (q0 + (size_t) q * N) : (q1 + (size_t) (q - 2) * N));
     const int n4 = N >> 2;
     const float4* q4 = (const float4*) qv;
     for (int d = 0; d < D; ++d) {
-        const float* sv = ptrs.p[d] + (size_t) t * N;
+        const float* sv = s_ptrs.p[d] + (size_t) t * N;
         float dot = 0.0f;
         if ((N & 3) == 0) {
             const float4* s4 = (const float4*) sv;
@@ -969,12 +990,13 @@ __global__ void k_mix_normed_4(NormMixPtrs ptrs, int D, const float* __restrict_
         for (int d = 0; d < D; ++d) w[d] *= inv;
     }
     __syncthreads();
+    float* out_q = (q == 0) ? out.p[0] : ((q == 1) ? out.p[1] : ((q == 2) ? out.p[2] : out.p[3]));
     if ((N & 3) == 0) {
-        float4* dst = (float4*) (out.p[q] + (size_t) t * N);
+        float4* dst = (float4*) (out_q + (size_t) t * N);
         for (int i = threadIdx.x; i < n4; i += blockDim.x) {
             float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
             for (int d = 0; d < D; ++d) {
-                const float4 v = ((const float4*) (ptrs.p[d] + (size_t) t * N))[i];
+                const float4 v = ((const float4*) (s_ptrs.p[d] + (size_t) t * N))[i];
                 const float wd = w[d];
                 ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
             }
@@ -982,10 +1004,10 @@ __global__ void k_mix_normed_4(NormMixPtrs ptrs, int D, const float* __restrict_
         }
         return;
     }
-    float* dst = out.p[q] + (size_t) t * N;
+    float* dst = out_q + (size_t) t * N;
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
         float acc = 0.0f;
-        for (int d = 0; d < D; ++d) acc += w[d] * ptrs.p[d][(size_t) t * N + i];
+        for (int d = 0; d < D; ++d) acc += w[d] * s_ptrs.p[d][(size_t) t * N + i];
         dst[i] = acc;
     }
 }
@@ -997,8 +1019,11 @@ __global__ void k_mix_normed_fused(NormMixPtrs ptrs, int D, const float* __restr
                                    MixOuts4 out, int N, float inv_sqrt_n, int swa_broadcast) {
     __shared__ float s_dot[NQ][8][8];  // [q][d][warp]
     __shared__ float s_w[NQ][8];
+    __shared__ NormMixPtrs s_ptrs;
     const int t = blockIdx.x;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    if (tid == 0) s_ptrs = ptrs;
+    __syncthreads();
     const int n4 = N >> 2;
     const float4* qp[NQ];
 #pragma unroll
@@ -1010,7 +1035,7 @@ __global__ void k_mix_normed_fused(NormMixPtrs ptrs, int D, const float* __restr
         }
     }
     for (int d = 0; d < D; ++d) {
-        const float4* s4 = (const float4*) (ptrs.p[d] + (size_t) t * N);
+        const float4* s4 = (const float4*) (s_ptrs.p[d] + (size_t) t * N);
         float acc[NQ] = {};
         for (int i = tid; i < n4; i += 256) {
             const float4 v = s4[i];
@@ -1058,7 +1083,7 @@ __global__ void k_mix_normed_fused(NormMixPtrs ptrs, int D, const float* __restr
             for (int i = tid; i < n4; i += 256) {
                 float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
                 for (int d = 0; d < D; ++d) {
-                    const float4 v = ((const float4*) (ptrs.p[d] + (size_t) t * N))[i];
+                    const float4 v = ((const float4*) (s_ptrs.p[d] + (size_t) t * N))[i];
                     const float wd = s_w[0][d];
                     ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
                 }
@@ -1074,7 +1099,7 @@ __global__ void k_mix_normed_fused(NormMixPtrs ptrs, int D, const float* __restr
     for (int i = tid; i < n4; i += 256) {
         float ax[NQ] = {}, ay[NQ] = {}, az[NQ] = {}, aw[NQ] = {};
         for (int d = 0; d < D; ++d) {
-            const float4 v = ((const float4*) (ptrs.p[d] + (size_t) t * N))[i];
+            const float4 v = ((const float4*) (s_ptrs.p[d] + (size_t) t * N))[i];
 #pragma unroll
             for (int q = 0; q < NQ; ++q) {
                 const float wd = s_w[q][d];
@@ -6491,17 +6516,46 @@ __global__ void k_clip_and_tau(float* __restrict__ x, const float* __restrict__ 
     const int h = blockIdx.x, t = blockIdx.y;
     const int lane = threadIdx.x & 31;
     float* v = x + ((size_t) t * n_heads + h) * D;
-    float sq = 0.0f;
-    float vals[4];
-    const int iters = (D + 31) / 32;   // D = 128 -> 4, D = 16 -> 1
-    for (int k = 0; k < iters; ++k) {
-        const int i = k * 32 + lane;
-        float val = 0.0f;
-        if (i < D) {
-            val = v[i];
-            if (scale) val *= scale[(size_t) h * D + i];
+    if (D <= 128) {
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        const int i0 = lane;
+        if (i0 < D) {
+            v0 = v[i0];
+            if (scale) v0 *= scale[(size_t) h * D + i0];
         }
-        vals[k] = val;
+        float sq = v0 * v0;
+        if (D > 32) {
+            const int i1 = 32 + lane, i2 = 64 + lane, i3 = 96 + lane;
+            if (i1 < D) { v1 = v[i1]; if (scale) v1 *= scale[(size_t) h * D + i1]; }
+            sq += v1 * v1;
+            if (i2 < D) { v2 = v[i2]; if (scale) v2 *= scale[(size_t) h * D + i2]; }
+            sq += v2 * v2;
+            if (i3 < D) { v3 = v[i3]; if (scale) v3 *= scale[(size_t) h * D + i3]; }
+            sq += v3 * v3;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        const float norm = sqrtf(sq) + 1e-6f;
+        float factor = fminf(1.0f, thr / norm);
+        if (apply_tau) {
+            const int pos = pos0[0] + t;
+            const float ratio = fmaxf(1.0f, (float) (pos + 1) / (float) floor_n);
+            factor *= (1.0f + alpha * logf(ratio));
+        }
+        if (i0 < D) v[i0] = v0 * factor;
+        if (D > 32) {
+            const int i1 = 32 + lane, i2 = 64 + lane, i3 = 96 + lane;
+            if (i1 < D) v[i1] = v1 * factor;
+            if (i2 < D) v[i2] = v2 * factor;
+            if (i3 < D) v[i3] = v3 * factor;
+        }
+        return;
+    }
+    float sq = 0.0f;
+    for (int i = lane; i < D; i += 32) {
+        float val = v[i];
+        if (scale) val *= scale[(size_t) h * D + i];
+        v[i] = val;
         sq += val * val;
     }
 #pragma unroll
@@ -6513,10 +6567,7 @@ __global__ void k_clip_and_tau(float* __restrict__ x, const float* __restrict__ 
         const float ratio = fmaxf(1.0f, (float) (pos + 1) / (float) floor_n);
         factor *= (1.0f + alpha * logf(ratio));
     }
-    for (int k = 0; k < iters; ++k) {
-        const int i = k * 32 + lane;
-        if (i < D) v[i] = vals[k] * factor;
-    }
+    for (int i = lane; i < D; i += 32) v[i] *= factor;
 }
 
 /// Per-head RMSNorm on Vcur [T][n_heads_kv][head_dim] (no weight). grid (n_heads_kv, T), block 32.
