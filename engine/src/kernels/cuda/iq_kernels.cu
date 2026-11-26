@@ -5192,6 +5192,103 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
             const int d_rel  = (r_g * 4 + half * 2) - gq_off;
             const uint8_t* qp = (const uint8_t*) grp_ptr[g] +
                                 ((size_t) (r >> 6) * 36u + (size_t) (warp >> 1)) * 4608u + gq_off;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+            if constexpr (NC <= 2) {
+                int4 gq = __ldg(reinterpret_cast<const int4*>(qp));
+                uint16_t gd = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel));
+                int k = warp;
+#pragma unroll 1
+                for (int iter = 0; iter < 9; ++iter) {
+                    float dx_c[NC];
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) dx_c[c] = __half2float(smem.st.dx[c * 72 + k]);
+                    const int4 uq = __ldg(reinterpret_cast<const int4*>(qp + 1024));
+                    const uint16_t ud = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel + 256));
+                    {
+                        const uint32_t qw[4] = {(uint32_t) gq.x, (uint32_t) gq.y, (uint32_t) gq.z, (uint32_t) gq.w};
+                        const uint32_t gd_cur = (uint32_t) gd;
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const float sc = s_ue4m3[h == 0 ? (gd_cur & 0xFFu) : (gd_cur >> 8)];
+                            int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 0]);
+                            asm volatile("" : "+r"(v0.x), "+r"(v0.y));
+                            const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 1]);
+#pragma unroll
+                            for (int c = 0; c < NC; ++c) {
+                                const int4 xv = smem.st.xq[c * 72 + k][h];
+                                int s = ggml_cuda_dp4a(v0.x, xv.x, 0);
+                                s = ggml_cuda_dp4a(v0.y, xv.y, s);
+                                s = ggml_cuda_dp4a(v1.x, xv.z, s);
+                                s = ggml_cuda_dp4a(v1.y, xv.w, s);
+                                sg[c] += sc * dx_c[c] * (float) s;
+                                if constexpr (NC >= 2) asm volatile("" : "+f"(sg[c]));
+                            }
+                        }
+                    }
+                    {
+                        const uint32_t qw[4] = {(uint32_t) uq.x, (uint32_t) uq.y, (uint32_t) uq.z, (uint32_t) uq.w};
+                        const uint32_t ud_cur = (uint32_t) ud;
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const float sc = s_ue4m3[h == 0 ? (ud_cur & 0xFFu) : (ud_cur >> 8)];
+                            int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 0]);
+                            asm volatile("" : "+r"(v0.x), "+r"(v0.y));
+                            const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 1]);
+                            if (h == 1 && iter < 8) {
+                                gq = __ldg(reinterpret_cast<const int4*>(qp + 18432));
+                                gd = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel + 18432));
+                            }
+#pragma unroll
+                            for (int c = 0; c < NC; ++c) {
+                                const int4 xv = smem.st.xq[c * 72 + k][h];
+                                int s = ggml_cuda_dp4a(v0.x, xv.x, 0);
+                                s = ggml_cuda_dp4a(v0.y, xv.y, s);
+                                s = ggml_cuda_dp4a(v1.x, xv.z, s);
+                                s = ggml_cuda_dp4a(v1.y, xv.w, s);
+                                su[c] += sc * dx_c[c] * (float) s;
+                                if constexpr (NC >= 2) asm volatile("" : "+f"(su[c]));
+                            }
+                        }
+                    }
+                    qp += 18432;
+                    k += 8;
+                }
+            } else {
+                auto apply_mat = [&](const int4& q, uint16_t d16, int k, float (&acc)[NC]) {
+                    const uint32_t qw[4] = {(uint32_t) q.x, (uint32_t) q.y, (uint32_t) q.z, (uint32_t) q.w};
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const float sc = s_ue4m3[h == 0 ? (d16 & 0xFFu) : (d16 >> 8)];
+                        int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 0]);
+                        asm volatile("" : "+r"(v0.x), "+r"(v0.y));
+                        const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 1]);
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            const int idx = c * 72 + k;
+                            const int4 xv = smem.st.xq[idx][h];
+                            int s = ggml_cuda_dp4a(v0.x, xv.x, 0);
+                            s = ggml_cuda_dp4a(v0.y, xv.y, s);
+                            s = ggml_cuda_dp4a(v1.x, xv.z, s);
+                            s = ggml_cuda_dp4a(v1.y, xv.w, s);
+                            acc[c] += sc * __half2float(smem.st.dx[idx]) * (float) s;
+                            asm volatile("" : "+f"(acc[c]));
+                        }
+                    }
+                };
+                int k = warp;
+#pragma unroll 1
+                for (int iter = 0; iter < 9; ++iter) {
+                    const int4 gq = __ldg(reinterpret_cast<const int4*>(qp));
+                    const uint16_t gd = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel));
+                    apply_mat(gq, gd, k, sg);
+                    const int4 uq = __ldg(reinterpret_cast<const int4*>(qp + 1024));
+                    const uint16_t ud = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel + 256));
+                    apply_mat(uq, ud, k, su);
+                    qp += 18432;
+                    k += 8;
+                }
+            }
+#else
             auto apply_mat = [&](const int4& q, uint16_t d16, int k, float (&acc)[NC]) {
                 const uint32_t qw[4] = {(uint32_t) q.x, (uint32_t) q.y, (uint32_t) q.z, (uint32_t) q.w};
 #pragma unroll
@@ -5232,6 +5329,7 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
                 qp += 18432;
                 k += 8;
             }
+#endif
             iq_sync_lds();
 #pragma unroll
             for (int c = 0; c < NC; ++c) {
@@ -5249,7 +5347,11 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
                 need_sync = true;
                 const int n_blks = n * 72;
                 for (int b = threadIdx.x; b < n_blks; b += 256) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+                    const int ci = (b < 72) ? 0 : (b < 144) ? 1 : (b < 216) ? 2 : 3;
+#else
                     const int ci = b / 72;
+#endif
                     const int j  = b - ci * 72;
                     iq_stage_q8_1_interleaved(xq + (size_t) ent_tok[e + ci] * 72 + j, smem.st.dx[b], smem.st.xq[b]);
                 }
@@ -5400,6 +5502,55 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
                     const float dx = s_dx[k];
                     const int4 xv0 = s_xq[k][0];
                     const int4 xv1 = s_xq[k][1];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+                    const float g_sc0 = s_ue4m3[gd & 0xFFu];
+                    const float g_sc1 = s_ue4m3[gd >> 8];
+                    {
+                        int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.x);
+                        asm volatile("" : "+r"(v0.x), "+r"(v0.y));
+                        const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.y);
+                        int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
+                        s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
+                        s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
+                        s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
+                        int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.z);
+                        asm volatile("" : "+r"(v2.x), "+r"(v2.y));
+                        const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.w);
+                        int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
+                        s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
+                        s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
+                        s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
+                        float p = g_sc0 * dx * (float) s0;
+                        p += g_sc1 * dx * (float) s1;
+                        sg += p;
+                    }
+                    if (iter < 8) {
+                        const uint8_t* kt_n = kt + 18432u;
+                        gq = __ldg(reinterpret_cast<const int4*>(kt_n + gq_off));
+                        gd = __ldg(reinterpret_cast<const uint16_t*>(kt_n + gd_off));
+                    }
+                    {
+                        const float u_sc0 = s_ue4m3[ud & 0xFFu];
+                        const float u_sc1 = s_ue4m3[ud >> 8];
+                        int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.x);
+                        asm volatile("" : "+r"(v0.x), "+r"(v0.y));
+                        const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.y);
+                        int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
+                        s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
+                        s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
+                        s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
+                        int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.z);
+                        asm volatile("" : "+r"(v2.x), "+r"(v2.y));
+                        const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.w);
+                        int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
+                        s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
+                        s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
+                        s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
+                        float p = u_sc0 * dx * (float) s0;
+                        p += u_sc1 * dx * (float) s1;
+                        su += p;
+                    }
+#else
                     {
                         int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.x);
                         asm volatile("" : "+r"(v0.x), "+r"(v0.y));
@@ -5443,6 +5594,7 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
                         p += s_ue4m3[ud >> 8] * dx * (float) s1;
                         su += p;
                     }
+#endif
                     kt += 18432u;
                     k += 8;
                 }
