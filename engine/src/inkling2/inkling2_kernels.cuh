@@ -17221,7 +17221,7 @@ __global__ void k_route_and_group_smallT(const float* __restrict__ logits, const
 }
 
 /// Fused k_combine_experts + k_shortconv (post-FFN, full-VRAM small-T): eliminates moe_raw HBM roundtrip & 1 launch/layer!
-__global__ void k_combine_experts_shortconv(const float* __restrict__ eparts, const float* __restrict__ ewts,
+__global__ void __launch_bounds__(32, 16) k_combine_experts_shortconv(const float* __restrict__ eparts, const float* __restrict__ ewts,
                                             const float* __restrict__ w_conv, float* __restrict__ hist,
                                             const float* __restrict__ res_add, float* __restrict__ out,
                                             int N, int top_k, int hist_offset, int T,
@@ -17230,19 +17230,71 @@ __global__ void k_combine_experts_shortconv(const float* __restrict__ eparts, co
     if (c >= N) return;
     float* hc = hist + (size_t) (hist_offset + c) * 3;
     float h0 = hc[0], h1 = hc[1], h2 = hc[2];
-    const float4 w4 = *reinterpret_cast<const float4*>(w_conv + (size_t) c * 4);
+    const float4 w4 = __ldg(reinterpret_cast<const float4*>(w_conv + (size_t) c * 4));
     const float scale = rsqrtf(5.0f);
     for (int t = 0; t < T; ++t) {
         const size_t base = (size_t) t * top_k;
         float x = 0.0f;
-        for (int k = 0; k < top_k; ++k) x += ewts[base + k] * eparts[(base + k) * N + c];
+        for (int k = 0; k < top_k; ++k) x += __ldg(&ewts[base + k]) * __ldg(&eparts[(base + k) * N + c]);
         const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
         const size_t idx = (size_t) t * N + c;
         float y = (x + s) * scale;
-        if (res_add) y += res_add[idx];
+        if (res_add) y += __ldg(&res_add[idx]);
         out[idx] = y;
         h0 = h1; h1 = h2; h2 = x;
         if (hist_trace) {
+            float* ht = hist_trace + (size_t) t * hist_trace_stride + (size_t) (hist_offset + c) * 3;
+            ht[0] = h0; ht[1] = h1; ht[2] = h2;
+        }
+    }
+    hc[0] = h0; hc[1] = h1; hc[2] = h2;
+}
+
+/// Specialized compile-time top_k=8 fused combine_experts + shortconv: 2x LDG.128 ewts + 8x back-to-back __ldg eparts (8x MLP!),
+/// eliminates runtime top_k loop & dead top_k==0/hist_trace branches, 100% bit-exact FP32 accum, STACK:0.
+template <bool HAS_TRACE, bool SINGLE_T>
+__global__ void __launch_bounds__(32, 16) k_combine_experts_shortconv_k8(
+        const float* __restrict__ eparts, const float* __restrict__ ewts,
+        const float* __restrict__ w_conv, float* __restrict__ hist,
+        const float* __restrict__ res_add, float* __restrict__ out,
+        int N, int hist_offset, int T,
+        float* __restrict__ hist_trace = nullptr, size_t hist_trace_stride = 0) {
+    const int c = (int) blockIdx.x * 32 + (int) threadIdx.x;
+    if (c >= N) return;
+    float* hc = hist + (size_t) (hist_offset + c) * 3;
+    float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+    const float4 w4 = __ldg(reinterpret_cast<const float4*>(w_conv + (size_t) c * 4));
+    const float scale = rsqrtf(5.0f);
+    const size_t n_sz = (size_t) N;
+    const int n_tok = SINGLE_T ? 1 : T;
+    for (int t = 0; t < n_tok; ++t) {
+        const size_t base = (size_t) t * 8u;
+        const float4 e0 = __ldg(reinterpret_cast<const float4*>(ewts + base));
+        const float4 e1 = __ldg(reinterpret_cast<const float4*>(ewts + base + 4));
+        const float* ep = eparts + base * n_sz + (size_t) c;
+        const float p0 = __ldg(ep + 0u * n_sz);
+        const float p1 = __ldg(ep + 1u * n_sz);
+        const float p2 = __ldg(ep + 2u * n_sz);
+        const float p3 = __ldg(ep + 3u * n_sz);
+        const float p4 = __ldg(ep + 4u * n_sz);
+        const float p5 = __ldg(ep + 5u * n_sz);
+        const float p6 = __ldg(ep + 6u * n_sz);
+        const float p7 = __ldg(ep + 7u * n_sz);
+        float x = e0.x * p0;
+        x = fmaf(e0.y, p1, x);
+        x = fmaf(e0.z, p2, x);
+        x = fmaf(e0.w, p3, x);
+        x = fmaf(e1.x, p4, x);
+        x = fmaf(e1.y, p5, x);
+        x = fmaf(e1.z, p6, x);
+        x = fmaf(e1.w, p7, x);
+        const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+        const size_t idx = (size_t) t * n_sz + (size_t) c;
+        float y = (x + s) * scale;
+        if (res_add) y += __ldg(&res_add[idx]);
+        out[idx] = y;
+        h0 = h1; h1 = h2; h2 = x;
+        if constexpr (HAS_TRACE) {
             float* ht = hist_trace + (size_t) t * hist_trace_stride + (size_t) (hist_offset + c) * 3;
             ht[0] = h0; ht[1] = h1; ht[2] = h2;
         }

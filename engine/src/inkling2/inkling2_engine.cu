@@ -4529,9 +4529,32 @@ struct Engine {
             return false;
         }
         if (post_conv && post_conv->w_conv && T <= std::max(verify_max_t, 8)) {
-            k_combine_experts_shortconv<<<(unsigned) ((N + 31) / 32), 32, 0, st>>>(
-                eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
-                N, Kp, post_conv->hist_offset, T, post_conv->hist_trace, post_conv->hist_trace_stride);
+            const unsigned nb = (unsigned) ((N + 31) / 32);
+            if (Kp == 8 && ((((uintptr_t) ewts) & 15u) == 0u)) {
+                if (T == 1) {
+                    if (post_conv->hist_trace) {
+                        k_combine_experts_shortconv_k8<true, true><<<nb, 32, 0, st>>>(
+                            eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
+                            N, post_conv->hist_offset, 1, post_conv->hist_trace, post_conv->hist_trace_stride);
+                    } else {
+                        k_combine_experts_shortconv_k8<false, true><<<nb, 32, 0, st>>>(
+                            eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
+                            N, post_conv->hist_offset, 1, nullptr, 0);
+                    }
+                } else if (post_conv->hist_trace) {
+                    k_combine_experts_shortconv_k8<true, false><<<nb, 32, 0, st>>>(
+                        eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
+                        N, post_conv->hist_offset, T, post_conv->hist_trace, post_conv->hist_trace_stride);
+                } else {
+                    k_combine_experts_shortconv_k8<false, false><<<nb, 32, 0, st>>>(
+                        eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
+                        N, post_conv->hist_offset, T, nullptr, 0);
+                }
+            } else {
+                k_combine_experts_shortconv<<<nb, 32, 0, st>>>(
+                    eparts, ewts, post_conv->w_conv, post_conv->hist, post_conv->res_add, post_conv->out,
+                    N, Kp, post_conv->hist_offset, T, post_conv->hist_trace, post_conv->hist_trace_stride);
+            }
             if (prof && need_cpu) { CK(cudaStreamSynchronize(st)); p_moe_post_ms += ms_since(tp_p0); }
             return true;
         }
@@ -8870,9 +8893,29 @@ struct Engine {
             } else if (can_defer_postffn) {
                 deferred_postffn = DeferredPostFfn{true, il, L.ffn_post_conv, hst, 2 * (int) kv_dim + N};
             } else if (fuse_comb_conv) {
-                k_combine_experts_shortconv<<<(unsigned) ((N + 31) / 32), 32, 0, st>>>(
-                    eparts, ewts, L.ffn_post_conv, hst, ffn_inp, cur, N, (int) hp.n_expert_used,
-                    2 * (int) kv_dim + N, T, h_tr, total_conv_floats);
+                const unsigned nb = (unsigned) ((N + 31) / 32);
+                const int ho = 2 * (int) kv_dim + N;
+                if ((int) hp.n_expert_used == 8 && ((((uintptr_t) ewts) & 15u) == 0u)) {
+                    if (T == 1) {
+                        if (h_tr) {
+                            k_combine_experts_shortconv_k8<true, true><<<nb, 32, 0, st>>>(
+                                eparts, ewts, L.ffn_post_conv, hst, ffn_inp, cur, N, ho, 1, h_tr, total_conv_floats);
+                        } else {
+                            k_combine_experts_shortconv_k8<false, true><<<nb, 32, 0, st>>>(
+                                eparts, ewts, L.ffn_post_conv, hst, ffn_inp, cur, N, ho, 1, nullptr, 0);
+                        }
+                    } else if (h_tr) {
+                        k_combine_experts_shortconv_k8<true, false><<<nb, 32, 0, st>>>(
+                            eparts, ewts, L.ffn_post_conv, hst, ffn_inp, cur, N, ho, T, h_tr, total_conv_floats);
+                    } else {
+                        k_combine_experts_shortconv_k8<false, false><<<nb, 32, 0, st>>>(
+                            eparts, ewts, L.ffn_post_conv, hst, ffn_inp, cur, N, ho, T, nullptr, 0);
+                    }
+                } else {
+                    k_combine_experts_shortconv<<<nb, 32, 0, st>>>(
+                        eparts, ewts, L.ffn_post_conv, hst, ffn_inp, cur, N, (int) hp.n_expert_used,
+                        ho, T, h_tr, total_conv_floats);
+                }
             } else if (T >= 32 && !save_conv_trace) {
                 k_shortconv_pp<<<dim3((unsigned) ((N + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
                     moe_raw, L.ffn_post_conv, hst, cur, N, 2 * (int) kv_dim + N, T, ffn_inp);
