@@ -3511,13 +3511,13 @@ struct Engine {
             const float* wd = (const float*) L.loop_down[mod].d;
             const int R = (int) hp.loop_gate_rank;
             if (T == 4) {
-                k_loop_down_fused_smallT<4, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 4, hp.rms_eps);
+                k_loop_down_fused_smallT<4, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 4, hp.rms_eps);
             } else if (T == 1) {
-                k_loop_down_fused_smallT<1, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 1, hp.rms_eps);
+                k_loop_down_fused_smallT<1, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 1, hp.rms_eps);
             } else if (T == 2) {
-                k_loop_down_fused_smallT<2, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 2, hp.rms_eps);
+                k_loop_down_fused_smallT<2, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 2, hp.rms_eps);
             } else if (T == 3) {
-                k_loop_down_fused_smallT<3, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 3, hp.rms_eps);
+                k_loop_down_fused_smallT<3, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 3, hp.rms_eps);
             } else if (T == 5) {
                 k_loop_down_fused_smallT<5, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 5, hp.rms_eps);
             } else if (T == 6) {
@@ -3535,13 +3535,13 @@ struct Engine {
         }
         if (hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
             if (T == 1) {
-                k_control_up_combine_t1<<<(unsigned) ((N + 7) / 8), 128, 0, st>>>(
+                k_control_up_combine_t1<<<(unsigned) ((N + 15) / 16), 128, 0, st>>>(
                     c, msg, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d,
                     ctrl64, out, (int) hp.loop_gate_rank, N);
                 return;
             }
             if (T >= 2 && T <= 8) {
-                const unsigned nb = (unsigned) ((N + 15) / 16);
+                const unsigned nb = (unsigned) ((N + 31) / 32);
                 const float* wg = (const float*) L.loop_gain[mod].d;
                 const float* wf = (const float*) L.loop_forget[mod].d;
                 if (T == 4) {
@@ -4006,7 +4006,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(h_h, x_norm, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
             if (can_fused_router_t1) {
-                k_router_gemv_and_group_t1<<<(unsigned) ((hp.n_expert + 1) / 2), 128, 0, st>>>(
+                k_router_gemv_and_group_t1<<<(unsigned) ((hp.n_expert + 1) / 2), 192, 0, st>>>(
                     L.ffn_gate_inp, x_norm, router_logits, L.exp_probs_b, ids, ewts,
                     has_gpu ? L.d_slot_of : nullptr, has_gpu ? L.d_blobs : nullptr, L.stride,
                     N, (int) hp.n_expert, Kp, hp.expert_weights_scale,
@@ -7355,23 +7355,23 @@ struct Engine {
                                             L.loop_forget[0].type == 0 && L.loop_forget[1].type == 0 && L.loop_forget[2].type == 0);
                     if (can_ctrl3) {
                         CtrlPtrs3 cp{(const float*) L.loop_down[0].d, (const float*) L.loop_down[1].d, (const float*) L.loop_down[2].d,
-                                     in_q, in_k, in_v, msg0, msg1, msg2};
+                                     in_q, is_swa ? in_q : in_k, is_swa ? in_q : in_v, msg0, msg1, msg2};
                         CtrlUpPtrs3 up{(const float*) L.loop_gain[0].d, (const float*) L.loop_gain[1].d, (const float*) L.loop_gain[2].d,
                                        (const float*) L.loop_forget[0].d, (const float*) L.loop_forget[1].d, (const float*) L.loop_forget[2].d,
                                        in_q, in_k, in_v, msg0, msg1, msg2, in_q, in_k, in_v};
-                        const unsigned nb = (unsigned) ((N + 15) / 16);
+                        const unsigned nb = (unsigned) ((N + 31) / 32);
                         // Reuse ctrl2N (size T*2*N floats >> 3*T*64 floats) for batched 3-module ctrl64 (0 extra VRAM).
                         if (T == 1) {
-                            k_loop_down_fused_smallT_3<1, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 1, hp.rms_eps);
+                            k_loop_down_fused_smallT_3<1, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 1, hp.rms_eps);
                             k_control_up_combine_smallT_3<1, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 1, N);
                         } else if (T == 4) {
-                            k_loop_down_fused_smallT_3<4, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 4, hp.rms_eps);
+                            k_loop_down_fused_smallT_3<4, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 4, hp.rms_eps);
                             k_control_up_combine_smallT_3<4, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 4, N);
                         } else if (T == 2) {
-                            k_loop_down_fused_smallT_3<2, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 2, hp.rms_eps);
+                            k_loop_down_fused_smallT_3<2, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 2, hp.rms_eps);
                             k_control_up_combine_smallT_3<2, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 2, N);
                         } else if (T == 3) {
-                            k_loop_down_fused_smallT_3<3, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 3, hp.rms_eps);
+                            k_loop_down_fused_smallT_3<3, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 3, hp.rms_eps);
                             k_control_up_combine_smallT_3<3, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 3, N);
                         } else if (T == 5) {
                             k_loop_down_fused_smallT_3<5, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 5, hp.rms_eps);
@@ -8699,7 +8699,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(h_h, in_ffn, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
                 if (T == 1 && hp.n_expert <= 128 && Kp <= 16 && (N & 3) == 0 && d_router_done != nullptr) {
                     const bool has_g = L.n_slots > 0;
-                    k_router_gemv_and_group_t1<<<(unsigned) ((hp.n_expert + 1) / 2), 128, 0, st>>>(
+                    k_router_gemv_and_group_t1<<<(unsigned) ((hp.n_expert + 1) / 2), 192, 0, st>>>(
                         L.ffn_gate_inp, in_ffn, router_logits, L.exp_probs_b, ids, ewts,
                         has_g ? L.d_slot_of : nullptr, has_g ? L.d_blobs : nullptr, L.stride,
                         N, (int) hp.n_expert, Kp, hp.expert_weights_scale,
