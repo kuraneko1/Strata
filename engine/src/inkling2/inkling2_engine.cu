@@ -1545,8 +1545,12 @@ struct Engine {
         const int swa_len = std::min<int>(cur_pos, (int) hp.n_swa);
         const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
         size_t total = conv_bytes;
+        int n_swa_l = 0;
+        bool all_swa_same_cap = (swa_len > 0 && swa_kv_pool != nullptr && swa_kv_pool_bytes > 0 && swa_kv_cap > 0);
         for (int il = 0; il < hp.n_layer; ++il) {
             if (!hp.is_swa(il)) continue;
+            ++n_swa_l;
+            if (kv_cap[(size_t) il] != swa_kv_cap) all_swa_same_cap = false;
             const size_t n = (size_t) swa_len;
             if (kv_q8) total += n * (size_t) hp.kv_dim * 2 + n * (size_t) hp.n_head_kv * sizeof(__half) * 2;
             else total += n * (size_t) hp.kv_dim * sizeof(__half) * 2;
@@ -1558,7 +1562,8 @@ struct Engine {
         cp.data_bytes = total;
         const size_t ds_bytes = dspark ? dspark->checkpoint_bytes() : 0;
         cp.dspark_bytes = ds_bytes;
-        const size_t stage_bytes = total + ds_bytes;
+        const size_t stage_swa_bytes = all_swa_same_cap ? swa_kv_pool_bytes : (total - conv_bytes);
+        const size_t stage_bytes = conv_bytes + stage_swa_bytes + ds_bytes;
         if (stage_bytes > ckpt_pin_cap) {
             if (ckpt_pin) { cudaFreeHost(ckpt_pin); ckpt_pin = nullptr; ckpt_pin_cap = 0; }
             if (cudaMallocHost(&ckpt_pin, stage_bytes) == cudaSuccess) ckpt_pin_cap = stage_bytes;
@@ -1568,6 +1573,7 @@ struct Engine {
             cp.data.reset(new uint8_t[total]);
             if (dspark && ds_bytes > 0) cp.dspark_data.reset(new uint8_t[ds_bytes]);
         }
+        const bool use_bulk_swa = (ckpt_pin != nullptr && all_swa_same_cap);
         uint8_t* dst_base = ckpt_pin ? ckpt_pin : cp.data.get();
         size_t off = 0;
         auto pull = [&](const void* src, size_t n) {
@@ -1576,7 +1582,11 @@ struct Engine {
             off += n;
         };
         pull(conv_hist_pool, conv_bytes);
-        if (swa_len > 0) {
+        if (use_bulk_swa) {
+            // Single contiguous swa_kv_pool D2H (replaces 320 per-layer/per-half D2H copies -> 160x fewer D2H launches!);
+            // background CPU thread unwraps the ring into identical StateCheckpoint layout while GPU resumes decoding.
+            pull(swa_kv_pool, swa_kv_pool_bytes);
+        } else if (swa_len > 0) {
             for (int il = 0; il < hp.n_layer; ++il) {
                 if (!hp.is_swa(il)) continue;
                 const int cap = kv_cap[(size_t) il];
@@ -1603,19 +1613,65 @@ struct Engine {
                 }
             }
         }
+        const size_t ds_pin_off = off;
         if (dspark) {
-            dspark->save_checkpoint(ckpt_pin ? (ckpt_pin + total) : cp.dspark_data.get(), st);
+            dspark->save_checkpoint(ckpt_pin ? (ckpt_pin + ds_pin_off) : cp.dspark_data.get(), st);
         }
         CK(cudaStreamSynchronize(st));
         if (ckpt_pin) {
             const uint8_t* pin = ckpt_pin;
             const bool has_ds = (dspark != nullptr && ds_bytes > 0);
-            ckpt_bg_thread = std::thread([&cp, pin, total, ds_bytes, has_ds]() {
+            const int cap_bg = swa_kv_cap;
+            const bool kv_q8_bg = kv_q8;
+            const size_t kv_dim_bg = (size_t) hp.kv_dim;
+            const size_t n_hkv_bg = (size_t) hp.n_head_kv;
+            ckpt_bg_thread = std::thread([&cp, pin, total, conv_bytes, ds_pin_off, ds_bytes, has_ds,
+                                          use_bulk_swa, n_swa_l, cur_pos, swa_len, cap_bg, kv_q8_bg, kv_dim_bg, n_hkv_bg]() {
                 cp.data.reset(new uint8_t[total]);
-                std::memcpy(cp.data.get(), pin, total);
+                if (!use_bulk_swa) {
+                    std::memcpy(cp.data.get(), pin, total);
+                } else {
+                    std::memcpy(cp.data.get(), pin, conv_bytes);
+                    auto a256 = [](size_t n) -> size_t { return (n + 255u) & ~size_t(255u); };
+                    const int start = (cur_pos - swa_len) % cap_bg;
+                    const int n1 = std::min(swa_len, cap_bg - start);
+                    const int n2 = swa_len - n1;
+                    const uint8_t* src_pool = pin + conv_bytes;
+                    uint8_t* dst = cp.data.get() + conv_bytes;
+                    size_t s_off = 0, d_off = 0;
+                    auto copy_ring = [&](const uint8_t* base, size_t row_b) {
+                        const size_t b1 = (size_t) n1 * row_b;
+                        std::memcpy(dst + d_off, base + (size_t) start * row_b, b1);
+                        d_off += b1;
+                        if (n2 > 0) {
+                            const size_t b2 = (size_t) n2 * row_b;
+                            std::memcpy(dst + d_off, base, b2);
+                            d_off += b2;
+                        }
+                    };
+                    if (kv_q8_bg) {
+                        const size_t q_bytes = a256((size_t) cap_bg * kv_dim_bg * sizeof(int8_t));
+                        const size_t s_bytes = a256((size_t) cap_bg * n_hkv_bg * sizeof(__half));
+                        const size_t row_q = kv_dim_bg;
+                        const size_t row_s = n_hkv_bg * sizeof(__half);
+                        for (int si = 0; si < n_swa_l; ++si) {
+                            copy_ring(src_pool + s_off, row_q); s_off += q_bytes;
+                            copy_ring(src_pool + s_off, row_q); s_off += q_bytes;
+                            copy_ring(src_pool + s_off, row_s); s_off += s_bytes;
+                            copy_ring(src_pool + s_off, row_s); s_off += s_bytes;
+                        }
+                    } else {
+                        const size_t h_bytes = a256((size_t) cap_bg * kv_dim_bg * sizeof(__half));
+                        const size_t row_h = kv_dim_bg * sizeof(__half);
+                        for (int si = 0; si < n_swa_l; ++si) {
+                            copy_ring(src_pool + s_off, row_h); s_off += h_bytes;
+                            copy_ring(src_pool + s_off, row_h); s_off += h_bytes;
+                        }
+                    }
+                }
                 if (has_ds) {
                     cp.dspark_data.reset(new uint8_t[ds_bytes]);
-                    std::memcpy(cp.dspark_data.get(), pin + total, ds_bytes);
+                    std::memcpy(cp.dspark_data.get(), pin + ds_pin_off, ds_bytes);
                 }
             });
         }
@@ -6556,9 +6612,11 @@ struct Engine {
             }
             uint16_t& fg_hits = full_decode_graph_hits[T][capture_dspark ? 1 : 0][want_softcap ? 1 : 0][want_argmax ? 1 : 0][fg_sp_b];
             if (fg_hits < 65535u) ++fg_hits;
-            // Defer 700-node cudaGraphInstantiate to hit #2 for 1-off rare verify sizes (T>=5 or capture_dspark T==1)
-            // so rare extension steps skip ~6 ms graph instantiation overhead!
-            const bool want_capture_fg = (T == 1 && !capture_dspark) || (T >= 2 && T <= 4) || (fg_hits >= 2);
+            // Break-even 700-node cudaGraphInstantiate policy: capture primary hot sizes (T=1 OFF, T=4 base_k=3) on hit #1,
+            // common verify sizes (T=2,3,7) on hit #2, and rare intermediate sizes (T=5,6,8,9 or T=1 dspark) on hit #3+!
+            const bool want_capture_fg = (T == 1 && !capture_dspark) || (T == 4) ||
+                                         ((T == 2 || T == 3 || T == 7) && fg_hits >= 2) ||
+                                         (fg_hits >= 3);
             if (want_capture_fg) {
                 if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
                     capturing_full_graph = true;
