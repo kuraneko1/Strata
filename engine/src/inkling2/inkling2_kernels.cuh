@@ -9072,7 +9072,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
         int ld_sink = 0, int swa_hm_base = 0) {
 #if defined(__CUDA_ARCH__) && ((__CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750) || __CUDA_ARCH__ >= 800)
 #if __CUDA_ARCH__ < 750
-    constexpr int STRIDE = 144;  // 73,728 B <= 96 KB on Volta sm_70 (sQ + sKV)
+    constexpr int STRIDE = 144;  // 94,208 B <= 96 KB on Volta sm_70 (sQ + sKV + s_rb + sR)
 #else
     constexpr int STRIDE = 128;  // 97,024 B <= 97,280 B on Ampere/Ada sm_80+ (XOR-swizzled sQ + sK + sV + s_rb_hi + s_rb_lo + sR_hi + s_rl)
     constexpr bool kRelOzaki = true;
@@ -9080,7 +9080,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
     extern __shared__ __align__(16) char smem_raw[];
     __half* sQ = reinterpret_cast<__half*>(smem_raw);
 #if __CUDA_ARCH__ < 750
-    __half* sKV = sQ + 192 * STRIDE;
+    __half* sKV = sQ + 192 * STRIDE;                          // +55,296 B (18,432 B: 64x144 FP16); s_rb (+73,728 B), sR (+81,920 B -> 94,208 B)
 #else
     __half* sK            = sQ + 192 * STRIDE;                         // +49,152 B (16,384 B: 8 per-warp 2KB slices for K)
     __half* sV            = sK + 64 * STRIDE;                          // +65,536 B (16,384 B: 8 per-warp 2KB slices for V; temp sR_lo in Prologue)
@@ -9164,28 +9164,41 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
             float* s_ml = reinterpret_cast<float*>(sQ + qr * STRIDE + 128);
             s_ml[0] = 0.0f;
             s_ml[1] = 1.0f;
+            s_ml[2] = (t < T) ? (-__ldg(&sink[(size_t) t * sink_stride + h]) * kLog2e) : 0.0f;
         }
     }
-    if (r_scale != nullptr && R_ptr != nullptr && tid < 192) {
+    if (R_ptr != nullptr && tid < 192) {
         const int g = tid >> 6, r = tid & 63, t = t0 + r, h = 3 * hkv + g;
+        float* sR_loc = reinterpret_cast<float*>(sKV + 64 * STRIDE) + 128 * 16;
+        float4* dst_r = reinterpret_cast<float4*>(sR_loc + tid * 16);
         if (t < T) {
-            float4* rp = reinterpret_cast<float4*>(R_ptr + (size_t) t * r_stride + (size_t) h * 16);
-            const float4* rsp = reinterpret_cast<const float4*>(r_scale + (size_t) h * 16);
+            const float4* rp = reinterpret_cast<const float4*>(R_ptr + (size_t) t * r_stride + (size_t) h * 16);
             float4 r0 = rp[0], r1 = rp[1], r2 = rp[2], r3 = rp[3];
-            const float4 s0 = __ldg(rsp + 0), s1 = __ldg(rsp + 1), s2 = __ldg(rsp + 2), s3 = __ldg(rsp + 3);
-            r0.x *= s0.x; r0.y *= s0.y; r0.z *= s0.z; r0.w *= s0.w;
-            r1.x *= s1.x; r1.y *= s1.y; r1.z *= s1.z; r1.w *= s1.w;
-            r2.x *= s2.x; r2.y *= s2.y; r2.z *= s2.z; r2.w *= s2.w;
-            r3.x *= s3.x; r3.y *= s3.y; r3.z *= s3.z; r3.w *= s3.w;
-            const float rsq = (r0.x * r0.x + r0.y * r0.y + r0.z * r0.z + r0.w * r0.w)
-                            + (r1.x * r1.x + r1.y * r1.y + r1.z * r1.z + r1.w * r1.w)
-                            + (r2.x * r2.x + r2.y * r2.y + r2.z * r2.z + r2.w * r2.w)
-                            + (r3.x * r3.x + r3.y * r3.y + r3.z * r3.z + r3.w * r3.w);
-            const float rfac = fminf(1.0f, rel_clip / (sqrtf(rsq) + 1e-6f)) * compute_tau_r(r) * kLog2e;
-            rp[0] = make_float4(r0.x * rfac, r0.y * rfac, r0.z * rfac, r0.w * rfac);
-            rp[1] = make_float4(r1.x * rfac, r1.y * rfac, r1.z * rfac, r1.w * rfac);
-            rp[2] = make_float4(r2.x * rfac, r2.y * rfac, r2.z * rfac, r2.w * rfac);
-            rp[3] = make_float4(r3.x * rfac, r3.y * rfac, r3.z * rfac, r3.w * rfac);
+            if (r_scale != nullptr) {
+                const float4* rsp = reinterpret_cast<const float4*>(r_scale + (size_t) h * 16);
+                const float4 s0 = __ldg(rsp + 0), s1 = __ldg(rsp + 1), s2 = __ldg(rsp + 2), s3 = __ldg(rsp + 3);
+                r0.x *= s0.x; r0.y *= s0.y; r0.z *= s0.z; r0.w *= s0.w;
+                r1.x *= s1.x; r1.y *= s1.y; r1.z *= s1.z; r1.w *= s1.w;
+                r2.x *= s2.x; r2.y *= s2.y; r2.z *= s2.z; r2.w *= s2.w;
+                r3.x *= s3.x; r3.y *= s3.y; r3.z *= s3.z; r3.w *= s3.w;
+                const float rsq = (r0.x * r0.x + r0.y * r0.y + r0.z * r0.z + r0.w * r0.w)
+                                + (r1.x * r1.x + r1.y * r1.y + r1.z * r1.z + r1.w * r1.w)
+                                + (r2.x * r2.x + r2.y * r2.y + r2.z * r2.z + r2.w * r2.w)
+                                + (r3.x * r3.x + r3.y * r3.y + r3.z * r3.z + r3.w * r3.w);
+                const float rfac = fminf(1.0f, rel_clip / (sqrtf(rsq) + 1e-6f)) * compute_tau_r(r) * kLog2e;
+                dst_r[0] = make_float4(r0.x * rfac, r0.y * rfac, r0.z * rfac, r0.w * rfac);
+                dst_r[1] = make_float4(r1.x * rfac, r1.y * rfac, r1.z * rfac, r1.w * rfac);
+                dst_r[2] = make_float4(r2.x * rfac, r2.y * rfac, r2.z * rfac, r2.w * rfac);
+                dst_r[3] = make_float4(r3.x * rfac, r3.y * rfac, r3.z * rfac, r3.w * rfac);
+            } else {
+                dst_r[0] = make_float4(r0.x * kLog2e, r0.y * kLog2e, r0.z * kLog2e, r0.w * kLog2e);
+                dst_r[1] = make_float4(r1.x * kLog2e, r1.y * kLog2e, r1.z * kLog2e, r1.w * kLog2e);
+                dst_r[2] = make_float4(r2.x * kLog2e, r2.y * kLog2e, r2.z * kLog2e, r2.w * kLog2e);
+                dst_r[3] = make_float4(r3.x * kLog2e, r3.y * kLog2e, r3.z * kLog2e, r3.w * kLog2e);
+            }
+        } else {
+            const float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            dst_r[0] = z4; dst_r[1] = z4; dst_r[2] = z4; dst_r[3] = z4;
         }
     }
     __syncthreads();
@@ -9213,52 +9226,92 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
 
     int slot_base = (IS_SWA && !SWA_LINEAR_HM) ? (pow2_cap ? (j_start & cap_mask) : (j_start % cap)) : 0;
     const int j_bias = (IS_SWA && SWA_LINEAR_HM) ? swa_hm_base : 0;
-    const int8_t* kq_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (kq + (size_t) hkv * cap * 128);
-    const __half* ks_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (ks + (size_t) hkv * cap);
-    const int8_t* vq_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (vq + (size_t) hkv * cap * 128);
-    const __half* vs_full_h = (IS_SWA && !SWA_LINEAR_HM) ? nullptr : (vs + (size_t) hkv * cap);
-    for (int jb = j_start; jb < j_end; jb += 64) {
-        // 1. Load & dequant K (64x128 = 512 uint4s) -> sKV using all 384 threads (12 warps active, 0 idle warps!).
-        {
-            auto load_k_u4 = [&](int u) {
-                const int kr = u >> 3, kc0 = (u & 7) * 16;
-                const int j = jb + kr;
-                __half* dst = sKV + kr * STRIDE + kc0;
-                if (j < j_end) {
-                    __half2 dk2;
-                    const int8_t* kp;
-                    if constexpr (IS_SWA && !SWA_LINEAR_HM) {
-                        int sl = slot_base + kr;
-                        if (sl >= cap) sl -= cap;
-                        dk2 = __half2half2(__ldg(&ks[(size_t) sl * n_head_kv + hkv]));
-                        kp = kq + ((size_t) sl * n_head_kv + hkv) * 128 + kc0;
-                    } else {
-                        const int j_hm = j - j_bias;
-                        dk2 = __half2half2(__ldg(&ks_full_h[j_hm]));
-                        kp = kq_full_h + (size_t) j_hm * 128 + kc0;
-                    }
-                    const __half2 kb = __hmul2(__half2half2(__float2half(-1152.0f)), dk2);
-                    const uint4 raw = *reinterpret_cast<const uint4*>(kp);
-                    __half2 h0, h1, h2v, h3;
-                    i8x4_to_h2x2_fma(raw.x, dk2, kb, h0, h1);
-                    i8x4_to_h2x2_fma(raw.y, dk2, kb, h2v, h3);
-                    __half2* d2 = reinterpret_cast<__half2*>(dst);
-                    d2[0] = h0; d2[1] = h1; d2[2] = h2v; d2[3] = h3;
-                    i8x4_to_h2x2_fma(raw.z, dk2, kb, h0, h1);
-                    i8x4_to_h2x2_fma(raw.w, dk2, kb, h2v, h3);
-                    d2[4] = h0; d2[5] = h1; d2[6] = h2v; d2[7] = h3;
-                } else {
-                    const uint4 z = make_uint4(0, 0, 0, 0);
-                    *reinterpret_cast<uint4*>(dst)     = z;
-                    *reinterpret_cast<uint4*>(dst + 8) = z;
-                }
-            };
-            load_k_u4(tid);
-            if (tid < 128) load_k_u4(tid + 384);
-        }
-        __syncthreads();
 
-        // 2. Native QK^T (1x4 = 16x64 per warp).
+    auto fetch_kv_u4 = [&](int u, int jb_cur, int sl_base, const int8_t* q_ptr, uint4& raw_out) {
+        const int kr = u >> 3, kc0 = (u & 7) * 16;
+        const int j = jb_cur + kr;
+        if (j < j_end) {
+            if constexpr (IS_SWA && !SWA_LINEAR_HM) {
+                int sl = sl_base + kr;
+                if (sl >= cap) sl -= cap;
+                raw_out = *reinterpret_cast<const uint4*>(q_ptr + ((size_t) sl * n_head_kv + hkv) * 128 + kc0);
+            } else {
+                const size_t hj = (size_t) hkv * (size_t) cap + (size_t) (j - j_bias);
+                raw_out = *reinterpret_cast<const uint4*>(q_ptr + hj * 128 + kc0);
+            }
+        }
+    };
+    auto store_kv_u4 = [&](int u, int jb_cur, int sl_base, const __half* s_ptr, const uint4& raw) {
+        const int kr = u >> 3, kc0 = (u & 7) * 16;
+        const int j = jb_cur + kr;
+        __half* dst = sKV + kr * STRIDE + kc0;
+        if (j < j_end) {
+            __half2 d2;
+            if constexpr (IS_SWA && !SWA_LINEAR_HM) {
+                int sl = sl_base + kr;
+                if (sl >= cap) sl -= cap;
+                d2 = __half2half2(__ldg(&s_ptr[(size_t) sl * n_head_kv + hkv]));
+            } else {
+                const size_t hj = (size_t) hkv * (size_t) cap + (size_t) (j - j_bias);
+                d2 = __half2half2(__ldg(&s_ptr[hj]));
+            }
+            const __half2 b2 = __hmul2(__half2half2(__float2half(-1152.0f)), d2);
+            __half2 h0, h1, h2v, h3;
+            i8x4_to_h2x2_fma(raw.x, d2, b2, h0, h1);
+            i8x4_to_h2x2_fma(raw.y, d2, b2, h2v, h3);
+            __half2* p2 = reinterpret_cast<__half2*>(dst);
+            p2[0] = h0; p2[1] = h1; p2[2] = h2v; p2[3] = h3;
+            i8x4_to_h2x2_fma(raw.z, d2, b2, h0, h1);
+            i8x4_to_h2x2_fma(raw.w, d2, b2, h2v, h3);
+            p2[4] = h0; p2[5] = h1; p2[6] = h2v; p2[7] = h3;
+        } else {
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(dst)     = z;
+            *reinterpret_cast<uint4*>(dst + 8) = z;
+        }
+    };
+
+    // Prefetch tile-0 K (384/512 uint4s = 75% of tile) into registers before main loop (saves 8 regs -> STACK:0 on Full-Attn!).
+    uint4 kraw0;
+    if (j_start < j_end) {
+        fetch_kv_u4(tid, j_start, slot_base, kq, kraw0);
+    }
+
+    for (int jb = j_start; jb < j_end; jb += 64) {
+        // 1. Dequant prefetched K -> sKV (tail 128 uint4s fetched in parallel) + stage rel_bias -> dedicated s_rb (4 BAR/tile!).
+        {
+            uint4 kraw1;
+            if (tid < 128) fetch_kv_u4(tid + 384, jb, slot_base, kq, kraw1);
+            store_kv_u4(tid, jb, slot_base, ks, kraw0);
+            if (tid < 128) store_kv_u4(tid + 384, jb, slot_base, ks, kraw1);
+        }
+
+        const int d_lo = max(0, p0_t0 - (jb + 63));
+        const int d_hi = min(n_ext - 1, (p0_t0 + 63) - jb);
+        const int d_cnt = max(0, d_hi - d_lo + 1);
+        const bool all_bulk_no_rel = (!IS_SWA) && (t0 + 63 < T) && (jb + 63 <= p0_t0 - n_ext);
+        if (!all_bulk_no_rel && d_cnt > 0) {
+            float* s_rb = reinterpret_cast<float*>(sKV + 64 * STRIDE);
+            const int lim = d_cnt * 4;
+            if (tid < lim) {
+                const int di = tid >> 2, c4 = tid & 3;
+                *reinterpret_cast<float4*>(s_rb + di * 16 + c4 * 4) =
+                    __ldg(reinterpret_cast<const float4*>(rel_bias_ptr + (size_t) (d_lo + di) * 16) + c4);
+            }
+            if (tid + 384 < lim) {
+                const int idx = tid + 384;
+                const int di = idx >> 2, c4 = idx & 3;
+                *reinterpret_cast<float4*>(s_rb + di * 16 + c4 * 4) =
+                    __ldg(reinterpret_cast<const float4*>(rel_bias_ptr + (size_t) (d_lo + di) * 16) + c4);
+            }
+        }
+        __syncthreads();  // Barrier #1: sKV (K) and s_rb both ready
+
+        // 2. Issue V HBM2 prefetch (384/512 uint4s = 75%) into registers BEFORE QK^T + Softmax!
+        uint4 vraw0;
+        fetch_kv_u4(tid, jb, slot_base, vq, vraw0);
+
+        // 3. Native QK^T (1x4 = 16x64 per warp).
         float fc[4][8];
 #pragma unroll
         for (int ct = 0; ct < 4; ++ct)
@@ -9277,31 +9330,8 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                 mma_rc(fc[ct], q0.z, q0.w, kb.z, kb.w);
             }
         }
-        __syncthreads();
 
-        // 3. Stage rel_bias[d_lo..d_hi][16] into idle sKV (2-step unrolled, skipped for bulk Full-Attn tiles).
-        const int d_lo = max(0, p0_t0 - (jb + 63));
-        const int d_hi = min(n_ext - 1, (p0_t0 + 63) - jb);
-        const int d_cnt = max(0, d_hi - d_lo + 1);
-        const bool all_bulk_no_rel = (!IS_SWA) && (t0 + 63 < T) && (jb + 63 <= p0_t0 - n_ext);
-        float* s_rb = reinterpret_cast<float*>(sKV);
-        if (!all_bulk_no_rel && d_cnt > 0) {
-            const int lim = d_cnt * 4;
-            if (tid < lim) {
-                const int di = tid >> 2, c4 = tid & 3;
-                *reinterpret_cast<float4*>(s_rb + di * 20 + c4 * 4) =
-                    reinterpret_cast<const float4*>(rel_bias_ptr + (size_t) (d_lo + di) * 16)[c4];
-            }
-            if (tid + 384 < lim) {
-                const int idx = tid + 384;
-                const int di = idx >> 2, c4 = idx & 3;
-                *reinterpret_cast<float4*>(s_rb + di * 20 + c4 * 4) =
-                    reinterpret_cast<const float4*>(rel_bias_ptr + (size_t) (d_lo + di) * 16)[c4];
-            }
-            __syncthreads();
-        }
-
-        // 4. Register-resident bias + online softmax + in-place packed P in fc[ct][0..3] (ZERO ph[], ZERO sP, STACK:0!).
+        // 4. Register-hoisted sR dot16(R, s_rb) + online softmax + in-place packed P (0 global R/sink loads, 0 BAR before this!).
         {
             int acc_r0, acc_r1, acc_c0, acc_c1;
             wmma_acc_layout_16x16(lane, acc_r0, acc_r1, acc_c0, acc_c1);
@@ -9311,9 +9341,9 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
             const bool all_unmasked = all_valid_swa || all_bulk_no_rel;
             auto eval_row = [&](int qr, int i0, int i1, int i4, int i5) {
                 const int r_loc = qr & 63;
-                const int tr = t0 + r_loc, hr = 3 * hkv + (qr >> 6);
+                const int tr = t0 + r_loc;
                 const int pos_q = p0_t0 + r_loc;
-                const float neg_sk = (all_unmasked || tr < T) ? (-__ldg(&sink[(size_t) tr * sink_stride + hr]) * kLog2e) : 0.0f;
+                const float neg_sk = reinterpret_cast<const float*>(sQ + qr * STRIDE + 128)[2];
                 if (all_bulk_no_rel) {
 #pragma unroll
                     for (int ct = 0; ct < 4; ++ct) {
@@ -9337,32 +9367,41 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                     fc[ct][i4] = init_one(fc[ct][i4], j1);
                     fc[ct][i5] = init_one(fc[ct][i5], j1 + 1);
                 }
-                if (d_cnt > 0 && (all_valid_swa || tr < T)) {
-                    const float4* rp = reinterpret_cast<const float4*>(R_ptr + (size_t) tr * r_stride + (size_t) hr * 16);
-                    const float q_fac = (r_scale == nullptr) ? kLog2e : 1.0f;
-                    auto add_dot16 = [&](float s, int j) -> float {
+                if (d_cnt > 0 && R_ptr != nullptr && (all_valid_swa || tr < T)) {
+                    // Hoist pre-scaled R[qr][0..15] from SMEM sR in 2 x 8-float passes (8 live regs instead of 16 -> STACK:0 on Full-Attn!).
+                    const float* s_rb_loc = reinterpret_cast<const float*>(sKV + 64 * STRIDE);
+                    const float4* rp = reinterpret_cast<const float4*>(s_rb_loc + 128 * 16 + qr * 16);
+                    auto add_dot8 = [&](float s, int j, const float4& ra, const float4& rb, int off4) -> float {
                         const int d = pos_q - j;
                         if (!all_valid_swa && (j > pos_q || (IS_SWA && d >= n_swa) || d >= n_ext)) return s;
-                        const float4* bp = reinterpret_cast<const float4*>(s_rb + (d - d_lo) * 20);
-                        float dot = 0.0f;
-                        {
-                            const float4 q0 = rp[0], b0 = bp[0];
-                            dot = (q0.x * q_fac) * b0.x + (q0.y * q_fac) * b0.y + (q0.z * q_fac) * b0.z + (q0.w * q_fac) * b0.w;
-                        }
-#pragma unroll
-                        for (int rk = 1; rk < 4; ++rk) {
-                            const float4 qk = rp[rk], bk = bp[rk];
-                            dot = fmaf(qk.x * q_fac, bk.x, fmaf(qk.y * q_fac, bk.y, fmaf(qk.z * q_fac, bk.z, fmaf(qk.w * q_fac, bk.w, dot))));
-                        }
+                        const float4* bp = reinterpret_cast<const float4*>(s_rb_loc + (d - d_lo) * 16) + off4;
+                        const float4 b0 = bp[0];
+                        float dot = fmaf(ra.x, b0.x, fmaf(ra.y, b0.y, fmaf(ra.z, b0.z, ra.w * b0.w)));
+                        const float4 b1 = bp[1];
+                        dot = fmaf(rb.x, b1.x, fmaf(rb.y, b1.y, fmaf(rb.z, b1.z, fmaf(rb.w, b1.w, dot))));
                         return s + dot;
                     };
+                    {
+                        const float4 r0 = rp[0], r1 = rp[1];
 #pragma unroll
-                    for (int ct = 0; ct < 4; ++ct) {
-                        const int j0 = jb + ct * 16 + acc_c0, j1 = jb + ct * 16 + acc_c1;
-                        fc[ct][i0] = add_dot16(fc[ct][i0], j0);
-                        fc[ct][i1] = add_dot16(fc[ct][i1], j0 + 1);
-                        fc[ct][i4] = add_dot16(fc[ct][i4], j1);
-                        fc[ct][i5] = add_dot16(fc[ct][i5], j1 + 1);
+                        for (int ct = 0; ct < 4; ++ct) {
+                            const int j0 = jb + ct * 16 + acc_c0, j1 = jb + ct * 16 + acc_c1;
+                            fc[ct][i0] = add_dot8(fc[ct][i0], j0,     r0, r1, 0);
+                            fc[ct][i1] = add_dot8(fc[ct][i1], j0 + 1, r0, r1, 0);
+                            fc[ct][i4] = add_dot8(fc[ct][i4], j1,     r0, r1, 0);
+                            fc[ct][i5] = add_dot8(fc[ct][i5], j1 + 1, r0, r1, 0);
+                        }
+                    }
+                    {
+                        const float4 r2 = rp[2], r3 = rp[3];
+#pragma unroll
+                        for (int ct = 0; ct < 4; ++ct) {
+                            const int j0 = jb + ct * 16 + acc_c0, j1 = jb + ct * 16 + acc_c1;
+                            fc[ct][i0] = add_dot8(fc[ct][i0], j0,     r2, r3, 2);
+                            fc[ct][i1] = add_dot8(fc[ct][i1], j0 + 1, r2, r3, 2);
+                            fc[ct][i4] = add_dot8(fc[ct][i4], j1,     r2, r3, 2);
+                            fc[ct][i5] = add_dot8(fc[ct][i5], j1 + 1, r2, r3, 2);
+                        }
                     }
                 }
             };
@@ -9428,54 +9467,28 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                 s_ml1[0] = m_new1; s_ml1[1] = rl_new1;
             }
         }
-        __syncthreads();
+        __syncthreads();  // Barrier #2: all warps finished reading sKV (K) and s_rb
 
-        // 5. Load & dequant V (64x128 = 512 uint4s) -> sKV using all 384 threads (12 warps active, 0 idle warps!).
+        // 5. Dequant already-prefetched V -> sKV (tail 128 uint4s fetched in parallel with raw0 dequant!).
         {
-            auto load_v_u4 = [&](int u) {
-                const int kr = u >> 3, kc0 = (u & 7) * 16;
-                const int j = jb + kr;
-                __half* dst = sKV + kr * STRIDE + kc0;
-                if (j < j_end) {
-                    __half2 dv2;
-                    const int8_t* vp;
-                    if constexpr (IS_SWA && !SWA_LINEAR_HM) {
-                        int sl = slot_base + kr;
-                        if (sl >= cap) sl -= cap;
-                        dv2 = __half2half2(__ldg(&vs[(size_t) sl * n_head_kv + hkv]));
-                        vp = vq + ((size_t) sl * n_head_kv + hkv) * 128 + kc0;
-                    } else {
-                        const int j_hm = j - j_bias;
-                        dv2 = __half2half2(__ldg(&vs_full_h[j_hm]));
-                        vp = vq_full_h + (size_t) j_hm * 128 + kc0;
-                    }
-                    const __half2 vb = __hmul2(__half2half2(__float2half(-1152.0f)), dv2);
-                    const uint4 raw = *reinterpret_cast<const uint4*>(vp);
-                    __half2 h0, h1, h2v, h3;
-                    i8x4_to_h2x2_fma(raw.x, dv2, vb, h0, h1);
-                    i8x4_to_h2x2_fma(raw.y, dv2, vb, h2v, h3);
-                    __half2* d2 = reinterpret_cast<__half2*>(dst);
-                    d2[0] = h0; d2[1] = h1; d2[2] = h2v; d2[3] = h3;
-                    i8x4_to_h2x2_fma(raw.z, dv2, vb, h0, h1);
-                    i8x4_to_h2x2_fma(raw.w, dv2, vb, h2v, h3);
-                    d2[4] = h0; d2[5] = h1; d2[6] = h2v; d2[7] = h3;
-                } else {
-                    const uint4 z = make_uint4(0, 0, 0, 0);
-                    *reinterpret_cast<uint4*>(dst)     = z;
-                    *reinterpret_cast<uint4*>(dst + 8) = z;
-                }
-            };
-            load_v_u4(tid);
-            if (tid < 128) load_v_u4(tid + 384);
+            uint4 vraw1;
+            if (tid < 128) fetch_kv_u4(tid + 384, jb, slot_base, vq, vraw1);
+            store_kv_u4(tid, jb, slot_base, vs, vraw0);
+            if (tid < 128) store_kv_u4(tid + 384, jb, slot_base, vs, vraw1);
         }
-        __syncthreads();
+        __syncthreads();  // Barrier #3: sKV (V) ready
 
         if constexpr (IS_SWA && !SWA_LINEAR_HM) {
             slot_base += 64;
             if (slot_base >= cap) slot_base -= cap;
         }
 
-        // 6. Native P*V (1x8 = 16x128 per warp).
+        // 6. Issue NEXT tile's K HBM2 prefetch (384/512 uint4s = 75%) BEFORE P*V HMMA!
+        if (jb + 64 < j_end) {
+            fetch_kv_u4(tid, jb + 64, slot_base, kq, kraw0);
+        }
+
+        // 7. Native P*V (1x8 = 16x128 per warp).
         const bool hi8 = (lane & 8) != 0;
         const int sv_off = (lane & 3) * STRIDE + (lane & 8) + ((lane & 16) >> 2);
 #pragma unroll
@@ -9516,7 +9529,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                 }
             }
         }
-        __syncthreads();
+        __syncthreads();  // Barrier #4: all warps finished reading sKV (V)
     }
 
     // Epilogue (sm_70): copy s_rl from sQ padding into sKV (768 B), reuse sQ for 2 passes x 96 rows.

@@ -2708,7 +2708,7 @@ struct Engine {
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<true, false, false>, 98304) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, true, false>, 98304) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, true, true>, 98304);
-        fa2_192_swa_smem = (cc_maj >= 8) ? 97280 : 73728;
+        fa2_192_swa_smem = (cc_maj >= 8) ? 97280 : 94208;
         can_fa2_192_swa_fast = ((cc_maj == 7 && cc_min < 5) || cc_maj >= 8) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192_swa_fast<true, true>, fa2_192_swa_smem) &&
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192_swa_fast<false, true>, fa2_192_swa_smem) &&
