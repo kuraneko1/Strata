@@ -13593,8 +13593,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
             }
 
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
@@ -13680,7 +13680,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
                     }
                 } else {
                     const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                     for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
                 }
             }
@@ -13704,14 +13704,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
             const bool need0 = (acc_r0 < kQRows) && (mx0 > -1e20f) && (rm0 <= -1e20f || (mx0 - rm0) > -26.0f);
             const bool need1 = (acc_r1 < kQRows) && (mx1 > -1e20f) && (rm1 <= -1e20f || (mx1 - rm1) > -26.0f);
             if (!__any_sync(0xffffffffu, need0 || need1)) {
-                const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - rm0) : 0.0f;
-                const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - rm0) : 0.0f;
-                const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - rm0) : 0.0f;
-                const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - rm0) : 0.0f;
-                const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - rm1) : 0.0f;
-                const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - rm1) : 0.0f;
-                const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - rm1) : 0.0f;
-                const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - rm1) : 0.0f;
+                const float m_exp0 = fmaxf(rm0, -1e20f), m_exp1 = fmaxf(rm1, -1e20f);
+                const float p00 = fast_exp2f_hw(fc[0] - m_exp0);
+                const float p01 = fast_exp2f_hw(fc[1] - m_exp0);
+                const float p04 = fast_exp2f_hw(fc[4] - m_exp0);
+                const float p05 = fast_exp2f_hw(fc[5] - m_exp0);
+                const float p12 = fast_exp2f_hw(fc[2] - m_exp1);
+                const float p13 = fast_exp2f_hw(fc[3] - m_exp1);
+                const float p16 = fast_exp2f_hw(fc[6] - m_exp1);
+                const float p17 = fast_exp2f_hw(fc[7] - m_exp1);
                 rl0 += wmma_row_sum_16((p00 + p01) + (p04 + p05));
                 rl1 += wmma_row_sum_16((p12 + p13) + (p16 + p17));
                 __syncwarp();
@@ -13736,13 +13737,13 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
                     }
                 } else {
                     const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                     for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
                 }
             }
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
@@ -13750,14 +13751,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
                     acc[n][2] *= a1; acc[n][3] *= a1; acc[n][6] *= a1; acc[n][7] *= a1;
                 }
             }
-            const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - m_new0) : 0.0f;
-            const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - m_new0) : 0.0f;
-            const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - m_new0) : 0.0f;
-            const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - m_new0) : 0.0f;
-            const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - m_new1) : 0.0f;
-            const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - m_new1) : 0.0f;
-            const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - m_new1) : 0.0f;
-            const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - m_new1) : 0.0f;
+            const float m_exp0 = fmaxf(m_new0, -1e20f), m_exp1 = fmaxf(m_new1, -1e20f);
+            const float p00 = fast_exp2f_hw(fc[0] - m_exp0);
+            const float p01 = fast_exp2f_hw(fc[1] - m_exp0);
+            const float p04 = fast_exp2f_hw(fc[4] - m_exp0);
+            const float p05 = fast_exp2f_hw(fc[5] - m_exp0);
+            const float p12 = fast_exp2f_hw(fc[2] - m_exp1);
+            const float p13 = fast_exp2f_hw(fc[3] - m_exp1);
+            const float p16 = fast_exp2f_hw(fc[6] - m_exp1);
+            const float p17 = fast_exp2f_hw(fc[7] - m_exp1);
             rm0 = m_new0; rl0 = rl0 * a0 + wmma_row_sum_16((p00 + p01) + (p04 + p05));
             rm1 = m_new1; rl1 = rl1 * a1 + wmma_row_sum_16((p12 + p13) + (p16 + p17));
             const uint32_t u0 = f2_to_h2u(p00, p01), u1 = f2_to_h2u(p04, p05);
@@ -13990,8 +13992,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
             const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc.x[0], fc.x[1]), fmaxf(fc.x[4], fc.x[5])));
             const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc.x[2], fc.x[3]), fmaxf(fc.x[6], fc.x[7])));
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) wmma_rescale_acc(acc[n], a0, a1);
@@ -14047,7 +14049,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
                     }
                 } else {
                     const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                     for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
                 }
             }
@@ -14081,7 +14083,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
                     }
                 } else {
                     const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                     for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
                 }
             }
@@ -14093,8 +14095,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
             const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc.x[0], fc.x[1]), fmaxf(fc.x[4], fc.x[5])));
             const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc.x[2], fc.x[3]), fmaxf(fc.x[6], fc.x[7])));
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) wmma_rescale_acc(acc[n], a0, a1);
@@ -14360,8 +14362,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
             const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc[0], fc[1]), fmaxf(fc[4], fc[5])));
             const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc[2], fc[3]), fmaxf(fc[6], fc[7])));
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
@@ -14447,7 +14449,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
                     }
                 } else {
                     const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                     for (int i = 0; i < 4; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
                 }
             }
@@ -14479,7 +14481,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
                     }
                 } else {
                     const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                     for (int i = 0; i < 4; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
                 }
             }
@@ -14491,8 +14493,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
             const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc[0], fc[1]), fmaxf(fc[4], fc[5])));
             const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc[2], fc[3]), fmaxf(fc[6], fc[7])));
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
@@ -14500,14 +14502,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
                     acc[n][2] *= a1; acc[n][3] *= a1; acc[n][6] *= a1; acc[n][7] *= a1;
                 }
             }
-            const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - m_new0) : 0.0f;
-            const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - m_new0) : 0.0f;
-            const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - m_new0) : 0.0f;
-            const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - m_new0) : 0.0f;
-            const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - m_new1) : 0.0f;
-            const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - m_new1) : 0.0f;
-            const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - m_new1) : 0.0f;
-            const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - m_new1) : 0.0f;
+            const float m_exp0 = fmaxf(m_new0, -1e20f), m_exp1 = fmaxf(m_new1, -1e20f);
+            const float p00 = fast_exp2f_hw(fc[0] - m_exp0);
+            const float p01 = fast_exp2f_hw(fc[1] - m_exp0);
+            const float p04 = fast_exp2f_hw(fc[4] - m_exp0);
+            const float p05 = fast_exp2f_hw(fc[5] - m_exp0);
+            const float p12 = fast_exp2f_hw(fc[2] - m_exp1);
+            const float p13 = fast_exp2f_hw(fc[3] - m_exp1);
+            const float p16 = fast_exp2f_hw(fc[6] - m_exp1);
+            const float p17 = fast_exp2f_hw(fc[7] - m_exp1);
             rm0 = m_new0; rl0 = rl0 * a0 + wmma_row_sum_16((p00 + p01) + (p04 + p05));
             rm1 = m_new1; rl1 = rl1 * a1 + wmma_row_sum_16((p12 + p13) + (p16 + p17));
             const uint32_t u0 = f2_to_h2u(p00, p01), u1 = f2_to_h2u(p04, p05);
@@ -14746,8 +14749,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
             }
 
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) wmma_rescale_acc(acc[n], a0, a1);
@@ -14848,8 +14851,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_wmma_split(
             const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc.x[0], fc.x[1]), fmaxf(fc.x[4], fc.x[5])));
             const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc.x[2], fc.x[3]), fmaxf(fc.x[6], fc.x[7])));
             const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-            const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-            const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+            const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+            const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
             if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
                 for (int n = 0; n < 8; ++n) wmma_rescale_acc(acc[n], a0, a1);
@@ -15067,14 +15070,14 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 }
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                 for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
             }
         }
         __syncwarp();
 
         float fc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll 1
+#pragma unroll 2
         for (int k = 0; k < 128; k += 8) {
             const uint4 q0 = *reinterpret_cast<const uint4*>(sQ + qa_off + k);
             const uint4 k0 = *reinterpret_cast<const uint4*>(sKV + kb_off + k);
@@ -15094,14 +15097,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
         const bool need0 = (acc_r0 < kQRows) && (mx0 > -1e20f) && (rm0 <= -1e20f || (mx0 - rm0) > -26.0f);
         const bool need1 = (acc_r1 < kQRows) && (mx1 > -1e20f) && (rm1 <= -1e20f || (mx1 - rm1) > -26.0f);
         if (!__any_sync(0xffffffffu, need0 || need1)) {
-            const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - rm0) : 0.0f;
-            const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - rm0) : 0.0f;
-            const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - rm0) : 0.0f;
-            const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - rm0) : 0.0f;
-            const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - rm1) : 0.0f;
-            const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - rm1) : 0.0f;
-            const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - rm1) : 0.0f;
-            const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - rm1) : 0.0f;
+            const float m_exp0 = fmaxf(rm0, -1e20f), m_exp1 = fmaxf(rm1, -1e20f);
+            const float p00 = fast_exp2f_hw(fc[0] - m_exp0);
+            const float p01 = fast_exp2f_hw(fc[1] - m_exp0);
+            const float p04 = fast_exp2f_hw(fc[4] - m_exp0);
+            const float p05 = fast_exp2f_hw(fc[5] - m_exp0);
+            const float p12 = fast_exp2f_hw(fc[2] - m_exp1);
+            const float p13 = fast_exp2f_hw(fc[3] - m_exp1);
+            const float p16 = fast_exp2f_hw(fc[6] - m_exp1);
+            const float p17 = fast_exp2f_hw(fc[7] - m_exp1);
             rl0 += wmma_row_sum_16((p00 + p01) + (p04 + p05));
             rl1 += wmma_row_sum_16((p12 + p13) + (p16 + p17));
             __syncwarp();
@@ -15126,14 +15130,14 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 }
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                 for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
             }
         }
 
         const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-        const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-        const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+        const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+        const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
         if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
             for (int n = 0; n < 8; ++n) {
@@ -15141,14 +15145,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 acc[n][2] *= a1; acc[n][3] *= a1; acc[n][6] *= a1; acc[n][7] *= a1;
             }
         }
-        const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - m_new0) : 0.0f;
-        const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - m_new0) : 0.0f;
-        const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - m_new0) : 0.0f;
-        const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - m_new0) : 0.0f;
-        const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - m_new1) : 0.0f;
-        const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - m_new1) : 0.0f;
-        const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - m_new1) : 0.0f;
-        const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - m_new1) : 0.0f;
+        const float m_exp0 = fmaxf(m_new0, -1e20f), m_exp1 = fmaxf(m_new1, -1e20f);
+        const float p00 = fast_exp2f_hw(fc[0] - m_exp0);
+        const float p01 = fast_exp2f_hw(fc[1] - m_exp0);
+        const float p04 = fast_exp2f_hw(fc[4] - m_exp0);
+        const float p05 = fast_exp2f_hw(fc[5] - m_exp0);
+        const float p12 = fast_exp2f_hw(fc[2] - m_exp1);
+        const float p13 = fast_exp2f_hw(fc[3] - m_exp1);
+        const float p16 = fast_exp2f_hw(fc[6] - m_exp1);
+        const float p17 = fast_exp2f_hw(fc[7] - m_exp1);
         rm0 = m_new0; rl0 = rl0 * a0 + wmma_row_sum_16((p00 + p01) + (p04 + p05));
         rm1 = m_new1; rl1 = rl1 * a1 + wmma_row_sum_16((p12 + p13) + (p16 + p17));
 
@@ -15348,7 +15353,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 }
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll 1
+#pragma unroll
                 for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
             }
         }
@@ -15618,14 +15623,17 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
     const bool pow2_cap = (cap & (cap - 1)) == 0;
     const int cap_mask = cap - 1;
 
-    auto mask_bias = [&](float s, int r, int j) -> float {
+    const int tok0 = r0 / 3, h_r0 = h0 + (r0 % 3), pos_q0 = p0 + tok0;
+    const int tok1 = r1 / 3, h_r1 = h0 + (r1 % 3), pos_q1 = p0 + tok1;
+    const float ns0_tail = (r0 < kQRows) ? (-__ldg(&sink[(size_t) tok0 * n_head + h_r0]) * kLog2e) : 0.0f;
+    const float ns1_tail = (r1 < kQRows) ? (-__ldg(&sink[(size_t) tok1 * n_head + h_r1]) * kLog2e) : 0.0f;
+    auto mask_bias = [&](float s, int r, int tok, int h, int pos_q, float ns, int j) -> float {
         if (r >= kQRows || j >= c_end) return -1e30f;
-        const int tok = r / 3, h = h0 + (r % 3), pos_q = p0 + tok;
         const int d = pos_q - j;
         if (d < 0 || d >= n_swa) return -1e30f;
         const float b = (d < n_ext)
             ? (__ldg(&rel_tab[((size_t) tok * n_head + h) * n_ext + d]) * kLog2e)
-            : (-__ldg(&sink[(size_t) tok * n_head + h]) * kLog2e);
+            : ns;
         return s + b;
     };
 
@@ -15657,7 +15665,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
         asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
 
         float fc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll 1
+#pragma unroll 2
         for (int k = 0; k < 128; k += 8) {
             const uint4 q0 = *reinterpret_cast<const uint4*>(sQ + qa_off + k);
             const uint4 k0 = *reinterpret_cast<const uint4*>(sKV + kb_off + k);
@@ -15666,10 +15674,14 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
         }
 
         const int j0 = jb + acc_c0, j1 = jb + acc_c1;
-        fc[0] = mask_bias(fc[0], r0, j0);     fc[1] = mask_bias(fc[1], r0, j0 + 1);
-        fc[4] = mask_bias(fc[4], r0, j1);     fc[5] = mask_bias(fc[5], r0, j1 + 1);
-        fc[2] = mask_bias(fc[2], r1, j0);     fc[3] = mask_bias(fc[3], r1, j0 + 1);
-        fc[6] = mask_bias(fc[6], r1, j1);     fc[7] = mask_bias(fc[7], r1, j1 + 1);
+        fc[0] = mask_bias(fc[0], r0, tok0, h_r0, pos_q0, ns0_tail, j0);
+        fc[1] = mask_bias(fc[1], r0, tok0, h_r0, pos_q0, ns0_tail, j0 + 1);
+        fc[4] = mask_bias(fc[4], r0, tok0, h_r0, pos_q0, ns0_tail, j1);
+        fc[5] = mask_bias(fc[5], r0, tok0, h_r0, pos_q0, ns0_tail, j1 + 1);
+        fc[2] = mask_bias(fc[2], r1, tok1, h_r1, pos_q1, ns1_tail, j0);
+        fc[3] = mask_bias(fc[3], r1, tok1, h_r1, pos_q1, ns1_tail, j0 + 1);
+        fc[6] = mask_bias(fc[6], r1, tok1, h_r1, pos_q1, ns1_tail, j1);
+        fc[7] = mask_bias(fc[7], r1, tok1, h_r1, pos_q1, ns1_tail, j1 + 1);
 
         const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc[0], fc[1]), fmaxf(fc[4], fc[5])));
         const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc[2], fc[3]), fmaxf(fc[6], fc[7])));
@@ -15680,14 +15692,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
         asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
 
         if (!(s_need_v[kw * 2] | s_need_v[kw * 2 + 1])) {
-            const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - rm0) : 0.0f;
-            const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - rm0) : 0.0f;
-            const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - rm0) : 0.0f;
-            const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - rm0) : 0.0f;
-            const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - rm1) : 0.0f;
-            const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - rm1) : 0.0f;
-            const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - rm1) : 0.0f;
-            const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - rm1) : 0.0f;
+            const float m_exp0 = fmaxf(rm0, -1e20f), m_exp1 = fmaxf(rm1, -1e20f);
+            const float p00 = fast_exp2f_hw(fc[0] - m_exp0);
+            const float p01 = fast_exp2f_hw(fc[1] - m_exp0);
+            const float p04 = fast_exp2f_hw(fc[4] - m_exp0);
+            const float p05 = fast_exp2f_hw(fc[5] - m_exp0);
+            const float p12 = fast_exp2f_hw(fc[2] - m_exp1);
+            const float p13 = fast_exp2f_hw(fc[3] - m_exp1);
+            const float p16 = fast_exp2f_hw(fc[6] - m_exp1);
+            const float p17 = fast_exp2f_hw(fc[7] - m_exp1);
             rl0 += wmma_row_sum_16((p00 + p01) + (p04 + p05));
             rl1 += wmma_row_sum_16((p12 + p13) + (p16 + p17));
             continue;
@@ -15716,8 +15729,8 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
         }
 
         const float m_new0 = fmaxf(rm0, mx0), m_new1 = fmaxf(rm1, mx1);
-        const float a0 = (rm0 > -1e20f) ? ((m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0)) : 0.0f;
-        const float a1 = (rm1 > -1e20f) ? ((m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1)) : 0.0f;
+        const float a0 = (rm0 <= -1e20f || m_new0 == rm0) ? 1.0f : fast_exp2f_hw(rm0 - m_new0);
+        const float a1 = (rm1 <= -1e20f || m_new1 == rm1) ? 1.0f : fast_exp2f_hw(rm1 - m_new1);
         if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
             for (int n = 0; n < 8; ++n) {
@@ -15725,14 +15738,15 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
                 acc[n][2] *= a1; acc[n][3] *= a1; acc[n][6] *= a1; acc[n][7] *= a1;
             }
         }
-        const float p00 = (fc[0] > -1e20f) ? fast_exp2f_hw(fc[0] - m_new0) : 0.0f;
-        const float p01 = (fc[1] > -1e20f) ? fast_exp2f_hw(fc[1] - m_new0) : 0.0f;
-        const float p04 = (fc[4] > -1e20f) ? fast_exp2f_hw(fc[4] - m_new0) : 0.0f;
-        const float p05 = (fc[5] > -1e20f) ? fast_exp2f_hw(fc[5] - m_new0) : 0.0f;
-        const float p12 = (fc[2] > -1e20f) ? fast_exp2f_hw(fc[2] - m_new1) : 0.0f;
-        const float p13 = (fc[3] > -1e20f) ? fast_exp2f_hw(fc[3] - m_new1) : 0.0f;
-        const float p16 = (fc[6] > -1e20f) ? fast_exp2f_hw(fc[6] - m_new1) : 0.0f;
-        const float p17 = (fc[7] > -1e20f) ? fast_exp2f_hw(fc[7] - m_new1) : 0.0f;
+        const float m_exp0 = fmaxf(m_new0, -1e20f), m_exp1 = fmaxf(m_new1, -1e20f);
+        const float p00 = fast_exp2f_hw(fc[0] - m_exp0);
+        const float p01 = fast_exp2f_hw(fc[1] - m_exp0);
+        const float p04 = fast_exp2f_hw(fc[4] - m_exp0);
+        const float p05 = fast_exp2f_hw(fc[5] - m_exp0);
+        const float p12 = fast_exp2f_hw(fc[2] - m_exp1);
+        const float p13 = fast_exp2f_hw(fc[3] - m_exp1);
+        const float p16 = fast_exp2f_hw(fc[6] - m_exp1);
+        const float p17 = fast_exp2f_hw(fc[7] - m_exp1);
         rm0 = m_new0; rl0 = rl0 * a0 + wmma_row_sum_16((p00 + p01) + (p04 + p05));
         rm1 = m_new1; rl1 = rl1 * a1 + wmma_row_sum_16((p12 + p13) + (p16 + p17));
 
@@ -15909,14 +15923,17 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
     const bool pow2_cap = (cap & (cap - 1)) == 0;
     const int cap_mask = cap - 1;
 
-    auto mask_bias = [&](float s, int r, int j) -> float {
+    const int tok0 = r0 / 3, h_r0 = h0 + (r0 % 3), pos_q0 = p0 + tok0;
+    const int tok1 = r1 / 3, h_r1 = h0 + (r1 % 3), pos_q1 = p0 + tok1;
+    const float ns0_tail = (r0 < kQRows) ? (-__ldg(&sink[(size_t) tok0 * n_head + h_r0]) * kLog2e) : 0.0f;
+    const float ns1_tail = (r1 < kQRows) ? (-__ldg(&sink[(size_t) tok1 * n_head + h_r1]) * kLog2e) : 0.0f;
+    auto mask_bias = [&](float s, int r, int tok, int h, int pos_q, float ns, int j) -> float {
         if (r >= kQRows || j >= c_end) return -1e30f;
-        const int tok = r / 3, h = h0 + (r % 3), pos_q = p0 + tok;
         const int d = pos_q - j;
         if (d < 0 || d >= n_swa) return -1e30f;
         const float b = (d < n_ext)
             ? (__ldg(&rel_tab[((size_t) tok * n_head + h) * n_ext + d]) * kLog2e)
-            : (-__ldg(&sink[(size_t) tok * n_head + h]) * kLog2e);
+            : ns;
         return s + b;
     };
 
@@ -15959,10 +15976,14 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
         }
 
         const int j0 = jb + acc_c0, j1 = jb + acc_c1;
-        fc.x[0] = mask_bias(fc.x[0], r0, j0);     fc.x[1] = mask_bias(fc.x[1], r0, j0 + 1);
-        fc.x[4] = mask_bias(fc.x[4], r0, j1);     fc.x[5] = mask_bias(fc.x[5], r0, j1 + 1);
-        fc.x[2] = mask_bias(fc.x[2], r1, j0);     fc.x[3] = mask_bias(fc.x[3], r1, j0 + 1);
-        fc.x[6] = mask_bias(fc.x[6], r1, j1);     fc.x[7] = mask_bias(fc.x[7], r1, j1 + 1);
+        fc.x[0] = mask_bias(fc.x[0], r0, tok0, h_r0, pos_q0, ns0_tail, j0);
+        fc.x[1] = mask_bias(fc.x[1], r0, tok0, h_r0, pos_q0, ns0_tail, j0 + 1);
+        fc.x[4] = mask_bias(fc.x[4], r0, tok0, h_r0, pos_q0, ns0_tail, j1);
+        fc.x[5] = mask_bias(fc.x[5], r0, tok0, h_r0, pos_q0, ns0_tail, j1 + 1);
+        fc.x[2] = mask_bias(fc.x[2], r1, tok1, h_r1, pos_q1, ns1_tail, j0);
+        fc.x[3] = mask_bias(fc.x[3], r1, tok1, h_r1, pos_q1, ns1_tail, j0 + 1);
+        fc.x[6] = mask_bias(fc.x[6], r1, tok1, h_r1, pos_q1, ns1_tail, j1);
+        fc.x[7] = mask_bias(fc.x[7], r1, tok1, h_r1, pos_q1, ns1_tail, j1 + 1);
 
         const float mx0 = wmma_row_max_16(fmaxf(fmaxf(fc.x[0], fc.x[1]), fmaxf(fc.x[4], fc.x[5])));
         const float mx1 = wmma_row_max_16(fmaxf(fmaxf(fc.x[2], fc.x[3]), fmaxf(fc.x[6], fc.x[7])));
