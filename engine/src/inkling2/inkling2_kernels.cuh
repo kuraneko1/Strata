@@ -16084,16 +16084,28 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify8_swa_wmma_split(
 }
 
 /// Combine Split-KV partials across active splits and apply fused sigmoid gate (+ optional direct Q8_1 store): grid (n_head, T), block 128.
-/// Cooperative SMEM staging computes mg, exp2f(ms-mg), and lg ONCE per split (128x fewer exp2f + skips zero-weight splits).
-__global__ void k_attn_split_combine(const float* __restrict__ split_out, const float* __restrict__ gate,
+/// Fast 1-barrier warp-0 path for active_splits <= 32 (all SWA), compacted non-zero split list (zero inner branches),
+/// and 4-warp parallel 2x-unrolled coalesced float2 (LDG.64) accumulation (16 LDG.64s in flight/CTA).
+__global__ void __launch_bounds__(128, 8) k_attn_split_combine(const float* __restrict__ split_out, const float* __restrict__ gate,
                                      float* __restrict__ out, int n_head, int split_n,
                                      const int32_t* __restrict__ pos0, int is_swa, int n_swa,
                                      void* __restrict__ xq_out = nullptr) {
-    __shared__ float s_m[kAttnSplitMax];
-    __shared__ float s_l[kAttnSplitMax];
-    __shared__ float s_w[kAttnSplitMax];
+    static_assert(kAttnSplitMax <= 256, "k_attn_split_combine assumes kAttnSplitMax <= 256");
+    __shared__ union {
+        struct {
+            float m[kAttnSplitMax];
+            float l[kAttnSplitMax];
+        } ml;
+        float og[4][128];
+    } smem_u;
+    __shared__ int s_nz_s[kAttnSplitMax];
+    __shared__ float s_nz_w[kAttnSplitMax];
     __shared__ float s_red[4];
     __shared__ float s_red_l[4];
+    __shared__ int s_wcnt[4];
+    __shared__ float s_lg;
+    __shared__ int s_nnz;
+
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const int warp = d >> 5, lane = d & 31;
     const int pos_q = pos0[0] + t;
@@ -16104,47 +16116,148 @@ __global__ void k_attn_split_combine(const float* __restrict__ split_out, const 
     const size_t stride_s = (size_t) n_head * 130;
     const float* base_h = split_out + ((size_t) t * split_n * n_head + h) * 130;
 
-    float local_mg = -1e30f;
-    for (int s = d; s < active_splits; s += 128) {
-        const float* src = base_h + (size_t) s * stride_s;
-        const float ms = src[128];
-        const float ls = src[129];
-        s_m[s] = ms;
-        s_l[s] = ls;
-        if (ls > 0.0f && ms > local_mg) local_mg = ms;
-    }
+    if (active_splits <= 32) {
+        if (warp == 0) {
+            float ms = -1e30f, ls = 0.0f;
+            if (lane < active_splits) {
+                const float2 ml = __ldg(reinterpret_cast<const float2*>(base_h + (size_t) lane * stride_s + 128));
+                ms = ml.x;
+                ls = ml.y;
+            }
+            float mg = (ls > 0.0f) ? ms : -1e30f;
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) local_mg = fmaxf(local_mg, __shfl_xor_sync(0xffffffffu, local_mg, o));
-    if (lane == 0) s_red[warp] = local_mg;
-    __syncthreads();
-    const float mg = fmaxf(fmaxf(s_red[0], s_red[1]), fmaxf(s_red[2], s_red[3]));
-
-    float local_lg = 0.0f;
-    for (int s = d; s < active_splits; s += 128) {
-        const float ls = s_l[s];
-        float w = 0.0f;
-        if (ls > 0.0f) {
-            const float diff = s_m[s] - mg;
-            w = (diff > -126.0f) ? exp2f(diff) : 0.0f;
-            local_lg += ls * w;
+            for (int o = 16; o > 0; o >>= 1) mg = fmaxf(mg, __shfl_xor_sync(0xffffffffu, mg, o));
+            float w = 0.0f;
+            if (ls > 0.0f) {
+                const float diff = ms - mg;
+                w = (diff > -126.0f) ? exp2f(diff) : 0.0f;
+            }
+            float lg = ls * w;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) lg += __shfl_xor_sync(0xffffffffu, lg, o);
+            const unsigned m_nz = __ballot_sync(0xffffffffu, w != 0.0f);
+            if (w != 0.0f) {
+                const int k = __popc(m_nz & ((1u << lane) - 1u));
+                s_nz_s[k] = lane;
+                s_nz_w[k] = w;
+            }
+            if (lane == 0) {
+                s_lg = lg;
+                s_nnz = __popc(m_nz);
+            }
         }
-        s_w[s] = w;
-    }
+        __syncthreads();
+    } else {
+        float local_mg = -1e30f;
+        for (int s = d; s < active_splits; s += 128) {
+            const float2 ml = __ldg(reinterpret_cast<const float2*>(base_h + (size_t) s * stride_s + 128));
+            smem_u.ml.m[s] = ml.x;
+            smem_u.ml.l[s] = ml.y;
+            if (ml.y > 0.0f && ml.x > local_mg) local_mg = ml.x;
+        }
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) local_lg += __shfl_xor_sync(0xffffffffu, local_lg, o);
-    if (lane == 0) s_red_l[warp] = local_lg;
-    __syncthreads();
-    const float lg = (s_red_l[0] + s_red_l[1]) + (s_red_l[2] + s_red_l[3]);
+        for (int o = 16; o > 0; o >>= 1) local_mg = fmaxf(local_mg, __shfl_xor_sync(0xffffffffu, local_mg, o));
+        if (lane == 0) s_red[warp] = local_mg;
+        __syncthreads();
+        const float mg = fmaxf(fmaxf(s_red[0], s_red[1]), fmaxf(s_red[2], s_red[3]));
 
-    float og = 0.0f;
-    const float* base_d = base_h + d;
-    for (int s = 0; s < active_splits; ++s) {
-        const float w = s_w[s];
-        if (w != 0.0f) og += base_d[(size_t) s * stride_s] * w;
+        float w0 = 0.0f, w1 = 0.0f;
+        float local_lg = 0.0f;
+        if (d < active_splits) {
+            const float ls = smem_u.ml.l[d];
+            if (ls > 0.0f) {
+                const float diff = smem_u.ml.m[d] - mg;
+                w0 = (diff > -126.0f) ? exp2f(diff) : 0.0f;
+                local_lg += ls * w0;
+            }
+        }
+        const int d1 = d + 128;
+        if (d1 < active_splits) {
+            const float ls = smem_u.ml.l[d1];
+            if (ls > 0.0f) {
+                const float diff = smem_u.ml.m[d1] - mg;
+                w1 = (diff > -126.0f) ? exp2f(diff) : 0.0f;
+                local_lg += ls * w1;
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) local_lg += __shfl_xor_sync(0xffffffffu, local_lg, o);
+        const unsigned m0 = __ballot_sync(0xffffffffu, w0 != 0.0f);
+        const unsigned m1 = __ballot_sync(0xffffffffu, w1 != 0.0f);
+        const int c0 = __popc(m0);
+        const int c1 = __popc(m1);
+        if (lane == 0) {
+            s_red_l[warp] = local_lg;
+            s_wcnt[warp] = c0 + c1;
+        }
+        __syncthreads();
+        const unsigned lane_mask = (1u << lane) - 1u;
+        int w_base = 0;
+        if (warp >= 1) w_base += s_wcnt[0];
+        if (warp >= 2) w_base += s_wcnt[1];
+        if (warp >= 3) w_base += s_wcnt[2];
+        if (w0 != 0.0f) {
+            const int k = w_base + __popc(m0 & lane_mask);
+            s_nz_s[k] = d;
+            s_nz_w[k] = w0;
+        }
+        if (w1 != 0.0f) {
+            const int k = w_base + c0 + __popc(m1 & lane_mask);
+            s_nz_s[k] = d1;
+            s_nz_w[k] = w1;
+        }
+        if (d == 0) {
+            s_lg = (s_red_l[0] + s_red_l[1]) + (s_red_l[2] + s_red_l[3]);
+            s_nnz = s_wcnt[0] + s_wcnt[1] + s_wcnt[2] + s_wcnt[3];
+        }
+        __syncthreads();
     }
+
+    const int n_nz = s_nnz;
+    const float lg = s_lg;
+    const int d2_lo = lane * 2;
+    const int d2_hi = d2_lo + 64;
+    const float* base_lo = base_h + d2_lo;
+    const float* base_hi = base_h + d2_hi;
+    float2 acc_lo = make_float2(0.0f, 0.0f);
+    float2 acc_hi = make_float2(0.0f, 0.0f);
+    int k = warp;
+    for (; k + 4 < n_nz; k += 8) {
+        const size_t off0 = (size_t) s_nz_s[k]     * stride_s;
+        const size_t off1 = (size_t) s_nz_s[k + 4] * stride_s;
+        const float w0 = s_nz_w[k];
+        const float w1 = s_nz_w[k + 4];
+        const float2 a0 = __ldg(reinterpret_cast<const float2*>(base_lo + off0));
+        const float2 a1 = __ldg(reinterpret_cast<const float2*>(base_hi + off0));
+        const float2 b0 = __ldg(reinterpret_cast<const float2*>(base_lo + off1));
+        const float2 b1 = __ldg(reinterpret_cast<const float2*>(base_hi + off1));
+        acc_lo.x = fmaf(a0.x, w0, acc_lo.x);
+        acc_lo.y = fmaf(a0.y, w0, acc_lo.y);
+        acc_hi.x = fmaf(a1.x, w0, acc_hi.x);
+        acc_hi.y = fmaf(a1.y, w0, acc_hi.y);
+        acc_lo.x = fmaf(b0.x, w1, acc_lo.x);
+        acc_lo.y = fmaf(b0.y, w1, acc_lo.y);
+        acc_hi.x = fmaf(b1.x, w1, acc_hi.x);
+        acc_hi.y = fmaf(b1.y, w1, acc_hi.y);
+    }
+    if (k < n_nz) {
+        const size_t off0 = (size_t) s_nz_s[k] * stride_s;
+        const float w0 = s_nz_w[k];
+        const float2 a0 = __ldg(reinterpret_cast<const float2*>(base_lo + off0));
+        const float2 a1 = __ldg(reinterpret_cast<const float2*>(base_hi + off0));
+        acc_lo.x = fmaf(a0.x, w0, acc_lo.x);
+        acc_lo.y = fmaf(a0.y, w0, acc_lo.y);
+        acc_hi.x = fmaf(a1.x, w0, acc_hi.x);
+        acc_hi.y = fmaf(a1.y, w0, acc_hi.y);
+    }
+    *reinterpret_cast<float2*>(&smem_u.og[warp][d2_lo]) = acc_lo;
+    *reinterpret_cast<float2*>(&smem_u.og[warp][d2_hi]) = acc_hi;
+    __syncthreads();
+
+    const float og = (smem_u.og[0][d] + smem_u.og[1][d]) + (smem_u.og[2][d] + smem_u.og[3][d]);
     const size_t oi = ((size_t) t * n_head + h) * 128 + d;
     float val = __fdividef(og, lg);
-    if (gate) val *= sigmf(gate[oi]);
+    if (gate) val *= sigmf(__ldg(&gate[oi]));
     out[oi] = val;
     if (xq_out) {
         q8_1_warp_store(val, xq_out, (t * n_head + h) * 4 + (d >> 5), d & 31);
