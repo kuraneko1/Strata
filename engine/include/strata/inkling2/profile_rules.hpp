@@ -55,7 +55,7 @@ inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
         p.full_vram_want_sp = 6;
         p.hybrid_want_sp_1024 = 7;
         p.hybrid_want_sp_2048 = 4;
-        p.t1_full_split_mult = 6;
+        p.t1_full_split_mult = 16;
         p.t1_swa_split_mult = 3;
         p.pp_stage_mb = 64;
         p.pp_stage_cnt_pref = 3;
@@ -280,6 +280,8 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     // 3. Split-KV arena reserve, PCIe staging ring, and GPU routing hit counters:
     if (out.chunk >= 8192) {
         out.want_sp = out.arch.hybrid_want_sp_8192;
+    } else if (out.arch.id == ArchId::Sm70Volta && out.regime == VramRegime::FullVram) {
+        out.want_sp = out.arch.full_vram_want_sp;
     } else if (out.chunk >= 2048) {
         out.want_sp = out.arch.hybrid_want_sp_2048;
     } else if (out.regime == VramRegime::FullVram) {
