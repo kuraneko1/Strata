@@ -2167,6 +2167,8 @@ struct DsparkEngine {
     bool markov_graph_oom[8] = {};
     cudaGraphExec_t markov_step_graphs[7] = {};   // per-step captured Markov graph with argmax + prob
     bool markov_step_oom[7] = {};
+    cudaGraphExec_t markov_samp_step_graphs[7] = {}; // per-step captured Markov graph for sampled draft (logits + softcap)
+    bool markov_samp_step_oom[7] = {};
     cudaGraphExec_t inject_graphs[9] = {};        // captured inject(T=1..8, feat_off=0) graphs
     bool inject_graph_oom[9] = {};
     std::vector<cudaGraphExec_t> deferred_graphs_destroy;
@@ -2209,6 +2211,8 @@ struct DsparkEngine {
         for (int i = 0; i < 7; ++i) {
             if (markov_step_graphs[i]) { cudaGraphExecDestroy(markov_step_graphs[i]); markov_step_graphs[i] = nullptr; }
             markov_step_oom[i] = false;
+            if (markov_samp_step_graphs[i]) { cudaGraphExecDestroy(markov_samp_step_graphs[i]); markov_samp_step_graphs[i] = nullptr; }
+            markov_samp_step_oom[i] = false;
         }
     }
 
@@ -2237,6 +2241,8 @@ struct DsparkEngine {
         for (int i = 0; i < 7; ++i) {
             defer(markov_step_graphs[i]);
             markov_step_oom[i] = false;
+            defer(markov_samp_step_graphs[i]);
+            markov_samp_step_oom[i] = false;
         }
     }
 
@@ -3089,18 +3095,65 @@ struct DsparkEngine {
         float p_cum = 1.0f;
         for (int i = 0; i < eff_max; ++i) {
             const float* hi = block_cur + (size_t) (i + 1) * N;
-            dspark_detail::k_dspark_prep_joint<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
-                rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N);
-            E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
-            dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
-                joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
-            E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
-            dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
-                h_pred, hi, rnn_corr, dm->hidden_out_b, N);
-            E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
-            if (hp.softcap > 0.0f) {
-                k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
-                    E.logits, hp.vocab_unpadded, hp.softcap);
+            auto emit_step_d = [&]() {
+                dspark_detail::k_dspark_prep_joint_d<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
+                    rnn_state, dm->markov_w1, dm->markov_w1_type, d_draft_ids + i, hi, f_rnn_last, joint_inp, rank, N);
+                E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+                dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
+                    joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
+                E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
+                dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
+                    h_pred, hi, rnn_corr, dm->hidden_out_b, N);
+                E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
+                if (hp.softcap > 0.0f) {
+                    k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
+                        E.logits, hp.vocab_unpadded, hp.softcap);
+                }
+            };
+            if (!E.prof && d_draft_ids && !markov_samp_step_oom[i]) {
+                if (h_draft_ids_pin) {
+                    h_draft_ids_pin[i] = prev_id;
+                    CK(cudaMemcpyAsync(d_draft_ids + i, h_draft_ids_pin + i, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+                } else {
+                    CK(cudaMemcpyAsync(d_draft_ids + i, &prev_id, sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+                }
+                cudaGraphExec_t& sg = markov_samp_step_graphs[i];
+                if (!sg) {
+                    cudaGraph_t g = nullptr;
+                    if (cudaStreamBeginCapture(E.st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                        emit_step_d();
+                        if (cudaStreamEndCapture(E.st, &g) == cudaSuccess && g) {
+                            if (cudaGraphInstantiate(&sg, g, nullptr, nullptr, 0) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                sg = nullptr;
+                                markov_samp_step_oom[i] = true;
+                            }
+                            cudaGraphDestroy(g);
+                        } else {
+                            (void) cudaGetLastError();
+                            markov_samp_step_oom[i] = true;
+                        }
+                    } else {
+                        (void) cudaGetLastError();
+                        markov_samp_step_oom[i] = true;
+                    }
+                }
+                if (sg) CK(cudaGraphLaunch(sg, E.st));
+                else emit_step_d();
+            } else {
+                dspark_detail::k_dspark_prep_joint<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
+                    rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N);
+                E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+                dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
+                    joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
+                E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
+                dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
+                    h_pred, hi, rnn_corr, dm->hidden_out_b, N);
+                E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
+                if (hp.softcap > 0.0f) {
+                    k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
+                        E.logits, hp.vocab_unpadded, hp.softcap);
+                }
             }
             float p_i = 0.0f;
             if (gpu_sampled) {

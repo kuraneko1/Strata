@@ -2641,7 +2641,7 @@ struct Engine {
             int max_slots = std::max(attn_split_t1_full, attn_split_t1_swa);
             for (int t = 2; t <= max_t_split; ++t) {
                 int sp_t = 1;
-                if (t <= 5) {
+                if (t <= 8) {
                     const int sp_swa = std::clamp((sm_count + n_hkv - 1) / n_hkv, 4, 16);
                     const int sp_full = std::clamp((sm_count * 24) / n_hkv, 40, kAttnSplitMax);
                     sp_t = std::max(sp_swa, sp_full);
@@ -2672,6 +2672,12 @@ struct Engine {
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<4>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<3>, 24576);
         try_set_smem((const void*) k_attn_q8_gqa3_verify4_swa_wmma_split<2>, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify8_wmma_split<8>, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify8_wmma_split<7>, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify8_wmma_split<6>, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify8_swa_wmma_split<8>, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify8_swa_wmma_split<7>, 24576);
+        try_set_smem((const void*) k_attn_q8_gqa3_verify8_swa_wmma_split<6>, 24576);
         can_ctrl_wmma = (cc_maj >= 7);
         can_ctrl_down_wmma = (cc_maj >= 8);
         cudaFuncSetAttribute((const void*) k_control_up_combine_pp_wmma, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
@@ -3163,6 +3169,12 @@ struct Engine {
                         k_mmvq_q8_0_smallT<4, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 4);
                     } else if (T == 8) {
                         k_mmvq_q8_0_smallT<8, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 8);
+                    } else if (T == 7) {
+                        k_mmvq_q8_0_smallT<7, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 7);
+                    } else if (T == 6) {
+                        k_mmvq_q8_0_smallT<6, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 6);
+                    } else if (T == 5) {
+                        k_mmvq_q8_0_smallT<5, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 5);
                     } else if (T == 2) {
                         k_mmvq_q8_0_smallT<2, true, false><<<nb, 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 2);
                     } else if (T == 3) {
@@ -3222,6 +3234,12 @@ struct Engine {
             k_mmvq_q8_0_smallT<1, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 1, w2, Y2, (int) N2);
         } else if (T == 8) {
             k_mmvq_q8_0_smallT<8, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 8, w2, Y2, (int) N2);
+        } else if (T == 7) {
+            k_mmvq_q8_0_smallT<7, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 7, w2, Y2, (int) N2);
+        } else if (T == 6) {
+            k_mmvq_q8_0_smallT<6, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 6, w2, Y2, (int) N2);
+        } else if (T == 5) {
+            k_mmvq_q8_0_smallT<5, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 5, w2, Y2, (int) N2);
         } else if (T == 2) {
             k_mmvq_q8_0_smallT<2, true, true><<<nb, 128, 0, st>>>(w1, xu, Y1, (int) K_in, (int) N1, 2, w2, Y2, (int) N2);
         } else if (T == 3) {
@@ -3262,6 +3280,9 @@ struct Engine {
             else if (T == 3) k_mmvq_q8_0_smallT_multi<3, true, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, 3);
             else if (T == 2) k_mmvq_q8_0_smallT_multi<2, true, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, 2);
             else if (T == 1) k_mmvq_q8_0_smallT_multi<1, true, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, 1);
+            else if (T == 5) k_mmvq_q8_0_smallT_multi<5, true, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, 5);
+            else if (T == 6) k_mmvq_q8_0_smallT_multi<6, true, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, 6);
+            else if (T == 7) k_mmvq_q8_0_smallT_multi<7, true, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, 7);
             else if (T == 8) k_mmvq_q8_0_smallT_multi<8, true, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, 8);
             else k_mmvq_q8_0_smallT_multi<8, false, 3><<<nb, 128, 0, st>>>(sp, (int) K_in, T);
         } else {
@@ -3269,6 +3290,9 @@ struct Engine {
             else if (T == 3) k_mmvq_q8_0_smallT_multi<3, true, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, 3);
             else if (T == 2) k_mmvq_q8_0_smallT_multi<2, true, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, 2);
             else if (T == 1) k_mmvq_q8_0_smallT_multi<1, true, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, 1);
+            else if (T == 5) k_mmvq_q8_0_smallT_multi<5, true, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, 5);
+            else if (T == 6) k_mmvq_q8_0_smallT_multi<6, true, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, 6);
+            else if (T == 7) k_mmvq_q8_0_smallT_multi<7, true, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, 7);
             else if (T == 8) k_mmvq_q8_0_smallT_multi<8, true, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, 8);
             else k_mmvq_q8_0_smallT_multi<8, false, 5><<<nb, 128, 0, st>>>(sp, (int) K_in, T);
         }
@@ -3477,6 +3501,14 @@ struct Engine {
                 k_loop_down_fused_smallT<2, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 2, hp.rms_eps);
             } else if (T == 3) {
                 k_loop_down_fused_smallT<3, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 3, hp.rms_eps);
+            } else if (T == 5) {
+                k_loop_down_fused_smallT<5, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 5, hp.rms_eps);
+            } else if (T == 6) {
+                k_loop_down_fused_smallT<6, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 6, hp.rms_eps);
+            } else if (T == 7) {
+                k_loop_down_fused_smallT<7, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 7, hp.rms_eps);
+            } else if (T == 8) {
+                k_loop_down_fused_smallT<8, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 8, hp.rms_eps);
             } else {
                 k_loop_down_fused_smallT<8, false><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, T, hp.rms_eps);
             }
@@ -3501,6 +3533,14 @@ struct Engine {
                     k_control_up_combine_smallT<2, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 2, N);
                 } else if (T == 3) {
                     k_control_up_combine_smallT<3, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 3, N);
+                } else if (T == 5) {
+                    k_control_up_combine_smallT<5, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 5, N);
+                } else if (T == 6) {
+                    k_control_up_combine_smallT<6, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 6, N);
+                } else if (T == 7) {
+                    k_control_up_combine_smallT<7, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 7, N);
+                } else if (T == 8) {
+                    k_control_up_combine_smallT<8, true><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, 8, N);
                 } else {
                     k_control_up_combine_smallT<8, false><<<nb, 256, 0, st>>>(c, msg, wg, wf, ctrl64, out, T, N);
                 }
@@ -7255,6 +7295,18 @@ struct Engine {
                         } else if (T == 3) {
                             k_loop_down_fused_smallT_3<3, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 3, hp.rms_eps);
                             k_control_up_combine_smallT_3<3, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 3, N);
+                        } else if (T == 5) {
+                            k_loop_down_fused_smallT_3<5, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 5, hp.rms_eps);
+                            k_control_up_combine_smallT_3<5, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 5, N);
+                        } else if (T == 6) {
+                            k_loop_down_fused_smallT_3<6, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 6, hp.rms_eps);
+                            k_control_up_combine_smallT_3<6, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 6, N);
+                        } else if (T == 7) {
+                            k_loop_down_fused_smallT_3<7, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 7, hp.rms_eps);
+                            k_control_up_combine_smallT_3<7, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 7, N);
+                        } else if (T == 8) {
+                            k_loop_down_fused_smallT_3<8, true><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, 8, hp.rms_eps);
+                            k_control_up_combine_smallT_3<8, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 8, N);
                         } else {
                             k_loop_down_fused_smallT_3<8, false><<<dim3(64, 3), 256, 0, st>>>(cp, ctrl2N, N, 64, T, hp.rms_eps);
                             k_control_up_combine_smallT_3<8, false><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, T, N);
@@ -7906,10 +7958,22 @@ struct Engine {
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (is_swa && T >= 6 && T <= 8) {
-                        k_attn_q8_gqa3_swa_1pass<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink,
-                            pGate, att, xq, (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext,
-                            cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
+                        const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
+                        if (T == 8) {
+                            k_attn_q8_gqa3_verify8_swa_wmma_split<8><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else if (T == 7) {
+                            k_attn_q8_gqa3_verify8_swa_wmma_split<7><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else {
+                            k_attn_q8_gqa3_verify8_swa_wmma_split<6><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        }
+                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (T >= 2 && T <= 5 && !is_swa) {
                         const int sp = std::min(sp_cap, std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
@@ -7927,6 +7991,24 @@ struct Engine {
                                 (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         } else {
                             k_attn_q8_gqa3_verify4_wmma_split<2><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        }
+                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
+                        att_xq_ready = xq;
+                    } else if (T >= 6 && T <= 8 && !is_swa) {
+                        const int sp = std::min(sp_cap, std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
+                        if (T == 8) {
+                            k_attn_q8_gqa3_verify8_wmma_split<8><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else if (T == 7) {
+                            k_attn_q8_gqa3_verify8_wmma_split<7><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else {
+                            k_attn_q8_gqa3_verify8_wmma_split<6><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
                                 pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
                                 (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         }
@@ -9894,9 +9976,9 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
     const float tau_min0 = env_f("STRATA_DSPARK_TAU0", tight_hy ? 0.15f : 0.0f);
     const float tau_step = env_f("STRATA_DSPARK_TAU_STEP", tight_hy ? 0.50f : 0.45f);
     const float tau_cum  = env_f("STRATA_DSPARK_TAU_CUM", tight_hy ? 0.30f : 0.25f);
-    const float tau_ext  = env_f("STRATA_DSPARK_TAU_EXT", E.hybrid ? 0.78f : 0.90f);
-    const float tau_cum_ext = env_f("STRATA_DSPARK_TAU_CUM_EXT", E.hybrid ? 0.58f : 0.72f);
-    const int base_k_cfg = std::clamp(env_i("STRATA_DSPARK_BASE_K", (E.hybrid && draft_max >= 4) ? 3 : draft_max), 1, 7);
+    const float tau_ext  = env_f("STRATA_DSPARK_TAU_EXT", E.hybrid ? 0.78f : 0.72f);
+    const float tau_cum_ext = env_f("STRATA_DSPARK_TAU_CUM_EXT", E.hybrid ? 0.58f : 0.50f);
+    const int base_k_cfg = std::clamp(env_i("STRATA_DSPARK_BASE_K", (draft_max >= 4) ? 3 : draft_max), 1, 7);
     const int max_ext_cfg = [&] {
         const char* v = std::getenv("STRATA_DSPARK_MAX_EXT");
         return (v && v[0]) ? std::clamp(std::atoi(v), 1, 7) : draft_max;
