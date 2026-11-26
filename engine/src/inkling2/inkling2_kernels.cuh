@@ -5678,6 +5678,77 @@ __global__ void k_gemm_f32_smallT_warp(const float* __restrict__ W, const float*
     }
 }
 
+/// Fused small-T (1..8) BF16-weight x FP32-activation GEMM for full-attn dyn_k + dyn_v conv projections:
+/// Combines attn_k_conv_proj (n_out=32) + attn_v_conv_proj (n_out=32) into 1 single 64-CTA x 96-thr launch!
+/// Exact 288/96 = 3 uint4 (8 BF16) loads/thread for N==2304 (0 tail divergence, 3-warp reduce, STACK: 0).
+template <int MT, bool EXACT_T>
+__global__ void __launch_bounds__(96, (MT <= 4) ? 8 : 6) k_bf16_conv_kv_smallT(
+    const uint16_t* __restrict__ Wk, const float* __restrict__ Xk, float* __restrict__ Yk,
+    const uint16_t* __restrict__ Wv, const float* __restrict__ Xv, float* __restrict__ Yv,
+    int n_in, int n_out, int T) {
+    __shared__ float s_sum[MT][3];
+    const int bx = (int) blockIdx.x;
+    const bool is_v = (bx >= n_out);
+    const int o = is_v ? (bx - n_out) : bx;
+    if (o >= n_out) return;
+    const uint16_t* W = is_v ? Wv : Wk;
+    const float* X = is_v ? Xv : Xk;
+    float* Y = is_v ? Yv : Yk;
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n8 = n_in >> 3;
+    const uint4* wr8 = reinterpret_cast<const uint4*>(W + (size_t) o * n_in);
+    float acc[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
+    auto step_i = [&](int i) {
+        const uint4 w4 = __ldg(wr8 + i);
+        const float f0 = __uint_as_float((w4.x & 0xFFFFu) << 16);
+        const float f1 = __uint_as_float(w4.x & 0xFFFF0000u);
+        const float f2 = __uint_as_float((w4.y & 0xFFFFu) << 16);
+        const float f3 = __uint_as_float(w4.y & 0xFFFF0000u);
+        const float f4 = __uint_as_float((w4.z & 0xFFFFu) << 16);
+        const float f5 = __uint_as_float(w4.z & 0xFFFF0000u);
+        const float f6 = __uint_as_float((w4.w & 0xFFFFu) << 16);
+        const float f7 = __uint_as_float(w4.w & 0xFFFF0000u);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4* xt = reinterpret_cast<const float4*>(X + (size_t) t * n_in) + (i << 1);
+                const float4 b0 = __ldg(xt);
+                const float4 b1 = __ldg(xt + 1);
+                acc[t] += (f0 * b0.x + f1 * b0.y + f2 * b0.z + f3 * b0.w) +
+                          (f4 * b1.x + f5 * b1.y + f6 * b1.z + f7 * b1.w);
+            }
+        }
+    };
+    if (n8 == 288) {
+        if constexpr (MT <= 4) {
+            step_i(tid);
+            step_i(tid + 96);
+            step_i(tid + 192);
+        } else {
+#pragma unroll 1
+            for (int it = 0; it < 3; ++it) step_i(tid + it * 96);
+        }
+    } else {
+#pragma unroll 1
+        for (int i = tid; i < n8; i += 96) step_i(i);
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (EXACT_T || t < T) {
+            float v = acc[t];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0) s_sum[t][warp] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < (EXACT_T ? MT : T)) {
+        Y[(size_t) tid * n_out + o] = s_sum[tid][0] + s_sum[tid][1] + s_sum[tid][2];
+    }
+}
+
 /// Small-T (2..8) BF16-weight x FP32-activation GEMM (n_out <= 128): 1 CTA of 256 threads per output row.
 /// Reads BF16 weights ONCE via 16-byte LDG.128 (uint4 = 8 BF16s/load) when n_in % 8 == 0 across all T tokens.
 template <int MT, bool EXACT_T>

@@ -393,10 +393,15 @@ struct Model : GpuWeightStore {
         const uint8_t* row = host_tok_embd + (size_t) tok * tok_embd_row_bytes;
         if (tok_embd_type == 30) {
             const uint16_t* bf = (const uint16_t*) row;
-            for (int i = 0; i < N; ++i) {
-                uint32_t u = (uint32_t) bf[i] << 16;
-                std::memcpy(&dst[i], &u, 4);
+            uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
+            int i = 0;
+            for (; i + 4 <= N; i += 4) {
+                d32[i + 0] = (uint32_t) bf[i + 0] << 16;
+                d32[i + 1] = (uint32_t) bf[i + 1] << 16;
+                d32[i + 2] = (uint32_t) bf[i + 2] << 16;
+                d32[i + 3] = (uint32_t) bf[i + 3] << 16;
             }
+            for (; i < N; ++i) d32[i] = (uint32_t) bf[i] << 16;
         } else if (tok_embd_type == 1) {
             const uint16_t* h = (const uint16_t*) row;
             for (int i = 0; i < N; ++i) {
@@ -1029,6 +1034,7 @@ struct PromptSuffixDrafter {
         int32_t p[4] = {-1, -1, -1, -1};
     };
     std::vector<Bucket> buckets;
+    std::vector<int32_t> indexed_toks;
     size_t indexed_len = 0;
     int32_t sig0 = 0, sig_mid = 0, sig_last = 0;
 
@@ -1042,16 +1048,40 @@ struct PromptSuffixDrafter {
     }
 
     void reset() {
-        buckets.clear();
-        buckets.resize(kBuckets);
+        if (!buckets.empty()) std::fill(buckets.begin(), buckets.end(), Bucket{});
+        indexed_toks.clear();
         indexed_len = 0;
         sig0 = sig_mid = sig_last = 0;
+    }
+
+    /// Incrementally index a prefill chunk while the CPU waits on GPU prefill sync (0 ms decode stall).
+    void sync_chunk(const int32_t* toks, int T, int64_t pos0) {
+        if (!toks || T <= 0 || pos0 < 0 || (size_t) pos0 != indexed_len) return;
+        if (buckets.empty()) buckets.resize(kBuckets);
+        const size_t old_n = indexed_len;
+        const size_t new_n = old_n + (size_t) T;
+        indexed_toks.insert(indexed_toks.end(), toks, toks + T);
+        const size_t start = std::max<size_t>(3, old_n);
+        for (size_t i = start; i < new_n; ++i) {
+            Bucket& bk = buckets[hash4(indexed_toks[i - 3], indexed_toks[i - 2], indexed_toks[i - 1], indexed_toks[i])];
+            bk.p[3] = bk.p[2];
+            bk.p[2] = bk.p[1];
+            bk.p[1] = bk.p[0];
+            bk.p[0] = (int32_t) i;
+        }
+        indexed_len = new_n;
+        if (new_n >= 4) {
+            sig0 = indexed_toks[0];
+            sig_mid = indexed_toks[new_n >> 1];
+            sig_last = indexed_toks[new_n - 1];
+        }
     }
 
     void sync(const std::vector<int32_t>& toks) {
         const size_t n = toks.size();
         if (n < 4) {
             indexed_len = 0;
+            indexed_toks.clear();
             return;
         }
         if (buckets.empty()) buckets.resize(kBuckets);
@@ -1061,6 +1091,7 @@ struct PromptSuffixDrafter {
             start = indexed_len;
         } else {
             std::fill(buckets.begin(), buckets.end(), Bucket{});
+            indexed_toks.clear();
         }
         for (size_t i = start; i < n; ++i) {
             Bucket& bk = buckets[hash4(toks[i - 3], toks[i - 2], toks[i - 1], toks[i])];
@@ -1123,6 +1154,7 @@ struct Engine {
     cudaEvent_t ev_dspark_acc_src = nullptr;
     cudaEvent_t ev_dspark_acc_done = nullptr;
     bool moe_raw_zero_pending = false;
+    bool commit_verify_pending = false;
     cudaMemPool_t phase_pool = nullptr;
     bool use_phase_pool = false;
     strata::prefill::Gemm gemm;
@@ -1457,6 +1489,7 @@ struct Engine {
     cudaGraphExec_t verify_core_graph[10][2] = {};
     // Full 48-layer + swa_bak + head + argmax/softcap graphs for Full-VRAM (T=1..9, capture_dspark, want_softcap, want_argmax, sp_bucket)
     cudaGraphExec_t full_decode_graph[10][2][2][2][2] = {};
+    uint16_t full_decode_graph_hits[10][2][2][2][2] = {};
     std::vector<cudaGraphExec_t> layer_pre_graph;
     std::vector<cudaGraphExec_t> verify_pre_graph[10];
     std::vector<cudaGraphExec_t> deferred_graphs_destroy;
@@ -1505,6 +1538,7 @@ struct Engine {
     // uninitialized heap buffer while GPU immediately resumes the next prefill chunk / decode token!
     void save_checkpoint_into(StateCheckpoint& cp, const std::vector<int32_t>& tokens,
                               const std::vector<uint64_t>& img_sigs = {}) {
+        wait_commit_verify();
         flush_ckpt_bg();
         const auto& hp = m->hp;
         const int cur_pos = (int) tokens.size();
@@ -1588,6 +1622,7 @@ struct Engine {
     }
 
     void restore_checkpoint(const StateCheckpoint& cp) {
+        wait_commit_verify();
         flush_ckpt_bg();
         const auto& hp = m->hp;
         const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
@@ -2347,6 +2382,7 @@ struct Engine {
     void resize_swa_kv_pool(int new_cap) {
         if (new_cap == swa_kv_cap || swa_ptrs.n_swa_layers == 0) return;
         const auto t0 = Clock::now();
+        wait_commit_verify();
         const auto& hp = m->hp;
         const size_t new_bytes = swa_kv_pool_size_for(new_cap);
         const int n_live = (int) std::min<int64_t>(pos, hp.n_swa);
@@ -2990,6 +3026,7 @@ struct Engine {
     }
 
     void reset_state() {
+        wait_commit_verify();
         pos = 0;
         decode_scores_normalized = false;
         pld.reset();
@@ -3025,25 +3062,43 @@ struct Engine {
         if (!swa_bak) CK(cudaMalloc(&swa_bak, (size_t) swa_bak_slots * swa_ptrs.n_swa_layers * slot_bytes));
     }
 
+    void wait_commit_verify() {
+        if (commit_verify_pending) {
+            CK(cudaStreamWaitEvent(st, ev_moe_zeroed, 0));
+            commit_verify_pending = false;
+        }
+    }
+
     /// Commit `1 + m` tokens `[anchor, d_0..d_{m-1}]` out of `1 + K` verified tokens starting at `pos_pre`.
+    /// Runs conv_hist rollback + SWA KV restore asynchronously on aux_st so DSpark inject + draft_confident overlap on st!
     void commit_verify(int m_accepted, int K, int pos_pre) {
         const auto& hp = m->hp;
         if (m_accepted < K) {
             const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
             const size_t total_conv = (size_t) hp.n_layer * layer_conv_floats;
+            const bool use_aux = (aux_st != nullptr && ev_attn_done != nullptr && ev_moe_zeroed != nullptr);
+            cudaStream_t rst = use_aux ? aux_st : st;
+            if (use_aux) {
+                CK(cudaEventRecord(ev_attn_done, st));
+                CK(cudaStreamWaitEvent(aux_st, ev_attn_done, 0));
+            }
             CK(cudaMemcpyAsync(conv_hist_pool, d_conv_trace + (size_t) m_accepted * total_conv,
-                               conv_bytes, cudaMemcpyDeviceToDevice, st));
+                               conv_bytes, cudaMemcpyDeviceToDevice, rst));
             if (swa_ptrs.n_swa_layers > 0) {
                 const int n_restore = K - m_accepted;
                 if (kv_q8) {
-                    k_swa_q8_bak<<<dim3((unsigned) n_restore, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                    k_swa_q8_bak<<<dim3((unsigned) n_restore, (unsigned) swa_ptrs.n_swa_layers), 256, 0, rst>>>(
                         swa_ptrs, swa_bak, (int) hp.kv_dim, (int) hp.n_head_kv, swa_kv_cap,
                         pos_pre + 1, m_accepted, n_restore, 1);
                 } else {
-                    k_swa_f16_bak<<<dim3((unsigned) n_restore, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                    k_swa_f16_bak<<<dim3((unsigned) n_restore, (unsigned) swa_ptrs.n_swa_layers), 256, 0, rst>>>(
                         swa_ptrs, swa_bak, (int) hp.kv_dim, swa_kv_cap,
                         pos_pre + 1, m_accepted, n_restore, 1);
                 }
+            }
+            if (use_aux) {
+                CK(cudaEventRecord(ev_moe_zeroed, aux_st));
+                commit_verify_pending = true;
             }
         }
         pos = pos_pre + 1 + m_accepted;
@@ -4599,8 +4654,10 @@ struct Engine {
             for (int c = 0; c < 2; ++c)
                 for (int s = 0; s < 2; ++s)
                     for (int a = 0; a < 2; ++a)
-                        for (int b = 0; b < 2; ++b)
+                        for (int b = 0; b < 2; ++b) {
                             defer(full_decode_graph[t][c][s][a][b]);
+                            full_decode_graph_hits[t][c][s][a][b] = 0;
+                        }
         for (auto& g : layer_pre_graph) defer(g);
         for (int t = 0; t < 10; ++t) {
             for (auto& g : verify_pre_graph[t]) defer(g);
@@ -6460,6 +6517,7 @@ struct Engine {
         cudaGraphExec_t* fg_slot = nullptr;
         const int fg_sp_b = (cc_maj == 7 && cc_min < 5)
             ? ((T == 1) ? ((pos >= 32768 && pos < 131072) ? 1 : 0) : (pos > 98304 ? 1 : 0)) : 0;
+        wait_commit_verify();
         if (can_full_graph) {
             for (int ip = 0; ip < (int) m->layers.size() && ip < kMaxRebalLayers; ++ip) {
                 if (layer_pending_rebal[ip]) {
@@ -6481,11 +6539,18 @@ struct Engine {
                 pos += T;
                 return last_pick;
             }
-            if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
-                capturing_full_graph = true;
-            } else {
-                (void) cudaGetLastError();
-                graph_oom = true;
+            uint16_t& fg_hits = full_decode_graph_hits[T][capture_dspark ? 1 : 0][want_softcap ? 1 : 0][want_argmax ? 1 : 0][fg_sp_b];
+            if (fg_hits < 65535u) ++fg_hits;
+            // Defer 700-node cudaGraphInstantiate to hit #2 for 1-off rare verify sizes (T>=5 or capture_dspark T==1)
+            // so rare extension steps skip ~6 ms graph instantiation overhead!
+            const bool want_capture_fg = (T == 1 && !capture_dspark) || (T >= 2 && T <= 4) || (fg_hits >= 2);
+            if (want_capture_fg) {
+                if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                    capturing_full_graph = true;
+                } else {
+                    (void) cudaGetLastError();
+                    graph_oom = true;
+                }
             }
         }
 
@@ -7726,8 +7791,27 @@ struct Engine {
                                               L.attn_rel, R, rel_dim, &L.attn_k, K, kv_dim, &L.attn_v, V, kv_dim, T, N)) {
                 // Fused 5-way Q+Gate+R+K+V in 1 launch (per-matrix xq_k/xq_v covers all 48 layers)!
                 if (!is_swa) {
-                    project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N, nullptr);
-                    project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N, nullptr);
+                    const bool can_fused_conv_kv = (L.attn_k_conv_proj.type == 30 && L.attn_v_conv_proj.type == 30 &&
+                                                    (N & 7) == 0 && dyn_dim > 0 &&
+                                                    ((((uintptr_t) L.attn_k_conv_proj.d) | ((uintptr_t) L.attn_v_conv_proj.d)) & 15u) == 0u &&
+                                                    ((((uintptr_t) ink_src) | ((uintptr_t) inv_src)) & 15u) == 0u);
+                    if (can_fused_conv_kv) {
+                        const uint16_t* wk = (const uint16_t*) L.attn_k_conv_proj.d;
+                        const uint16_t* wv = (const uint16_t*) L.attn_v_conv_proj.d;
+                        const unsigned g_kv = (unsigned) (2 * dyn_dim);
+                        if (T == 1) k_bf16_conv_kv_smallT<1, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 1);
+                        else if (T == 4) k_bf16_conv_kv_smallT<4, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 4);
+                        else if (T == 2) k_bf16_conv_kv_smallT<2, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 2);
+                        else if (T == 3) k_bf16_conv_kv_smallT<3, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 3);
+                        else if (T == 5) k_bf16_conv_kv_smallT<5, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 5);
+                        else if (T == 6) k_bf16_conv_kv_smallT<6, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 6);
+                        else if (T == 7) k_bf16_conv_kv_smallT<7, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 7);
+                        else if (T == 8) k_bf16_conv_kv_smallT<8, true><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, 8);
+                        else k_bf16_conv_kv_smallT<8, false><<<g_kv, 96, 0, st>>>(wk, ink_src, dyn_k, wv, inv_src, dyn_v, N, (int) dyn_dim, T);
+                    } else {
+                        project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N, nullptr);
+                        project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N, nullptr);
+                    }
                 }
             } else {
                 if (use_fused_qgr) {
@@ -8814,8 +8898,8 @@ struct Engine {
 
         const int core_end_virt = (int) (hp.core_start + hp.num_loops * n_core);
         for (int il = 0; il < hp.n_layer; ++il) {
-            const bool use_t1_core = (!capturing_full_graph && !prof && T == 1 && !capture_dspark);
-            const bool use_vf_core = (!capturing_full_graph && !prof && T >= 1 && T <= std::min(verify_max_t, 9) &&
+            const bool use_t1_core = (!can_full_graph && !capturing_full_graph && !prof && T == 1 && !capture_dspark);
+            const bool use_vf_core = (!can_full_graph && !capturing_full_graph && !prof && T >= 1 && T <= std::min(verify_max_t, 9) &&
                                       capture_dspark && ((T == 1 && !save_conv_trace) || (T >= 2 && save_conv_trace)));
             if ((use_t1_core || use_vf_core) && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
                 // EX-5 Idea D: Drain any pending async cst rebal events on core layers BEFORE entering stream capture!
@@ -9120,6 +9204,7 @@ struct Engine {
         if (!compute_logits) {
             const bool queued_hits = pp_streaming ? queue_sync_d_hits() : false;
             if (T <= kDecodePhaseCap) flush_deferred_graphs();
+            if (capture_dspark && dspark && T >= 32) pld.sync_chunk(tokens, T, pos);
             CK(cudaStreamSynchronize(st));
             if (queued_hits) finish_sync_d_hits(true);
             if (prof) p_head_ms += ms_since(tp_h0);
@@ -9193,11 +9278,13 @@ struct Engine {
             if (!pbuf) { tmp_picks.assign((size_t) rows, 0); pbuf = tmp_picks.data(); }
             CK(cudaMemcpyAsync(pbuf, pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
             if (T <= kDecodePhaseCap) flush_deferred_graphs();
+            if (capture_dspark && dspark && T >= 32) pld.sync_chunk(tokens, T, pos);
             CK(cudaStreamSynchronize(st));
             if (out_picks) out_picks->assign(pbuf, pbuf + rows);
             last_pick = pbuf[rows - 1];
         } else {
             if (T <= kDecodePhaseCap) flush_deferred_graphs();
+            if (capture_dspark && dspark && T >= 32) pld.sync_chunk(tokens, T, pos);
             CK(cudaStreamSynchronize(st));
         }
         if (queued_hits) finish_sync_d_hits(true);
@@ -10056,6 +10143,9 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
     int emitted = 0;
     std::vector<float> lg;
     std::vector<int32_t> d_toks, vtoks, t_picks;
+    d_toks.reserve(8);
+    vtoks.reserve(9);
+    t_picks.reserve(9);
     std::vector<std::vector<float>> d_logits;
     std::vector<SamplingDist> q_dists;
     if (out_hit_eos) *out_hit_eos = false;
@@ -11021,8 +11111,21 @@ int run(int argc, char** argv) {
         if (max_new > 0) {
             if (dspark && max_new >= 2) {
                 if (E.hybrid) E.set_phase_decode();
+                const int w_max_k = std::min(std::min(E.verify_max_t - 1, draft_max), max_new - 1);
+                const int w_base_k = std::min(w_max_k, (draft_max >= 4) ? 3 : draft_max);
                 std::vector<int32_t> wd;
-                dspark->draft(E, w, std::min(draft_max, max_new - 1), wd, nullptr, [&](int, std::vector<float>&) -> int32_t { return 0; });
+                dspark->draft_confident(E, w, w_base_k, w_max_k, 0.0f, 0.45f, 0.25f, 0.72f, 0.50f, wd);
+                const int wk = (int) wd.size();
+                if (wk >= 1 && E.pos + 1 + wk <= E.ctx) {
+                    std::vector<int32_t> wv(1 + (size_t) wk);
+                    wv[0] = w;
+                    for (int i = 0; i < wk; ++i) wv[1 + (size_t) i] = wd[(size_t) i];
+                    std::vector<int32_t> wp;
+                    const int wp0 = (int) E.pos;
+                    E.forward(wv.data(), 1 + wk, false, nullptr, false, true, wk, &wp, true, false);
+                    E.commit_verify(0, wk, wp0);
+                    dspark->inject(E, wp0, 1);
+                }
                 if (E.in_decode_phase) E.set_phase_prefill();
             } else {
                 E.forward(&w, 1);
