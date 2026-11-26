@@ -2143,34 +2143,53 @@ __global__ void __launch_bounds__(256, 4) k_loop_down_fused_smallT(const float* 
                 s_rm[warp] = rsqrtf(vsm / (float) N + eps);
             }
         }
-        float dc[MT], dm[MT];
+        {
+            float dc[MT];
 #pragma unroll
-        for (int t = 0; t < MT; ++t) { dc[t] = 0.0f; dm[t] = 0.0f; }
-        for (int i = tid; i < n4; i += 256) {
-            const float4 awc = wc4[i];
-            const float4 awm = wm4[i];
+            for (int t = 0; t < MT; ++t) dc[t] = 0.0f;
+#pragma unroll 1
+            for (int i = tid; i < n4; i += 256) {
+                const float4 awc = wc4[i];
+#pragma unroll
+                for (int t = 0; t < MT; ++t) {
+                    if (EXACT_T || t < T) {
+                        const float4 vc = reinterpret_cast<const float4*>(cur + (size_t) t * N)[i];
+                        dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
+                    }
+                }
+            }
 #pragma unroll
             for (int t = 0; t < MT; ++t) {
                 if (EXACT_T || t < T) {
-                    const float4 vc = reinterpret_cast<const float4*>(cur + (size_t) t * N)[i];
-                    const float4 vm = reinterpret_cast<const float4*>(msg + (size_t) t * N)[i];
-                    dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
-                    dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
+                    float vdc = dc[t];
+#pragma unroll
+                    for (int m = 16; m > 0; m >>= 1) vdc += __shfl_xor_sync(0xffffffffu, vdc, m);
+                    if (lane == 0) s_dc[t][warp] = vdc;
                 }
             }
         }
+        {
+            float dm[MT];
 #pragma unroll
-        for (int t = 0; t < MT; ++t) {
-            if (EXACT_T || t < T) {
-                float vdc = dc[t], vdm = dm[t];
+            for (int t = 0; t < MT; ++t) dm[t] = 0.0f;
+#pragma unroll 1
+            for (int i = tid; i < n4; i += 256) {
+                const float4 awm = wm4[i];
 #pragma unroll
-                for (int m = 16; m > 0; m >>= 1) {
-                    vdc += __shfl_xor_sync(0xffffffffu, vdc, m);
-                    vdm += __shfl_xor_sync(0xffffffffu, vdm, m);
+                for (int t = 0; t < MT; ++t) {
+                    if (EXACT_T || t < T) {
+                        const float4 vm = reinterpret_cast<const float4*>(msg + (size_t) t * N)[i];
+                        dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
+                    }
                 }
-                if (lane == 0) {
-                    s_dc[t][warp] = vdc;
-                    s_dm[t][warp] = vdm;
+            }
+#pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                if (EXACT_T || t < T) {
+                    float vdm = dm[t];
+#pragma unroll
+                    for (int m = 16; m > 0; m >>= 1) vdm += __shfl_xor_sync(0xffffffffu, vdm, m);
+                    if (lane == 0) s_dm[t][warp] = vdm;
                 }
             }
         }
@@ -2286,34 +2305,53 @@ __global__ void __launch_bounds__(256, 4) k_loop_down_fused_smallT_3(CtrlPtrs3 c
                 s_rm[warp] = rsqrtf(vsm / (float) N + eps);
             }
         }
-        float dc[MT], dm[MT];
+        {
+            float dc[MT];
 #pragma unroll
-        for (int t = 0; t < MT; ++t) { dc[t] = 0.0f; dm[t] = 0.0f; }
-        for (int i = tid; i < n4; i += 256) {
-            const float4 awc = wc4[i];
-            const float4 awm = wm4[i];
+            for (int t = 0; t < MT; ++t) dc[t] = 0.0f;
+#pragma unroll 1
+            for (int i = tid; i < n4; i += 256) {
+                const float4 awc = wc4[i];
+#pragma unroll
+                for (int t = 0; t < MT; ++t) {
+                    if (EXACT_T || t < T) {
+                        const float4 vc = reinterpret_cast<const float4*>(cur + (size_t) t * N)[i];
+                        dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
+                    }
+                }
+            }
 #pragma unroll
             for (int t = 0; t < MT; ++t) {
                 if (EXACT_T || t < T) {
-                    const float4 vc = reinterpret_cast<const float4*>(cur + (size_t) t * N)[i];
-                    const float4 vm = reinterpret_cast<const float4*>(msg + (size_t) t * N)[i];
-                    dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
-                    dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
+                    float vdc = dc[t];
+#pragma unroll
+                    for (int m = 16; m > 0; m >>= 1) vdc += __shfl_xor_sync(0xffffffffu, vdc, m);
+                    if (lane == 0) s_dc[t][warp] = vdc;
                 }
             }
         }
+        {
+            float dm[MT];
 #pragma unroll
-        for (int t = 0; t < MT; ++t) {
-            if (EXACT_T || t < T) {
-                float vdc = dc[t], vdm = dm[t];
+            for (int t = 0; t < MT; ++t) dm[t] = 0.0f;
+#pragma unroll 1
+            for (int i = tid; i < n4; i += 256) {
+                const float4 awm = wm4[i];
 #pragma unroll
-                for (int m = 16; m > 0; m >>= 1) {
-                    vdc += __shfl_xor_sync(0xffffffffu, vdc, m);
-                    vdm += __shfl_xor_sync(0xffffffffu, vdm, m);
+                for (int t = 0; t < MT; ++t) {
+                    if (EXACT_T || t < T) {
+                        const float4 vm = reinterpret_cast<const float4*>(msg + (size_t) t * N)[i];
+                        dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
+                    }
                 }
-                if (lane == 0) {
-                    s_dc[t][warp] = vdc;
-                    s_dm[t][warp] = vdm;
+            }
+#pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                if (EXACT_T || t < T) {
+                    float vdm = dm[t];
+#pragma unroll
+                    for (int m = 16; m > 0; m >>= 1) vdm += __shfl_xor_sync(0xffffffffu, vdm, m);
+                    if (lane == 0) s_dm[t][warp] = vdm;
                 }
             }
         }
@@ -14083,7 +14121,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 const __half2 dk2 = __half2half2(__ldg(&ks[(size_t) slot * n_head_kv + hkv]));
                 const __half2 kb = __hmul2(neg1152, dk2);
                 const int8_t* kp = kq + (size_t) slot * kv_dim + hkv * 128 + wc0;
-#pragma unroll
+#pragma unroll 1
                 for (int i = 0; i < 4; ++i) {
                     const uint4 raw = *reinterpret_cast<const uint4*>(kp + i * 16);
                     __half2 h2[8];
@@ -14094,7 +14132,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 }
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll
+#pragma unroll 1
                 for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
             }
         }
@@ -14142,7 +14180,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 const __half2 dv2 = __half2half2(__ldg(&vs[(size_t) slot * n_head_kv + hkv]));
                 const __half2 vb = __hmul2(neg1152, dv2);
                 const int8_t* vp = vq + (size_t) slot * kv_dim + hkv * 128 + wc0;
-#pragma unroll
+#pragma unroll 1
                 for (int i = 0; i < 4; ++i) {
                     const uint4 vr = *reinterpret_cast<const uint4*>(vp + i * 16);
                     __half2 h2[8];
@@ -14153,7 +14191,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 }
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll
+#pragma unroll 1
                 for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
             }
         }
@@ -14193,25 +14231,16 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
         const uint32_t pa6 = hi8 ? h2u : o2, pa7 = hi8 ? h3u : o3;
         __syncwarp();
 
-        uint2 b[2];
 #pragma unroll
-        for (int nb = 0; nb < 8; nb += 2) {
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE + (nb + 1) * 16);
-            mma_rr(acc[nb + 0], pa0, pa1, b[0].x, b[0].y);
-            mma_rr(acc[nb + 1], pa0, pa1, b[1].x, b[1].y);
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE + (nb + 1) * 16);
-            mma_rr(acc[nb + 0], pa2, pa3, b[0].x, b[0].y);
-            mma_rr(acc[nb + 1], pa2, pa3, b[1].x, b[1].y);
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE + (nb + 1) * 16);
-            mma_rr(acc[nb + 0], pa4, pa5, b[0].x, b[0].y);
-            mma_rr(acc[nb + 1], pa4, pa5, b[1].x, b[1].y);
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE + (nb + 1) * 16);
-            mma_rr(acc[nb + 0], pa6, pa7, b[0].x, b[0].y);
-            mma_rr(acc[nb + 1], pa6, pa7, b[1].x, b[1].y);
+        for (int n = 0; n < 8; ++n) {
+            uint2 b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE + n * 16);
+            mma_rr(acc[n], pa0, pa1, b0.x, b0.y);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE + n * 16);
+            mma_rr(acc[n], pa2, pa3, b0.x, b0.y);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE + n * 16);
+            mma_rr(acc[n], pa4, pa5, b0.x, b0.y);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE + n * 16);
+            mma_rr(acc[n], pa6, pa7, b0.x, b0.y);
         }
         __syncwarp();
     }
@@ -14373,7 +14402,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 const __half2 dk2 = __half2half2(__ldg(&ks[(size_t) slot * n_head_kv + hkv]));
                 const __half2 kb = __hmul2(neg1152, dk2);
                 const int8_t* kp = kq + (size_t) slot * kv_dim + hkv * 128 + wc0;
-#pragma unroll
+#pragma unroll 1
                 for (int i = 0; i < 4; ++i) {
                     const uint4 raw = *reinterpret_cast<const uint4*>(kp + i * 16);
                     __half2 h2[8];
@@ -14384,7 +14413,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
                 }
             } else {
                 const uint4 z = make_uint4(0, 0, 0, 0);
-#pragma unroll
+#pragma unroll 1
                 for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(dst + i * 8) = z;
             }
         }
