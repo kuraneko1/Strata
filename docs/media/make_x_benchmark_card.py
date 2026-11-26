@@ -173,7 +173,8 @@ def render(cfg: dict, out_path: Path):
         ann(ax_pp, depths[0], pp_on[0], f"{pp_on[0]:,.0f}", C_ON, dx=9, dy=4, ha="left", va="bottom", fs=10.8)
         ann(ax_pp, depths[0], pp_off[0], f"{pp_off[0]:,.0f}", C_OFF_TXT, dx=9, dy=-12, ha="left", va="top", fs=10.2, weight="normal")
     else:
-        ann(ax_pp, depths[0], max(pp_on[0], pp_off[0]), f"{max(pp_on[0], pp_off[0]):,.0f}", C_ON, dx=9, dy=3, ha="left", va="bottom", fs=10.8)
+        ann(ax_pp, depths[0], pp_off[0], f"{pp_off[0]:,.0f}", C_OFF_TXT, dx=9, dy=5, ha="left", va="bottom", fs=10.0, weight="normal")
+        ann(ax_pp, depths[0], pp_on[0], f"{pp_on[0]:,.0f}", C_ON, dx=10, dy=-8, ha="left", va="top", fs=10.6)
     if 65.536 in idx_map:
         i64 = idx_map[65.536]
         ann(ax_pp, depths[i64], pp_on[i64], f"{pp_on[i64]:,.0f}", C_ON, dx=-6, dy=-14, ha="right", va="top", fs=10.2)

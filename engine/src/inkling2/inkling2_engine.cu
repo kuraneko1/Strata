@@ -1794,9 +1794,9 @@ struct Engine {
 
     static bool layer_allow_pin_hblobs(const PhysLayer& L) {
         if (std::getenv("STRATA_NO_PIN_EXPERTS") != nullptr) return false;
-        // Keep Q5_K/BF16 tail layers (e.g. blk.20..23, ~3.16 GiB) in pageable malloc and stage async H2D via 16 MiB bounce buffer.
-        static const bool pin_q5k = (std::getenv("STRATA_PIN_Q5K_HBLOBS") != nullptr);
-        if (!pin_q5k && (L.gu_type == 13 || L.gu_type == 30)) return false;
+        // Keep BF16 tail layers (gu_type == 30) unpinned; pin Q5_K (gu_type == 13) when within max_pin_bytes unless opted out.
+        static const bool no_pin_q5k = (std::getenv("STRATA_NO_PIN_Q5K_HBLOBS") != nullptr);
+        if (L.gu_type == 30 || (no_pin_q5k && L.gu_type == 13)) return false;
         return true;
     }
 
@@ -9298,7 +9298,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                 unsigned long long avail_kb = 0;
                 if (std::sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) {
                     const size_t avail_b = (size_t) avail_kb * 1024ULL;
-                    const size_t head_b = (size_t) 6144 << 20;
+                    const size_t head_b = (size_t) 5120 << 20;
                     if (avail_b > head_b) {
                         max_pin_bytes = std::min<size_t>(avail_b - head_b, (size_t) 14336 << 20);
                     } else {
@@ -9418,11 +9418,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
 
         const bool is_tier1_ip = (ip >= hp.core_start && ip < hp.core_end) && L.gu_type != 30;
         const bool is_tier2_ip = (ip < hp.core_start || ip >= hp.core_end) && L.gu_type != 30;
-        static const bool force_core_borrow_pin = [] {
-            const char* v = std::getenv("STRATA_FORCE_CORE_BORROW_PIN");
-            return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
-        }();
-        const bool want_core_borrow_pin = (force_core_borrow_pin && !no_core_borrow_place &&
+        const bool want_core_borrow_pin = (!no_core_borrow_place &&
                                            E.profile.regime != strata::inkling2::VramRegime::FullVram &&
                                            tier1_planned_all_gpu && will_need_cpu &&
                                            hp.num_loops > 1 && hp.core_start < hp.core_end &&

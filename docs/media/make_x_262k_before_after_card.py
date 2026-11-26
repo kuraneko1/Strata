@@ -55,12 +55,16 @@ plt.rcParams.update({
 
 def load_4wl(path: Path):
     res = {}
+    rss = {}
     with path.open(newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             if r["mode"] != "sampling":
                 continue
-            res[(int(r["draft_max"]), r["workload"])] = float(r["tg_tps"])
-    return res
+            dm = int(r["draft_max"])
+            res[(dm, r["workload"])] = float(r["tg_tps"])
+            if "peak_rss_mib" in r and r["peak_rss_mib"]:
+                rss[dm] = max(rss.get(dm, 0.0), float(r["peak_rss_mib"]))
+    return res, rss
 
 
 def load_ladder(path: Path):
@@ -115,8 +119,8 @@ def style_clean_ax(ax, title: str, unit_note: str, ylim: float, xlabel: str):
 
 
 def main():
-    b4 = load_4wl(CSV_4WL_BEFORE)
-    a4 = load_4wl(CSV_4WL_AFTER)
+    b4, b_rss = load_4wl(CSV_4WL_BEFORE)
+    a4, a_rss = load_4wl(CSV_4WL_AFTER)
     xp3, dp3 = load_ladder(CSV_PRIOR3)
     xa6, da6 = load_ladder(CSV_AFTER6)
 
@@ -125,7 +129,9 @@ def main():
     a_dm6 = [a4[(6, w)] for w in WORKLOADS]
 
     avg_b6 = sum(b_dm6) / 4.0
-    avg_a6 = sum(a_dm6) / 4.0
+    avg_a3 = sum(a_dm3) / 4.0
+    ram_b = b_rss.get(6, 26995.0) / 1024.0
+    ram_a = a_rss.get(6, 12514.0) / 1024.0
 
     fig = plt.figure(figsize=(12.8, 7.2), dpi=150, facecolor="#FFFFFF")
     bg = fig.add_axes([0.0, 0.0, 1.0, 1.0], frameon=False)
@@ -137,8 +143,8 @@ def main():
     bg.text(0.055, 0.918, "Inkling-2-Mini 262K on RTX 4070 12 GB", fontsize=20.2, fontweight="bold", color=C_INK, va="center")
     bg.text(
         0.055, 0.866,
-        f"Before vs After  ·  Expert Freq-Prior + Draft-6 (+{(avg_a6/avg_b6-1)*100:.1f}% Sampling Avg)  ·  Peak RAM 27.0 → 17.8 GiB (-34%)",
-        fontsize=10.3, color=C_MUTED, va="center",
+        f"Before vs After  ·  Draft-3 Avg {avg_b6:.1f} → {avg_a3:.1f} t/s (+{(avg_a3/avg_b6-1)*100:.1f}% vs Before Draft-6)  ·  Peak RAM {ram_b:.1f} → {ram_a:.1f} GiB ({(ram_a/ram_b-1)*100:.0f}%)",
+        fontsize=10.0, color=C_MUTED, va="center",
     )
 
     draw_header_legend_item(bg, 0.745, 0.928, "After · Draft-6", C_ON, "-", 2.6, 6.0)
@@ -184,13 +190,13 @@ def main():
 
     idx3 = {round(v, 3): i for i, v in enumerate(xp3)}
     idx6 = {round(v, 3): i for i, v in enumerate(xa6)}
-    ann(ax2, xa6[0], da6[0], f"{da6[0]:.1f}", C_ON_TXT, dx=1, dy=11, ha="center", va="bottom", fs=10.2)
+    ann(ax2, xa6[0], da6[0], f"{da6[0]:.1f}", C_ON_TXT, dx=-8, dy=9, ha="right", va="bottom", fs=10.0)
     ann(ax2, XB_6B[0], DB_6B_ON[0], f"{DB_6B_ON[0]:.1f}", C_OFF_TXT, dx=1, dy=-13, ha="center", va="top", fs=9.5, weight="normal")
     ann(ax2, xa6[idx6[32.768]], da6[idx6[32.768]], f"{da6[idx6[32.768]]:.1f}", C_ON_TXT, dx=4, dy=10, ha="left", va="bottom", fs=10.2)
     ann(ax2, xp3[idx3[65.536]], dp3[idx3[65.536]], f"{dp3[idx3[65.536]]:.1f}", C_EM_TXT, dx=0, dy=10, ha="center", va="bottom", fs=9.8)
-    ann(ax2, xa6[idx6[163.840]], da6[idx6[163.840]], f"{da6[idx6[163.840]]:.1f}", C_ON_TXT, dx=3, dy=10, ha="left", va="bottom", fs=10.0)
-    ann(ax2, xa6[-1], da6[-1], f"{da6[-1]:.1f}", C_ON_TXT, dx=-2, dy=11, ha="right", va="bottom", fs=10.8)
-    ann(ax2, xp3[-1], dp3[-1], f"{dp3[-1]:.1f}", C_EM_TXT, dx=-2, dy=-11, ha="right", va="top", fs=9.8)
+    ann(ax2, xa6[idx6[163.840]], da6[idx6[163.840]], f"{da6[idx6[163.840]]:.1f}", C_ON_TXT, dx=0, dy=-14, ha="center", va="top", fs=9.8)
+    ann(ax2, xp3[-1], dp3[-1], f"{dp3[-1]:.1f}", C_EM_TXT, dx=-2, dy=11, ha="right", va="bottom", fs=10.2)
+    ann(ax2, xa6[-1], da6[-1], f"{da6[-1]:.1f}", C_ON_TXT, dx=-18, dy=-12, ha="right", va="top", fs=9.8)
     ann(ax2, XB_6B[-1], DB_6B_ON[-1], f"{DB_6B_ON[-1]:.1f}", C_OFF_TXT, dx=-2, dy=-12, ha="right", va="top", fs=9.6, weight="normal")
 
     bg.text(0.055, 0.042, "Strata Engine  ·  UD-Q4_K_M + Q8_0 KV  ·  Zero Precision Loss", fontsize=8.8, color=C_LIGHT, ha="left", va="center")
