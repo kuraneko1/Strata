@@ -674,12 +674,14 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         float* __restrict__ split_out,
         int n_head, int n_head_kv, int cap, int n_swa, const int32_t* __restrict__ pos_d, int block_n, float kq_scale, int split_n) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
-    // Volta sm_70 native PTX HMMA.884 path: STRIDE=144 (18,432 B = 4 blk/SM, 0-bank-conflict LDS.64),
+    // Volta sm_70 native PTX HMMA.884 path: split SMEM strides (STRIDE_QK=136 halves QK^T 4-way LDS.128 bank conflicts -> 2-way;
+    // STRIDE_V=144 keeps P*V LDS.64 0-bank-conflict; 32*136*2 + 2*16*144*2 = 17,920 B <= 18,432 B SMEM, bit-exact!),
     // V prefetch overlapping QK^T + K-next prefetch overlapping P*V, STACK:0, direct float2 epilogue.
-    constexpr int STRIDE = 144;
+    constexpr int STRIDE_QK = 136;
+    constexpr int STRIDE_V  = 144;
     extern __shared__ __align__(16) char smem_raw[];
-    __half* sQ = reinterpret_cast<__half*>(smem_raw);       // 32 * 144 * 2 = 9,216 B
-    __half* sKV_all = sQ + 32 * STRIDE;                     // 2 * 16 * 144 * 2 = 9,216 B (total = 18,432 B)
+    __half* sQ = reinterpret_cast<__half*>(smem_raw);       // 32 * 136 * 2 = 8,704 B
+    __half* sKV_all = sQ + 32 * STRIDE_QK;                  // 2 * 16 * 144 * 2 = 9,216 B (total = 17,920 B <= 18,432 B)
 
     const int hkv = blockIdx.x, sp = blockIdx.y;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -710,7 +712,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
     for (int br = 0; br < 32; br += 16) {
         const int qr = br + (tid >> 3), qc0 = (tid & 7) * 16;
         const float* qp = (qr < n_rows) ? (Q + ((size_t) (qr / 3) * n_head + (h0 + (qr % 3))) * 128 + qc0) : nullptr;
-        __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * STRIDE + qc0);
+        __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * STRIDE_QK + qc0);
         if (qp) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -761,10 +763,10 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         for (int i = 0; i < 8; ++i) acc[n][i] = 0.0f;
     }
 
-    __half* sKV = sKV_all + kw * 16 * STRIDE;
-    const int qa_off = (rt * 16 + qa_row) * STRIDE;
-    const int kb_off = kb_row * STRIDE;
-    const int vb_off = vb_row * STRIDE + vb_col;
+    __half* sKV = sKV_all + kw * 16 * STRIDE_V;
+    const int qa_off = (rt * 16 + qa_row) * STRIDE_QK;
+    const int kb_off = kb_row * STRIDE_QK;
+    const int vb_off = vb_row * STRIDE_V + vb_col;
     const int tid_kw = (rt << 5) | lane;
     const int kr = tid_kw >> 2;
     const int kc0 = (tid_kw & 3) * 32;
@@ -778,7 +780,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
             const __half2 dk2 = __half2half2(__ldg(IS_SWA ? &ks_ctx[(size_t) slot_s * n_head_kv + hkv] : &ks_ctx[hkv * cap + j]));
             const __half2 kb = __hmul2(neg1152, dk2);
             const int8_t* kp = IS_SWA ? (kq_ctx + (size_t) slot_s * kv_dim + hkv * 128 + kc0) : (kq_ctx + (size_t) (hkv * cap + j) * 128 + kc0);
-            __half* dst = sKV + kr * STRIDE + kc0;
+            __half* dst = sKV + kr * STRIDE_QK + kc0;
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
                 const uint4 raw = *reinterpret_cast<const uint4*>(kp + i * 16);
@@ -808,7 +810,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
 
         {
             const __half2 vb = __hmul2(neg1152, dv2);
-            __half* dst = sKV + kr * STRIDE + kc0;
+            __half* dst = sKV + kr * STRIDE_V + kc0;
             __half2 h2[8];
             dspark_i8x4_to_h2x2_fma(vr0.x, dv2, vb, h2[0], h2[1]); dspark_i8x4_to_h2x2_fma(vr0.y, dv2, vb, h2[2], h2[3]);
             dspark_i8x4_to_h2x2_fma(vr0.z, dv2, vb, h2[4], h2[5]); dspark_i8x4_to_h2x2_fma(vr0.w, dv2, vb, h2[6], h2[7]);
@@ -854,20 +856,20 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         uint2 b[2];
 #pragma unroll
         for (int nb = 0; nb < 8; nb += 2) {
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE + (nb + 1) * 16);
+            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE_V + (nb + 0) * 16);
+            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE_V + (nb + 1) * 16);
             mma_rr(acc[nb + 0], pa0, pa1, b[0].x, b[0].y);
             mma_rr(acc[nb + 1], pa0, pa1, b[1].x, b[1].y);
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE + (nb + 1) * 16);
+            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE_V + (nb + 0) * 16);
+            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE_V + (nb + 1) * 16);
             mma_rr(acc[nb + 0], pa2, pa3, b[0].x, b[0].y);
             mma_rr(acc[nb + 1], pa2, pa3, b[1].x, b[1].y);
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE + (nb + 1) * 16);
+            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE_V + (nb + 0) * 16);
+            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE_V + (nb + 1) * 16);
             mma_rr(acc[nb + 0], pa4, pa5, b[0].x, b[0].y);
             mma_rr(acc[nb + 1], pa4, pa5, b[1].x, b[1].y);
-            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE + (nb + 0) * 16);
-            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE + (nb + 1) * 16);
+            b[0] = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE_V + (nb + 0) * 16);
+            b[1] = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE_V + (nb + 1) * 16);
             mma_rr(acc[nb + 0], pa6, pa7, b[0].x, b[0].y);
             mma_rr(acc[nb + 1], pa6, pa7, b[1].x, b[1].y);
         }
@@ -878,7 +880,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         const int j = jb + kr;
         const int slot_s = (IS_SWA && j < c_end) ? (j % cap) : 0;
         {
-            __half* dst = sKV + kr * STRIDE + kc0;
+            __half* dst = sKV + kr * STRIDE_QK + kc0;
             if (j < c_end) {
                 const __half2 dk2 = __half2half2(__ldg(IS_SWA ? &ks_ctx[(size_t) slot_s * n_head_kv + hkv] : &ks_ctx[hkv * cap + j]));
                 const __half2 kb = __hmul2(neg1152, dk2);
@@ -911,7 +913,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
 
         {
-            __half* dst = sKV + kr * STRIDE + kc0;
+            __half* dst = sKV + kr * STRIDE_V + kc0;
             if (j < c_end) {
                 const __half2 dv2 = __half2half2(__ldg(IS_SWA ? &vs_ctx[(size_t) slot_s * n_head_kv + hkv] : &vs_ctx[hkv * cap + j]));
                 const __half2 vb = __hmul2(neg1152, dv2);
@@ -973,13 +975,13 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
-            uint2 b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE + n * 16);
+            uint2 b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa0, pa1, b0.x, b0.y);
-            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE + n * 16);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa2, pa3, b0.x, b0.y);
-            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE + n * 16);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa4, pa5, b0.x, b0.y);
-            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE + n * 16);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa6, pa7, b0.x, b0.y);
         }
         asm volatile("bar.sync %0, 64;" :: "r"(kw + 1) : "memory");
@@ -988,7 +990,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
     if (sp == 0 && kw == 0) {
         {
             const float* kp = (kr < block_n) ? (K_self + ((size_t) kr * n_head_kv + hkv) * 128 + kc0) : nullptr;
-            __half2* dst2 = reinterpret_cast<__half2*>(sKV + kr * STRIDE + kc0);
+            __half2* dst2 = reinterpret_cast<__half2*>(sKV + kr * STRIDE_QK + kc0);
             if (kp) {
 #pragma unroll 1
                 for (int i = 0; i < 8; ++i) {
@@ -1016,7 +1018,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
 
         {
             const float* vp = (kr < block_n) ? (V_self + ((size_t) kr * n_head_kv + hkv) * 128 + kc0) : nullptr;
-            __half2* dst2 = reinterpret_cast<__half2*>(sKV + kr * STRIDE + kc0);
+            __half2* dst2 = reinterpret_cast<__half2*>(sKV + kr * STRIDE_V + kc0);
             if (vp) {
 #pragma unroll 1
                 for (int i = 0; i < 8; ++i) {
@@ -1071,13 +1073,13 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         asm volatile("bar.sync 1, 64;" ::: "memory");
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
-            uint2 b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE + n * 16);
+            uint2 b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 0 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa0, pa1, b0.x, b0.y);
-            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE + n * 16);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 4 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa2, pa3, b0.x, b0.y);
-            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE + n * 16);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 8 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa4, pa5, b0.x, b0.y);
-            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE + n * 16);
+            b0 = *reinterpret_cast<const uint2*>(sKV + vb_off + 12 * STRIDE_V + n * 16);
             mma_rr(acc[n], pa6, pa7, b0.x, b0.y);
         }
     }
@@ -3442,8 +3444,9 @@ struct DsparkEngine {
                 }
             };
             cudaGraphExec_t& ig = inject_graphs[T];
-            if (!ig && ++inject_hits[T] < 2) {
-                // Lazy capture: avoid ~1 ms cudaGraphInstantiate HostGap on 1-off rare T values (e.g. T=5..7 in dm=6).
+            const int want_inj_hits = ((T == 4 && E.verify_max_t <= 5) || (T == 7 && E.verify_max_t >= 7)) ? 2 : 5;
+            if (!ig && ++inject_hits[T] < want_inj_hits) {
+                // Lazy capture: primary verify T on hit #2, defer rare secondary T until hit #5 (~1.5 ms Inst+Destroy break-even).
                 emit_inject_small(false);
                 pos = pos0 + T;
                 return;
