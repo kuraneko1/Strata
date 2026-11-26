@@ -5367,25 +5367,32 @@ __global__ void k_gemm_f16_smallT_warp(const uint16_t* __restrict__ W, const flo
     }
 }
 
-/// High-occupancy zero-SMEM, zero-sync Q8_0 x Q8_1 small-T (2..8) MMVQ:
-/// 4 warps/block (128 threads, 4 output rows/block), 100% occupancy (0 B SMEM, 0 __syncthreads).
-/// Branchless 4-byte aligned LDG.32 + funnelshift for 34-byte Q8_0 blocks (8 blocks/warp/iter -> 0% tail waste for nb=72/96/288).
-/// Supports optional PAIR=true (fused 2-matrix launch on shared xq, e.g. Q+Gate, K+V, DSpark Gate+Up).
-/// Requires (K_in % 256) == 0, 4-byte aligned W (and W2 when PAIR), and (n_out1 % 4) == 0 when PAIR.
-template <int MT, bool EXACT_T, bool PAIR, int WPB = 4>
-__global__ void __launch_bounds__(WPB * 32, (WPB == 1) ? 16 : ((WPB == 2) ? 16 : ((MT <= 4) ?
+/// High-occupancy zero-SMEM (WPR=1) or 2-warp-per-row Split-K (WPR=2) Q8_0 x Q8_1 small-T (1..8) MMVQ:
+/// - Coalesced 8-lane pair weight loader: reads every 4-byte word of the 272-byte (8-block) chunk EXACTLY ONCE
+///   (2.125 LDG.32/lane vs 4.5 LDGs/lane, zero LDG.16, zero duplicate loads, d0 + w2 reconstructed via 2 warp shuffles).
+/// - 2-stage software-pipelined weight prefetch (overlaps next 8-block HBM2 load with dp4a + FP32 FMA).
+/// - WPR=2 (2 warps/row) doubles warp occupancy on narrow N_out <= 3072 (e.g. O-proj N_out=2304 -> 4,608 warps = 57.6 w/SM on V100).
+/// - Supports optional PAIR=true (fused 2-matrix launch on shared xq).
+/// Requires (K_in % 256) == 0, 4-byte aligned W (and W2 when PAIR), and (n_out1 % (WPB / WPR)) == 0 when PAIR.
+template <int MT, bool EXACT_T, bool PAIR, int WPB = 4, int WPR = 1>
+__global__ void __launch_bounds__(WPB * 32,
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
-    10
+    (WPB == 1) ? 16 : ((WPB == 2) ? ((MT == 1) ? 24 : ((MT <= 4) ? 20 : 16)) : ((MT == 1) ? 12 : ((MT <= 4) ? 10 : 8)))
 #else
-    12
+    (WPB == 1) ? 16 : ((WPB == 2) ? 16 : ((MT <= 4) ? 12 : 8))
 #endif
-    : 8))) k_mmvq_q8_0_smallT(
+) k_mmvq_q8_0_smallT(
     const uint8_t* __restrict__ w1, const uint32_t* __restrict__ xq_u32, float* __restrict__ y1,
     int n_in, int n_out1, int T,
     const uint8_t* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr, int n_out2 = 0) {
+    static_assert(WPR == 1 || WPR == 2, "WPR must be 1 or 2");
+    static_assert((WPB % WPR) == 0, "WPB must be a multiple of WPR");
+    constexpr int RPB = WPB / WPR;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row_in_cta = (WPR == 1) ? warp : (warp >> 1);
+    const int kw = (WPR == 1) ? 0 : (warp & 1);
     const int nb = n_in >> 5;  // Q8_0 / Q8_1 blocks per row (multiple of 8)
-    int row = (int) blockIdx.x * WPB + warp;
+    int row = (int) blockIdx.x * RPB + row_in_cta;
     const uint8_t* w_cur = w1;
     float* y_cur = y1;
     int n_out_cur = n_out1;
@@ -5397,54 +5404,110 @@ __global__ void __launch_bounds__(WPB * 32, (WPB == 1) ? 16 : ((WPB == 2) ? 16 :
             n_out_cur = n_out2;
         }
     }
-    if (row >= n_out_cur) return;
-    const uint8_t* w_row = w_cur + (size_t) row * (size_t) nb * 34u;
-    const int blk_in_chunk = lane >> 2;  // 0..7
-    const int blk_odd = blk_in_chunk & 1;
-    const int iqs = (lane & 3) * 2;      // 0, 2, 4, 6
+    const bool valid_row = (row < n_out_cur);
+    if constexpr (WPR == 1) {
+        if (!valid_row) return;
+    }
+
+    const int blk_in_chunk = lane >> 2;         // 0..7
+    const int blk_odd = blk_in_chunk & 1;       // 0 or 1
+    const int pair = lane >> 3;                 // 0..3
+    const int sub = lane & 7;                   // 0..7
+    const int iqs = (lane & 3) * 2;             // 0, 2, 4, 6
     const uint32_t sh = blk_odd ? 0u : 16u;
-    const int p_off = (blk_odd ? 2 : 0) + iqs * 4;
+    const int w_u32_off = pair * 17 + blk_odd + sub * 2;
+    const int d0_src_lane = (lane & ~7) | (blk_odd ? 3 : 0);
 
     float acc[MT];
 #pragma unroll
     for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
 
-    for (int kb0 = 0; kb0 < nb; kb0 += 8) {
-        const int kb = kb0 + blk_in_chunk;
-        const uint8_t* bp = w_row + (size_t) kb * 34u;
-        const float d0 = __half2float(__ldg(reinterpret_cast<const __half*>(bp)));
-        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(bp + p_off);
-        const uint32_t w0 = __ldg(p32);
-        const uint32_t w1_u = __ldg(p32 + 1);
-        const uint32_t w2_u = blk_odd ? 0u : __ldg(p32 + 2);
-        const int v0 = (int) __funnelshift_r(w0, w1_u, sh);
-        const int v1 = (int) __funnelshift_r(w1_u, w2_u, sh);
+    if (valid_row) {
+        const uint8_t* w_row = w_cur + (size_t) row * (size_t) nb * 34u;
+        const int kb_start = kw * 8;
+        constexpr int KB_STEP = WPR * 8;
+        constexpr int W_STEP = WPR * 68;
+        constexpr int X_STEP = WPR * 72;
+        if (kb_start < nb) {
+            const uint32_t* w_ptr = reinterpret_cast<const uint32_t*>(w_row) + (size_t) kw * 68u + w_u32_off;
+            const uint32_t* xb_base = xq_u32 + (size_t) (kb_start + blk_in_chunk) * 9u;
+            const size_t x_tok_stride = (size_t) nb * 9u;
+
+            uint32_t w0 = __ldg(w_ptr);
+            uint32_t w1_u = __ldg(w_ptr + 1);
+            uint32_t mid = (sub == 3) ? __ldg(w_ptr + 2) : 0u;
+
+            for (int kb0 = kb_start; kb0 < nb; kb0 += KB_STEP) {
+                uint32_t nw0 = 0u, nw1 = 0u, nmid = 0u;
+                if (kb0 + KB_STEP < nb) {
+                    const uint32_t* wp_n = w_ptr + W_STEP;
+                    nw0 = __ldg(wp_n);
+                    nw1 = __ldg(wp_n + 1);
+                    nmid = (sub == 3) ? __ldg(wp_n + 2) : 0u;
+                }
+                const uint32_t next_w0 = __shfl_down_sync(0xffffffffu, w0, 1);
+                const uint32_t w2_u = (sub == 3) ? mid : next_w0;
+                const uint32_t d0_u = __shfl_sync(0xffffffffu, (sub == 3) ? mid : w0, d0_src_lane);
+                const __half2 d0_h2 = *reinterpret_cast<const __half2*>(&d0_u);
+                const float d0 = blk_odd ? __high2float(d0_h2) : __low2float(d0_h2);
+                const int v0 = (int) __funnelshift_r(w0, w1_u, sh);
+                const int v1 = (int) __funnelshift_r(w1_u, w2_u, sh);
 #pragma unroll
-        for (int t = 0; t < MT; ++t) {
-            if (EXACT_T || t < T) {
-                const uint32_t* xb = xq_u32 + ((size_t) t * nb + kb) * 9u;
-                const uint32_t ds_u = __ldg(xb);
-                const float d1 = __low2float(*reinterpret_cast<const __half2*>(&ds_u));
-                int sumi = dp4a_i8(v0, (int) __ldg(xb + 1 + iqs), 0);
-                sumi = dp4a_i8(v1, (int) __ldg(xb + 2 + iqs), sumi);
-                acc[t] += d0 * d1 * (float) sumi;
+                for (int t = 0; t < MT; ++t) {
+                    if (EXACT_T || t < T) {
+                        const uint32_t* xb = xb_base + (size_t) t * x_tok_stride;
+                        const uint32_t ds_u = __ldg(xb);
+                        const float d1 = __low2float(*reinterpret_cast<const __half2*>(&ds_u));
+                        int sumi = dp4a_i8(v0, (int) __ldg(xb + 1 + iqs), 0);
+                        sumi = dp4a_i8(v1, (int) __ldg(xb + 2 + iqs), sumi);
+                        acc[t] += d0 * d1 * (float) sumi;
+                    }
+                }
+                w0 = nw0;
+                w1_u = nw1;
+                mid = nmid;
+                w_ptr += W_STEP;
+                xb_base += X_STEP;
             }
         }
     }
 
+    if constexpr (WPR == 1) {
 #pragma unroll
-    for (int t = 0; t < MT; ++t) {
-        if (EXACT_T || t < T) {
-            float v = acc[t];
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                float v = acc[t];
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-            if (lane == 0) y_cur[(size_t) t * n_out_cur + row] = v;
+                for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                if (lane == 0) y_cur[(size_t) t * n_out_cur + row] = v;
+            }
+        }
+    } else {
+        __shared__ float s_wpr[RPB][MT];
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                float v = acc[t];
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                acc[t] = v;
+                if (kw == 1 && lane == 0) s_wpr[row_in_cta][t] = v;
+            }
+        }
+        __syncthreads();
+        if (valid_row && kw == 0 && lane == 0) {
+#pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                if (EXACT_T || t < T) {
+                    y_cur[(size_t) t * n_out_cur + row] = acc[t] + s_wpr[row_in_cta][t];
+                }
+            }
         }
     }
 }
 
 /// Fused 3-way (Q+Gate+R) or 5-way (Q+Gate+R+K+V) zero-SMEM Q8_0 x Q8_1 small-T MMVQ with per-matrix xq pointers.
-/// Scalar struct members (no dynamic array indexing) guarantee STACK:0 on sm_70 & sm_89!
+/// Coalesced 8-lane pair weight loader + 2-stage software prefetch, scalar struct members -> STACK:0 on sm_70 & sm_89!
 struct Q8MultiSpec {
     const uint8_t *w0, *w1, *w2, *w3, *w4;
     const uint32_t *x0, *x1, *x2, *x3, *x4;
@@ -5453,7 +5516,13 @@ struct Q8MultiSpec {
 };
 
 template <int MT, bool EXACT_T, int NMAT, int WPB = 4>
-__global__ void __launch_bounds__(WPB * 32, (WPB == 2) ? 16 : ((MT <= 4) ? 10 : 8)) k_mmvq_q8_0_smallT_multi(
+__global__ void __launch_bounds__(WPB * 32,
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    (WPB == 2) ? ((MT == 1) ? 24 : 16) : ((MT == 1) ? 12 : ((MT <= 3) ? 10 : 8))
+#else
+    (WPB == 2) ? 16 : ((MT <= 4) ? 10 : 8)
+#endif
+) k_mmvq_q8_0_smallT_multi(
     Q8MultiSpec sp, int n_in, int T) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nb = n_in >> 5;
@@ -5487,30 +5556,46 @@ __global__ void __launch_bounds__(WPB * 32, (WPB == 2) ? 16 : ((MT <= 4) ? 10 : 
     }
     if (row >= n_out_cur) return;
     const uint8_t* w_row = w_cur + (size_t) row * (size_t) nb * 34u;
-    const int blk_in_chunk = lane >> 2;
-    const int blk_odd = blk_in_chunk & 1;
-    const int iqs = (lane & 3) * 2;
+    const int blk_in_chunk = lane >> 2;         // 0..7
+    const int blk_odd = blk_in_chunk & 1;       // 0 or 1
+    const int pair = lane >> 3;                 // 0..3
+    const int sub = lane & 7;                   // 0..7
+    const int iqs = (lane & 3) * 2;             // 0, 2, 4, 6
     const uint32_t sh = blk_odd ? 0u : 16u;
-    const int p_off = (blk_odd ? 2 : 0) + iqs * 4;
+    const int w_u32_off = pair * 17 + blk_odd + sub * 2;
+    const int d0_src_lane = (lane & ~7) | (blk_odd ? 3 : 0);
 
     float acc[MT];
 #pragma unroll
     for (int t = 0; t < MT; ++t) acc[t] = 0.0f;
 
+    const uint32_t* w_ptr = reinterpret_cast<const uint32_t*>(w_row) + w_u32_off;
+    const uint32_t* xb_base = xq_u32 + (size_t) blk_in_chunk * 9u;
+    const size_t x_tok_stride = (size_t) nb * 9u;
+
+    uint32_t w0 = __ldg(w_ptr);
+    uint32_t w1_u = __ldg(w_ptr + 1);
+    uint32_t mid = (sub == 3) ? __ldg(w_ptr + 2) : 0u;
+
     for (int kb0 = 0; kb0 < nb; kb0 += 8) {
-        const int kb = kb0 + blk_in_chunk;
-        const uint8_t* bp = w_row + (size_t) kb * 34u;
-        const float d0 = __half2float(__ldg(reinterpret_cast<const __half*>(bp)));
-        const uint32_t* p32 = reinterpret_cast<const uint32_t*>(bp + p_off);
-        const uint32_t w0 = __ldg(p32);
-        const uint32_t w1_u = __ldg(p32 + 1);
-        const uint32_t w2_u = blk_odd ? 0u : __ldg(p32 + 2);
+        uint32_t nw0 = 0u, nw1 = 0u, nmid = 0u;
+        if (kb0 + 8 < nb) {
+            const uint32_t* wp_n = w_ptr + 68;
+            nw0 = __ldg(wp_n);
+            nw1 = __ldg(wp_n + 1);
+            nmid = (sub == 3) ? __ldg(wp_n + 2) : 0u;
+        }
+        const uint32_t next_w0 = __shfl_down_sync(0xffffffffu, w0, 1);
+        const uint32_t w2_u = (sub == 3) ? mid : next_w0;
+        const uint32_t d0_u = __shfl_sync(0xffffffffu, (sub == 3) ? mid : w0, d0_src_lane);
+        const __half2 d0_h2 = *reinterpret_cast<const __half2*>(&d0_u);
+        const float d0 = blk_odd ? __high2float(d0_h2) : __low2float(d0_h2);
         const int v0 = (int) __funnelshift_r(w0, w1_u, sh);
         const int v1 = (int) __funnelshift_r(w1_u, w2_u, sh);
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
             if (EXACT_T || t < T) {
-                const uint32_t* xb = xq_u32 + ((size_t) t * nb + kb) * 9u;
+                const uint32_t* xb = xb_base + (size_t) t * x_tok_stride;
                 const uint32_t ds_u = __ldg(xb);
                 const float d1 = __low2float(*reinterpret_cast<const __half2*>(&ds_u));
                 int sumi = dp4a_i8(v0, (int) __ldg(xb + 1 + iqs), 0);
@@ -5518,6 +5603,11 @@ __global__ void __launch_bounds__(WPB * 32, (WPB == 2) ? 16 : ((MT <= 4) ? 10 : 
                 acc[t] += d0 * d1 * (float) sumi;
             }
         }
+        w0 = nw0;
+        w1_u = nw1;
+        mid = nmid;
+        w_ptr += 68;
+        xb_base += 72;
     }
 
 #pragma unroll

@@ -3162,12 +3162,31 @@ struct Engine {
                 const uint8_t* w8 = (const uint8_t*) W.d;
                 const uint32_t* xu = (const uint32_t*) xq_ptr;
                 if (T == 1) {
-                    if (N_out <= 1024) {
-                        k_mmvq_q8_0_smallT<1, true, false, 1><<<(unsigned) N_out, 32, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
+                    if (N_out <= 3072 && K_in >= 512) {
+                        // 2 warps/row Split-K (1 row/CTA, 64 thr/CTA): doubles warp occupancy on O-proj (N_out=2304 -> 4,608 warps = 57.6 w/SM on V100).
+                        k_mmvq_q8_0_smallT<1, true, false, 2, 2><<<(unsigned) N_out, 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
+                    } else if (N_out <= 1024) {
+                        k_mmvq_q8_0_smallT<1, true, false, 1, 1><<<(unsigned) N_out, 32, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
                     } else if (N_out <= 3072) {
-                        k_mmvq_q8_0_smallT<1, true, false, 2><<<(unsigned) ((N_out + 1) / 2), 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
+                        k_mmvq_q8_0_smallT<1, true, false, 2, 1><<<(unsigned) ((N_out + 1) / 2), 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
                     } else {
-                        k_mmvq_q8_0_smallT<1, true, false, 4><<<(unsigned) ((N_out + 3) / 4), 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
+                        k_mmvq_q8_0_smallT<1, true, false, 4, 1><<<(unsigned) ((N_out + 3) / 4), 128, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
+                    }
+                } else if (N_out <= 3072 && K_in >= 512 && T <= 7) {
+                    // 2 warps/row Split-K (1 row/CTA, 64 thr/CTA) for O-proj small-T verify (T=2..7): 2x warp occupancy on V100.
+                    const unsigned nb_r1 = (unsigned) N_out;
+                    if (T == 4) {
+                        k_mmvq_q8_0_smallT<4, true, false, 2, 2><<<nb_r1, 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 4);
+                    } else if (T == 7) {
+                        k_mmvq_q8_0_smallT<7, true, false, 2, 2><<<nb_r1, 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 7);
+                    } else if (T == 6) {
+                        k_mmvq_q8_0_smallT<6, true, false, 2, 2><<<nb_r1, 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 6);
+                    } else if (T == 5) {
+                        k_mmvq_q8_0_smallT<5, true, false, 2, 2><<<nb_r1, 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 5);
+                    } else if (T == 2) {
+                        k_mmvq_q8_0_smallT<2, true, false, 2, 2><<<nb_r1, 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 2);
+                    } else {
+                        k_mmvq_q8_0_smallT<3, true, false, 2, 2><<<nb_r1, 64, 0, st>>>(w8, xu, Y, (int) K_in, (int) N_out, 3);
                     }
                 } else {
                     const unsigned nb = (unsigned) ((N_out + 3) / 4);
