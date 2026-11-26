@@ -16294,6 +16294,232 @@ __global__ void __launch_bounds__(128, 4) k_router_gemv_and_group_t1(
     }
 }
 
+/// Fused small-T (T=2..8) Router GEMM (64 CTAs x BLOCK, 2 expert rows/CTA) + Top-K Route + Parallel Warp-Scan Group:
+/// Single CUDA-Graph-safe launch (replaces k_gemm_f32_smallT_cta + k_route_and_group_smallT, eliminating 48 launches/step on dm=3/6!).
+/// Reads W_router ONCE across all T tokens & x ONCE across 2 expert rows; single-thread program-order relaxed stores +
+/// atom.acq_rel.gpu completion barrier ensure formal PTX 6.0+ visibility to the last CTA, which resets d_done to 0.
+template <int MT>
+__global__ void __launch_bounds__((MT <= 4) ? 128 : 256, 2) k_router_gemm_and_group_smallT(
+    const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ logits,
+    const float* __restrict__ bias, int32_t* __restrict__ ids, float* __restrict__ ewts,
+    const int32_t* __restrict__ slot_of, const uint8_t* __restrict__ blobs,
+    size_t stride, int n_in, int n_exp, int top_k, float scale,
+    unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
+    int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
+    int32_t* __restrict__ ent_tok, uint32_t* __restrict__ d_hits, uint32_t* __restrict__ d_done) {
+    constexpr int BLOCK = (MT <= 4) ? 128 : 256;
+    constexpr int NWARPS = BLOCK >> 5;
+    __shared__ float sh0[MT][NWARPS];
+    __shared__ float sh1[MT][NWARPS];
+    __shared__ int s_is_last;
+
+    const int o0 = (int) blockIdx.x * 2;
+    if (o0 >= n_exp) return;
+    const int o1 = o0 + 1;
+    const bool has1 = (o1 < n_exp);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const float4* wr0 = reinterpret_cast<const float4*>(W + (size_t) o0 * n_in);
+    const float4* wr1 = has1 ? reinterpret_cast<const float4*>(W + (size_t) o1 * n_in) : wr0;
+    const int n4 = n_in >> 2;
+
+    float acc0[MT], acc1[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
+
+    for (int i = tid; i < n4; i += BLOCK) {
+        const float4 a0 = wr0[i];
+        const float4 a1 = has1 ? wr1[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            const float4 b = reinterpret_cast<const float4*>(x + (size_t) t * n_in)[i];
+            acc0[t] += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+            if (has1) acc1[t] += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        float v0 = acc0[t], v1 = acc1[t];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v0 += __shfl_xor_sync(0xffffffffu, v0, o);
+            v1 += __shfl_xor_sync(0xffffffffu, v1, o);
+        }
+        if (lane == 0) {
+            sh0[t][warp] = v0;
+            sh1[t][warp] = v1;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const uint32_t expected_ctas = (uint32_t) ((n_exp + 1) >> 1);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+            for (int w = 0; w < NWARPS; ++w) { s0 += sh0[t][w]; s1 += sh1[t][w]; }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(logits + (size_t) t * n_exp + o0), "f"(s0) : "memory");
+            if (has1) asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(logits + (size_t) t * n_exp + o1), "f"(s1) : "memory");
+#else
+            *((volatile float*) (logits + (size_t) t * n_exp + o0)) = s0;
+            if (has1) *((volatile float*) (logits + (size_t) t * n_exp + o1)) = s1;
+#endif
+        }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        uint32_t prev = 0u;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(d_done) : "memory");
+        const int last = ((prev + 1u) == expected_ctas) ? 1 : 0;
+        if (last) {
+            asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" :: "l"(d_done) : "memory");
+        }
+#else
+        __threadfence();
+        const uint32_t prev = atomicAdd(d_done, 1u);
+        const int last = ((prev + 1u) == expected_ctas) ? 1 : 0;
+        if (last) {
+            *((volatile uint32_t*) d_done) = 0u;
+            __threadfence();
+        }
+#endif
+        s_is_last = last;
+    }
+    __syncthreads();
+    if (!s_is_last) return;
+
+    // Last CTA: exact parallel route + warp-scan group (bit-identical to k_route_and_group_smallT).
+    __shared__ int32_t s_ids[128];
+    __shared__ float s_wlocal[MT][16];
+    __shared__ float s_fac[MT];
+    __shared__ int32_t cnt[128];
+    __shared__ int32_t slot_id[128];
+    __shared__ int32_t cur_off[128];
+    if (slot_of && tid < n_exp) {
+        cnt[tid] = 0;
+        slot_id[tid] = slot_of[tid];
+    }
+    if (warp < MT) {
+        const int t = warp;
+        float p[4], s[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int e = j * 32 + lane;
+            if (e < n_exp) {
+                float lg_val;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                asm volatile("ld.relaxed.gpu.global.f32 %0, [%1];" : "=f"(lg_val) : "l"(logits + (size_t) t * n_exp + e) : "memory");
+#else
+                lg_val = __ldcg(logits + (size_t) t * n_exp + e);
+#endif
+                const float pr = sigmf(lg_val);
+                p[j] = pr;
+                s[j] = pr + (bias ? bias[e] : 0.0f);
+            } else {
+                p[j] = 0.0f;
+                s[j] = -1e30f;
+            }
+        }
+        float wsum = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            float bv = s[0];
+            int be = lane;
+            float bp = p[0];
+#pragma unroll
+            for (int j = 1; j < 4; ++j) {
+                if (s[j] > bv) { bv = s[j]; be = j * 32 + lane; bp = p[j]; }
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+                const float op = __shfl_xor_sync(0xffffffffu, bp, o);
+                if (ov > bv || (ov == bv && oe < be)) { bv = ov; be = oe; bp = op; }
+            }
+            if (lane == 0) {
+                const int eidx = t * top_k + k;
+                ids[eidx] = be;
+                s_ids[eidx] = be;
+                if (d_hits) atomicAdd(&d_hits[be], 1u);
+                s_wlocal[t][k] = bp;
+                wsum += bp;
+            }
+            if ((be & 31) == lane) {
+                const int b = be >> 5;
+                if (b == 0) s[0] = -1e30f;
+                else if (b == 1) s[1] = -1e30f;
+                else if (b == 2) s[2] = -1e30f;
+                else s[3] = -1e30f;
+            }
+        }
+        if (lane == 0) {
+            const float denom = fmaxf(wsum, 6.103515625e-5f);
+            s_fac[t] = scale / denom;
+        }
+        __syncwarp();
+        if (lane < top_k) {
+            ewts[(size_t) t * top_k + lane] = s_wlocal[t][lane] * s_fac[t];
+        }
+    }
+    if (!slot_of) return;
+    __syncthreads();
+    const int n_ent = MT * top_k;
+    for (int e = tid; e < n_ent; e += BLOCK) {
+        const int ex = s_ids[e];
+        if (slot_id[ex] >= 0) atomicAdd(&cnt[ex], 1);
+    }
+    __syncthreads();
+    __shared__ int32_t s_warp_ng[4];
+    __shared__ int32_t s_warp_off[4];
+    const int c_val = (tid < n_exp) ? cnt[tid] : 0;
+    const int has_val = (c_val > 0) ? 1 : 0;
+    int ng_inc = has_val;
+    int off_inc = c_val;
+    if (tid < 128) {
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int n_up = __shfl_up_sync(0xffffffffu, ng_inc, d);
+            const int o_up = __shfl_up_sync(0xffffffffu, off_inc, d);
+            if (lane >= d) { ng_inc += n_up; off_inc += o_up; }
+        }
+        if (lane == 31) {
+            s_warp_ng[warp] = ng_inc;
+            s_warp_off[warp] = off_inc;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int ng_acc = 0, off_acc = 0;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const int wn = s_warp_ng[w], wo = s_warp_off[w];
+            s_warp_ng[w] = ng_acc;
+            s_warp_off[w] = off_acc;
+            ng_acc += wn;
+            off_acc += wo;
+        }
+        grp_start[ng_acc] = off_acc;
+        *n_groups = ng_acc;
+    }
+    __syncthreads();
+    if (tid < n_exp && has_val) {
+        const int ng_idx = s_warp_ng[warp] + ng_inc - 1;
+        const int off_idx = s_warp_off[warp] + off_inc - c_val;
+        grp_ptr[ng_idx] = (unsigned long long) (blobs + (size_t) slot_id[tid] * stride);
+        grp_start[ng_idx] = off_idx;
+        cur_off[tid] = off_idx;
+    }
+    __syncthreads();
+    for (int e = tid; e < n_ent; e += BLOCK) {
+        const int ex = s_ids[e];
+        if (slot_id[ex] >= 0) {
+            const int pos = atomicAdd(&cur_off[ex], 1);
+            ent_dst[pos] = e;
+            ent_tok[pos] = e / top_k;
+        }
+    }
+}
+
 /// Zero-spill, zero-barrier, parallel 8-lane 1-warp router + grouping for T == 1 (top_k <= 16, n_exp <= 128):
 /// Uses tiny SMEM (132 B) so sel_e/sel_p never spill to local stack (STACK: 0), then lanes 0..top_k-1 look up
 /// slot_of[be] and emit compacted grp_ptr/grp_start/ent_dst/ent_tok in parallel via __ballot_sync/__popc!

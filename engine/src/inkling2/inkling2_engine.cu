@@ -3982,6 +3982,8 @@ struct Engine {
         const bool need_cpu = L.n_slots < hp.n_expert;
         const bool is_q5 = (L.L.gu_type == 13);
         const bool can_fused_router_t1 = (T == 1 && !pp_streaming && hp.n_expert <= 128 && Kp <= 16 && (N & 3) == 0 && d_router_done != nullptr);
+        const bool can_fused_router_smallT = (T >= 2 && T <= 8 && !pp_streaming && !need_cpu && has_gpu &&
+                                              hp.n_expert <= 128 && Kp <= 16 && (N & 3) == 0 && d_router_done != nullptr);
         const bool pre_grouped_t1 = (pre_routed_t1 && T == 1 && has_gpu && hp.n_expert <= 128 && Kp <= 16 && (N & 3) == 0 && d_router_done != nullptr);
         const bool fused_rg = (has_gpu && !pre_routed_t1 && !pp_streaming && T >= 1 && T <= 8 &&
                                hp.n_expert <= 128 && Kp <= 16 && (!need_cpu || T == 1));
@@ -3999,6 +4001,27 @@ struct Engine {
                     N, (int) hp.n_expert, Kp, hp.expert_weights_scale,
                     grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                     (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr, d_router_done);
+            } else if (can_fused_router_smallT) {
+                const unsigned grid_r = (unsigned) ((hp.n_expert + 1) / 2);
+                uint32_t* hits_p = (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr;
+                auto launch_r_smallT = [&](auto mt_tag) {
+                    constexpr int MT_V = decltype(mt_tag)::value;
+                    constexpr int BLK_V = (MT_V <= 4) ? 128 : 256;
+                    k_router_gemm_and_group_smallT<MT_V><<<grid_r, BLK_V, 0, st>>>(
+                        L.ffn_gate_inp, x_norm, router_logits, L.exp_probs_b, ids, ewts,
+                        L.d_slot_of, L.d_blobs, L.stride,
+                        N, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                        grp_ptr, grp_start, n_groups, ent_dst, ent_tok, hits_p, d_router_done);
+                };
+                switch (T) {
+                case 2: launch_r_smallT(std::integral_constant<int, 2>{}); break;
+                case 3: launch_r_smallT(std::integral_constant<int, 3>{}); break;
+                case 4: launch_r_smallT(std::integral_constant<int, 4>{}); break;
+                case 5: launch_r_smallT(std::integral_constant<int, 5>{}); break;
+                case 6: launch_r_smallT(std::integral_constant<int, 6>{}); break;
+                case 7: launch_r_smallT(std::integral_constant<int, 7>{}); break;
+                default: launch_r_smallT(std::integral_constant<int, 8>{}); break;
+                }
             } else {
                 if (!pre_routed_pp) {
                     launch_router_gemm_pp(x_norm, L.ffn_gate_inp, router_logits, T, (int) hp.n_expert, N);
