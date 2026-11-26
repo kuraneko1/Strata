@@ -5073,7 +5073,7 @@ __global__ void __launch_bounds__((M_MODS >= 3) ? 512 : 256, (M_MODS >= 3) ? 2 :
             }
             __syncthreads();
 
-#pragma unroll
+#pragma unroll 1
             for (int mr = 0; mr < 2; ++mr) {
                 const int r0 = wm * 32 + mr * 16 + acc_r0;
                 const int r1 = wm * 32 + mr * 16 + acc_r1;
@@ -5084,36 +5084,45 @@ __global__ void __launch_bounds__((M_MODS >= 3) ? 512 : 256, (M_MODS >= 3) ? 2 :
 
                 float2 b0_00{}, b0_01{}, b0_10{}, b0_11{};
                 float2 b1_00{}, b1_01{}, b1_10{}, b1_11{};
-#if __CUDA_ARCH__ >= 750
-                // Issue per-mr bank0/bank1 ldcs_f2 right after BAR.SYNC / before mr WMMA loop (0 Barrier-5 collision!)
-                if (r0_ok) {
-                    if (c0_ok) {
-                        b0_00 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c0));
-                        b1_00 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c0));
+                // Issue per-mr bank0/bank1 ldcs_f2 BEFORE WMMA loop on BOTH Volta and Turing/Ada so HBM2 overlaps HMMA!
+                if (r0_ok && r1_ok && c0_ok && c1_ok) {
+                    b0_00 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c0));
+                    b1_00 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c0));
+                    b0_01 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c1));
+                    b1_01 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c1));
+                    b0_10 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c0));
+                    b1_10 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c0));
+                    b0_11 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c1));
+                    b1_11 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c1));
+                } else {
+                    if (r0_ok) {
+                        if (c0_ok) {
+                            b0_00 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c0));
+                            b1_00 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c0));
+                        }
+                        if (c1_ok) {
+                            b0_01 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c1));
+                            b1_01 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c1));
+                        }
                     }
-                    if (c1_ok) {
-                        b0_01 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c1));
-                        b1_01 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c1));
+                    if (r1_ok) {
+                        if (c0_ok) {
+                            b0_10 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c0));
+                            b1_10 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c0));
+                        }
+                        if (c1_ok) {
+                            b0_11 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c1));
+                            b1_11 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c1));
+                        }
                     }
                 }
-                if (r1_ok) {
-                    if (c0_ok) {
-                        b0_10 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c0));
-                        b1_10 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c0));
-                    }
-                    if (c1_ok) {
-                        b0_11 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c1));
-                        b1_11 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c1));
-                    }
-                }
-#endif
 
                 float ag[8], af[8];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) { ag[i] = 0.0f; af[i] = 0.0f; }
 
 #if __CUDA_ARCH__ < 750
-#pragma unroll 1
+#pragma unroll
                 for (int kk = 0; kk < K; kk += 8) {
                     const uint4 a = *reinterpret_cast<const uint4*>(sx_r0 + mr * 16 * LD + kk);
                     {
@@ -5143,69 +5152,93 @@ __global__ void __launch_bounds__((M_MODS >= 3) ? 512 : 256, (M_MODS >= 3) ? 2 :
                 }
 #endif
 
-#if __CUDA_ARCH__ < 750
-                if (r0_ok) {
-                    if (c0_ok) {
-                        b0_00 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c0));
-                        b1_00 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c0));
-                    }
-                    if (c1_ok) {
-                        b0_01 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base0 + acc_c1));
-                        b1_01 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base0 + acc_c1));
-                    }
-                }
-                if (r1_ok) {
-                    if (c0_ok) {
-                        b0_10 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c0));
-                        b1_10 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c0));
-                    }
-                    if (c1_ok) {
-                        b0_11 = ldcs_f2(reinterpret_cast<const float2*>(bank0 + base1 + acc_c1));
-                        b1_11 = ldcs_f2(reinterpret_cast<const float2*>(bank1 + base1 + acc_c1));
-                    }
-                }
-#endif
                 float2 c_r0c0{}, c_r0c1{}, c_r1c0{}, c_r1c1{};
-                if (r0_ok) {
-                    if (c0_ok) c_r0c0 = *reinterpret_cast<const float2*>(c_ptr + base0 + acc_c0);
-                    if (c1_ok) c_r0c1 = *reinterpret_cast<const float2*>(c_ptr + base0 + acc_c1);
+                if (r0_ok && r1_ok && c0_ok && c1_ok) {
+                    c_r0c0 = *reinterpret_cast<const float2*>(c_ptr + base0 + acc_c0);
+                    c_r0c1 = *reinterpret_cast<const float2*>(c_ptr + base0 + acc_c1);
+                    c_r1c0 = *reinterpret_cast<const float2*>(c_ptr + base1 + acc_c0);
+                    c_r1c1 = *reinterpret_cast<const float2*>(c_ptr + base1 + acc_c1);
+                } else {
+                    if (r0_ok) {
+                        if (c0_ok) c_r0c0 = *reinterpret_cast<const float2*>(c_ptr + base0 + acc_c0);
+                        if (c1_ok) c_r0c1 = *reinterpret_cast<const float2*>(c_ptr + base0 + acc_c1);
+                    }
+                    if (r1_ok) {
+                        if (c0_ok) c_r1c0 = *reinterpret_cast<const float2*>(c_ptr + base1 + acc_c0);
+                        if (c1_ok) c_r1c1 = *reinterpret_cast<const float2*>(c_ptr + base1 + acc_c1);
+                    }
                 }
-                if (r1_ok) {
-                    if (c0_ok) c_r1c0 = *reinterpret_cast<const float2*>(c_ptr + base1 + acc_c0);
-                    if (c1_ok) c_r1c1 = *reinterpret_cast<const float2*>(c_ptr + base1 + acc_c1);
+                float tg[8], tf[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    tg[i] = fast_tanh(ag[i]);
+                    tf[i] = 1.0f - fast_tanh(af[i]);
                 }
-                if (r0_ok) {
-                    const float2 wv = s_wv[r0];
-                    if (c0_ok) {
-                        const float m0 = wv.x * b0_00.x + wv.y * b1_00.x;
-                        const float m1 = wv.x * b0_00.y + wv.y * b1_00.y;
+                if (r0_ok && r1_ok && c0_ok && c1_ok) {
+                    const float2 wv0 = s_wv[r0];
+                    const float2 wv1 = s_wv[r1];
+                    {
+                        const float m0 = wv0.x * b0_00.x + wv0.y * b1_00.x;
+                        const float m1 = wv0.x * b0_00.y + wv0.y * b1_00.y;
                         stg_f2(reinterpret_cast<float2*>(out_ptr + base0 + acc_c0),
-                               __fmaf_rn(1.0f - fast_tanh(af[0]), c_r0c0.x, fast_tanh(ag[0]) * m0),
-                               __fmaf_rn(1.0f - fast_tanh(af[1]), c_r0c0.y, fast_tanh(ag[1]) * m1));
+                               __fmaf_rn(tf[0], c_r0c0.x, tg[0] * m0),
+                               __fmaf_rn(tf[1], c_r0c0.y, tg[1] * m1));
                     }
-                    if (c1_ok) {
-                        const float m0 = wv.x * b0_01.x + wv.y * b1_01.x;
-                        const float m1 = wv.x * b0_01.y + wv.y * b1_01.y;
+                    {
+                        const float m0 = wv0.x * b0_01.x + wv0.y * b1_01.x;
+                        const float m1 = wv0.x * b0_01.y + wv0.y * b1_01.y;
                         stg_f2(reinterpret_cast<float2*>(out_ptr + base0 + acc_c1),
-                               __fmaf_rn(1.0f - fast_tanh(af[4]), c_r0c1.x, fast_tanh(ag[4]) * m0),
-                               __fmaf_rn(1.0f - fast_tanh(af[5]), c_r0c1.y, fast_tanh(ag[5]) * m1));
+                               __fmaf_rn(tf[4], c_r0c1.x, tg[4] * m0),
+                               __fmaf_rn(tf[5], c_r0c1.y, tg[5] * m1));
                     }
-                }
-                if (r1_ok) {
-                    const float2 wv = s_wv[r1];
-                    if (c0_ok) {
-                        const float m0 = wv.x * b0_10.x + wv.y * b1_10.x;
-                        const float m1 = wv.x * b0_10.y + wv.y * b1_10.y;
+                    {
+                        const float m0 = wv1.x * b0_10.x + wv1.y * b1_10.x;
+                        const float m1 = wv1.x * b0_10.y + wv1.y * b1_10.y;
                         stg_f2(reinterpret_cast<float2*>(out_ptr + base1 + acc_c0),
-                               __fmaf_rn(1.0f - fast_tanh(af[2]), c_r1c0.x, fast_tanh(ag[2]) * m0),
-                               __fmaf_rn(1.0f - fast_tanh(af[3]), c_r1c0.y, fast_tanh(ag[3]) * m1));
+                               __fmaf_rn(tf[2], c_r1c0.x, tg[2] * m0),
+                               __fmaf_rn(tf[3], c_r1c0.y, tg[3] * m1));
                     }
-                    if (c1_ok) {
-                        const float m0 = wv.x * b0_11.x + wv.y * b1_11.x;
-                        const float m1 = wv.x * b0_11.y + wv.y * b1_11.y;
+                    {
+                        const float m0 = wv1.x * b0_11.x + wv1.y * b1_11.x;
+                        const float m1 = wv1.x * b0_11.y + wv1.y * b1_11.y;
                         stg_f2(reinterpret_cast<float2*>(out_ptr + base1 + acc_c1),
-                               __fmaf_rn(1.0f - fast_tanh(af[6]), c_r1c1.x, fast_tanh(ag[6]) * m0),
-                               __fmaf_rn(1.0f - fast_tanh(af[7]), c_r1c1.y, fast_tanh(ag[7]) * m1));
+                               __fmaf_rn(tf[6], c_r1c1.x, tg[6] * m0),
+                               __fmaf_rn(tf[7], c_r1c1.y, tg[7] * m1));
+                    }
+                } else {
+                    if (r0_ok) {
+                        const float2 wv = s_wv[r0];
+                        if (c0_ok) {
+                            const float m0 = wv.x * b0_00.x + wv.y * b1_00.x;
+                            const float m1 = wv.x * b0_00.y + wv.y * b1_00.y;
+                            stg_f2(reinterpret_cast<float2*>(out_ptr + base0 + acc_c0),
+                                   __fmaf_rn(tf[0], c_r0c0.x, tg[0] * m0),
+                                   __fmaf_rn(tf[1], c_r0c0.y, tg[1] * m1));
+                        }
+                        if (c1_ok) {
+                            const float m0 = wv.x * b0_01.x + wv.y * b1_01.x;
+                            const float m1 = wv.x * b0_01.y + wv.y * b1_01.y;
+                            stg_f2(reinterpret_cast<float2*>(out_ptr + base0 + acc_c1),
+                                   __fmaf_rn(tf[4], c_r0c1.x, tg[4] * m0),
+                                   __fmaf_rn(tf[5], c_r0c1.y, tg[5] * m1));
+                        }
+                    }
+                    if (r1_ok) {
+                        const float2 wv = s_wv[r1];
+                        if (c0_ok) {
+                            const float m0 = wv.x * b0_10.x + wv.y * b1_10.x;
+                            const float m1 = wv.x * b0_10.y + wv.y * b1_10.y;
+                            stg_f2(reinterpret_cast<float2*>(out_ptr + base1 + acc_c0),
+                                   __fmaf_rn(tf[2], c_r1c0.x, tg[2] * m0),
+                                   __fmaf_rn(tf[3], c_r1c0.y, tg[3] * m1));
+                        }
+                        if (c1_ok) {
+                            const float m0 = wv.x * b0_11.x + wv.y * b1_11.x;
+                            const float m1 = wv.x * b0_11.y + wv.y * b1_11.y;
+                            stg_f2(reinterpret_cast<float2*>(out_ptr + base1 + acc_c1),
+                                   __fmaf_rn(tf[6], c_r1c1.x, tg[6] * m0),
+                                   __fmaf_rn(tf[7], c_r1c1.y, tg[7] * m1));
+                        }
                     }
                 }
             }
