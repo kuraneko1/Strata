@@ -4638,6 +4638,10 @@ struct Engine {
         const size_t eff_fr = fr + pool_free0;
 
         // ---- Plan target_slots[0..n_phys-1] ----
+        static const bool allow_core_spill = [] {
+            const char* v = std::getenv("STRATA_KNAP_ALLOW_CORE_SPILL");
+            return (v && v[0]) ? (std::atoi(v) != 0) : false;
+        }();
         const float* prior_ptr = strata::inkling2::inkling2_mini_decode_prior(hp.n_phys, ne);
         const bool use_knapsack = (knapsack_decode && prior_ptr != nullptr && !whole_layer_evict);
         std::vector<double> blended_scores;
@@ -4673,10 +4677,6 @@ struct Engine {
                 int e;
                 size_t stride;
             };
-            const bool allow_core_spill = [] {
-                const char* v = std::getenv("STRATA_KNAP_ALLOW_CORE_SPILL");
-                return (v && v[0]) ? (std::atoi(v) != 0) : false;
-            }();
             const bool knap_concave = [&] {
                 const char* v = std::getenv("STRATA_KNAP_CONCAVE");
                 return (v && v[0]) ? (std::atoi(v) != 0) : allow_core_spill;
@@ -4908,7 +4908,7 @@ struct Engine {
             layer_resized[(size_t) ip] = true;
             const bool is_tier1 = (ip >= hp.core_start && ip < hp.core_end);
             const bool use_pool_for_layer = (!is_tier1 && pool_active);
-            const bool use_sparse = (is_tier1 && !L.hblobs);
+            const bool use_sparse = (allow_core_spill && is_tier1 && !L.hblobs);
             if (!use_sparse) ensure_hblobs(L, is_tier1);
 
             if (tgt > 0) {
@@ -5271,7 +5271,7 @@ struct Engine {
         resize_experts_vram(vram_reserve_bytes, dec_guard, /*equalize_tier2=*/true, /*async_cst=*/true,
                             /*whole_layer_evict=*/false, /*restore_dspark_decode_w=*/(dspark != nullptr),
                             /*skip_sync=*/false, 0, 0, /*knapsack_decode=*/!no_dec_knapsack);
-        if (pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
+        if (verify_max_t >= 6 && pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
         normalize_decode_scores();
     }
 
@@ -5680,7 +5680,7 @@ struct Engine {
             prefill_ephemeral_bytes = alloc_ephemeral_bufs(target_cap);
             // Release leftover pool cache back to the CUDA driver so first-use cuBLAS/graph internal
             // allocations do not fail with CUBLAS_STATUS_INTERNAL_ERROR when raw driver free is tight.
-            if (pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
+            if (verify_max_t >= 6 && pool_cached_free_bytes() > ((size_t) 8 << 20)) trim_phase_pool(0);
         } else {
             free_ephemeral_bufs();
             prefill_ephemeral_bytes = alloc_ephemeral_bufs(target_cap);
@@ -9300,7 +9300,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                     const size_t avail_b = (size_t) avail_kb * 1024ULL;
                     const size_t head_b = (size_t) 5120 << 20;
                     if (avail_b > head_b) {
-                        max_pin_bytes = std::min<size_t>(avail_b - head_b, (size_t) 14336 << 20);
+                        max_pin_bytes = std::min<size_t>(avail_b - head_b, ((size_t) 14336 << 20) + pinned_used);
                     } else {
                         max_pin_bytes = (avail_b > ((size_t) 1024 << 20)) ? (avail_b / 2) : 0;
                     }
