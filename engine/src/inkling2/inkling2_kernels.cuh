@@ -9656,7 +9656,10 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
         int ld_sink = 0, int swa_hm_base = 0) {
 #if defined(__CUDA_ARCH__) && ((__CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750) || __CUDA_ARCH__ >= 800)
 #if __CUDA_ARCH__ < 750
-    constexpr int STRIDE = 144;  // 94,208 B <= 96 KB on Volta sm_70 (sQ + sKV + s_rb + sR)
+    constexpr int STRIDE_QK = 136; // 52,224 B sQ (4-way -> 2-way QK^T SMEM bank conflicts, fits s_ml[0..2] in +128..134)
+    constexpr int STRIDE_V  = 144; // 18,432 B sKV (0-conflict P*V LDS.64)
+    constexpr int RB_STRIDE = 20;  // 10,240 B s_rb (128x20 floats: 80 B/row = 20 banks -> 0-conflict across 8 d's, +sR 12,288 B -> 93,184 B <= 94,208 B)
+    constexpr int RB_ROWS   = 128;
 #else
     constexpr int STRIDE = 128;  // 97,024 B <= 97,280 B on Ampere/Ada sm_80+ (XOR-swizzled sQ + sK + sV + s_rb_hi + s_rb_lo + sR_hi + s_rl)
     constexpr bool kRelOzaki = true;
@@ -9664,7 +9667,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
     extern __shared__ __align__(16) char smem_raw[];
     __half* sQ = reinterpret_cast<__half*>(smem_raw);
 #if __CUDA_ARCH__ < 750
-    __half* sKV = sQ + 192 * STRIDE;                          // +55,296 B (18,432 B: 64x144 FP16); s_rb (+73,728 B), sR (+81,920 B -> 94,208 B)
+    __half* sKV = sQ + 192 * STRIDE_QK;                       // +52,224 B (18,432 B: 64x144 FP16); s_rb (+70,656 B), sR (+80,976 B -> 93,264 B)
 #else
     __half* sK            = sQ + 192 * STRIDE;                         // +49,152 B (16,384 B: 8 per-warp 2KB slices for K)
     __half* sV            = sK + 64 * STRIDE;                          // +65,536 B (16,384 B: 8 per-warp 2KB slices for V; temp sR_lo in Prologue)
@@ -9708,7 +9711,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
         const int qr = base_r + (tid >> 2);
         const int qc0 = (tid & 3) * 32;
         const int g = qr >> 6, r = qr & 63, t = t0 + r, h = 3 * hkv + g;
-        __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * STRIDE + qc0);
+        __half2* dst2 = reinterpret_cast<__half2*>(sQ + qr * STRIDE_QK + qc0);
         if (t < T) {
             const float* qp = Q + (size_t) t * q_stride + (size_t) h * 128 + qc0;
             if (q_scale != nullptr) {
@@ -9745,7 +9748,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
             for (int i = 0; i < 16; ++i) dst2[i] = z2;
         }
         if ((tid & 3) == 0) {
-            float* s_ml = reinterpret_cast<float*>(sQ + qr * STRIDE + 128);
+            float* s_ml = reinterpret_cast<float*>(sQ + qr * STRIDE_QK + 128);
             s_ml[0] = 0.0f;
             s_ml[1] = 1.0f;
             s_ml[2] = (t < T) ? (-__ldg(&sink[(size_t) t * sink_stride + h]) * kLog2e) : 0.0f;
@@ -9753,7 +9756,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
     }
     if (R_ptr != nullptr && tid < 192) {
         const int g = tid >> 6, r = tid & 63, t = t0 + r, h = 3 * hkv + g;
-        float* sR_loc = reinterpret_cast<float*>(sKV + 64 * STRIDE) + 128 * 16;
+        float* sR_loc = reinterpret_cast<float*>(sKV + 64 * STRIDE_V) + RB_ROWS * RB_STRIDE;
         float4* dst_r = reinterpret_cast<float4*>(sR_loc + tid * 16);
         if (t < T) {
             const float4* rp = reinterpret_cast<const float4*>(R_ptr + (size_t) t * r_stride + (size_t) h * 16);
@@ -9825,10 +9828,10 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
             }
         }
     };
-    auto store_kv_u4 = [&](int u, int jb_cur, int sl_base, const __half* s_ptr, const uint4& raw) {
+    auto store_kv_u4 = [&](int u, int jb_cur, int sl_base, const __half* s_ptr, const uint4& raw, int kv_stride) {
         const int kr = u >> 3, kc0 = (u & 7) * 16;
         const int j = jb_cur + kr;
-        __half* dst = sKV + kr * STRIDE + kc0;
+        __half* dst = sKV + kr * kv_stride + kc0;
         if (j < j_end) {
             __half2 d2;
             if constexpr (IS_SWA && !SWA_LINEAR_HM) {
@@ -9866,26 +9869,25 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
         {
             uint4 kraw1;
             if (tid < 128) fetch_kv_u4(tid + 384, jb, slot_base, kq, kraw1);
-            store_kv_u4(tid, jb, slot_base, ks, kraw0);
-            if (tid < 128) store_kv_u4(tid + 384, jb, slot_base, ks, kraw1);
+            store_kv_u4(tid, jb, slot_base, ks, kraw0, STRIDE_QK);
+            if (tid < 128) store_kv_u4(tid + 384, jb, slot_base, ks, kraw1, STRIDE_QK);
         }
 
         const int d_lo = max(0, p0_t0 - (jb + 63));
         const int d_hi = min(n_ext - 1, (p0_t0 + 63) - jb);
         const int d_cnt = max(0, d_hi - d_lo + 1);
-        const bool all_bulk_no_rel = (!IS_SWA) && (t0 + 63 < T) && (jb + 63 <= p0_t0 - n_ext);
-        if (!all_bulk_no_rel && d_cnt > 0) {
-            float* s_rb = reinterpret_cast<float*>(sKV + 64 * STRIDE);
+        if (d_cnt > 0) {
+            float* s_rb = reinterpret_cast<float*>(sKV + 64 * STRIDE_V);
             const int lim = d_cnt * 4;
             if (tid < lim) {
                 const int di = tid >> 2, c4 = tid & 3;
-                *reinterpret_cast<float4*>(s_rb + di * 16 + c4 * 4) =
+                *reinterpret_cast<float4*>(s_rb + di * RB_STRIDE + c4 * 4) =
                     __ldg(reinterpret_cast<const float4*>(rel_bias_ptr + (size_t) (d_lo + di) * 16) + c4);
             }
             if (tid + 384 < lim) {
                 const int idx = tid + 384;
                 const int di = idx >> 2, c4 = idx & 3;
-                *reinterpret_cast<float4*>(s_rb + di * 16 + c4 * 4) =
+                *reinterpret_cast<float4*>(s_rb + di * RB_STRIDE + c4 * 4) =
                     __ldg(reinterpret_cast<const float4*>(rel_bias_ptr + (size_t) (d_lo + di) * 16) + c4);
             }
         }
@@ -9902,14 +9904,14 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
 #pragma unroll
             for (int i = 0; i < 8; ++i) fc[ct][i] = 0.0f;
 
-        const int sq_off = (warp * 16 + ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3)) * STRIDE;
-        const int sk_off = (((lane & 16) >> 2) + (lane & 8) + (lane & 3)) * STRIDE;
+        const int sq_off = (warp * 16 + ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3)) * STRIDE_QK;
+        const int sk_off = (((lane & 16) >> 2) + (lane & 8) + (lane & 3)) * STRIDE_QK;
 #pragma unroll 1
         for (int k = 0; k < 128; k += 8) {
             const uint4 q0 = *reinterpret_cast<const uint4*>(sQ + sq_off + k);
 #pragma unroll
             for (int ct = 0; ct < 4; ++ct) {
-                const uint4 kb = *reinterpret_cast<const uint4*>(sKV + sk_off + (ct * 16) * STRIDE + k);
+                const uint4 kb = *reinterpret_cast<const uint4*>(sKV + sk_off + (ct * 16) * STRIDE_QK + k);
                 mma_rc(fc[ct], q0.x, q0.y, kb.x, kb.y);
                 mma_rc(fc[ct], q0.z, q0.w, kb.z, kb.w);
             }
@@ -9919,15 +9921,15 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
         {
             int acc_r0, acc_r1, acc_c0, acc_c1;
             wmma_acc_layout_16x16(lane, acc_r0, acc_r1, acc_c0, acc_c1);
-            const bool all_valid_swa = (t0 + 63 < T) &&
-                                       (!IS_SWA || jb >= (p0_t0 + 63) - n_swa + 1) && (jb + 63 <= p0_t0) &&
-                                       ((p0_t0 + 63) - jb < n_ext);
-            const bool all_unmasked = all_valid_swa || all_bulk_no_rel;
+            const bool all_unmasked_tile = (t0 + 63 < T) && (!IS_SWA || jb >= (p0_t0 + 63) - n_swa + 1) && (jb + 63 <= p0_t0);
+            const bool all_bulk_no_rel = all_unmasked_tile && (d_cnt == 0 || R_ptr == nullptr);
+            const bool all_valid_swa = all_unmasked_tile && ((p0_t0 + 63) - jb < n_ext);
+            const bool all_unmasked = all_unmasked_tile;
             auto eval_row = [&](int qr, int i0, int i1, int i4, int i5) {
                 const int r_loc = qr & 63;
                 const int tr = t0 + r_loc;
                 const int pos_q = p0_t0 + r_loc;
-                const float neg_sk = reinterpret_cast<const float*>(sQ + qr * STRIDE + 128)[2];
+                const float neg_sk = reinterpret_cast<const float*>(sQ + qr * STRIDE_QK + 128)[2];
                 if (all_bulk_no_rel) {
 #pragma unroll
                     for (int ct = 0; ct < 4; ++ct) {
@@ -9953,12 +9955,12 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                 }
                 if (d_cnt > 0 && R_ptr != nullptr && (all_valid_swa || tr < T)) {
                     // Hoist pre-scaled R[qr][0..15] from SMEM sR in 2 x 8-float passes (8 live regs instead of 16 -> STACK:0 on Full-Attn!).
-                    const float* s_rb_loc = reinterpret_cast<const float*>(sKV + 64 * STRIDE);
-                    const float4* rp = reinterpret_cast<const float4*>(s_rb_loc + 128 * 16 + qr * 16);
+                    const float* s_rb_loc = reinterpret_cast<const float*>(sKV + 64 * STRIDE_V);
+                    const float4* rp = reinterpret_cast<const float4*>(s_rb_loc + RB_ROWS * RB_STRIDE + qr * 16);
                     auto add_dot8 = [&](float s, int j, const float4& ra, const float4& rb, int off4) -> float {
                         const int d = pos_q - j;
                         if (!all_valid_swa && (j > pos_q || (IS_SWA && d >= n_swa) || d >= n_ext)) return s;
-                        const float4* bp = reinterpret_cast<const float4*>(s_rb_loc + (d - d_lo) * 16) + off4;
+                        const float4* bp = reinterpret_cast<const float4*>(s_rb_loc + (d - d_lo) * RB_STRIDE) + off4;
                         const float4 b0 = bp[0];
                         float dot = fmaf(ra.x, b0.x, fmaf(ra.y, b0.y, fmaf(ra.z, b0.z, ra.w * b0.w)));
                         const float4 b1 = bp[1];
@@ -10000,8 +10002,8 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                 mx0 = fmaxf(mx0, fmaxf(fmaxf(fc[ct][0], fc[ct][1]), fmaxf(fc[ct][4], fc[ct][5])));
                 mx1 = fmaxf(mx1, fmaxf(fmaxf(fc[ct][2], fc[ct][3]), fmaxf(fc[ct][6], fc[ct][7])));
             }
-            float* s_ml0 = reinterpret_cast<float*>(sQ + (warp * 16 + acc_r0) * STRIDE + 128);
-            float* s_ml1 = reinterpret_cast<float*>(sQ + (warp * 16 + acc_r1) * STRIDE + 128);
+            float* s_ml0 = reinterpret_cast<float*>(sQ + (warp * 16 + acc_r0) * STRIDE_QK + 128);
+            float* s_ml1 = reinterpret_cast<float*>(sQ + (warp * 16 + acc_r1) * STRIDE_QK + 128);
             const float rm0 = s_ml0[0], rm1 = s_ml1[0];
             const float m_new0 = fmaxf(rm0, wmma_row_max_16(mx0));
             const float m_new1 = fmaxf(rm1, wmma_row_max_16(mx1));
@@ -10057,8 +10059,8 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
         {
             uint4 vraw1;
             if (tid < 128) fetch_kv_u4(tid + 384, jb, slot_base, vq, vraw1);
-            store_kv_u4(tid, jb, slot_base, vs, vraw0);
-            if (tid < 128) store_kv_u4(tid + 384, jb, slot_base, vs, vraw1);
+            store_kv_u4(tid, jb, slot_base, vs, vraw0, STRIDE_V);
+            if (tid < 128) store_kv_u4(tid + 384, jb, slot_base, vs, vraw1, STRIDE_V);
         }
         __syncthreads();  // Barrier #3: sKV (V) ready
 
@@ -10074,10 +10076,10 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
 
         // 7. Native P*V (1x8 = 16x128 per warp).
         const bool hi8 = (lane & 8) != 0;
-        const int sv_off = (lane & 3) * STRIDE + (lane & 8) + ((lane & 16) >> 2);
+        const int sv_off = (lane & 3) * STRIDE_V + (lane & 8) + ((lane & 16) >> 2);
 #pragma unroll
         for (int ct = 0; ct < 4; ++ct) {
-            const __half* sv_base = sKV + sv_off + (ct * 16) * STRIDE;
+            const __half* sv_base = sKV + sv_off + (ct * 16) * STRIDE_V;
             {
                 const uint32_t p0 = __float_as_uint(fc[ct][0]), p1 = __float_as_uint(fc[ct][1]);
                 const uint32_t o0 = __shfl_xor_sync(0xffffffffu, p0, 8);
@@ -10086,12 +10088,12 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                 const uint32_t a4 = hi8 ? p0 : o0, a5 = hi8 ? p1 : o1;
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
-                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 0 * STRIDE + n * 16);
+                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 0 * STRIDE_V + n * 16);
                     mma_rr(acc[n], a0, a1, b.x, b.y);
                 }
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
-                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 8 * STRIDE + n * 16);
+                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 8 * STRIDE_V + n * 16);
                     mma_rr(acc[n], a4, a5, b.x, b.y);
                 }
             }
@@ -10103,12 +10105,12 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
                 const uint32_t a6 = hi8 ? p2 : o2, a7 = hi8 ? p3 : o3;
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
-                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 4 * STRIDE + n * 16);
+                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 4 * STRIDE_V + n * 16);
                     mma_rr(acc[n], a2, a3, b.x, b.y);
                 }
 #pragma unroll
                 for (int n = 0; n < 8; ++n) {
-                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 12 * STRIDE + n * 16);
+                    const uint2 b = *reinterpret_cast<const uint2*>(sv_base + 12 * STRIDE_V + n * 16);
                     mma_rr(acc[n], a6, a7, b.x, b.y);
                 }
             }
@@ -10121,7 +10123,7 @@ __global__ void __launch_bounds__(384, 1) k_attn_q8_gqa3_pp_fa2_192_swa_fast(
     wmma_acc_layout_16x16(lane, acc_r0, acc_r1, acc_c0, acc_c1);
     float* s_rl = reinterpret_cast<float*>(sKV);
     if (tid < 192) {
-        s_rl[tid] = reinterpret_cast<const float*>(sQ + tid * STRIDE + 128)[1];
+        s_rl[tid] = reinterpret_cast<const float*>(sQ + tid * STRIDE_QK + 128)[1];
     }
     __syncthreads();
 
