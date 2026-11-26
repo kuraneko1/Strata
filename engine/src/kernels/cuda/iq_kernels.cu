@@ -9934,19 +9934,6 @@ __device__ __forceinline__ void iq_sts128_u32_sm70(uint32_t addr, uint4 v) {
                      :: "r"(addr), "n"(IMM), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
     }
 }
-template <bool HAS_LB>
-__device__ __forceinline__ float wmma_situ_eval_prescaled_sm70(
-    float g, float u, float sg_inv_b, float neg_sc_g, float su_inv_lb, float out_scale) {
-    const float xc = fmaxf(-9.0f, fminf(9.0f, g * sg_inv_b));
-    const float th_g = __fdividef(2.0f, 1.0f + __expf(-2.0f * xc)) - 1.0f;
-    const float sig = __fdividef(1.0f, 1.0f + __expf(g * neg_sc_g));
-    float tu = u;
-    if constexpr (HAS_LB) {
-        const float xu = fmaxf(-9.0f, fminf(9.0f, u * su_inv_lb));
-        tu = __fdividef(2.0f, 1.0f + __expf(-2.0f * xu)) - 1.0f;
-    }
-    return __fmul_rn(__fmul_rn(out_scale, th_g), __fmul_rn(sig, tu));
-}
 #endif
 
 #if __CUDA_ARCH__ >= 800
@@ -11574,7 +11561,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
 
         auto run_gu_epilogue_sm70 = [&](auto mr_tag, const auto& acc_mr) {
             constexpr int MR_RUN = decltype(mr_tag)::value;
-            // Volta sm_70 compact prescaled SiTU + 128B coalesced STG.E.128 epilogue via idle stage 0 (0x0000..0x3FFF, 0 pre-barrier)!
+            // Volta sm_70 compact exact SiTU + 128B coalesced STG.E.128 epilogue via idle stage 0 (0x0000..0x3FFF, 0 pre-barrier)!
             // Reload tile scalars with asm barrier so ptxas never carries epilogue regs across the K-loop -> STACK: 0!
             int e_by = (int) blockIdx.y;
             int e_tid = (int) threadIdx.x;
@@ -11585,10 +11572,8 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
             const uint8_t* ep_blob = L.tail_off ? (const uint8_t*) grp_ptr[e_g] : nullptr;
             const float ep_sc_g = (L.tail_off ? ((const float*) (ep_blob + L.tail_off))[0] : 1.0f) * 128.0f;
             const float ep_sc_u = (L.tail_off ? ((const float*) (ep_blob + L.tail_off))[1] : 1.0f) * 128.0f;
-            const float sg_inv_b = ep_sc_g * __fdividef(1.0f, beta);
-            const float neg_sc_g = -ep_sc_g;
-            const float su_inv_lb = HAS_LB ? (ep_sc_u * __fdividef(1.0f, lb)) : 0.0f;
-            const float out_scale = HAS_LB ? (beta * lb) : (beta * ep_sc_u);
+            const float ep_inv_b = __fdividef(1.0f, beta);
+            const float ep_inv_lb = HAS_LB ? __fdividef(1.0f, lb) : 0.0f;
             const int ep_warp = e_tid >> 5, ep_lane = e_tid & 31;
             const int ep_wm = ep_warp >> 2, ep_wn = ep_warp & 3;
             const int ep_acc_r0 = ((ep_lane & 16) >> 2) + ((ep_lane & 4) << 1) + (ep_lane & 1);
@@ -11640,11 +11625,11 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                     }
                 }
                 const __half2 h0 = __floats2half2_rn(
-                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g0, u0, sg_inv_b, neg_sc_g, su_inv_lb, out_scale),
-                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g1, u1, sg_inv_b, neg_sc_g, su_inv_lb, out_scale));
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(g0, ep_sc_g), __fmul_rn(u0, ep_sc_u), beta, ep_inv_b, lb, ep_inv_lb),
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(g1, ep_sc_g), __fmul_rn(u1, ep_sc_u), beta, ep_inv_b, lb, ep_inv_lb));
                 const __half2 h1 = __floats2half2_rn(
-                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g2, u2, sg_inv_b, neg_sc_g, su_inv_lb, out_scale),
-                    wmma_situ_eval_prescaled_sm70<HAS_LB>(g3, u3, sg_inv_b, neg_sc_g, su_inv_lb, out_scale));
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(g2, ep_sc_g), __fmul_rn(u2, ep_sc_u), beta, ep_inv_b, lb, ep_inv_lb),
+                    wmma_situ_eval_t<HAS_LB>(__fmul_rn(g3, ep_sc_g), __fmul_rn(u3, ep_sc_u), beta, ep_inv_b, lb, ep_inv_lb));
                 const uint32_t u_h0 = *reinterpret_cast<const uint32_t*>(&h0);
                 const uint32_t u_h1 = *reinterpret_cast<const uint32_t*>(&h1);
                 const uint32_t s_addr = ep_base + ((uint32_t) r << 7) + (hi ? swz_r1 : swz_r0);
