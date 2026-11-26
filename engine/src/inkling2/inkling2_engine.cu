@@ -3457,15 +3457,7 @@ struct Engine {
         for (int i = 0; i < n_q; ++i) mo4.p[i] = outs[i];
         const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
         if (n_q == 1) {
-            if (T <= 8 && d_mix_scratch != nullptr && d_router_done != nullptr) {
-                k_mix_normed_q8_phase1<false><<<dim3(18u, (unsigned) T), 128, 0, st>>>(
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0,
-                    np, D, query, d_mix_scratch, d_router_done + 1, N, inv_sqrt_n, hp.rms_eps);
-                k_mix_normed_q8_phase2<<<dim3(18u, (unsigned) T), 32, 0, st>>>(
-                    np, D, d_mix_scratch, mo4.p[0], nq8.w0, nq8.xq0, N);
-            } else {
-                k_mix_normed_fused_1pass_q8<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
-            }
+            k_mix_normed_fused_1pass_q8<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
         } else {
             k_mix_normed_fused_1pass_q8<3><<<(unsigned) T, 576, 0, st>>>(np, D, query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
         }
@@ -3566,13 +3558,13 @@ struct Engine {
             const float* wd = (const float*) L.loop_down[mod].d;
             const int R = (int) hp.loop_gate_rank;
             if (T == 4) {
-                k_loop_down_fused_smallT<4, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 4, hp.rms_eps);
+                k_loop_down_fused_smallT<4, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 4, hp.rms_eps);
             } else if (T == 1) {
-                k_loop_down_fused_smallT<1, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 1, hp.rms_eps);
+                k_loop_down_fused_smallT<1, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 1, hp.rms_eps);
             } else if (T == 2) {
-                k_loop_down_fused_smallT<2, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 2, hp.rms_eps);
+                k_loop_down_fused_smallT<2, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 2, hp.rms_eps);
             } else if (T == 3) {
-                k_loop_down_fused_smallT<3, true><<<(unsigned) R, 192, 0, st>>>(wd, c, msg, ctrl64, N, R, 3, hp.rms_eps);
+                k_loop_down_fused_smallT<3, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 3, hp.rms_eps);
             } else if (T == 5) {
                 k_loop_down_fused_smallT<5, true><<<(unsigned) R, 256, 0, st>>>(wd, c, msg, ctrl64, N, R, 5, hp.rms_eps);
             } else if (T == 6) {
@@ -3590,13 +3582,13 @@ struct Engine {
         }
         if (hp.loop_gate_rank == 64 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
             if (T == 1) {
-                k_control_up_combine_t1<<<(unsigned) ((N + 15) / 16), 128, 0, st>>>(
+                k_control_up_combine_t1<<<(unsigned) ((N + 7) / 8), 128, 0, st>>>(
                     c, msg, (const float*) L.loop_gain[mod].d, (const float*) L.loop_forget[mod].d,
                     ctrl64, out, (int) hp.loop_gate_rank, N);
                 return;
             }
             if (T >= 2 && T <= 8) {
-                const unsigned nb = (unsigned) ((N + 31) / 32);
+                const unsigned nb = (unsigned) ((N + 15) / 16);
                 const float* wg = (const float*) L.loop_gain[mod].d;
                 const float* wf = (const float*) L.loop_forget[mod].d;
                 if (T == 4) {
@@ -7424,7 +7416,7 @@ struct Engine {
                         CtrlUpPtrs3 up{(const float*) L.loop_gain[0].d, (const float*) L.loop_gain[1].d, (const float*) L.loop_gain[2].d,
                                        (const float*) L.loop_forget[0].d, (const float*) L.loop_forget[1].d, (const float*) L.loop_forget[2].d,
                                        in_q, in_k, in_v, msg0, msg1, msg2, in_q, in_k, in_v};
-                        const unsigned nb = (unsigned) ((N + 31) / 32);
+                        const unsigned nb = (unsigned) ((N + 15) / 16);
                         // Reuse ctrl2N (size T*2*N floats >> 3*T*64 floats) for batched 3-module ctrl64 (0 extra VRAM).
                         if (T == 1) {
                             k_loop_down_fused_smallT_3<1, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 1, hp.rms_eps);

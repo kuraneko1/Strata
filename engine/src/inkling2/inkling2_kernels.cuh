@@ -2461,10 +2461,9 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_pp(
 
 /// Fused k_control_prep + loop_down ([2*N -> R=64] F32 GEMM) for small T (1..8):
 /// Exploits linearity of RMSNorm: dot(cur*rc, W_c) + dot(msg*rm, W_m) = rc*dot(cur, W_c) + rm*dot(msg, W_m).
-/// Eliminates k_control_prep launch and all ctrl2N HBM writes/reads!
-/// Grid (R), block ((MT <= 4) ? 192 : 256): 192 thr gives exact 576/192=3 float4 iters (0 tail waste) for N==2304!
+/// Eliminates k_control_prep launch and all ctrl2N HBM writes/reads! Grid (R), block 256.
 template <int MT, bool EXACT_T>
-__global__ void __launch_bounds__((MT <= 4) ? 192 : 256, 4) k_loop_down_fused_smallT(const float* __restrict__ W, const float* __restrict__ cur,
+__global__ void __launch_bounds__(256, 4) k_loop_down_fused_smallT(const float* __restrict__ W, const float* __restrict__ cur,
                                          const float* __restrict__ msg, float* __restrict__ Y,
                                          int N, int R, int T, float eps) {
     const int o = blockIdx.x;
@@ -2486,8 +2485,8 @@ __global__ void __launch_bounds__((MT <= 4) ? 192 : 256, 4) k_loop_down_fused_sm
             const float4* m4 = reinterpret_cast<const float4*>(msg + (size_t) warp * N);
             float vsc = 0.0f, vsm = 0.0f;
             for (int i = lane; i < n4; i += 32) {
-                const float4 vc = __ldg(c4 + i);
-                const float4 vm = __ldg(m4 + i);
+                const float4 vc = c4[i];
+                const float4 vm = m4[i];
                 vsc += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
                 vsm += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
             }
@@ -2507,11 +2506,11 @@ __global__ void __launch_bounds__((MT <= 4) ? 192 : 256, 4) k_loop_down_fused_sm
             for (int t = 0; t < MT; ++t) dc[t] = 0.0f;
 #pragma unroll 1
             for (int i = tid; i < n4; i += 256) {
-                const float4 awc = __ldg(wc4 + i);
+                const float4 awc = wc4[i];
 #pragma unroll
                 for (int t = 0; t < MT; ++t) {
                     if (EXACT_T || t < T) {
-                        const float4 vc = __ldg(reinterpret_cast<const float4*>(cur + (size_t) t * N) + i);
+                        const float4 vc = reinterpret_cast<const float4*>(cur + (size_t) t * N)[i];
                         dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
                     }
                 }
@@ -2532,11 +2531,11 @@ __global__ void __launch_bounds__((MT <= 4) ? 192 : 256, 4) k_loop_down_fused_sm
             for (int t = 0; t < MT; ++t) dm[t] = 0.0f;
 #pragma unroll 1
             for (int i = tid; i < n4; i += 256) {
-                const float4 awm = __ldg(wm4 + i);
+                const float4 awm = wm4[i];
 #pragma unroll
                 for (int t = 0; t < MT; ++t) {
                     if (EXACT_T || t < T) {
-                        const float4 vm = __ldg(reinterpret_cast<const float4*>(msg + (size_t) t * N) + i);
+                        const float4 vm = reinterpret_cast<const float4*>(msg + (size_t) t * N)[i];
                         dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
                     }
                 }
@@ -2562,46 +2561,26 @@ __global__ void __launch_bounds__((MT <= 4) ? 192 : 256, 4) k_loop_down_fused_sm
             Y[(size_t) tid * R + o] = tdc * s_rc[tid] + tdm * s_rm[tid];
         }
         return;
-    } else {
-    __shared__ float s_dc[MT][6];
-    __shared__ float s_sc[MT][6];
-    __shared__ float s_dm[MT][6];
-    __shared__ float s_sm[MT][6];
+    }
+    __shared__ float s_dc[MT][8];
+    __shared__ float s_sc[MT][8];
+    __shared__ float s_dm[MT][8];
+    __shared__ float s_sm[MT][8];
     float dc[MT], sc[MT], dm[MT], sm[MT];
 #pragma unroll
     for (int t = 0; t < MT; ++t) { dc[t] = 0.0f; sc[t] = 0.0f; dm[t] = 0.0f; sm[t] = 0.0f; }
-    if (n4 == 576) {
+    for (int i = tid; i < n4; i += 256) {
+        const float4 awc = wc4[i];
+        const float4 awm = wm4[i];
 #pragma unroll
-        for (int it = 0; it < 3; ++it) {
-            const int i = tid + it * 192;
-            const float4 awc = __ldg(wc4 + i);
-            const float4 awm = __ldg(wm4 + i);
-#pragma unroll
-            for (int t = 0; t < MT; ++t) {
-                if (EXACT_T || t < T) {
-                    const float4 vc = __ldg(reinterpret_cast<const float4*>(cur + (size_t) t * N) + i);
-                    const float4 vm = __ldg(reinterpret_cast<const float4*>(msg + (size_t) t * N) + i);
-                    dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
-                    sc[t] += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
-                    dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
-                    sm[t] += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
-                }
-            }
-        }
-    } else {
-        for (int i = tid; i < n4; i += 192) {
-            const float4 awc = __ldg(wc4 + i);
-            const float4 awm = __ldg(wm4 + i);
-#pragma unroll
-            for (int t = 0; t < MT; ++t) {
-                if (EXACT_T || t < T) {
-                    const float4 vc = __ldg(reinterpret_cast<const float4*>(cur + (size_t) t * N) + i);
-                    const float4 vm = __ldg(reinterpret_cast<const float4*>(msg + (size_t) t * N) + i);
-                    dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
-                    sc[t] += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
-                    dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
-                    sm[t] += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
-                }
+        for (int t = 0; t < MT; ++t) {
+            if (EXACT_T || t < T) {
+                const float4 vc = reinterpret_cast<const float4*>(cur + (size_t) t * N)[i];
+                const float4 vm = reinterpret_cast<const float4*>(msg + (size_t) t * N)[i];
+                dc[t] += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
+                sc[t] += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
+                dm[t] += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
+                sm[t] += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
             }
         }
     }
@@ -2626,14 +2605,13 @@ __global__ void __launch_bounds__((MT <= 4) ? 192 : 256, 4) k_loop_down_fused_sm
     if (tid < (EXACT_T ? MT : T)) {
         float tdc = 0.0f, tsc = 0.0f, tdm = 0.0f, tsm = 0.0f;
 #pragma unroll
-        for (int w = 0; w < 6; ++w) {
+        for (int w = 0; w < 8; ++w) {
             tdc += s_dc[tid][w]; tsc += s_sc[tid][w];
             tdm += s_dm[tid][w]; tsm += s_sm[tid][w];
         }
         const float rc = rsqrtf(tsc / (float) N + eps);
         const float rm = rsqrtf(tsm / (float) N + eps);
         Y[(size_t) tid * R + o] = tdc * rc + tdm * rm;
-    }
     }
 }
 
@@ -5248,60 +5226,26 @@ __global__ void k_control_combine(const float* __restrict__ cur, const float* __
     out[i] = (1.0f - f) * cur[i] + g * msg[i];
 }
 
-/// Fused T=1 loop_gain + loop_forget ([R=64 -> N] F32) + k_control_combine:
-/// 4 warps/block (128 thr), 4 rows/warp = 16 rows/CTA (144 CTAs = 1.8/SM on V100 -> halves CTA/barrier overhead,
-/// overlaps 2 weight row loads in flight, and uses coalesced float4 cur/msg/out!).
+/// Fused T=1 loop_gain + loop_forget ([R=64 -> N] F32) + k_control_combine: 4 warps/block (128 thr), 2 rows/warp = 8 rows/CTA (288 CTAs = 3.6/SM on V100).
 __global__ void __launch_bounds__(128, 8) k_control_up_combine_t1(
         const float* __restrict__ cur, const float* __restrict__ msg,
         const float* __restrict__ w_gain, const float* __restrict__ w_forget,
         const float* __restrict__ ctrl64, float* __restrict__ out,
         int R, int N) {
     __shared__ float sx[64];
-    if (threadIdx.x < R) sx[threadIdx.x] = __ldg(ctrl64 + threadIdx.x);
+    if (threadIdx.x < R) sx[threadIdx.x] = ctrl64[threadIdx.x];
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int base_o = (blockIdx.x * 4 + warp) * 4;
-    if (base_o >= N) return;
+    const int base_o = (blockIdx.x * 4 + warp) * 2;
     const int half = lane >> 4;
     const int i = lane & 15;
     const float4 x = reinterpret_cast<const float4*>(sx)[i];
     const float* wg = half ? w_forget : w_gain;
-    if (base_o + 4 <= N) {
-        const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 0) * R) + i);
-        const float4 w1 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 1) * R) + i);
-        float a0 = w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-        float a1 = w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w;
-        const float4 w2 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 2) * R) + i);
-        const float4 w3 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 3) * R) + i);
-        float a2 = w2.x * x.x + w2.y * x.y + w2.z * x.z + w2.w * x.w;
-        float a3 = w3.x * x.x + w3.y * x.y + w3.z * x.z + w3.w * x.w;
 #pragma unroll
-        for (int m = 8; m > 0; m >>= 1) {
-            a0 += __shfl_xor_sync(0xffffffffu, a0, m);
-            a1 += __shfl_xor_sync(0xffffffffu, a1, m);
-            a2 += __shfl_xor_sync(0xffffffffu, a2, m);
-            a3 += __shfl_xor_sync(0xffffffffu, a3, m);
-        }
-        const float f0 = __shfl_sync(0xffffffffu, a0, 16);
-        const float f1 = __shfl_sync(0xffffffffu, a1, 16);
-        const float f2 = __shfl_sync(0xffffffffu, a2, 16);
-        const float f3 = __shfl_sync(0xffffffffu, a3, 16);
-        if (lane == 0) {
-            const float4 c4 = __ldg(reinterpret_cast<const float4*>(cur + base_o));
-            const float4 m4 = __ldg(reinterpret_cast<const float4*>(msg + base_o));
-            reinterpret_cast<float4*>(out + base_o)[0] = make_float4(
-                (1.0f - fast_tanh(f0)) * c4.x + fast_tanh(a0) * m4.x,
-                (1.0f - fast_tanh(f1)) * c4.y + fast_tanh(a1) * m4.y,
-                (1.0f - fast_tanh(f2)) * c4.z + fast_tanh(a2) * m4.z,
-                (1.0f - fast_tanh(f3)) * c4.w + fast_tanh(a3) * m4.w);
-        }
-        return;
-    }
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < 2; ++k) {
         const int o = base_o + k;
         if (o >= N) return;
-        const float4 w = __ldg(reinterpret_cast<const float4*>(wg + (size_t) o * R) + i);
+        const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * R)[i];
         float acc = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
 #pragma unroll
         for (int m = 8; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
@@ -5313,8 +5257,8 @@ __global__ void __launch_bounds__(128, 8) k_control_up_combine_t1(
 }
 
 /// Fused small-T (2..8) loop_gain + loop_forget ([R=64 -> N] F32) + k_control_combine:
-/// 8 warps/CTA x 4 rows/warp = 32 rows/CTA (halves CTAs & barriers vs 16 rows/CTA), overlaps 2 rows of W in flight,
-/// and uses coalesced float2 cur/msg/out stores.
+/// Loads W_gain/W_forget ONCE per output row across all T tokens against SMEM ctrl64[T][64].
+/// Eliminates 2x cuBLAS SGEMM + splitKreduce + k_control_combine per module during verify decode.
 template <int MT, bool EXACT_T>
 __global__ void __launch_bounds__(256, 4) k_control_up_combine_smallT(const float* __restrict__ cur, const float* __restrict__ msg,
                                             const float* __restrict__ w_gain, const float* __restrict__ w_forget,
@@ -5323,102 +5267,67 @@ __global__ void __launch_bounds__(256, 4) k_control_up_combine_smallT(const floa
     __shared__ float sx[MT][64];
     const int tot_x = (EXACT_T ? MT : T) * 64;
     for (int idx = threadIdx.x; idx < tot_x; idx += 256) {
-        sx[idx >> 6][idx & 63] = __ldg(ctrl64 + idx);
+        sx[idx >> 6][idx & 63] = ctrl64[idx];
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int base_o = (blockIdx.x * 8 + warp) * 4;
-    if (base_o >= N) return;
+    const int base_o = (blockIdx.x * 8 + warp) * 2;
     const int half = lane >> 4;
     const int i = lane & 15;
     const float* wg = half ? w_forget : w_gain;
-    const bool even_n = ((N & 1) == 0);
     if constexpr (MT > 4) {
 #pragma unroll 1
-        for (int kp = 0; kp < 4; kp += 2) {
-            const int o0 = base_o + kp;
-            if (o0 >= N) return;
-            const bool has1 = (o0 + 1 < N);
-            const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) o0 * 64) + i);
-            const float4 w1 = has1 ? __ldg(reinterpret_cast<const float4*>(wg + (size_t) (o0 + 1) * 64) + i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int k = 0; k < 2; ++k) {
+            const int o = base_o + k;
+            if (o >= N) return;
+            const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * 64)[i];
 #pragma unroll
             for (int t = 0; t < MT; ++t) {
                 if (EXACT_T || t < T) {
                     const float4 x = reinterpret_cast<const float4*>(sx[t])[i];
-                    float a0 = w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                    float a1 = has1 ? (w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w) : 0.0f;
+                    float a = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
 #pragma unroll
-                    for (int m = 8; m > 0; m >>= 1) {
-                        a0 += __shfl_xor_sync(0xffffffffu, a0, m);
-                        a1 += __shfl_xor_sync(0xffffffffu, a1, m);
-                    }
-                    const float f0 = __shfl_sync(0xffffffffu, a0, 16);
-                    const float f1 = __shfl_sync(0xffffffffu, a1, 16);
+                    for (int m = 8; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+                    const float f_val = __shfl_sync(0xffffffffu, a, 16);
                     if (lane == 0) {
-                        const size_t idx0 = (size_t) t * N + o0;
-                        if (has1 && even_n) {
-                            const float2 c2 = __ldg(reinterpret_cast<const float2*>(cur + idx0));
-                            const float2 m2 = __ldg(reinterpret_cast<const float2*>(msg + idx0));
-                            *reinterpret_cast<float2*>(out + idx0) = make_float2(
-                                (1.0f - fast_tanh(f0)) * c2.x + fast_tanh(a0) * m2.x,
-                                (1.0f - fast_tanh(f1)) * c2.y + fast_tanh(a1) * m2.y);
-                        } else {
-                            out[idx0] = (1.0f - fast_tanh(f0)) * __ldg(&cur[idx0]) + fast_tanh(a0) * __ldg(&msg[idx0]);
-                            if (has1) out[idx0 + 1] = (1.0f - fast_tanh(f1)) * __ldg(&cur[idx0 + 1]) + fast_tanh(a1) * __ldg(&msg[idx0 + 1]);
-                        }
+                        const size_t idx = (size_t) t * N + o;
+                        out[idx] = (1.0f - fast_tanh(f_val)) * cur[idx] + fast_tanh(a) * msg[idx];
                     }
                 }
             }
         }
         return;
-    } else {
+    }
 #pragma unroll
-    for (int kp = 0; kp < 4; kp += 2) {
-        const int o0 = base_o + kp;
-        if (o0 >= N) return;
-        const bool has1 = (o0 + 1 < N);
-        const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) o0 * 64) + i);
-        const float4 w1 = has1 ? __ldg(reinterpret_cast<const float4*>(wg + (size_t) (o0 + 1) * 64) + i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        float acc0[MT], acc1[MT];
+    for (int k = 0; k < 2; ++k) {
+        const int o = base_o + k;
+        if (o >= N) return;
+        const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * 64)[i];
+        float acc[MT];
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
             if (EXACT_T || t < T) {
                 const float4 x = reinterpret_cast<const float4*>(sx[t])[i];
-                acc0[t] = w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                acc1[t] = has1 ? (w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w) : 0.0f;
+                acc[t] = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
             }
         }
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
             if (EXACT_T || t < T) {
-                float a0 = acc0[t], a1 = acc1[t];
+                float a = acc[t];
 #pragma unroll
-                for (int m = 8; m > 0; m >>= 1) {
-                    a0 += __shfl_xor_sync(0xffffffffu, a0, m);
-                    a1 += __shfl_xor_sync(0xffffffffu, a1, m);
-                }
-                const float f0 = __shfl_sync(0xffffffffu, a0, 16);
-                const float f1 = __shfl_sync(0xffffffffu, a1, 16);
+                for (int m = 8; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+                const float f_val = __shfl_sync(0xffffffffu, a, 16);
                 if (lane == 0) {
-                    const size_t idx0 = (size_t) t * N + o0;
-                    if (has1 && even_n) {
-                        const float2 c2 = __ldg(reinterpret_cast<const float2*>(cur + idx0));
-                        const float2 m2 = __ldg(reinterpret_cast<const float2*>(msg + idx0));
-                        *reinterpret_cast<float2*>(out + idx0) = make_float2(
-                            (1.0f - fast_tanh(f0)) * c2.x + fast_tanh(a0) * m2.x,
-                            (1.0f - fast_tanh(f1)) * c2.y + fast_tanh(a1) * m2.y);
-                    } else {
-                        out[idx0] = (1.0f - fast_tanh(f0)) * __ldg(&cur[idx0]) + fast_tanh(a0) * __ldg(&msg[idx0]);
-                        if (has1) out[idx0 + 1] = (1.0f - fast_tanh(f1)) * __ldg(&cur[idx0 + 1]) + fast_tanh(a1) * __ldg(&msg[idx0 + 1]);
-                    }
+                    const size_t idx = (size_t) t * N + o;
+                    out[idx] = (1.0f - fast_tanh(f_val)) * cur[idx] + fast_tanh(a) * msg[idx];
                 }
             }
         }
     }
-    }
 }
 
-/// 3-module batched k_control_up_combine_smallT for Q/K/V loop controllers (grid = ((N+31)/32, 3) = 216 CTAs -> 2.7/SM on V100!).
+/// 3-module batched k_control_up_combine_smallT for Q/K/V loop controllers (grid = ((N+15)/16, 3)).
 struct CtrlUpPtrs3 {
     const float *wg0, *wg1, *wg2;
     const float *wf0, *wf1, *wf2;
@@ -5437,12 +5346,11 @@ __global__ void __launch_bounds__(256, 4) k_control_up_combine_smallT_3(CtrlUpPt
     const float* ctrl64 = ctrl64_base + (size_t) mod * (size_t) n_t * 64;
     const int tot_x = n_t * 64;
     for (int idx = threadIdx.x; idx < tot_x; idx += 256) {
-        sx[idx >> 6][idx & 63] = __ldg(ctrl64 + idx);
+        sx[idx >> 6][idx & 63] = ctrl64[idx];
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int base_o = (blockIdx.x * 8 + warp) * 4;
-    if (base_o >= N) return;
+    const int base_o = (blockIdx.x * 8 + warp) * 2;
     const int half = lane >> 4;
     const int i = lane & 15;
     const float* wg_m = (mod == 0) ? cp.wg0 : ((mod == 1) ? cp.wg1 : cp.wg2);
@@ -5453,42 +5361,11 @@ __global__ void __launch_bounds__(256, 4) k_control_up_combine_smallT_3(CtrlUpPt
     float* out = (mod == 0) ? cp.o0 : ((mod == 1) ? cp.o1 : cp.o2);
     if constexpr (MT == 1 && EXACT_T) {
         const float4 x0 = reinterpret_cast<const float4*>(sx[0])[i];
-        if (base_o + 4 <= N) {
-            const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 0) * 64) + i);
-            const float4 w1 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 1) * 64) + i);
-            float a0 = w0.x * x0.x + w0.y * x0.y + w0.z * x0.z + w0.w * x0.w;
-            float a1 = w1.x * x0.x + w1.y * x0.y + w1.z * x0.z + w1.w * x0.w;
-            const float4 w2 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 2) * 64) + i);
-            const float4 w3 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 3) * 64) + i);
-            float a2 = w2.x * x0.x + w2.y * x0.y + w2.z * x0.z + w2.w * x0.w;
-            float a3 = w3.x * x0.x + w3.y * x0.y + w3.z * x0.z + w3.w * x0.w;
 #pragma unroll
-            for (int m = 8; m > 0; m >>= 1) {
-                a0 += __shfl_xor_sync(0xffffffffu, a0, m);
-                a1 += __shfl_xor_sync(0xffffffffu, a1, m);
-                a2 += __shfl_xor_sync(0xffffffffu, a2, m);
-                a3 += __shfl_xor_sync(0xffffffffu, a3, m);
-            }
-            const float f0 = __shfl_sync(0xffffffffu, a0, 16);
-            const float f1 = __shfl_sync(0xffffffffu, a1, 16);
-            const float f2 = __shfl_sync(0xffffffffu, a2, 16);
-            const float f3 = __shfl_sync(0xffffffffu, a3, 16);
-            if (lane == 0) {
-                const float4 c4 = __ldg(reinterpret_cast<const float4*>(cur + base_o));
-                const float4 m4 = __ldg(reinterpret_cast<const float4*>(msg + base_o));
-                reinterpret_cast<float4*>(out + base_o)[0] = make_float4(
-                    (1.0f - fast_tanh(f0)) * c4.x + fast_tanh(a0) * m4.x,
-                    (1.0f - fast_tanh(f1)) * c4.y + fast_tanh(a1) * m4.y,
-                    (1.0f - fast_tanh(f2)) * c4.z + fast_tanh(a2) * m4.z,
-                    (1.0f - fast_tanh(f3)) * c4.w + fast_tanh(a3) * m4.w);
-            }
-            return;
-        }
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
+        for (int k = 0; k < 2; ++k) {
             const int o = base_o + k;
             if (o >= N) return;
-            const float4 w = __ldg(reinterpret_cast<const float4*>(wg + (size_t) o * 64) + i);
+            const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * 64)[i];
             float a = w.x * x0.x + w.y * x0.y + w.z * x0.z + w.w * x0.w;
 #pragma unroll
             for (int m = 8; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
@@ -5499,85 +5376,51 @@ __global__ void __launch_bounds__(256, 4) k_control_up_combine_smallT_3(CtrlUpPt
         }
         return;
     } else if constexpr (MT > 4) {
-        const bool even_n = ((N & 1) == 0);
 #pragma unroll 1
-        for (int kp = 0; kp < 4; kp += 2) {
-            const int o0 = base_o + kp;
-            if (o0 >= N) return;
-            const bool has1 = (o0 + 1 < N);
-            const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) o0 * 64) + i);
-            const float4 w1 = has1 ? __ldg(reinterpret_cast<const float4*>(wg + (size_t) (o0 + 1) * 64) + i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int k = 0; k < 2; ++k) {
+            const int o = base_o + k;
+            if (o >= N) return;
+            const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * 64)[i];
 #pragma unroll
             for (int t = 0; t < MT; ++t) {
                 if (EXACT_T || t < T) {
                     const float4 x = reinterpret_cast<const float4*>(sx[t])[i];
-                    float a0 = w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                    float a1 = has1 ? (w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w) : 0.0f;
+                    float a = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
 #pragma unroll
-                    for (int m = 8; m > 0; m >>= 1) {
-                        a0 += __shfl_xor_sync(0xffffffffu, a0, m);
-                        a1 += __shfl_xor_sync(0xffffffffu, a1, m);
-                    }
-                    const float f0 = __shfl_sync(0xffffffffu, a0, 16);
-                    const float f1 = __shfl_sync(0xffffffffu, a1, 16);
+                    for (int m = 8; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+                    const float f_val = __shfl_sync(0xffffffffu, a, 16);
                     if (lane == 0) {
-                        const size_t idx0 = (size_t) t * N + o0;
-                        if (has1 && even_n) {
-                            const float2 c2 = __ldg(reinterpret_cast<const float2*>(cur + idx0));
-                            const float2 m2 = __ldg(reinterpret_cast<const float2*>(msg + idx0));
-                            *reinterpret_cast<float2*>(out + idx0) = make_float2(
-                                (1.0f - fast_tanh(f0)) * c2.x + fast_tanh(a0) * m2.x,
-                                (1.0f - fast_tanh(f1)) * c2.y + fast_tanh(a1) * m2.y);
-                        } else {
-                            out[idx0] = (1.0f - fast_tanh(f0)) * __ldg(&cur[idx0]) + fast_tanh(a0) * __ldg(&msg[idx0]);
-                            if (has1) out[idx0 + 1] = (1.0f - fast_tanh(f1)) * __ldg(&cur[idx0 + 1]) + fast_tanh(a1) * __ldg(&msg[idx0 + 1]);
-                        }
+                        const size_t idx = (size_t) t * N + o;
+                        out[idx] = (1.0f - fast_tanh(f_val)) * cur[idx] + fast_tanh(a) * msg[idx];
                     }
                 }
             }
         }
         return;
     } else {
-        const bool even_n = ((N & 1) == 0);
 #pragma unroll
-    for (int kp = 0; kp < 4; kp += 2) {
-        const int o0 = base_o + kp;
-        if (o0 >= N) return;
-        const bool has1 = (o0 + 1 < N);
-        const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) o0 * 64) + i);
-        const float4 w1 = has1 ? __ldg(reinterpret_cast<const float4*>(wg + (size_t) (o0 + 1) * 64) + i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        float acc0[MT], acc1[MT];
+    for (int k = 0; k < 2; ++k) {
+        const int o = base_o + k;
+        if (o >= N) return;
+        const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * 64)[i];
+        float acc[MT];
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
             if (EXACT_T || t < T) {
                 const float4 x = reinterpret_cast<const float4*>(sx[t])[i];
-                acc0[t] = w0.x * x.x + w0.y * x.y + w0.z * x.z + w0.w * x.w;
-                acc1[t] = has1 ? (w1.x * x.x + w1.y * x.y + w1.z * x.z + w1.w * x.w) : 0.0f;
+                acc[t] = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
             }
         }
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
             if (EXACT_T || t < T) {
-                float a0 = acc0[t], a1 = acc1[t];
+                float a = acc[t];
 #pragma unroll
-                for (int m = 8; m > 0; m >>= 1) {
-                    a0 += __shfl_xor_sync(0xffffffffu, a0, m);
-                    a1 += __shfl_xor_sync(0xffffffffu, a1, m);
-                }
-                const float f0 = __shfl_sync(0xffffffffu, a0, 16);
-                const float f1 = __shfl_sync(0xffffffffu, a1, 16);
+                for (int m = 8; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+                const float f_val = __shfl_sync(0xffffffffu, a, 16);
                 if (lane == 0) {
-                    const size_t idx0 = (size_t) t * N + o0;
-                    if (has1 && even_n) {
-                        const float2 c2 = __ldg(reinterpret_cast<const float2*>(cur + idx0));
-                        const float2 m2 = __ldg(reinterpret_cast<const float2*>(msg + idx0));
-                        *reinterpret_cast<float2*>(out + idx0) = make_float2(
-                            (1.0f - fast_tanh(f0)) * c2.x + fast_tanh(a0) * m2.x,
-                            (1.0f - fast_tanh(f1)) * c2.y + fast_tanh(a1) * m2.y);
-                    } else {
-                        out[idx0] = (1.0f - fast_tanh(f0)) * __ldg(&cur[idx0]) + fast_tanh(a0) * __ldg(&msg[idx0]);
-                        if (has1) out[idx0 + 1] = (1.0f - fast_tanh(f1)) * __ldg(&cur[idx0 + 1]) + fast_tanh(a1) * __ldg(&msg[idx0 + 1]);
-                    }
+                    const size_t idx = (size_t) t * N + o;
+                    out[idx] = (1.0f - fast_tanh(f_val)) * cur[idx] + fast_tanh(a) * msg[idx];
                 }
             }
         }
