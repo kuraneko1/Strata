@@ -642,12 +642,13 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
 // kvalues_fp4 holds the E2M1 values doubled (0, 1, 2, 3, 4, 6, 8, 12), so the scale is halved here - exactly
 // ggml's ggml_cuda_ue4m3_to_fp32, decoded in software so the GPU and ggml-cpu agree bit for bit (NaN -> 0).
 __device__ __forceinline__ float ue4m3_to_f32_half(uint8_t x) {
-    // The same value as ldexpf(1 + man/8, exp - 7) * 0.5 (ldexpf(man, -9) * 0.5 for exp 0), built from its bits: every
-    // such value is exact in FP32, so this is equal for all 256 inputs - without the ldexpf and the branches it cost
-    // in the decode experts' inner loop.  Normal: 2^(exp-8) * (1 + man/8) = exponent field exp + 119, mantissa man<<20.
-    if (x == 0 || x == 0x7F) return 0.0f;
-    const uint32_t exp = (x >> 3) & 0xF, man = x & 0x7;
-    return exp == 0 ? (float) man * 0.0009765625f : __uint_as_float(((exp + 119u) << 23) | (man << 20));
+    // Branchless exact FP32 bit construction for all 256 UE4M3 inputs (NaN 0x7F -> 0.0f, 0x00/0x80 -> 0.0f).
+    // Normal: 2^(exp-8) * (1 + man/8) = ((exp + 119) << 23) | (man << 20) = ((x & 0x7F) << 20) + (119 << 23).
+    const uint32_t u = (uint32_t) x & 0x7Fu;
+    const float norm = __uint_as_float((u << 20) + 0x3B800000u);
+    const float sub  = (float) u * 0.0009765625f;
+    const float val  = (u < 8u) ? sub : norm;
+    return (x == 0x7Fu) ? 0.0f : val;
 }
 
 // One call = two sub-blocks (32 values); `bq8_1` is the block's first q8_1 block (two per 64 values).
@@ -1645,6 +1646,66 @@ __device__ __forceinline__ uint32_t iq_nvfp4_ktile_unperm_u32(uint32_t p) {
     return ((p & 0x01010101u) << 7) | (p & 0x70707070u) |
            ((p & 0x80808080u) >> 4) | ((p & 0x0E0E0E0Eu) >> 1);
 }
+__device__ __forceinline__ uint32_t iq_prmt_raw(uint32_t a, uint32_t b, uint32_t s) {
+#if defined(__CUDA_ARCH__) && !defined(__HIPCC__)
+    uint32_t d;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s));
+    return d;
+#else
+    return __byte_perm(a, b, s);
+#endif
+}
+// Direct zero-unperm NVFP4 K-tile u32 -> interleaved signed int8 pair { {l0,h0,l1,h1}, {l2,h2,l3,h3} }.
+// Bit-exact with get_int_from_table_16(iq_nvfp4_ktile_unperm_u32(p), kvalues_fp4) when paired with
+// pre-interleaved q8_1 activations ({qs[0],qs[8],qs[1],qs[9]}, {qs[2],qs[10],qs[3],qs[11]}).
+// Every nibble of mag and sel has bit 3 == 0, so raw prmt.b32 eliminates all & 0x7777 / & 0x7654 masks.
+__device__ __forceinline__ int2 iq_nvfp4_ktile_decode_pair_interleaved(uint32_t p) {
+    const uint32_t mag  = ((p >> 1) & 0x07070707u) | (p & 0x70707070u);
+    const uint32_t sel  = 0x32103210u | ((p >> 5) & 0x04040404u) | ((p << 6) & 0x40404040u);
+    const uint32_t lo0  = iq_prmt_raw(0x03020100u, 0x0C080604u, mag);
+    const uint32_t hi0  = iq_prmt_raw(0xFDFEFF00u, 0xF4F8FAFCu, mag);
+    const uint32_t t0   = iq_prmt_raw(lo0, hi0, sel);
+    const uint32_t mag1 = mag >> 16;
+    const uint32_t sel1 = sel >> 16;
+    const uint32_t lo1  = iq_prmt_raw(0x03020100u, 0x0C080604u, mag1);
+    const uint32_t hi1  = iq_prmt_raw(0xFDFEFF00u, 0xF4F8FAFCu, mag1);
+    const uint32_t t1   = iq_prmt_raw(lo1, hi1, sel1);
+    return make_int2((int) t0, (int) t1);
+}
+__device__ __forceinline__ void iq_stage_q8_1_interleaved(const block_q8_1* bq, __half& dst_dx, int4* dst_xq) {
+    dst_dx = __low2half(bq->ds);
+    const uint32_t x0 = (uint32_t) get_int_b4(bq->qs, 0), x1 = (uint32_t) get_int_b4(bq->qs, 1);
+    const uint32_t x2 = (uint32_t) get_int_b4(bq->qs, 2), x3 = (uint32_t) get_int_b4(bq->qs, 3);
+    const uint32_t x4 = (uint32_t) get_int_b4(bq->qs, 4), x5 = (uint32_t) get_int_b4(bq->qs, 5);
+    const uint32_t x6 = (uint32_t) get_int_b4(bq->qs, 6), x7 = (uint32_t) get_int_b4(bq->qs, 7);
+    dst_xq[0] = make_int4(
+        (int) __byte_perm(x0, x2, 0x5140u),
+        (int) __byte_perm(x0, x2, 0x7362u),
+        (int) __byte_perm(x1, x3, 0x5140u),
+        (int) __byte_perm(x1, x3, 0x7362u));
+    dst_xq[1] = make_int4(
+        (int) __byte_perm(x4, x6, 0x5140u),
+        (int) __byte_perm(x4, x6, 0x7362u),
+        (int) __byte_perm(x5, x7, 0x5140u),
+        (int) __byte_perm(x5, x7, 0x7362u));
+}
+__device__ __forceinline__ void iq_stage_q8_1_interleaved_f32(const block_q8_1* bq, float& dst_dx, int4* dst_xq) {
+    dst_dx = __low2float(bq->ds);
+    const uint32_t x0 = (uint32_t) get_int_b4(bq->qs, 0), x1 = (uint32_t) get_int_b4(bq->qs, 1);
+    const uint32_t x2 = (uint32_t) get_int_b4(bq->qs, 2), x3 = (uint32_t) get_int_b4(bq->qs, 3);
+    const uint32_t x4 = (uint32_t) get_int_b4(bq->qs, 4), x5 = (uint32_t) get_int_b4(bq->qs, 5);
+    const uint32_t x6 = (uint32_t) get_int_b4(bq->qs, 6), x7 = (uint32_t) get_int_b4(bq->qs, 7);
+    dst_xq[0] = make_int4(
+        (int) __byte_perm(x0, x2, 0x5140u),
+        (int) __byte_perm(x0, x2, 0x7362u),
+        (int) __byte_perm(x1, x3, 0x5140u),
+        (int) __byte_perm(x1, x3, 0x7362u));
+    dst_xq[1] = make_int4(
+        (int) __byte_perm(x4, x6, 0x5140u),
+        (int) __byte_perm(x4, x6, 0x7362u),
+        (int) __byte_perm(x5, x7, 0x5140u),
+        (int) __byte_perm(x5, x7, 0x7362u));
+}
 template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1's two 16-value sub-blocks, weights decoded once per call
     struct W { int2 v0[2], v1[2]; float sc[2]; };
     template<bool STAGE_GRID = false>
@@ -2302,71 +2363,6 @@ __device__ __forceinline__ void row_dot_36_sub8_2rows_t1(const uint8_t* row0, co
             s0 = ggml_cuda_dp4a(v01.y, x3, s0);
             const int2 v10 = get_int_from_table_16(r1q2, kvalues_fp4);
             const int2 v11 = get_int_from_table_16(r1q3, kvalues_fp4);
-            int s1 = ggml_cuda_dp4a(v10.x, x4, 0);
-            s1 = ggml_cuda_dp4a(v10.y, x6, s1);
-            s1 = ggml_cuda_dp4a(v11.x, x5, s1);
-            s1 = ggml_cuda_dp4a(v11.y, x7, s1);
-            float p = s_ue4m3[r1d16 & 0xFFu] * dx * (float) s0;
-            p += s_ue4m3[r1d16 >> 8] * dx * (float) s1;
-            if (first) acc1 = p; else acc1 += p;
-        }
-    };
-    do_step(t, true);
-#pragma unroll 1
-    for (int step = 8; step <= 24; step += 8) do_step(t + step, false);
-    if (t < 4) do_step(t + 32, false);
-#pragma unroll
-    for (int o = 4; o > 0; o >>= 1) {
-        acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
-        acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
-    }
-    s0_out = acc0;
-    s1_out = acc1;
-}
-
-__device__ __forceinline__ void row_dot_36_sub8_2rows_t1_ktile(const uint8_t* kt_base, int rl0, int rl1,
-                                                               const block_q8_1* x, int t, float& s0_out, float& s1_out,
-                                                               const float* __restrict__ s_ue4m3) {
-    float acc0 = 0.0f, acc1 = 0.0f;
-    auto do_step = [&](int k, bool first) {
-        const int kbx = k >> 1, half = k & 1;
-        const uint8_t* kt = kt_base + (size_t) kbx * 4608u;
-        const block_q8_1* bq8 = x + k;
-        const int4 r0q = __ldg(reinterpret_cast<const int4*>(kt + 512u + (size_t) half * 2048u + (size_t) rl0 * 16u));
-        const uint16_t r0d16 = __ldg(reinterpret_cast<const uint16_t*>(kt + (size_t) rl0 * 4u + (size_t) half * 2u));
-        const int4 r1q = __ldg(reinterpret_cast<const int4*>(kt + 512u + (size_t) half * 2048u + (size_t) rl1 * 16u));
-        const uint16_t r1d16 = __ldg(reinterpret_cast<const uint16_t*>(kt + (size_t) rl1 * 4u + (size_t) half * 2u));
-        const float dx = __low2float(bq8->ds);
-        const int x0 = get_int_b4(bq8->qs, 0), x1 = get_int_b4(bq8->qs, 1);
-        const int x2 = get_int_b4(bq8->qs, 2), x3 = get_int_b4(bq8->qs, 3);
-        const int x4 = get_int_b4(bq8->qs, 4), x5 = get_int_b4(bq8->qs, 5);
-        const int x6 = get_int_b4(bq8->qs, 6), x7 = get_int_b4(bq8->qs, 7);
-        {
-            const int2 v00 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r0q.x), kvalues_fp4);
-            const int2 v01 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r0q.y), kvalues_fp4);
-            int s0 = ggml_cuda_dp4a(v00.x, x0, 0);
-            s0 = ggml_cuda_dp4a(v00.y, x2, s0);
-            s0 = ggml_cuda_dp4a(v01.x, x1, s0);
-            s0 = ggml_cuda_dp4a(v01.y, x3, s0);
-            const int2 v10 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r0q.z), kvalues_fp4);
-            const int2 v11 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r0q.w), kvalues_fp4);
-            int s1 = ggml_cuda_dp4a(v10.x, x4, 0);
-            s1 = ggml_cuda_dp4a(v10.y, x6, s1);
-            s1 = ggml_cuda_dp4a(v11.x, x5, s1);
-            s1 = ggml_cuda_dp4a(v11.y, x7, s1);
-            float p = s_ue4m3[r0d16 & 0xFFu] * dx * (float) s0;
-            p += s_ue4m3[r0d16 >> 8] * dx * (float) s1;
-            if (first) acc0 = p; else acc0 += p;
-        }
-        {
-            const int2 v00 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r1q.x), kvalues_fp4);
-            const int2 v01 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r1q.y), kvalues_fp4);
-            int s0 = ggml_cuda_dp4a(v00.x, x0, 0);
-            s0 = ggml_cuda_dp4a(v00.y, x2, s0);
-            s0 = ggml_cuda_dp4a(v01.x, x1, s0);
-            s0 = ggml_cuda_dp4a(v01.y, x3, s0);
-            const int2 v10 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r1q.z), kvalues_fp4);
-            const int2 v11 = get_int_from_table_16((int) iq_nvfp4_ktile_unperm_u32((uint32_t) r1q.w), kvalues_fp4);
             int s1 = ggml_cuda_dp4a(v10.x, x4, 0);
             s1 = ggml_cuda_dp4a(v10.y, x6, s1);
             s1 = ggml_cuda_dp4a(v11.x, x5, s1);
@@ -5340,8 +5336,10 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
     }
 }
 
-// Standalone T=1 (128-thr = 16 subwarps x 2 rows = 32 rows/CTA -> 72x8 = 576 CTAs = 0.90 wave on V100!) L1-direct NVFP4 down:
-// Eliminates wave-2 tail (1152 -> 576 CTAs), halves s_ue4m3 init barriers, shares hq across 2 rows + 2x MLP, STACK: 0!
+// Standalone T=1 NVFP4 down (n_ff == 1152, 36 half-blocks, 32 rows/CTA -> 72x8 = 576 CTAs = 0.90 wave on V100!).
+// KTILE=true: 4 warps (128 thr) x 32 consecutive rows/warp (100% coalesced 512B LDG.E.128 & 128B STG.E.32),
+// Split-K=4 (exact 9 half-blocks/warp, 0 tail idle), software-pipelined prefetch, direct zero-unperm decode,
+// pre-interleaved SMEM hq (2x LDS.128 broadcast), STACK: 0!
 template <bool KTILE = false>
 __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
@@ -5352,93 +5350,248 @@ __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
     __shared__ float s_ue4m3[256];
     s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
     s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
-    iq_sync_lds();
-    const int r0 = (int) blockIdx.x * 32 + (threadIdx.x >> 3) * 2;
-    const int t = threadIdx.x & 7;
-    if (r0 >= L.n_embd) return;
-    const bool has_r1 = (r0 + 1 < L.n_embd);
-    const size_t w_off0 = KTILE ? (L.down_off + (size_t) (r0 >> 7) * 18u * 4608u) : (L.down_off + (size_t) r0 * L.d_row);
-    const size_t w_off1 = has_r1 ? (w_off0 + L.d_row) : w_off0;
-    const int rl0 = r0 & 127;
-    const int rl1 = has_r1 ? (rl0 + 1) : rl0;
-    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-        const uint8_t* wr0 = blob + w_off0;
-        const uint8_t* wr1 = blob + w_off1;
-        const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        for (int e = e0; e < e1; ++e) {
-            float s0 = 0.0f, s1 = 0.0f;
-            if constexpr (KTILE) {
-                row_dot_36_sub8_2rows_t1_ktile(wr0, rl0, rl1, hq + (size_t) e * 36, t, s0, s1, s_ue4m3);
-            } else {
-                row_dot_36_sub8_2rows_t1(wr0, wr1, hq + (size_t) e * 36, t, s0, s1, s_ue4m3);
+    if constexpr (KTILE) {
+        __shared__ float s_dx[36];
+        __shared__ __align__(16) int4 s_xq[36][2];
+        __shared__ float s_red[3][32];
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int r = (int) blockIdx.x * 32 + lane;
+        const bool valid_r = (r < L.n_embd);
+        const int r_c = valid_r ? r : 0;
+        const int rl = r_c & 127;
+        const int half = warp & 1;
+        const int kb0 = warp >> 1;
+        const size_t w_off = L.down_off + (size_t) (r_c >> 7) * 18u * 4608u + (size_t) kb0 * 4608u;
+        const size_t q_off = 512u + (size_t) half * 2048u + (size_t) rl * 16u;
+        const size_t d_off = (size_t) rl * 4u + (size_t) half * 2u;
+        for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const uint8_t* qp_base = blob + w_off + q_off;
+            const uint8_t* dp_base = blob + w_off + d_off;
+            const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int e = e0; e < e1; ++e) {
+                if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+                if (threadIdx.x < 36) {
+                    iq_stage_q8_1_interleaved_f32(hq + (size_t) e * 36 + threadIdx.x, s_dx[threadIdx.x], s_xq[threadIdx.x]);
+                }
+                iq_sync_lds();
+                const uint8_t* qp = qp_base;
+                const uint8_t* dp = dp_base;
+                int4 q_cur = __ldg(reinterpret_cast<const int4*>(qp));
+                uint16_t d_cur = __ldg(reinterpret_cast<const uint16_t*>(dp));
+                float acc = 0.0f;
+                int k = warp;
+#pragma unroll 1
+                for (int iter = 0; iter < 9; ++iter) {
+                    int4 q_nxt;
+                    uint16_t d_nxt;
+                    if (iter < 8) {
+                        q_nxt = __ldg(reinterpret_cast<const int4*>(qp + 9216u));
+                        d_nxt = __ldg(reinterpret_cast<const uint16_t*>(dp + 9216u));
+                    }
+                    const float dx = s_dx[k];
+                    const int4 xv0 = s_xq[k][0];
+                    const int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.x);
+                    const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.y);
+                    int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
+                    s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
+                    s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
+                    s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
+                    const int4 xv1 = s_xq[k][1];
+                    const int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.z);
+                    const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.w);
+                    int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
+                    s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
+                    s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
+                    s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
+                    float p = s_ue4m3[d_cur & 0xFFu] * dx * (float) s0;
+                    p += s_ue4m3[d_cur >> 8] * dx * (float) s1;
+                    acc += p;
+                    qp += 9216u;
+                    dp += 9216u;
+                    k += 4;
+                    q_cur = q_nxt;
+                    d_cur = d_nxt;
+                }
+                if (warp > 0) s_red[warp - 1][lane] = acc;
+                iq_sync_lds();
+                if (warp == 0 && valid_r) {
+                    const float sum = acc + s_red[0][lane] + s_red[1][lane] + s_red[2][lane];
+                    out[(size_t) ent_dst[e] * L.n_embd + r] = sum * sd;
+                }
             }
-            if (t == 0) {
-                float* dst = out + (size_t) ent_dst[e] * L.n_embd + r0;
-                if (has_r1) *reinterpret_cast<float2*>(dst) = make_float2(s0 * sd, s1 * sd);
-                else dst[0] = s0 * sd;
+        }
+    } else {
+        iq_sync_lds();
+        const int r0 = (int) blockIdx.x * 32 + (threadIdx.x >> 3) * 2;
+        const int t = threadIdx.x & 7;
+        if (r0 >= L.n_embd) return;
+        const bool has_r1 = (r0 + 1 < L.n_embd);
+        const size_t w_off0 = L.down_off + (size_t) r0 * L.d_row;
+        const size_t w_off1 = has_r1 ? (w_off0 + L.d_row) : w_off0;
+        for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const uint8_t* wr0 = blob + w_off0;
+            const uint8_t* wr1 = blob + w_off1;
+            const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int e = e0; e < e1; ++e) {
+                float s0 = 0.0f, s1 = 0.0f;
+                row_dot_36_sub8_2rows_t1(wr0, wr1, hq + (size_t) e * 36, t, s0, s1, s_ue4m3);
+                if (t == 0) {
+                    float* dst = out + (size_t) ent_dst[e] * L.n_embd + r0;
+                    if (has_r1) *reinterpret_cast<float2*>(dst) = make_float2(s0 * sd, s1 * sd);
+                    else dst[0] = s0 * sd;
+                }
             }
         }
     }
 }
 
-// Standalone zero-spill NVFP4 (type 40) down kernel for n_ff == 1152 (36 dots, 8 lanes/row, 32 rows/block, SMEM hq).
+// Standalone zero-spill NVFP4 (type 40) down kernel for n_ff == 1152 (36 half-blocks, 32 rows/CTA).
+// KTILE=true: 4 warps (128 thr, 8 blk/SM <= 5,920 B SMEM!), 32 consecutive rows/warp (100% coalesced 512B LDG.E.128),
+// Split-K=4 (9 exact steps/warp, 0 tail idle), software-pipelined prefetch, direct zero-unperm decode, union SMEM red.
 template <bool KTILE = false>
-__global__ void __launch_bounds__(256, 4) native_down_nvfp4_36_kernel(
+__global__ void __launch_bounds__(KTILE ? 128 : 256, KTILE ? 8 : 4) native_down_nvfp4_36_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
     const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out) {
     const int ng = *n_groups;
-    if (blockIdx.y >= ng) return;
-    __shared__ uint32_t s_hq_buf[GRP_NC * 36 * 9];
+    if ((int) blockIdx.y >= ng) return;
     __shared__ float s_ue4m3[256];
-    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
-    const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
-    const int t = threadIdx.x & 7;
-    const bool valid_r = (r < L.n_embd);
-    const int r_c = valid_r ? r : 0;
-    const size_t w_off = KTILE ? (L.down_off + (size_t) (r_c >> 7) * 18u * 4608u) : (L.down_off + (size_t) r_c * L.d_row);
-    const int r_local = r_c & 127;
-    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
-    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
-        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        for (int e = e0; e < e1; e += GRP_NC) {
-            const int n = min(GRP_NC, e1 - e);
-            const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 36);
-            const int words = n * (36 * 9);
-            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
-            for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+    if constexpr (KTILE) {
+        s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+        s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
+        union SmemBuf {
+            struct {
+                __align__(16) int4 xq[GRP_NC * 36][2];
+                __half dx[GRP_NC * 36];
+            } st;
+            float red[GRP_NC][4][32];
+        };
+        __shared__ SmemBuf smem;
+        auto run_chunk = [&](auto nc_tag, int g) {
+            constexpr int NC = decltype(nc_tag)::value;
+            float acc[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+            const int warp = threadIdx.x >> 5;
+            const int lane = threadIdx.x & 31;
+            const int r_c = min((int) blockIdx.x * 32 + lane, (int) L.n_embd - 1);
+            const int rl = r_c & 127;
+            const int half = warp & 1;
+            const int q_off = 512 + half * 2048 + rl * 16;
+            const int d_rel = (rl * 4 + half * 2) - q_off;
+            const uint8_t* qp = (const uint8_t*) grp_ptr[g] + L.down_off +
+                                ((size_t) (r_c >> 7) * 18u + (size_t) (warp >> 1)) * 4608u + q_off;
+            int k = warp;
+#pragma unroll 1
+            for (int iter = 0; iter < 9; ++iter) {
+                const int4 q_cur = __ldg(reinterpret_cast<const int4*>(qp));
+                const uint16_t d_cur = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel));
+                const uint32_t qw[4] = {(uint32_t) q_cur.x, (uint32_t) q_cur.y, (uint32_t) q_cur.z, (uint32_t) q_cur.w};
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const float sc = s_ue4m3[h == 0 ? (d_cur & 0xFFu) : (d_cur >> 8)];
+                    int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 0]);
+                    asm volatile("" : "+r"(v0.x), "+r"(v0.y));
+                    const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved(qw[h * 2 + 1]);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        const int idx = c * 36 + k;
+                        const int4 xv = smem.st.xq[idx][h];
+                        int s = ggml_cuda_dp4a(v0.x, xv.x, 0);
+                        s = ggml_cuda_dp4a(v0.y, xv.y, s);
+                        s = ggml_cuda_dp4a(v1.x, xv.z, s);
+                        s = ggml_cuda_dp4a(v1.y, xv.w, s);
+                        acc[c] += sc * __half2float(smem.st.dx[idx]) * (float) s;
+                        if constexpr (NC >= 2) asm volatile("" : "+f"(acc[c]));
+                    }
+                }
+                qp += 9216;
+                k += 4;
+            }
             iq_sync_lds();
-            if (valid_r) {
-                if (n == 1) {
-                    const int off1[1] = { 0 };
-                    float s1[1];
-                    if constexpr (KTILE) row_dot_36_sub8_ktile<1, true>(wr, r_local, s_hq, off1, 1, t, s1, s_ue4m3);
-                    else row_dot_36_sub8<1, true>(wr, s_hq, off1, 1, t, s1, s_ue4m3);
-                    if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
-                } else if (n == 2) {
-                    const int off2[2] = { 0, 36 };
-                    float s2[2];
-                    if constexpr (KTILE) row_dot_36_sub8_ktile<2, true>(wr, r_local, s_hq, off2, 2, t, s2, s_ue4m3);
-                    else row_dot_36_sub8<2, true>(wr, s_hq, off2, 2, t, s2, s_ue4m3);
-                    if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s2[0] : s2[1]) * sd;
-                } else if (n == 3) {
-                    const int off3[3] = { 0, 36, 72 };
-                    float s3[3];
-                    if constexpr (KTILE) row_dot_36_sub8_ktile<3, true>(wr, r_local, s_hq, off3, 3, t, s3, s_ue4m3);
-                    else row_dot_36_sub8<3, true>(wr, s_hq, off3, 3, t, s3, s_ue4m3);
-                    if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sd;
-                } else {
-                    const int off4[4] = { 0, 36, 72, 108 };
-                    float s4[4];
-                    if constexpr (KTILE) row_dot_36_sub8_ktile<4, true>(wr, r_local, s_hq, off4, 4, t, s4, s_ue4m3);
-                    else row_dot_36_sub8<4, true>(wr, s_hq, off4, 4, t, s4, s_ue4m3);
-                    if (t < 4) {
-                        const float v = (t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3];
-                        out[(size_t) ent_dst[e + t] * L.n_embd + r] = v * sd;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) smem.red[c][warp][lane] = acc[c];
+        };
+        bool need_sync = false;
+        for (int g = blockIdx.y; ; g += gridDim.y) {
+            if (g >= *(const volatile int32_t*) n_groups) break;
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int e = e0; e < e1; e += GRP_NC) {
+                const int n = min(GRP_NC, e1 - e);
+                const block_q8_1* hq_e = hq + (size_t) e * 36;
+                const int n_blks = n * 36;
+                if (need_sync) iq_sync_lds();
+                need_sync = true;
+                for (int b = threadIdx.x; b < n_blks; b += 128) {
+                    iq_stage_q8_1_interleaved(hq_e + b, smem.st.dx[b], smem.st.xq[b]);
+                }
+                iq_sync_lds();
+                if (n == 1)      run_chunk(std::integral_constant<int, 1>{}, g);
+                else if (n == 2) run_chunk(std::integral_constant<int, 2>{}, g);
+                else if (n == 3) run_chunk(std::integral_constant<int, 3>{}, g);
+                else             run_chunk(std::integral_constant<int, 4>{}, g);
+                iq_sync_lds();
+                const int warp = threadIdx.x >> 5;
+                const int lane = threadIdx.x & 31;
+                const int r = (int) blockIdx.x * 32 + lane;
+                if (warp < n && r < L.n_embd) {
+                    const uint8_t* e_blob = (const uint8_t*) grp_ptr[g];
+                    const float sd = L.tail_off ? ((const float*) (e_blob + L.tail_off))[2] : 1.0f;
+                    const float sum = smem.red[warp][0][lane] + smem.red[warp][1][lane]
+                                    + smem.red[warp][2][lane] + smem.red[warp][3][lane];
+                    out[(size_t) ent_dst[e + warp] * L.n_embd + r] = sum * sd;
+                }
+            }
+        }
+    } else {
+        __shared__ uint32_t s_hq_buf[GRP_NC * 36 * 9];
+        s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+        const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
+        const int t = threadIdx.x & 7;
+        const bool valid_r = (r < L.n_embd);
+        const int r_c = valid_r ? r : 0;
+        const size_t w_off = L.down_off + (size_t) r_c * L.d_row;
+        const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+        for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+            const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+            const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int e = e0; e < e1; e += GRP_NC) {
+                const int n = min(GRP_NC, e1 - e);
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 36);
+                const int words = n * (36 * 9);
+                if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+                for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+                iq_sync_lds();
+                if (valid_r) {
+                    if (n == 1) {
+                        const int off1[1] = { 0 };
+                        float s1[1];
+                        row_dot_36_sub8<1, true>(wr, s_hq, off1, 1, t, s1, s_ue4m3);
+                        if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                    } else if (n == 2) {
+                        const int off2[2] = { 0, 36 };
+                        float s2[2];
+                        row_dot_36_sub8<2, true>(wr, s_hq, off2, 2, t, s2, s_ue4m3);
+                        if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s2[0] : s2[1]) * sd;
+                    } else if (n == 3) {
+                        const int off3[3] = { 0, 36, 72 };
+                        float s3[3];
+                        row_dot_36_sub8<3, true>(wr, s_hq, off3, 3, t, s3, s_ue4m3);
+                        if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sd;
+                    } else {
+                        const int off4[4] = { 0, 36, 72, 108 };
+                        float s4[4];
+                        row_dot_36_sub8<4, true>(wr, s_hq, off4, 4, t, s4, s_ue4m3);
+                        if (t < 4) {
+                            const float v = (t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3];
+                            out[(size_t) ent_dst[e + t] * L.n_embd + r] = v * sd;
+                        }
                     }
                 }
             }
@@ -5727,7 +5880,7 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
                 return;
             }
             if (L.nvfp4_ktile) {
-                native_down_nvfp4_36_kernel<true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                native_down_nvfp4_36_kernel<true><<<grid, 128, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             } else {
                 native_down_nvfp4_36_kernel<false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             }
