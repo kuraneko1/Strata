@@ -68,7 +68,7 @@ int main() {
         check(p.max_adaptive_chunk == p.chunk, "V100 819K keeps max_adaptive_chunk == chunk");
         check(p.full_kv_init == 819200, "V100 819K allocates full 819K KV upfront");
         check(p.want_sp == 6, "V100 819K FullVram chunk=2048 uses want_sp=6 (best_sp=5 + 1 tail = 12 exact waves on 80 SMs)");
-        check(p.t1_full_split_mult == 16, "V100 uses t1_full_split_mult=16 (sp=160 on 80-SM / sp=144 on 72-SM)");
+        check(p.t1_full_split_mult == 12, "V100 uses t1_full_split_mult=12 (sp=120 on 80-SM / sp=108 on 72-SM = exact 2 waves)");
         check(!p.use_d_hits, "V100 FullVram skips d_hits atomics");
         check(p.pp_stage_cnt_pref == 0, "V100 FullVram allocates no pp_stage");
         check(p.force_bf16_x_f16, "V100 enables force_bf16_x_f16");
@@ -79,7 +79,7 @@ int main() {
         check(p_tight.chunk == 1024, "V100 819K tight falls back cleanly to chunk=1024");
         check(p_tight.max_adaptive_chunk == p_tight.chunk, "V100 819K tight keeps max_adaptive_chunk == chunk");
         check(p_tight.want_sp == 6, "V100 819K chunk=1024 uses exact want_sp=6 (best_sp=5 + 1 tail on 80 SMs)");
-        check(p_tight.t1_full_split_mult == 16, "V100 819K tight uses t1_full_split_mult=16");
+        check(p_tight.t1_full_split_mult == 12, "V100 819K tight uses t1_full_split_mult=12");
     }
 
     // 2. V100 32GB @ 1,048,576 ctx (1M, DSpark OFF & ON): overflows FullVram -> CoreResidentHybrid with dynamic
@@ -120,7 +120,7 @@ int main() {
                 check(p_fv.max_adaptive_chunk == 4096, "V100 65K/262K FullVram keeps max_adaptive_chunk == 4096");
                 check(p_fv.full_kv_init == ctx, "V100 65K/262K FullVram allocates full max_ctx KV upfront");
                 check(p_fv.want_sp == 6, "V100 65K/262K FullVram chunk=4096 uses want_sp=6 (24 exact waves on 80 SMs)");
-                check(p_fv.t1_full_split_mult == 16, "V100 65K/262K FullVram uses t1_full_split_mult=16");
+                check(p_fv.t1_full_split_mult == 12, "V100 65K/262K FullVram uses t1_full_split_mult=12");
                 check(!p_fv.use_d_hits && p_fv.pp_stage_cnt_pref == 0, "V100 65K/262K FullVram skips d_hits & staging");
             }
         }

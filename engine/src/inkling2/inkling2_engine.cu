@@ -2641,7 +2641,7 @@ struct Engine {
             const int n_hkv = std::max(1, (int) hp.n_head_kv);
             const int max_t_split = std::min(std::max(verify_max_t, 1), 15);
             const int sm70_t1_hi = (cc_maj == 7 && cc_min < 5)
-                ? std::clamp((sm_count * 16) / n_hkv, 40, kAttnSplitMax) : attn_split_t1_full;
+                ? std::clamp((sm_count * 12) / n_hkv, 40, kAttnSplitMax) : attn_split_t1_full;
             int max_slots = std::max({attn_split_t1_full, sm70_t1_hi, attn_split_t1_swa});
             for (int t = 2; t <= max_t_split; ++t) {
                 int sp_t = 1;
@@ -6425,7 +6425,7 @@ struct Engine {
         bool capturing_full_graph = false;
         cudaGraphExec_t* fg_slot = nullptr;
         const int fg_sp_b = (cc_maj == 7 && cc_min < 5)
-            ? ((T == 1) ? (pos >= 32768 ? 1 : 0) : (pos > 98304 ? 1 : 0)) : 0;
+            ? ((T == 1) ? ((pos >= 32768 && pos < 131072) ? 1 : 0) : (pos > 98304 ? 1 : 0)) : 0;
         if (can_full_graph) {
             for (int ip = 0; ip < (int) m->layers.size() && ip < kMaxRebalLayers; ++ip) {
                 if (layer_pending_rebal[ip]) {
@@ -8034,9 +8034,9 @@ struct Engine {
                         att_xq_ready = xq;
                     } else if (T < 16) {
                         const int t1_full_sp = (cc_maj == 7 && cc_min < 5)
-                            ? ((pos >= 32768)
-                                ? std::max(attn_split_t1_full, std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax))
-                                : std::min(attn_split_t1_full, std::clamp((sm_count * 8) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax)))
+                            ? ((pos >= 32768 && pos < 131072)
+                                ? std::clamp((sm_count * 12) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax)
+                                : std::clamp((sm_count * 6) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax))
                             : attn_split_t1_full;
                         const int sp = std::min(sp_cap, (T == 1)
                             ? (is_swa ? attn_split_t1_swa : t1_full_sp)
