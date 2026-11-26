@@ -1725,24 +1725,6 @@ __device__ __forceinline__ void iq_stage_q8_1_raw_f32(const block_q8_1* bq, floa
     dst_xq[0] = make_int4(get_int_b4(bq->qs, 0), get_int_b4(bq->qs, 1), get_int_b4(bq->qs, 2), get_int_b4(bq->qs, 3));
     dst_xq[1] = make_int4(get_int_b4(bq->qs, 4), get_int_b4(bq->qs, 5), get_int_b4(bq->qs, 6), get_int_b4(bq->qs, 7));
 }
-__device__ __forceinline__ void iq_stage_q8_1_q5k(const block_q8_1* bq, __half& dst_dx, int16_t& dst_sumq, int4* dst_xq) {
-    dst_dx = __low2half(bq->ds);
-    const int x0 = get_int_b4(bq->qs, 0), x1 = get_int_b4(bq->qs, 1);
-    const int x2 = get_int_b4(bq->qs, 2), x3 = get_int_b4(bq->qs, 3);
-    const int x4 = get_int_b4(bq->qs, 4), x5 = get_int_b4(bq->qs, 5);
-    const int x6 = get_int_b4(bq->qs, 6), x7 = get_int_b4(bq->qs, 7);
-    int s = ggml_cuda_dp4a(0x01010101, x0, 0);
-    s = ggml_cuda_dp4a(0x01010101, x1, s);
-    s = ggml_cuda_dp4a(0x01010101, x2, s);
-    s = ggml_cuda_dp4a(0x01010101, x3, s);
-    s = ggml_cuda_dp4a(0x01010101, x4, s);
-    s = ggml_cuda_dp4a(0x01010101, x5, s);
-    s = ggml_cuda_dp4a(0x01010101, x6, s);
-    s = ggml_cuda_dp4a(0x01010101, x7, s);
-    dst_sumq = (int16_t) s;
-    dst_xq[0] = make_int4(x0, x1, x2, x3);
-    dst_xq[1] = make_int4(x4, x5, x6, x7);
-}
 __device__ __forceinline__ void iq_stage_q8_1_q5k_f32(const block_q8_1* bq, float& dst_dx, int16_t& dst_sumq, int4* dst_xq) {
     dst_dx = __low2float(bq->ds);
     const int x0 = get_int_b4(bq->qs, 0), x1 = get_int_b4(bq->qs, 1);
@@ -5917,206 +5899,103 @@ __global__ void __launch_bounds__(288, 4) native_gu_q5k_72_situ_q8_1_t1_ktile_ke
 }
 
 // Standalone zero-spill fused Q5_K (type 13) Gate+Up + SiTU + Q8_1 quantization kernel for n_embd == 2304, n_ff % 32 == 0.
-// KTILE=true: 9 warps (288 thr, 4 blk/SM, 10,368 B union SMEM), 32 consecutive rows/warp (100% coalesced LDG.E.128),
-// Split-K=9 (exact 1 super-block/warp, 1x hdr/qh load, precomputed SMEM sumq), parallel warp SiTU + q8_1_store.
+// Same 32-row CTA + SMEM xq staging as native_gu_nvfp4_72_situ_q8_1_kernel (eliminates gate/up HBM roundtrip & situ launch).
 template <bool KTILE = false>
-__global__ void __launch_bounds__(KTILE ? 288 : 256, 4) native_gu_q5k_72_situ_q8_1_kernel(
+__global__ void __launch_bounds__(256, 4) native_gu_q5k_72_situ_q8_1_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
     const block_q8_1* __restrict__ xq, NativeExpertLayout L, float beta, float lb,
     block_q8_1* __restrict__ hq) {
-    if ((int) blockIdx.y >= *n_groups) return;
-    if constexpr (KTILE) {
-        union SmemBuf {
-            struct {
-                __align__(16) int4 xq[GRP_NC * 72][2];
-                __half dx[GRP_NC * 72];
-                int16_t sumq[GRP_NC * 72];
-            } st;
-            float red[GRP_NC][2][9][32];
-        };
-        __shared__ SmemBuf smem;
-        auto run_chunk = [&](auto nc_tag, int g) {
-            constexpr int NC = decltype(nc_tag)::value;
-            auto dot_mat = [&](int mat, float (&out_s)[NC]) {
-#pragma unroll
-                for (int c = 0; c < NC; ++c) out_s[c] = 0.0f;
-#pragma unroll 1
-                for (int h = 0; h < 2; ++h) {
-                    const int warp = threadIdx.x >> 5;
-                    const int lane = threadIdx.x & 31;
-                    const int r = (int) blockIdx.x * 32 + lane;
-                    const int r_mat = mat ? (64 + (r & 63)) : (r & 63);
-                    const uint8_t* kt = (const uint8_t*) grp_ptr[g] + ((size_t) (r >> 6) * 9u + (size_t) warp) * 22528u;
-                    const uint4 hdr = __ldg(reinterpret_cast<const uint4*>(kt + (size_t) r_mat * 16u));
-                    const half2 dm = *reinterpret_cast<const half2*>(&hdr.x);
-                    uint32_t sc_lo = hdr.y & 0x3F3F3F3Fu;
-                    uint32_t sc_hi = (hdr.w & 0x0F0F0F0Fu) | ((hdr.y >> 2) & 0x30303030u);
-                    uint32_t m_lo  = hdr.z & 0x3F3F3F3Fu;
-                    uint32_t m_hi  = ((hdr.w >> 4) & 0x0F0F0F0Fu) | ((hdr.z >> 2) & 0x30303030u);
-                    const uint8_t* qlh = kt + 2048u + (size_t) r_mat * 32u + (size_t) h * 16u;
-                    uint4 qh = __ldg(reinterpret_cast<const uint4*>(qlh));
-                    qlh += 4096u;
-#pragma unroll 1
-                    for (int il = 0; il < 4; ++il) {
-                        const uint4 ql = __ldg(reinterpret_cast<const uint4*>(qlh));
-                        qlh += 4096u;
-                        const int b0 = (threadIdx.x >> 5) * 8 + il * 2;
-                        const int sc0 = (int) (sc_lo & 0xFFu);
-                        const float d5 = __low2float(dm);
-#pragma unroll
-                        for (int c = 0; c < NC; ++c) {
-                            const int idx = c * 72 + b0;
-                            const int4 xv = smem.st.xq[idx][h];
-                            int d = ggml_cuda_dp4a((int) ((ql.x & 0x0F0F0F0Fu) | ((qh.x << 4) & 0x10101010u)), xv.x, 0);
-                            d = ggml_cuda_dp4a((int) ((ql.y & 0x0F0F0F0Fu) | ((qh.y << 4) & 0x10101010u)), xv.y, d);
-                            d = ggml_cuda_dp4a((int) ((ql.z & 0x0F0F0F0Fu) | ((qh.z << 4) & 0x10101010u)), xv.z, d);
-                            d = ggml_cuda_dp4a((int) ((ql.w & 0x0F0F0F0Fu) | ((qh.w << 4) & 0x10101010u)), xv.w, d);
-                            const float d8 = __half2float(smem.st.dx[idx]);
-                            float delta = (d5 * d8) * (float) (d * sc0);
-                            if (h == 0) delta -= (__high2float(dm) * d8) * (float) ((int) smem.st.sumq[idx] * (int) (m_lo & 0xFFu));
-                            out_s[c] += delta;
-                            if constexpr (NC >= 2) asm volatile("" : "+f"(out_s[c]));
-                        }
-                        const int sc1 = (int) ((sc_lo >> 8) & 0xFFu);
-#pragma unroll
-                        for (int c = 0; c < NC; ++c) {
-                            const int idx = c * 72 + b0 + 1;
-                            const int4 xv = smem.st.xq[idx][h];
-                            int d = ggml_cuda_dp4a((int) (((ql.x >> 4) & 0x0F0F0F0Fu) | ((qh.x << 3) & 0x10101010u)), xv.x, 0);
-                            d = ggml_cuda_dp4a((int) (((ql.y >> 4) & 0x0F0F0F0Fu) | ((qh.y << 3) & 0x10101010u)), xv.y, d);
-                            d = ggml_cuda_dp4a((int) (((ql.z >> 4) & 0x0F0F0F0Fu) | ((qh.z << 3) & 0x10101010u)), xv.z, d);
-                            d = ggml_cuda_dp4a((int) (((ql.w >> 4) & 0x0F0F0F0Fu) | ((qh.w << 3) & 0x10101010u)), xv.w, d);
-                            const float d8 = __half2float(smem.st.dx[idx]);
-                            float delta = (d5 * d8) * (float) (d * sc1);
-                            if (h == 0) delta -= (__high2float(dm) * d8) * (float) ((int) smem.st.sumq[idx] * (int) ((m_lo >> 8) & 0xFFu));
-                            out_s[c] += delta;
-                            if constexpr (NC >= 2) asm volatile("" : "+f"(out_s[c]));
-                        }
-                        qh.x >>= 2; qh.y >>= 2; qh.z >>= 2; qh.w >>= 2;
-                        sc_lo = __funnelshift_r(sc_lo, sc_hi, 16);
-                        sc_hi >>= 16;
-                        m_lo  = __funnelshift_r(m_lo, m_hi, 16);
-                        m_hi  >>= 16;
-                    }
-                }
-            };
-            float sg[NC], su[NC];
-            dot_mat(0, sg);
-            dot_mat(1, su);
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    __shared__ uint32_t s_xq_buf[GRP_NC * 72 * 9];
+    __shared__ float sh[GRP_NC][32];
+    const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = (int) blockIdx.x * 32 + subwarp;
+    const size_t g_off = KTILE ? ((size_t) (r >> 6) * 9u * 22528u) : ((size_t) r * L.gu_row);
+    const size_t u_off = L.up_off + g_off;
+    const int r_g = r & 63;
+    const block_q8_1* s_xq = reinterpret_cast<const block_q8_1*>(s_xq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const float sg = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+        const float su = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int i = 0; i < n; ++i) {
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + i] * 72);
+                for (int j = threadIdx.x; j < 72 * 9; j += 256) s_xq_buf[i * (72 * 9) + j] = src[j];
+            }
             iq_sync_lds();
-            const int warp = threadIdx.x >> 5;
-            const int lane = threadIdx.x & 31;
-#pragma unroll
-            for (int c = 0; c < NC; ++c) {
-                smem.red[c][0][warp][lane] = sg[c];
-                smem.red[c][1][warp][lane] = su[c];
-            }
-        };
-        bool need_sync = false;
-        for (int g = blockIdx.y; ; g += gridDim.y) {
-            if (g >= *(const volatile int32_t*) n_groups) break;
-            const int e0 = grp_start[g], e1 = grp_start[g + 1];
-            for (int e = e0; e < e1; e += GRP_NC) {
-                const int n = min(GRP_NC, e1 - e);
-                if (need_sync) iq_sync_lds();
-                need_sync = true;
-                const int n_blks = n * 72;
-                if ((int) threadIdx.x < n_blks) {
-                    const int tx = (int) threadIdx.x;
-                    const int ci = (tx >= 144) ? ((tx >= 216) ? 3 : 2) : ((tx >= 72) ? 1 : 0);
-                    const int j  = tx - ci * 72;
-                    iq_stage_q8_1_q5k(xq + (size_t) ent_tok[e + ci] * 72 + j,
-                                      smem.st.dx[tx], smem.st.sumq[tx], smem.st.xq[tx]);
-                }
-                iq_sync_lds();
-                if (n == 1)      run_chunk(std::integral_constant<int, 1>{}, g);
-                else if (n == 2) run_chunk(std::integral_constant<int, 2>{}, g);
-                else if (n == 3) run_chunk(std::integral_constant<int, 3>{}, g);
-                else             run_chunk(std::integral_constant<int, 4>{}, g);
-                iq_sync_lds();
-                const int warp = threadIdx.x >> 5;
-                const int lane = threadIdx.x & 31;
-                if (warp < n) {
-                    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-                    const float sc_g = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
-                    const float sc_u = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
-                    float sum_g = 0.0f, sum_u = 0.0f;
-#pragma unroll
-                    for (int w = 0; w < 9; ++w) {
-                        sum_g += smem.red[warp][0][w][lane];
-                        sum_u += smem.red[warp][1][w][lane];
-                    }
-                    const float gg = sum_g * sc_g;
-                    const float uu = sum_u * sc_u;
-                    const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
-                    const float tu = lb > 0.0f ? lb * tanhf(uu / lb) : uu;
-                    q8_1_store(tg * tu, hq, (long long) (e + warp) * L.n_ff + (long long) blockIdx.x * 32 + lane);
-                }
-            }
-        }
-    } else {
-        const int ng = *n_groups;
-        __shared__ uint32_t s_xq_buf[GRP_NC * 72 * 9];
-        __shared__ float sh[GRP_NC][32];
-        const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
-        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-        const int r = (int) blockIdx.x * 32 + subwarp;
-        const size_t g_off = (size_t) r * L.gu_row;
-        const size_t u_off = L.up_off + g_off;
-        const block_q8_1* s_xq = reinterpret_cast<const block_q8_1*>(s_xq_buf);
-        for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-            const float sg = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
-            const float su = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
-            const int e0 = grp_start[g], e1 = grp_start[g + 1];
-            for (int e = e0; e < e1; e += GRP_NC) {
-                const int n = min(GRP_NC, e1 - e);
-                if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
-                for (int i = 0; i < n; ++i) {
-                    const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + i] * 72);
-                    for (int j = threadIdx.x; j < 72 * 9; j += 256) s_xq_buf[i * (72 * 9) + j] = src[j];
-                }
-                iq_sync_lds();
-                float gg = 0.0f, uu = 0.0f;
-                if (n == 1) {
-                    const int off1[1] = { 0 };
-                    float s1[1];
+            float gg = 0.0f, uu = 0.0f;
+            if (n == 1) {
+                const int off1[1] = { 0 };
+                float s1[1];
+                if constexpr (KTILE) {
+                    row_dot_q5k_144_sub8_ktile<1, true>(blob + g_off, r_g, s_xq, off1, 1, t, s1);
+                    if (t == 0) gg = s1[0] * sg;
+                    row_dot_q5k_144_sub8_ktile<1, true>(blob + g_off, 64 + r_g, s_xq, off1, 1, t, s1);
+                    if (t == 0) uu = s1[0] * su;
+                } else {
                     row_dot_q5k_144_sub8<1, true>(blob + g_off, s_xq, off1, 1, t, s1);
                     if (t == 0) gg = s1[0] * sg;
                     row_dot_q5k_144_sub8<1, true>(blob + u_off, s_xq, off1, 1, t, s1);
                     if (t == 0) uu = s1[0] * su;
-                } else if (n == 2) {
-                    const int off2[2] = { 0, 72 };
-                    float s2[2];
+                }
+            } else if (n == 2) {
+                const int off2[2] = { 0, 72 };
+                float s2[2];
+                if constexpr (KTILE) {
+                    row_dot_q5k_144_sub8_ktile<2, true>(blob + g_off, r_g, s_xq, off2, 2, t, s2);
+                    if (t < 2) gg = ((t == 0) ? s2[0] : s2[1]) * sg;
+                    row_dot_q5k_144_sub8_ktile<2, true>(blob + g_off, 64 + r_g, s_xq, off2, 2, t, s2);
+                    if (t < 2) uu = ((t == 0) ? s2[0] : s2[1]) * su;
+                } else {
                     row_dot_q5k_144_sub8<2, true>(blob + g_off, s_xq, off2, 2, t, s2);
                     if (t < 2) gg = ((t == 0) ? s2[0] : s2[1]) * sg;
                     row_dot_q5k_144_sub8<2, true>(blob + u_off, s_xq, off2, 2, t, s2);
                     if (t < 2) uu = ((t == 0) ? s2[0] : s2[1]) * su;
-                } else if (n == 3) {
-                    const int off3[3] = { 0, 72, 144 };
-                    float s3[3];
+                }
+            } else if (n == 3) {
+                const int off3[3] = { 0, 72, 144 };
+                float s3[3];
+                if constexpr (KTILE) {
+                    row_dot_q5k_144_sub8_ktile<3, true>(blob + g_off, r_g, s_xq, off3, 3, t, s3);
+                    if (t < 3) gg = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sg;
+                    row_dot_q5k_144_sub8_ktile<3, true>(blob + g_off, 64 + r_g, s_xq, off3, 3, t, s3);
+                    if (t < 3) uu = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * su;
+                } else {
                     row_dot_q5k_144_sub8<3, true>(blob + g_off, s_xq, off3, 3, t, s3);
                     if (t < 3) gg = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * sg;
                     row_dot_q5k_144_sub8<3, true>(blob + u_off, s_xq, off3, 3, t, s3);
                     if (t < 3) uu = ((t == 0) ? s3[0] : (t == 1) ? s3[1] : s3[2]) * su;
+                }
+            } else {
+                const int off4[4] = { 0, 72, 144, 216 };
+                float s4[4];
+                if constexpr (KTILE) {
+                    row_dot_q5k_144_sub8_ktile<4, true>(blob + g_off, r_g, s_xq, off4, 4, t, s4);
+                    if (t < 4) gg = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * sg;
+                    row_dot_q5k_144_sub8_ktile<4, true>(blob + g_off, 64 + r_g, s_xq, off4, 4, t, s4);
+                    if (t < 4) uu = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * su;
                 } else {
-                    const int off4[4] = { 0, 72, 144, 216 };
-                    float s4[4];
                     row_dot_q5k_144_sub8<4, true>(blob + g_off, s_xq, off4, 4, t, s4);
                     if (t < 4) gg = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * sg;
                     row_dot_q5k_144_sub8<4, true>(blob + u_off, s_xq, off4, 4, t, s4);
                     if (t < 4) uu = ((t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3]) * su;
                 }
-                if (t < n) {
-                    const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
-                    const float tu = lb > 0.0f ? lb * tanhf(uu / lb) : uu;
-                    sh[t][subwarp] = tg * tu;
-                }
-                iq_sync_lds();
-                if (warp < n) {
-                    q8_1_store(sh[warp][lane], hq, (long long) (e + warp) * L.n_ff + (long long) blockIdx.x * 32 + lane);
-                }
+            }
+            if (t < n) {
+                const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
+                const float tu = lb > 0.0f ? lb * tanhf(uu / lb) : uu;
+                sh[t][subwarp] = tg * tu;
+            }
+            iq_sync_lds();
+            if (warp < n) {
+                q8_1_store(sh[warp][lane], hq, (long long) (e + warp) * L.n_ff + (long long) blockIdx.x * 32 + lane);
             }
         }
     }
@@ -8849,7 +8728,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                     native_gu_q5k_72_situ_q8_1_t1_ktile_kernel<<<gl, 288, 0, s>>>(
                         grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
                 } else {
-                    native_gu_q5k_72_situ_q8_1_kernel<true><<<gl, 288, 0, s>>>(
+                    native_gu_q5k_72_situ_q8_1_kernel<true><<<gl, 256, 0, s>>>(
                         grp_ptr, grp_start, n_groups, ent_tok, X, L, L.situ_beta, L.situ_linear_beta, hq);
                 }
             } else {
@@ -10611,34 +10490,6 @@ __device__ __forceinline__ void dq_q8_0_ktile_sub16_store(const uint8_t* kt_base
     *reinterpret_cast<uint4*>(dst)     = *reinterpret_cast<const uint4*>(h2);
     *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
 }
-#if __CUDA_ARCH__ < 750
-template <bool IS_HI>
-__device__ __forceinline__ void dq_q5k_sub16_store_sm70(
-    uint4 ql4, uint4 qh4, float dall, float dmin, uint32_t sc_u, uint32_t m_u, __half* dst) {
-    const __half2 d2  = __half2half2(__float2half(dall * (float) sc_u));
-    const __half2 nm2 = __half2half2(__float2half(-(dmin * (float) m_u)));
-    const uint32_t qw[4] = {ql4.x, ql4.y, ql4.z, ql4.w};
-    const uint32_t hw[4] = {qh4.x, qh4.y, qh4.z, qh4.w};
-    __align__(16) __half2 h2[8];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const uint32_t q4 = (IS_HI ? (qw[j] >> 4) : qw[j]) & 0x0F0F0F0Fu;
-        const uint32_t u = q4 | ((hw[j] << (IS_HI ? 3u : 4u)) & 0x10101010u);
-        u5x4_to_h2x2_fma_iq(u, d2, nm2, h2[j * 2 + 0], h2[j * 2 + 1]);
-    }
-    *reinterpret_cast<uint4*>(dst)     = *reinterpret_cast<const uint4*>(h2);
-    *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
-}
-__device__ __forceinline__ void dq_q8_sub16_store_sm70(uint4 q, __half2 d2, __half* dst) {
-    __align__(16) __half2 h2[8];
-    i8x4_to_h2x2_scaled_iq(q.x, d2, h2[0], h2[1]);
-    i8x4_to_h2x2_scaled_iq(q.y, d2, h2[2], h2[3]);
-    i8x4_to_h2x2_scaled_iq(q.z, d2, h2[4], h2[5]);
-    i8x4_to_h2x2_scaled_iq(q.w, d2, h2[6], h2[7]);
-    *reinterpret_cast<uint4*>(dst)     = *reinterpret_cast<const uint4*>(h2);
-    *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(h2 + 4);
-}
-#endif
 #endif
 
 /// 3-bucket LPT + L2-contiguous tile-list builder for grouped WMMA (1 CTA, <=256 groups, <2 us):
@@ -11158,14 +11009,12 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
     }
     constexpr int BM = 128;
 #if __CUDA_ARCH__ < 750
-    constexpr bool SM70_DBL = (WT == 40 || (WT == 13 && KTILE) || WT == 8);
-    constexpr int WK = SM70_DBL ? 32 : 64;
-    constexpr int LD = SM70_DBL ? 40 : 72;
-    constexpr int STAGES = SM70_DBL ? 2 : 1;
+    constexpr int WK = (WT == 40) ? 32 : 64;
+    constexpr int LD = (WT == 40) ? 40 : 72;
+    constexpr int STAGES = (WT == 40) ? 2 : 1;
     constexpr int STAGE_ELEMS = (BM + 128) * LD;
     __shared__ __align__(16) __half smem[STAGES * STAGE_ELEMS];
     __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
-    __shared__ __align__(16) uint4 s_q5k_hdr[(WT == 13 && KTILE) ? 128 : 1];
     const int tid = threadIdx.x, warp = tid >> 5;
     if constexpr (WT == 40) {
         s_ue4m3[tid] = ue4m3_to_h2_x256((uint8_t) tid);
@@ -12262,226 +12111,6 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
             else run_swz48(std::integral_constant<int, 2>{});
         } else {
 #endif
-#if __CUDA_ARCH__ < 750
-        if constexpr (WT == 13 && KTILE) {
-            // Volta sm_70: 2-stage WK=32 (LD=40) double-buffered Q5_K KTILE (43,024 B <= 48 KB -> 2 blk/SM):
-            // 1x hdr per 256 K-elems shared via s_q5k_hdr[128] (2x fewer LDGs & 5 fewer live regs -> STACK: 0!),
-            // 1x qh per 256 K-elems, 1x ql per 64 K-elems, deferred sx_n prefetch, paired zero-RAW-stall HMMA.884.
-            const int xr = tid >> 1;      // 0..127 (0..63 = gate, 64..127 = up)
-            const int sb2 = tid & 1;      // 0..1
-            const int xc = sb2 * 16;      // 0 or 16
-            const int smem_off = xr * LD + xc;
-            const bool x_ok = (xr < rows);
-            const int in_row = x_ok ? ent_idx[c0 + xr] : 0;
-            const __half* xp = X + (size_t) in_row * K + xc;
-            const uint8_t* wp = blob + (size_t) nt * (size_t) (K >> 8) * 22528u;
-
-            auto q5k_hdr_unpack = [](uint4 h, int sub, uint32_t& sc, uint32_t& mn) {
-                const int sh = (sub & 3) * 8;
-                if (sub < 4) {
-                    sc = (h.y >> sh) & 0x3Fu;
-                    mn = (h.z >> sh) & 0x3Fu;
-                } else {
-                    sc = ((h.w >> sh) & 0x0Fu) | (((h.y >> sh) >> 2) & 0x30u);
-                    mn = (((h.w >> sh) >> 4) & 0x0Fu) | (((h.z >> sh) >> 2) & 0x30u);
-                }
-            };
-
-            uint4 cur_qh, cur_ql;
-            {
-                const uint32_t t_u = (uint32_t) threadIdx.x;
-                __half* sx0 = smem;
-                __half* sw0 = smem + BM * LD;
-                *reinterpret_cast<uint4*>(sx0 + smem_off)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(sx0 + smem_off + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
-                if (sb2 == 0) s_q5k_hdr[xr] = __ldg(reinterpret_cast<const uint4*>(wp + (xr << 4)));
-                cur_qh = __ldg(reinterpret_cast<const uint4*>(wp + (2048u + (t_u << 4))));
-                cur_ql = __ldg(reinterpret_cast<const uint4*>(wp + (6144u + (t_u << 4))));
-                __syncwarp();
-                const uint4 h0 = s_q5k_hdr[xr];
-                const __half2 dm0 = *reinterpret_cast<const __half2*>(&h0.x);
-                dq_q5k_sub16_store_sm70<false>(cur_ql, cur_qh, __low2half(dm0), __high2half(dm0), h0.y & 0x3Fu, h0.z & 0x3Fu, sw0 + smem_off);
-                __syncthreads();
-            }
-
-            auto run_q5k_sm70 = [&](auto mr_tag) {
-                constexpr int MR_RUN = decltype(mr_tag)::value;
-                auto do_hmma = [&](int st) {
-                    const __half* sx_c = smem + st * STAGE_ELEMS;
-                    const __half* sw_c = sx_c + BM * LD;
-                    const __half* sx_r = sx_c + (wm * (MR_RUN * 16) + qa_row) * LD;
-                    const __half* sw_r0 = sw_c + (wn * 16 + kb_row) * LD;
-                    const __half* sw_r1 = sw_c + (64 + wn * 16 + kb_row) * LD;
-#pragma unroll 1
-                    for (int kk = 0; kk < 32; kk += 8) {
-                        const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
-                        const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
-                        uint4 a0 = *reinterpret_cast<const uint4*>(sx_r + kk);
-                        uint4 a1 = *reinterpret_cast<const uint4*>(sx_r + 16 * LD + kk);
-                        hmma_rc(acc[0][0], a0.x, a0.y, b0.x, b0.y);
-                        hmma_rc(acc[0][1], a0.x, a0.y, b1.x, b1.y);
-                        hmma_rc(acc[1][0], a1.x, a1.y, b0.x, b0.y);
-                        hmma_rc(acc[1][1], a1.x, a1.y, b1.x, b1.y);
-                        hmma_rc(acc[0][0], a0.z, a0.w, b0.z, b0.w);
-                        hmma_rc(acc[0][1], a0.z, a0.w, b1.z, b1.w);
-                        if constexpr (MR_RUN == 4) a0 = *reinterpret_cast<const uint4*>(sx_r + 32 * LD + kk);
-                        hmma_rc(acc[1][0], a1.z, a1.w, b0.z, b0.w);
-                        hmma_rc(acc[1][1], a1.z, a1.w, b1.z, b1.w);
-                        if constexpr (MR_RUN == 4) {
-                            a1 = *reinterpret_cast<const uint4*>(sx_r + 48 * LD + kk);
-                            hmma_rc(acc[2][0], a0.x, a0.y, b0.x, b0.y);
-                            hmma_rc(acc[2][1], a0.x, a0.y, b1.x, b1.y);
-                            hmma_rc(acc[3][0], a1.x, a1.y, b0.x, b0.y);
-                            hmma_rc(acc[3][1], a1.x, a1.y, b1.x, b1.y);
-                            hmma_rc(acc[2][0], a0.z, a0.w, b0.z, b0.w);
-                            hmma_rc(acc[2][1], a0.z, a0.w, b1.z, b1.w);
-                            hmma_rc(acc[3][0], a1.z, a1.w, b0.z, b0.w);
-                            hmma_rc(acc[3][1], a1.z, a1.w, b1.z, b1.w);
-                        }
-                    }
-                };
-#pragma unroll 1
-                for (int k0 = 0; k0 < K; k0 += 64) {
-                    const int il = (k0 >> 6) & 3;
-                    // Half 0 (stage 0 -> stage 1): write X(k0+32) + dequant high nibble into inactive stage 1 before do_hmma(0)
-                    // (cur_ql is dead across do_hmma(0)!)
-                    const bool has_h1 = (k0 + 32 < K);
-                    if (has_h1) {
-                        __half* sx1 = smem + STAGE_ELEMS;
-                        const __half* nxp = xp + k0 + 32;
-                        *reinterpret_cast<uint4*>(sx1 + smem_off)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp))     : make_uint4(0, 0, 0, 0);
-                        *reinterpret_cast<uint4*>(sx1 + smem_off + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
-                        const uint4 h = s_q5k_hdr[xr];
-                        const __half2 dm = *reinterpret_cast<const __half2*>(&h.x);
-                        uint32_t sc, mn;
-                        q5k_hdr_unpack(h, 2 * il + 1, sc, mn);
-                        dq_q5k_sub16_store_sm70<true>(cur_ql, cur_qh, __low2half(dm), __high2half(dm), sc, mn,
-                                                      sx1 + BM * LD + smem_off);
-                    }
-                    do_hmma(0);
-                    if (!has_h1) break;
-                    __syncthreads();
-
-                    // Half 1 (stage 1 -> stage 0): write X(k0+64) directly into inactive stage 0 + prefetch next ql (and hdr+qh every 256)
-                    const bool has_next = (k0 + 64 < K);
-                    const int il_nxt = (il + 1) & 3;
-                    if (has_next) {
-                        __half* sx0 = smem;
-                        const __half* nxp = xp + k0 + 64;
-                        *reinterpret_cast<uint4*>(sx0 + smem_off)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp))     : make_uint4(0, 0, 0, 0);
-                        *reinterpret_cast<uint4*>(sx0 + smem_off + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
-                        const uint32_t t_u = (uint32_t) threadIdx.x;
-                        const uint32_t ql_off0 = 6144u + (t_u << 4);
-                        if (il_nxt == 0) {
-                            wp += 22528u;
-                            if (sb2 == 0) s_q5k_hdr[xr] = __ldg(reinterpret_cast<const uint4*>(wp + (xr << 4)));
-                            cur_qh = __ldg(reinterpret_cast<const uint4*>(wp + (2048u + (t_u << 4))));
-                            cur_ql = __ldg(reinterpret_cast<const uint4*>(wp + ql_off0));
-                        } else {
-                            cur_ql = __ldg(reinterpret_cast<const uint4*>(wp + ql_off0 + (size_t) il_nxt * 4096u));
-                            cur_qh.x >>= 2; cur_qh.y >>= 2; cur_qh.z >>= 2; cur_qh.w >>= 2;
-                        }
-                    }
-                    do_hmma(1);
-                    if (has_next) {
-                        if (il_nxt == 0) __syncwarp();
-                        const uint4 h = s_q5k_hdr[xr];
-                        const __half2 dm = *reinterpret_cast<const __half2*>(&h.x);
-                        uint32_t sc, mn;
-                        q5k_hdr_unpack(h, 2 * il_nxt, sc, mn);
-                        dq_q5k_sub16_store_sm70<false>(cur_ql, cur_qh, __low2half(dm), __high2half(dm), sc, mn,
-                                                       smem + BM * LD + smem_off);
-                        __syncthreads();
-                    }
-                }
-            };
-            if (has_hi) run_q5k_sm70(std::integral_constant<int, 4>{});
-            else        run_q5k_sm70(std::integral_constant<int, 2>{});
-        } else if constexpr (WT == 8) {
-            // Volta sm_70: 2-stage WK=32 (LD=40) double-buffered Q8_0 (40,960 B -> 2 blk/SM).
-            const int xr = tid >> 1;
-            const int sb2 = tid & 1;
-            const int xc = sb2 * 16;
-            const bool x_ok = (xr < rows);
-            const int in_row = x_ok ? ent_idx[c0 + xr] : 0;
-            const __half* xp = X + (size_t) in_row * K + xc;
-            const uint8_t* we_row = (xr < 64)
-                ? (blob + (size_t) (col0 + xr) * row_stride)
-                : (blob + L.up_off + (size_t) (col0 + (xr - 64)) * row_stride);
-            {
-                __half* sx0 = smem;
-                __half* sw0 = smem + BM * LD;
-                *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
-                const iq_q8_sub16 q0 = iq_q8_load_sub16(we_row, 0, sb2);
-                dq_q8_sub16_store_sm70(make_uint4(q0.w[0], q0.w[1], q0.w[2], q0.w[3]),
-                                       __half2half2(__ushort_as_half(q0.d_bits)), sw0 + xr * LD + xc);
-                __syncthreads();
-            }
-            auto run_q8_sm70 = [&](auto mr_tag) {
-                constexpr int MR_RUN = decltype(mr_tag)::value;
-                int stage = 0;
-#pragma unroll 1
-                for (int k0 = 0; k0 < K; k0 += 32, stage ^= 1) {
-                    const int nxt = stage ^ 1;
-                    const bool has_next = (k0 + 32 < K);
-                    uint4 nx0 = make_uint4(0, 0, 0, 0), nx1 = make_uint4(0, 0, 0, 0);
-                    iq_q8_sub16 nq{};
-                    if (has_next) {
-                        const int nk = k0 + 32;
-                        if (x_ok) {
-                            nx0 = __ldg(reinterpret_cast<const uint4*>(xp + nk));
-                            nx1 = __ldg(reinterpret_cast<const uint4*>(xp + nk + 8));
-                        }
-                        nq = iq_q8_load_sub16(we_row, nk & ~63, (((nk >> 5) & 1) << 1) | sb2);
-                    }
-                    const __half* sx_c = smem + stage * STAGE_ELEMS;
-                    const __half* sw_c = sx_c + BM * LD;
-                    const __half* sx_r = sx_c + (wm * (MR_RUN * 16) + qa_row) * LD;
-                    const __half* sw_r0 = sw_c + (wn * 16 + kb_row) * LD;
-                    const __half* sw_r1 = sw_c + (64 + wn * 16 + kb_row) * LD;
-#pragma unroll 1
-                    for (int kk = 0; kk < 32; kk += 8) {
-                        const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
-                        const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
-                        uint4 a0 = *reinterpret_cast<const uint4*>(sx_r + kk);
-                        uint4 a1 = *reinterpret_cast<const uint4*>(sx_r + 16 * LD + kk);
-                        hmma_rc(acc[0][0], a0.x, a0.y, b0.x, b0.y);
-                        hmma_rc(acc[0][1], a0.x, a0.y, b1.x, b1.y);
-                        hmma_rc(acc[1][0], a1.x, a1.y, b0.x, b0.y);
-                        hmma_rc(acc[1][1], a1.x, a1.y, b1.x, b1.y);
-                        hmma_rc(acc[0][0], a0.z, a0.w, b0.z, b0.w);
-                        hmma_rc(acc[0][1], a0.z, a0.w, b1.z, b1.w);
-                        if constexpr (MR_RUN == 4) a0 = *reinterpret_cast<const uint4*>(sx_r + 32 * LD + kk);
-                        hmma_rc(acc[1][0], a1.z, a1.w, b0.z, b0.w);
-                        hmma_rc(acc[1][1], a1.z, a1.w, b1.z, b1.w);
-                        if constexpr (MR_RUN == 4) {
-                            a1 = *reinterpret_cast<const uint4*>(sx_r + 48 * LD + kk);
-                            hmma_rc(acc[2][0], a0.x, a0.y, b0.x, b0.y);
-                            hmma_rc(acc[2][1], a0.x, a0.y, b1.x, b1.y);
-                            hmma_rc(acc[3][0], a1.x, a1.y, b0.x, b0.y);
-                            hmma_rc(acc[3][1], a1.x, a1.y, b1.x, b1.y);
-                            hmma_rc(acc[2][0], a0.z, a0.w, b0.z, b0.w);
-                            hmma_rc(acc[2][1], a0.z, a0.w, b1.z, b1.w);
-                            hmma_rc(acc[3][0], a1.z, a1.w, b0.z, b0.w);
-                            hmma_rc(acc[3][1], a1.z, a1.w, b1.z, b1.w);
-                        }
-                    }
-                    if (has_next) {
-                        __half* sx_n = smem + nxt * STAGE_ELEMS;
-                        *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = nx0;
-                        *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = nx1;
-                        dq_q8_sub16_store_sm70(make_uint4(nq.w[0], nq.w[1], nq.w[2], nq.w[3]),
-                                               __half2half2(__ushort_as_half(nq.d_bits)),
-                                               sx_n + BM * LD + xr * LD + xc);
-                        __syncthreads();
-                    }
-                }
-            };
-            if (has_hi) run_q8_sm70(std::integral_constant<int, 4>{});
-            else        run_q8_sm70(std::integral_constant<int, 2>{});
-        } else {
-#endif
         __half* sx = smem;
         __half* sw = smem + BM * LD;
         const int wr = tid >> 2, sb = tid & 3;
@@ -12662,7 +12291,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_gu_situ_128_kernel(
                 if (k0 + WK < K) __syncthreads();
             }
         }
-#if __CUDA_ARCH__ >= 800 || __CUDA_ARCH__ < 750
+#if __CUDA_ARCH__ >= 800
         }
 #endif
     }
@@ -13641,10 +13270,9 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     (void) n_tile;
     constexpr int BM = 128, BN = 128;
 #if __CUDA_ARCH__ < 750
-    constexpr bool SM70_DBL = (WT == 40 || (WT == 8 && USE_TILES));
-    constexpr int WK = SM70_DBL ? 32 : 64;
-    constexpr int LD = SM70_DBL ? 40 : 72;
-    constexpr int STAGES = SM70_DBL ? 2 : 1;
+    constexpr int WK = (WT == 40) ? 32 : 64;
+    constexpr int LD = (WT == 40) ? 40 : 72;
+    constexpr int STAGES = (WT == 40) ? 2 : 1;
     constexpr int STAGE_ELEMS = (BM + BN) * LD;
     __shared__ __align__(16) __half smem[STAGES * STAGE_ELEMS];
     __shared__ __half2 s_ue4m3[(WT == 40) ? 256 : 1];
@@ -14970,204 +14598,6 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                     else run_swz48(std::integral_constant<int, 2>{});
                 } else {
 #endif
-#if __CUDA_ARCH__ < 750
-                if constexpr (WT == 8 && USE_TILES) {
-                    // Volta sm_70: 2-stage WK=32 (LD=40) double-buffered Q8_0 (40,960 B -> 2 blk/SM):
-                    // 1x d01 scale load per 64 K-elems (2x fewer), coalesced LDG.E.128, deferred sx_n prefetch,
-                    // paired zero-RAW-stall HMMA.884 scheduling (STACK: 0).
-                    const int xr = tid >> 1;      // 0..127
-                    const int sb2 = tid & 1;      // 0..1
-                    const int xc = sb2 * 16;      // 0 or 16
-                    const bool x_ok = (xr < rows);
-                    const int in_row = x_ok ? (IS_DOWN ? (c0 + xr) : ent_idx[c0 + xr]) : 0;
-                    const __half* xp = X + (size_t) in_row * K + xc;
-
-                    auto do_hmma_q8 = [&](auto mr_tag, int st) {
-                        constexpr int MR_RUN = decltype(mr_tag)::value;
-                        const __half* sx_c = smem + st * STAGE_ELEMS;
-                        const __half* sw_c = sx_c + BM * LD;
-                        const __half* sx_r = sx_c + (wm * (MR_RUN * 16) + qa_row) * LD;
-                        const __half* sw_r0 = sw_c + (wn * 32 + kb_row) * LD;
-                        const __half* sw_r1 = sw_c + (wn * 32 + 16 + kb_row) * LD;
-#pragma unroll 1
-                        for (int kk = 0; kk < 32; kk += 8) {
-                            const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
-                            const uint4 b1 = *reinterpret_cast<const uint4*>(sw_r1 + kk);
-                            if constexpr (USE_TILES) {
-                                uint4 a0 = *reinterpret_cast<const uint4*>(sx_r + kk);
-                                uint4 a1 = *reinterpret_cast<const uint4*>(sx_r + 16 * LD + kk);
-                                hmma_rc(acc[0][0], a0.x, a0.y, b0.x, b0.y);
-                                hmma_rc(acc[0][1], a0.x, a0.y, b1.x, b1.y);
-                                hmma_rc(acc[1][0], a1.x, a1.y, b0.x, b0.y);
-                                hmma_rc(acc[1][1], a1.x, a1.y, b1.x, b1.y);
-                                hmma_rc(acc[0][0], a0.z, a0.w, b0.z, b0.w);
-                                hmma_rc(acc[0][1], a0.z, a0.w, b1.z, b1.w);
-                                if constexpr (MR_RUN == 4) a0 = *reinterpret_cast<const uint4*>(sx_r + 32 * LD + kk);
-                                hmma_rc(acc[1][0], a1.z, a1.w, b0.z, b0.w);
-                                hmma_rc(acc[1][1], a1.z, a1.w, b1.z, b1.w);
-                                if constexpr (MR_RUN == 4) {
-                                    a1 = *reinterpret_cast<const uint4*>(sx_r + 48 * LD + kk);
-                                    hmma_rc(acc[2][0], a0.x, a0.y, b0.x, b0.y);
-                                    hmma_rc(acc[2][1], a0.x, a0.y, b1.x, b1.y);
-                                    hmma_rc(acc[3][0], a1.x, a1.y, b0.x, b0.y);
-                                    hmma_rc(acc[3][1], a1.x, a1.y, b1.x, b1.y);
-                                    hmma_rc(acc[2][0], a0.z, a0.w, b0.z, b0.w);
-                                    hmma_rc(acc[2][1], a0.z, a0.w, b1.z, b1.w);
-                                    hmma_rc(acc[3][0], a1.z, a1.w, b0.z, b0.w);
-                                    hmma_rc(acc[3][1], a1.z, a1.w, b1.z, b1.w);
-                                }
-                            } else {
-                                uint4 a_cur = *reinterpret_cast<const uint4*>(sx_r + kk);
-#pragma unroll
-                                for (int mr = 0; mr < MR_RUN; ++mr) {
-                                    uint4 a_nxt;
-                                    if (mr + 1 < MR_RUN) a_nxt = *reinterpret_cast<const uint4*>(sx_r + (mr + 1) * 16 * LD + kk);
-                                    hmma_rc(acc[mr][0], a_cur.x, a_cur.y, b0.x, b0.y);
-                                    hmma_rc(acc[mr][1], a_cur.x, a_cur.y, b1.x, b1.y);
-                                    hmma_rc(acc[mr][0], a_cur.z, a_cur.w, b0.z, b0.w);
-                                    hmma_rc(acc[mr][1], a_cur.z, a_cur.w, b1.z, b1.w);
-                                    if (mr + 1 < MR_RUN) a_cur = a_nxt;
-                                }
-                            }
-                        }
-                    };
-
-                    if constexpr (IS_DOWN && KTILE) {
-                        const uint8_t* wp = blob + L.down_off + (size_t) (col0 >> 7) * (size_t) (K >> 6) * 8704u;
-                        const uint32_t d_off = (uint32_t) xr * 4u;
-                        const uint32_t q_off = (uint32_t) tid * 16u;
-                        __half2 d01;
-                        {
-                            __half* sx0 = smem;
-                            __half* sw0 = smem + BM * LD;
-                            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
-                            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
-                            const uint32_t d_u = __ldg(reinterpret_cast<const uint32_t*>(wp + d_off));
-                            d01 = *reinterpret_cast<const __half2*>(&d_u);
-                            const uint4 q0 = __ldg(reinterpret_cast<const uint4*>(wp + 512u + q_off));
-                            dq_q8_sub16_store_sm70(q0, __low2half2(d01), sw0 + xr * LD + xc);
-                            __syncthreads();
-                        }
-                        auto run_q8_kt = [&](auto mr_tag) {
-#pragma unroll 1
-                            for (int k0 = 0; k0 < K; k0 += 64) {
-                                const bool has_h1 = (k0 + 32 < K);
-                                uint4 nx0 = make_uint4(0, 0, 0, 0), nx1 = make_uint4(0, 0, 0, 0);
-                                uint4 nq = make_uint4(0, 0, 0, 0);
-                                if (has_h1) {
-                                    const __half* nxp = xp + k0 + 32;
-                                    if constexpr (USE_TILES) {
-                                        if (x_ok) {
-                                            nx0 = __ldg(reinterpret_cast<const uint4*>(nxp));
-                                            nx1 = __ldg(reinterpret_cast<const uint4*>(nxp + 8));
-                                        }
-                                    } else {
-                                        __half* sx1 = smem + STAGE_ELEMS;
-                                        *reinterpret_cast<uint4*>(sx1 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp))     : make_uint4(0, 0, 0, 0);
-                                        *reinterpret_cast<uint4*>(sx1 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
-                                    }
-                                    nq = __ldg(reinterpret_cast<const uint4*>(wp + 4608u + q_off));
-                                }
-                                do_hmma_q8(mr_tag, 0);
-                                if (!has_h1) break;
-                                {
-                                    __half* sx1 = smem + STAGE_ELEMS;
-                                    if constexpr (USE_TILES) {
-                                        *reinterpret_cast<uint4*>(sx1 + xr * LD + xc)     = nx0;
-                                        *reinterpret_cast<uint4*>(sx1 + xr * LD + xc + 8) = nx1;
-                                    }
-                                    dq_q8_sub16_store_sm70(nq, __high2half2(d01), sx1 + BM * LD + xr * LD + xc);
-                                    __syncthreads();
-                                }
-
-                                const bool has_next = (k0 + 64 < K);
-                                nx0 = make_uint4(0, 0, 0, 0);
-                                nx1 = make_uint4(0, 0, 0, 0);
-                                if (has_next) {
-                                    const __half* nxp = xp + k0 + 64;
-                                    if constexpr (USE_TILES) {
-                                        if (x_ok) {
-                                            nx0 = __ldg(reinterpret_cast<const uint4*>(nxp));
-                                            nx1 = __ldg(reinterpret_cast<const uint4*>(nxp + 8));
-                                        }
-                                    } else {
-                                        __half* sx0 = smem;
-                                        *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp))     : make_uint4(0, 0, 0, 0);
-                                        *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
-                                    }
-                                    wp += 8704u;
-                                    const uint32_t d_u = __ldg(reinterpret_cast<const uint32_t*>(wp + d_off));
-                                    d01 = *reinterpret_cast<const __half2*>(&d_u);
-                                    nq = __ldg(reinterpret_cast<const uint4*>(wp + 512u + q_off));
-                                }
-                                do_hmma_q8(mr_tag, 1);
-                                if (has_next) {
-                                    __half* sx0 = smem;
-                                    if constexpr (USE_TILES) {
-                                        *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = nx0;
-                                        *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = nx1;
-                                    }
-                                    dq_q8_sub16_store_sm70(nq, __low2half2(d01), sx0 + BM * LD + xr * LD + xc);
-                                    __syncthreads();
-                                }
-                            }
-                        };
-                        if (has_hi) run_q8_kt(std::integral_constant<int, 4>{});
-                        else        run_q8_kt(std::integral_constant<int, 2>{});
-                    } else {
-                        const uint8_t* we_row = blob + role_off + (size_t) (col0 + xr) * row_stride;
-                        {
-                            __half* sx0 = smem;
-                            __half* sw0 = smem + BM * LD;
-                            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp))     : make_uint4(0, 0, 0, 0);
-                            *reinterpret_cast<uint4*>(sx0 + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(xp + 8)) : make_uint4(0, 0, 0, 0);
-                            const iq_q8_sub16 q0 = iq_q8_load_sub16(we_row, 0, sb2);
-                            dq_q8_sub16_store_sm70(make_uint4(q0.w[0], q0.w[1], q0.w[2], q0.w[3]),
-                                                   __half2half2(__ushort_as_half(q0.d_bits)), sw0 + xr * LD + xc);
-                            __syncthreads();
-                        }
-                        auto run_q8_gen = [&](auto mr_tag) {
-                            int stage = 0;
-#pragma unroll 1
-                            for (int k0 = 0; k0 < K; k0 += 32, stage ^= 1) {
-                                const int nxt = stage ^ 1;
-                                const bool has_next = (k0 + 32 < K);
-                                uint4 nx0 = make_uint4(0, 0, 0, 0), nx1 = make_uint4(0, 0, 0, 0);
-                                iq_q8_sub16 nq{};
-                                if (has_next) {
-                                    const int nk = k0 + 32;
-                                    const __half* nxp = xp + nk;
-                                    if constexpr (USE_TILES) {
-                                        if (x_ok) {
-                                            nx0 = __ldg(reinterpret_cast<const uint4*>(nxp));
-                                            nx1 = __ldg(reinterpret_cast<const uint4*>(nxp + 8));
-                                        }
-                                    } else {
-                                        __half* sx_n = smem + nxt * STAGE_ELEMS;
-                                        *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp))     : make_uint4(0, 0, 0, 0);
-                                        *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = x_ok ? __ldg(reinterpret_cast<const uint4*>(nxp + 8)) : make_uint4(0, 0, 0, 0);
-                                    }
-                                    nq = iq_q8_load_sub16(we_row, nk & ~63, (((nk >> 5) & 1) << 1) | sb2);
-                                }
-                                do_hmma_q8(mr_tag, stage);
-                                if (has_next) {
-                                    __half* sx_n = smem + nxt * STAGE_ELEMS;
-                                    if constexpr (USE_TILES) {
-                                        *reinterpret_cast<uint4*>(sx_n + xr * LD + xc)     = nx0;
-                                        *reinterpret_cast<uint4*>(sx_n + xr * LD + xc + 8) = nx1;
-                                    }
-                                    dq_q8_sub16_store_sm70(make_uint4(nq.w[0], nq.w[1], nq.w[2], nq.w[3]),
-                                                           __half2half2(__ushort_as_half(nq.d_bits)),
-                                                           sx_n + BM * LD + xr * LD + xc);
-                                    __syncthreads();
-                                }
-                            }
-                        };
-                        if (has_hi) run_q8_gen(std::integral_constant<int, 4>{});
-                        else        run_q8_gen(std::integral_constant<int, 2>{});
-                    }
-                } else {
-#endif
                 __half* sx = smem;
                 __half* sw = smem + BM * LD;
                 const int wr = tid >> 2, sb = tid & 3;
@@ -15356,7 +14786,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                         if (k0 + WK < K) __syncthreads();
                     }
                 }
-#if __CUDA_ARCH__ >= 800 || __CUDA_ARCH__ < 750
+#if __CUDA_ARCH__ >= 800
                 }
 #endif
             }
