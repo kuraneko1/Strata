@@ -642,6 +642,15 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
 // kvalues_fp4 holds the E2M1 values doubled (0, 1, 2, 3, 4, 6, 8, 12), so the scale is halved here - exactly
 // ggml's ggml_cuda_ue4m3_to_fp32, decoded in software so the GPU and ggml-cpu agree bit for bit (NaN -> 0).
 __device__ __forceinline__ float ue4m3_to_f32_half(uint8_t x) {
+    // The same value as ldexpf(1 + man/8, exp - 7) * 0.5 (ldexpf(man, -9) * 0.5 for exp 0), built from its bits: every
+    // such value is exact in FP32, so this is equal for all 256 inputs - without the ldexpf and the branches it cost
+    // in the decode experts' inner loop.  Normal: 2^(exp-8) * (1 + man/8) = exponent field exp + 119, mantissa man<<20.
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t exp = (x >> 3) & 0xF, man = x & 0x7;
+    return exp == 0 ? (float) man * 0.0009765625f : __uint_as_float(((exp + 119u) << 23) | (man << 20));
+}
+
+__device__ __forceinline__ float ue4m3_to_f32_half_branchless(uint8_t x) {
     // Branchless exact FP32 bit construction for all 256 UE4M3 inputs (NaN 0x7F -> 0.0f, 0x00/0x80 -> 0.0f).
     // Normal: 2^(exp-8) * (1 + man/8) = ((exp + 119) << 23) | (man << 20) = ((x & 0x7F) << 20) + (119 << 23).
     const uint32_t u = (uint32_t) x & 0x7Fu;
@@ -5130,7 +5139,8 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
     block_q8_1* __restrict__ hq) {
     if ((int) blockIdx.y >= *n_groups) return;
     __shared__ float s_ue4m3[256];
-    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    if constexpr (KTILE) s_ue4m3[threadIdx.x] = ue4m3_to_f32_half_branchless((uint8_t) threadIdx.x);
+    else                 s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
     if constexpr (KTILE) {
         union SmemBuf {
             struct {
@@ -5320,7 +5330,8 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
     block_q8_1* __restrict__ hq) {
     if ((int) blockIdx.y >= *n_groups) return;
     __shared__ float s_ue4m3[256];
-    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    if constexpr (KTILE) s_ue4m3[threadIdx.x] = ue4m3_to_f32_half_branchless((uint8_t) threadIdx.x);
+    else                 s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
     if constexpr (KTILE) {
         __shared__ float s_dx[72];
         __shared__ __align__(16) int4 s_xq[72][2];
@@ -5476,8 +5487,13 @@ __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
     const int ng = *n_groups;
     if ((int) blockIdx.y >= ng) return;
     __shared__ float s_ue4m3[256];
-    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
-    s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
+    if constexpr (KTILE) {
+        s_ue4m3[threadIdx.x] = ue4m3_to_f32_half_branchless((uint8_t) threadIdx.x);
+        s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half_branchless((uint8_t) (threadIdx.x + 128));
+    } else {
+        s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+        s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
+    }
     if constexpr (KTILE) {
         __shared__ float s_dx[36];
         __shared__ __align__(16) int4 s_xq[36][2];
@@ -5590,8 +5606,8 @@ __global__ void __launch_bounds__(KTILE ? 128 : 256, KTILE ? 8 : 4) native_down_
     if ((int) blockIdx.y >= ng) return;
     __shared__ float s_ue4m3[256];
     if constexpr (KTILE) {
-        s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
-        s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
+        s_ue4m3[threadIdx.x] = ue4m3_to_f32_half_branchless((uint8_t) threadIdx.x);
+        s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half_branchless((uint8_t) (threadIdx.x + 128));
         union SmemBuf {
             struct {
                 __align__(16) int4 xq[GRP_NC * 36][2];
