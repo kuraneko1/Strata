@@ -6413,10 +6413,10 @@ __global__ void __launch_bounds__(256, 4) k_loop_ctrl_fused_rms_q8_t1(
     constexpr int MAX_ITERS = (N_BLK + G - 1) / G;
     constexpr int ROWS_PER_CTA = R / G;
 
+    alignas(16) __shared__ float s_x[64];
+    alignas(16) __shared__ float s_blk[MAX_ITERS][32];
+    alignas(16) __shared__ float s_red[6][8];
     __shared__ uint32_t s_sense;
-    __shared__ float s_x[64];
-    __shared__ float s_blk[MAX_ITERS][32];
-    __shared__ float s_red[6][8];
     __shared__ float s_ir;
 
     float* mod_scr = scratch + (size_t) mod * 128u;
@@ -17701,7 +17701,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, (BLOCK_THREADS == 512) ? 2 : 8)
     __shared__ float s_l[kHW];
     __shared__ float s_c[kHW];
     __shared__ float s_lg_val;
-    __shared__ float s_acc[kHW][128];
+    alignas(16) __shared__ float s_acc[kHW][128];
     const int h = blockIdx.x, t = blockIdx.y;
     const int hkv = h / 3;
     const int tid = threadIdx.x;
