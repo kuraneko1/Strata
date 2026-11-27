@@ -42,7 +42,7 @@ struct ArchProfile {
     bool allow_core_chunk_4096 = false;   // EX-4: Measured win on sm_89 12GB with SWA compaction + dynamic KV init
     bool allow_core_chunk_8192 = false;   // Wave 4/5: Enables adaptive T=8192 upper cap on CoreResidentHybrid
     bool allow_full_vram_chunk_2048 = false; // Measured +21-23% prefill win on sm_70 32GB FullVram (fills BM=128 tiles)
-    bool allow_full_vram_chunk_4096 = false; // Enables T=4096 on sm_70 32GB FullVram when >=512 MiB headroom remains (65K/262K; 819K stays 2048)
+    bool allow_full_vram_chunk_4096 = false; // Enables T=4096 on sm_70 32GB FullVram across 65K/262K/819K via Wave 9 Shared-Scratch SWA when >=384 MiB margin remains
     int core_hybrid_kv_init = 0;          // Optional initial Full-KV cap on CoreResidentHybrid (0 = max_ctx upfront)
 };
 
@@ -215,7 +215,7 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     }
 
     // 2. Prefill chunk size (user --chunk always wins):
-    //    - FullVram promotes to 4096 (when >=512 MiB extra margin fits, e.g. V100 32GB @ 65K/262K) or 2048 (V100 @ 819K).
+    //    - FullVram promotes to 4096 (when Wave 9 Shared-Scratch SWA + >=384 MiB extra margin fits, e.g. V100 32GB @ 65K/262K/819K) or falls back to 2048 -> 1024.
     //    - CoreResidentHybrid on sm_89 / sm_70 Q8KV promotes to 4096 (SWA compaction + dynamic KV init)
     //      when tier1 fits 128/128 with initial KV + SWA-5120 ring, else falls back cleanly to 2048 -> 1024.
     //    - TightHybrid on sm_89 Q8KV uses 2048 (SWA-3072 ring halves PCIe streaming bytes/tok).
@@ -235,7 +235,9 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     const size_t core_hybrid_4096_need = init_kv_bytes + swa_kv_4096 + engine_overhead_4096 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_4096_need + 160 * MiB;
     const size_t core_hybrid_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + stage_bytes_core + in.tier1_experts_bytes + dspark_kv_2048_need + 160 * MiB;
     const size_t full_vram_2048_need = full_kv_total + swa_kv_2048 + engine_overhead_2048 + in.all_experts_bytes + dspark_kv_need + 256 * MiB;
-    const size_t full_vram_4096_need = full_kv_total + swa_kv_4096 + engine_overhead_4096 + in.all_experts_bytes + dspark_kv_need + 512 * MiB;
+    // Wave 9 Shared-Scratch SWA keeps only the 40-layer persistent ring (n_swa) + 1 shared scratch layer (n_swa + chunk).
+    const size_t swa_kv_shared_4096 = swa_kv_1024 + (size_t) (std::max(1, in.n_swa) + 4096) * in.kv_bytes_per_tok;
+    const size_t full_vram_4096_need = full_kv_total + swa_kv_shared_4096 + engine_overhead_4096 + in.all_experts_bytes + dspark_kv_need + 384 * MiB;
 
     if (in.requested_chunk > 0) {
         out.chunk = std::clamp(in.requested_chunk, 1, 16384);
