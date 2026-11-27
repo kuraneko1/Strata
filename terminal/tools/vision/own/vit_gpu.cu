@@ -58,7 +58,9 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 #include <mma.h>
+#endif
 #define VIT_COMPUTE_32F CUBLAS_COMPUTE_32F
 #define VIT_GEMM_DEFAULT CUBLAS_GEMM_DEFAULT
 #define VIT_SHFL_XOR(v, m) __shfl_xor_sync(0xffffffffu, (v), (m))
@@ -635,6 +637,7 @@ __global__ void __launch_bounds__(128) k_attn_fa_gfx11(const uint16_t* __restric
 #endif
 
 #if !defined(STRATA_VIT_HIP)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 // In-register WMMA 16x16x16 helpers (exact on Volta sm_70 AND Turing/Ampere/Ada sm_75+, zero SMEM for S/P/O)
 __device__ __forceinline__ float vit_exp2f_hw(float x) {
     float y;
@@ -731,6 +734,7 @@ __device__ __forceinline__ void vit_wmma_acc_to_matA(
     fa_u[3] = fa_u[7] = b1;
 #endif
 }
+#endif
 
 // Pipelined 100% In-Register WMMA FlashAttention-2 for CUDA sm_70+, head_dim == 64:
 //   - Double-buffered SMEM (sK[2][32][72] + sV[2][32][72] = 18,432 B) with register-prefetched GMEM loads (1 __syncthreads() per tile)
@@ -918,6 +922,315 @@ __global__ void __launch_bounds__(256, 2) k_attn_fa_cuda_hd64(
     }
 #else
     (void) q; (void) k; (void) v; (void) ctx_out; (void) N; (void) D;
+#endif
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
+__device__ __forceinline__ void vit_sm70_mma_rc(
+    float (&d)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
+          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+        : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void vit_sm70_mma_rr(
+    float (&d)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
+          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+        : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+
+template <int BK, int HD, int STRIDE, bool IS_TAIL>
+__device__ __forceinline__ void vit_sm70_fa_tile(
+    int jb, int N, int D, int hoff, int r_in_pass, int c_in_row,
+    const __half* __restrict__ k, const __half* __restrict__ v,
+    __half* sk, __half* sv,
+    const __half* sq_r0, const __half* sq_r1,
+    const __half* sk_r, const __half* sv_r,
+    bool hi8, bool want_r1, int acc_c0, int acc_c1,
+    float (&acc)[2][4][8], float (&rm0)[2], float (&rm1)[2], float (&rl0)[2], float (&rl1)[2]) {
+    const uint4 zero4 = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int lr = p * 16 + r_in_pass;
+        const int gj = jb + lr;
+        const bool valid = !IS_TAIL || (gj < N);
+        *reinterpret_cast<uint4*>(sk + lr * STRIDE + c_in_row) =
+            valid ? *reinterpret_cast<const uint4*>(k + (size_t) gj * D + hoff + c_in_row) : zero4;
+        *reinterpret_cast<uint4*>(sv + lr * STRIDE + c_in_row) =
+            valid ? *reinterpret_cast<const uint4*>(v + (size_t) gj * D + hoff + c_in_row) : zero4;
+    }
+    __syncthreads();
+
+    float fc[2][4][8];
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) fc[m][ct][i] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int kd = 0; kd < HD; kd += 8) {
+        const uint4 q0 = *reinterpret_cast<const uint4*>(sq_r0 + kd);
+        const uint4 q1 = *reinterpret_cast<const uint4*>(sq_r1 + kd);
+        const uint4 kb0 = *reinterpret_cast<const uint4*>(sk_r + 0  * STRIDE + kd);
+        const uint4 kb1 = *reinterpret_cast<const uint4*>(sk_r + 16 * STRIDE + kd);
+        const uint4 kb2 = *reinterpret_cast<const uint4*>(sk_r + 32 * STRIDE + kd);
+        const uint4 kb3 = *reinterpret_cast<const uint4*>(sk_r + 48 * STRIDE + kd);
+        vit_sm70_mma_rc(fc[0][0], q0.x, q0.y, kb0.x, kb0.y); vit_sm70_mma_rc(fc[1][0], q1.x, q1.y, kb0.x, kb0.y);
+        vit_sm70_mma_rc(fc[0][1], q0.x, q0.y, kb1.x, kb1.y); vit_sm70_mma_rc(fc[1][1], q1.x, q1.y, kb1.x, kb1.y);
+        vit_sm70_mma_rc(fc[0][2], q0.x, q0.y, kb2.x, kb2.y); vit_sm70_mma_rc(fc[1][2], q1.x, q1.y, kb2.x, kb2.y);
+        vit_sm70_mma_rc(fc[0][3], q0.x, q0.y, kb3.x, kb3.y); vit_sm70_mma_rc(fc[1][3], q1.x, q1.y, kb3.x, kb3.y);
+        vit_sm70_mma_rc(fc[0][0], q0.z, q0.w, kb0.z, kb0.w); vit_sm70_mma_rc(fc[1][0], q1.z, q1.w, kb0.z, kb0.w);
+        vit_sm70_mma_rc(fc[0][1], q0.z, q0.w, kb1.z, kb1.w); vit_sm70_mma_rc(fc[1][1], q1.z, q1.w, kb1.z, kb1.w);
+        vit_sm70_mma_rc(fc[0][2], q0.z, q0.w, kb2.z, kb2.w); vit_sm70_mma_rc(fc[1][2], q1.z, q1.w, kb2.z, kb2.w);
+        vit_sm70_mma_rc(fc[0][3], q0.z, q0.w, kb3.z, kb3.w); vit_sm70_mma_rc(fc[1][3], q1.z, q1.w, kb3.z, kb3.w);
+    }
+
+    if constexpr (IS_TAIL) {
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+            const int jc0 = jb + ct * 16 + acc_c0;
+            const int jc1 = jb + ct * 16 + acc_c1;
+#pragma unroll
+            for (int m = 0; m < 2; ++m) {
+                if (jc0 >= N)     { fc[m][ct][0] = -1e30f; fc[m][ct][2] = -1e30f; }
+                if (jc0 + 1 >= N) { fc[m][ct][1] = -1e30f; fc[m][ct][3] = -1e30f; }
+                if (jc1 >= N)     { fc[m][ct][4] = -1e30f; fc[m][ct][6] = -1e30f; }
+                if (jc1 + 1 >= N) { fc[m][ct][5] = -1e30f; fc[m][ct][7] = -1e30f; }
+            }
+        }
+    }
+
+    uint32_t ph[2][4][4];
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+        float mx0 = -1e30f, mx1 = -1e30f;
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+            mx0 = fmaxf(mx0, fmaxf(fmaxf(fc[m][ct][0], fc[m][ct][1]), fmaxf(fc[m][ct][4], fc[m][ct][5])));
+            mx1 = fmaxf(mx1, fmaxf(fmaxf(fc[m][ct][2], fc[m][ct][3]), fmaxf(fc[m][ct][6], fc[m][ct][7])));
+        }
+        const float m_new0 = fmaxf(rm0[m], vit_wmma_row_max(mx0));
+        const float m_new1 = fmaxf(rm1[m], vit_wmma_row_max(mx1));
+        const float a0 = (rm0[m] > -1e20f) ? ((m_new0 == rm0[m]) ? 1.0f : vit_exp2f_hw(rm0[m] - m_new0)) : 0.0f;
+        const float a1 = (rm1[m] > -1e20f) ? ((m_new1 == rm1[m]) ? 1.0f : vit_exp2f_hw(rm1[m] - m_new1)) : 0.0f;
+        if (__any_sync(0xffffffffu, a0 != 1.0f || a1 != 1.0f)) {
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                acc[m][n][0] *= a0; acc[m][n][1] *= a0; acc[m][n][4] *= a0; acc[m][n][5] *= a0;
+                acc[m][n][2] *= a1; acc[m][n][3] *= a1; acc[m][n][6] *= a1; acc[m][n][7] *= a1;
+            }
+        }
+        float ps0 = 0.0f, ps1 = 0.0f;
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+            const float p00 = (!IS_TAIL || fc[m][ct][0] > -1e20f) ? vit_exp2f_hw(fc[m][ct][0] - m_new0) : 0.0f;
+            const float p01 = (!IS_TAIL || fc[m][ct][1] > -1e20f) ? vit_exp2f_hw(fc[m][ct][1] - m_new0) : 0.0f;
+            const float p04 = (!IS_TAIL || fc[m][ct][4] > -1e20f) ? vit_exp2f_hw(fc[m][ct][4] - m_new0) : 0.0f;
+            const float p05 = (!IS_TAIL || fc[m][ct][5] > -1e20f) ? vit_exp2f_hw(fc[m][ct][5] - m_new0) : 0.0f;
+            ps0 += (p00 + p01) + (p04 + p05);
+            const float p12 = (!IS_TAIL || fc[m][ct][2] > -1e20f) ? vit_exp2f_hw(fc[m][ct][2] - m_new1) : 0.0f;
+            const float p13 = (!IS_TAIL || fc[m][ct][3] > -1e20f) ? vit_exp2f_hw(fc[m][ct][3] - m_new1) : 0.0f;
+            const float p16 = (!IS_TAIL || fc[m][ct][6] > -1e20f) ? vit_exp2f_hw(fc[m][ct][6] - m_new1) : 0.0f;
+            const float p17 = (!IS_TAIL || fc[m][ct][7] > -1e20f) ? vit_exp2f_hw(fc[m][ct][7] - m_new1) : 0.0f;
+            ps1 += (p12 + p13) + (p16 + p17);
+            const uint32_t u0 = vit_f2_to_h2u(p00, p01), u1 = vit_f2_to_h2u(p04, p05);
+            const uint32_t v0 = vit_f2_to_h2u(p12, p13), v1 = vit_f2_to_h2u(p16, p17);
+            const uint32_t r0 = __shfl_xor_sync(0xffffffffu, want_r1 ? u0 : v0, 2);
+            const uint32_t r1 = __shfl_xor_sync(0xffffffffu, want_r1 ? u1 : v1, 2);
+            ph[m][ct][0] = want_r1 ? r0 : u0; ph[m][ct][1] = want_r1 ? v0 : r0;
+            ph[m][ct][2] = want_r1 ? r1 : u1; ph[m][ct][3] = want_r1 ? v1 : r1;
+        }
+        rm0[m] = m_new0; rl0[m] = rl0[m] * a0 + vit_wmma_row_sum(ps0);
+        rm1[m] = m_new1; rl1[m] = rl1[m] * a1 + vit_wmma_row_sum(ps1);
+    }
+
+#pragma unroll
+    for (int ct = 0; ct < 4; ++ct) {
+        uint32_t a0_0, a0_1, a0_2, a0_3, a0_4, a0_5, a0_6, a0_7;
+        uint32_t a1_0, a1_1, a1_2, a1_3, a1_4, a1_5, a1_6, a1_7;
+        {
+            const uint32_t o0 = __shfl_xor_sync(0xffffffffu, ph[0][ct][0], 8);
+            const uint32_t o1 = __shfl_xor_sync(0xffffffffu, ph[0][ct][1], 8);
+            const uint32_t o2 = __shfl_xor_sync(0xffffffffu, ph[0][ct][2], 8);
+            const uint32_t o3 = __shfl_xor_sync(0xffffffffu, ph[0][ct][3], 8);
+            a0_0 = hi8 ? o0 : ph[0][ct][0]; a0_1 = hi8 ? o1 : ph[0][ct][1];
+            a0_2 = hi8 ? o2 : ph[0][ct][2]; a0_3 = hi8 ? o3 : ph[0][ct][3];
+            a0_4 = hi8 ? ph[0][ct][0] : o0; a0_5 = hi8 ? ph[0][ct][1] : o1;
+            a0_6 = hi8 ? ph[0][ct][2] : o2; a0_7 = hi8 ? ph[0][ct][3] : o3;
+        }
+        {
+            const uint32_t o0 = __shfl_xor_sync(0xffffffffu, ph[1][ct][0], 8);
+            const uint32_t o1 = __shfl_xor_sync(0xffffffffu, ph[1][ct][1], 8);
+            const uint32_t o2 = __shfl_xor_sync(0xffffffffu, ph[1][ct][2], 8);
+            const uint32_t o3 = __shfl_xor_sync(0xffffffffu, ph[1][ct][3], 8);
+            a1_0 = hi8 ? o0 : ph[1][ct][0]; a1_1 = hi8 ? o1 : ph[1][ct][1];
+            a1_2 = hi8 ? o2 : ph[1][ct][2]; a1_3 = hi8 ? o3 : ph[1][ct][3];
+            a1_4 = hi8 ? ph[1][ct][0] : o0; a1_5 = hi8 ? ph[1][ct][1] : o1;
+            a1_6 = hi8 ? ph[1][ct][2] : o2; a1_7 = hi8 ? ph[1][ct][3] : o3;
+        }
+        const __half* sv_base = sv_r + (ct * 16) * STRIDE;
+        uint2 b[4];
+#pragma unroll
+        for (int n = 0; n < 4; ++n) b[n] = *reinterpret_cast<const uint2*>(sv_base + 0 * STRIDE + n * 16);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) { vit_sm70_mma_rr(acc[0][n], a0_0, a0_1, b[n].x, b[n].y); vit_sm70_mma_rr(acc[1][n], a1_0, a1_1, b[n].x, b[n].y); }
+#pragma unroll
+        for (int n = 0; n < 4; ++n) b[n] = *reinterpret_cast<const uint2*>(sv_base + 4 * STRIDE + n * 16);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) { vit_sm70_mma_rr(acc[0][n], a0_2, a0_3, b[n].x, b[n].y); vit_sm70_mma_rr(acc[1][n], a1_2, a1_3, b[n].x, b[n].y); }
+#pragma unroll
+        for (int n = 0; n < 4; ++n) b[n] = *reinterpret_cast<const uint2*>(sv_base + 8 * STRIDE + n * 16);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) { vit_sm70_mma_rr(acc[0][n], a0_4, a0_5, b[n].x, b[n].y); vit_sm70_mma_rr(acc[1][n], a1_4, a1_5, b[n].x, b[n].y); }
+#pragma unroll
+        for (int n = 0; n < 4; ++n) b[n] = *reinterpret_cast<const uint2*>(sv_base + 12 * STRIDE + n * 16);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) { vit_sm70_mma_rr(acc[0][n], a0_6, a0_7, b[n].x, b[n].y); vit_sm70_mma_rr(acc[1][n], a1_6, a1_7, b[n].x, b[n].y); }
+    }
+    __syncthreads();
+}
+#endif
+
+// Volta sm_70 native mma.sync.aligned.m8n8k4 FlashAttention-2 (hd == 64).
+// 128 threads = 4 warps, BQ = 128 (2 M-tiles/warp), BK = 64 (4 K-tiles), HD = 64 (4 D-tiles).
+// `q` must already be scaled by sqrt(1/64) * log2(e) as in VitGpu::encode when m.cuda_fa is true.
+template <bool OUT_F16>
+__global__ void __launch_bounds__(128, 2)
+k_attn_fa_cuda_hd64_sm70(
+    const uint16_t* __restrict__ q_raw,
+    const uint16_t* __restrict__ k_raw,
+    const uint16_t* __restrict__ v_raw,
+    void* __restrict__ ctx_out,
+    int N,
+    int D) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
+    const __half* __restrict__ q = (const __half*) q_raw;
+    const __half* __restrict__ k = (const __half*) k_raw;
+    const __half* __restrict__ v = (const __half*) v_raw;
+    constexpr int BQ = 128;
+    constexpr int BK = 64;
+    constexpr int HD = 64;
+    constexpr int STRIDE = 72;
+
+    __shared__ __align__(16) __half sq[BQ * STRIDE];
+    __shared__ __align__(16) __half sk[BK * STRIDE];
+    __shared__ __align__(16) __half sv[BK * STRIDE];
+
+    const int tid = (int) threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int hoff = (int) blockIdx.y * HD;
+    const int q_base = (int) blockIdx.x * BQ;
+
+    // Coalesced Q load: 8 threads/row * 16 rows/pass, 8 passes = 128 rows.
+    const int r_in_pass = tid >> 3;
+    const int c_in_row = (tid & 7) * 8;
+    const uint4 zero4 = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const int lr = p * 16 + r_in_pass;
+        const int gr = q_base + lr;
+        *reinterpret_cast<uint4*>(sq + lr * STRIDE + c_in_row) =
+            (gr < N) ? *reinterpret_cast<const uint4*>(q + (size_t) gr * D + hoff + c_in_row) : zero4;
+    }
+
+    float acc[2][4][8];
+    float rm0[2], rm1[2], rl0[2], rl1[2];
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+        rm0[m] = -1e30f;
+        rm1[m] = -1e30f;
+        rl0[m] = 0.0f;
+        rl1[m] = 0.0f;
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[m][n][i] = 0.0f;
+        }
+    }
+
+    const int qr_base = warp * 32;
+    const int qa_row = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3);
+    const int kb_row = ((lane & 16) >> 2) + (lane & 8) + (lane & 3);
+    const __half* const sq_r0 = sq + (qr_base + qa_row) * STRIDE;
+    const __half* const sq_r1 = sq + (qr_base + 16 + qa_row) * STRIDE;
+    const __half* const sk_r = sk + kb_row * STRIDE;
+    const int vb_row = lane & 3;
+    const int vb_col = (lane & 8) + ((lane & 16) >> 2);
+    const __half* const sv_r = sv + vb_row * STRIDE + vb_col;
+
+    const bool hi8 = (lane & 8) != 0;
+    const bool want_r1 = (lane & 2) != 0;
+    int acc_r0, acc_r1, acc_c0, acc_c1;
+    vit_wmma_acc_layout(lane, acc_r0, acc_r1, acc_c0, acc_c1);
+
+    const int n_full = (N / BK) * BK;
+    for (int jb = 0; jb < n_full; jb += BK) {
+        vit_sm70_fa_tile<BK, HD, STRIDE, false>(
+            jb, N, D, hoff, r_in_pass, c_in_row, k, v, sk, sv,
+            sq_r0, sq_r1, sk_r, sv_r, hi8, want_r1, acc_c0, acc_c1,
+            acc, rm0, rm1, rl0, rl1);
+    }
+    if (n_full < N) {
+        vit_sm70_fa_tile<BK, HD, STRIDE, true>(
+            n_full, N, D, hoff, r_in_pass, c_in_row, k, v, sk, sv,
+            sq_r0, sq_r1, sk_r, sv_r, hi8, want_r1, acc_c0, acc_c1,
+            acc, rm0, rm1, rl0, rl1);
+    }
+
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+        const float inv0 = (rl0[m] > 0.0f) ? (1.0f / rl0[m]) : 0.0f;
+        const float inv1 = (rl1[m] > 0.0f) ? (1.0f / rl1[m]) : 0.0f;
+        const int qi0 = q_base + qr_base + m * 16 + acc_r0;
+        const int qi1 = q_base + qr_base + m * 16 + acc_r1;
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int d0 = n * 16 + acc_c0;
+            const int d1 = n * 16 + acc_c1;
+            const float o00 = acc[m][n][0] * inv0, o01 = acc[m][n][1] * inv0;
+            const float o04 = acc[m][n][4] * inv0, o05 = acc[m][n][5] * inv0;
+            const float o12 = acc[m][n][2] * inv1, o13 = acc[m][n][3] * inv1;
+            const float o16 = acc[m][n][6] * inv1, o17 = acc[m][n][7] * inv1;
+            if constexpr (OUT_F16) {
+                __half* const ctx16 = (__half*) ctx_out;
+                if (qi0 < N) {
+                    __half* row0 = ctx16 + (size_t) qi0 * D + hoff;
+                    *reinterpret_cast<__half2*>(row0 + d0) = __floats2half2_rn(o00, o01);
+                    *reinterpret_cast<__half2*>(row0 + d1) = __floats2half2_rn(o04, o05);
+                }
+                if (qi1 < N) {
+                    __half* row1 = ctx16 + (size_t) qi1 * D + hoff;
+                    *reinterpret_cast<__half2*>(row1 + d0) = __floats2half2_rn(o12, o13);
+                    *reinterpret_cast<__half2*>(row1 + d1) = __floats2half2_rn(o16, o17);
+                }
+            } else {
+                float* const ctx32 = (float*) ctx_out;
+                if (qi0 < N) {
+                    float* row0 = ctx32 + (size_t) qi0 * D + hoff;
+                    row0[d0] = o00; row0[d0 + 1] = o01;
+                    row0[d1] = o04; row0[d1 + 1] = o05;
+                }
+                if (qi1 < N) {
+                    float* row1 = ctx32 + (size_t) qi1 * D + hoff;
+                    row1[d0] = o12; row1[d0 + 1] = o13;
+                    row1[d1] = o16; row1[d1 + 1] = o17;
+                }
+            }
+        }
+    }
+#else
+    (void) q_raw; (void) k_raw; (void) v_raw; (void) ctx_out; (void) N; (void) D;
 #endif
 }
 #endif
@@ -1205,6 +1518,7 @@ struct VitGpuImpl {
     uint8_t* d_rgb = nullptr;      // reusable device buffer for raw uint8 RGB H2D upload
     size_t rgb_cap = 0;
     bool cuda_fa = false;          // CUDA sm_70+ WMMA FlashAttention-2 (hd == 64): no d_S needed!
+    bool sm70_fa = false;          // Volta sm_70 native mma.m8n8k4 FlashAttention-2 (hd == 64)
     int kRows = 512;      // rows per chunk of the matrix products (STRATA_VIT_ROWS overrides: a diagnostic)
     size_t kScoreElems = (size_t) 8 << 20;     // scores per attention chunk, 8M: 16 MB of F16 (STRATA_VIT_SCORES, in M elements, overrides)
     size_t kScoreElemsLarge = (size_t) 512 << 20;   // the chunk above 16,384 patches: 512M scores, 1 GB of F16 (see size_buffers)
@@ -1714,6 +2028,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
             if (p.major >= 7 && g.head_dim == 64) {
                 const char* e = std::getenv("STRATA_VIT_FA");
                 m.cuda_fa = (!e || std::atoi(e) != 0);
+                m.sm70_fa = m.cuda_fa && (p.major == 7 && p.minor < 5);
             }
         }
         (void) cudaGetLastError();
@@ -1965,8 +2280,13 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         const bool att_f16_out = m.cuda_fa && L.o.kind == K_F16 && !m.round_out;
         if (m.cuda_fa) {
             const dim3 grid((unsigned) ((N + 127) / 128), (unsigned) H);
-            if (att_f16_out) k_attn_fa_cuda_hd64<true><<<grid, 256>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, D);
-            else k_attn_fa_cuda_hd64<false><<<grid, 256>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, D);
+            if (m.sm70_fa && N > 1024) {
+                if (att_f16_out) k_attn_fa_cuda_hd64_sm70<true><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, D);
+                else k_attn_fa_cuda_hd64_sm70<false><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, D);
+            } else {
+                if (att_f16_out) k_attn_fa_cuda_hd64<true><<<grid, 256>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, D);
+                else k_attn_fa_cuda_hd64<false><<<grid, 256>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, D);
+            }
             if (!sync_err("fused WMMA attention")) return false;
         } else
 #endif

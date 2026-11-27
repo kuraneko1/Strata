@@ -2459,10 +2459,10 @@ struct Engine {
             const int64_t pos0 = pos - n_live;
             if (kv_q8) {
                 k_swa_ring_remap_q8<<<dim3((unsigned) n_live, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
-                    swa_ptrs, new_ptrs, (int) hp.kv_dim, (int) hp.n_head_kv, swa_kv_cap, new_cap, pos0, n_live);
+                    to_swa_q8_ptrs(swa_ptrs), to_swa_q8_ptrs(new_ptrs), (int) hp.kv_dim, (int) hp.n_head_kv, swa_kv_cap, new_cap, pos0, n_live);
             } else {
                 k_swa_ring_remap_f16<<<dim3((unsigned) n_live, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
-                    swa_ptrs, new_ptrs, (int) hp.kv_dim, swa_kv_cap, new_cap, pos0, n_live);
+                    to_swa_f16_ptrs(swa_ptrs), to_swa_f16_ptrs(new_ptrs), (int) hp.kv_dim, swa_kv_cap, new_cap, pos0, n_live);
             }
             if (!use_phase_pool) CK(cudaStreamSynchronize(st));
             if (swa_kv_pool) pool_free(swa_kv_pool);
@@ -7852,8 +7852,8 @@ struct Engine {
             const size_t reg1_cap_floats = reg1_bytes_cur / sizeof(float);
             const bool can_fused_qgr_base = (!no_fused_qgr && !use_dequant_side && !save_conv_trace &&
                                              T >= 128 && cc_maj >= 7 && kv_q8 && want_att_f16 &&
-                                             use_fa2_192_swa_fast && f16_q != nullptr &&
-                                             L.attn_qgr.d != nullptr && L.attn_qgr.type == 8);
+                                             (use_fa2_192_swa_fast || (use_fa2_256_path && fuse_fa2_256_tail)) &&
+                                             f16_q != nullptr && L.attn_qgr.d != nullptr && L.attn_qgr.type == 8);
             static const bool qr_pad128 = [] {
                 const char* v = std::getenv("STRATA_QR_PAD128");
                 return v != nullptr && std::atoi(v) != 0;
@@ -8294,7 +8294,7 @@ struct Engine {
                     k_clip_and_tau_qr<<<dim3((unsigned) ((hp.n_head + 3) / 4), (unsigned) T), 128, 0, st>>>(
                         pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
                         (int) hp.n_head, (int) hp.n_rel, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha,
-                        fuse_fa2_256_tail ? rel_tab : nullptr);
+                        fuse_fa2_256_tail ? rel_tab : nullptr, ld_q_attn, ld_r_attn);
                 } else {
                     k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
                         pQ, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
@@ -8467,16 +8467,17 @@ struct Engine {
                         }
                         const int total_sp = best_sp + 1;
                         k_attn_q8_gqa3_pp_fa2_256_bulk<<<dim3((unsigned) (3 * q_tiles), (unsigned) hp.n_head_kv, (unsigned) best_sp), 256, (size_t) fa2_256_bulk_smem, st>>>(
-                            pQ, cur_kq, cur_ks, cur_vq, cur_vs, sink, pp_sp_buf,
-                            (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, bulk_aligned, kq_scale, T, best_sp, total_sp);
+                            pQ, cur_kq, cur_ks, cur_vq, cur_vs, pSink, pp_sp_buf,
+                            (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, bulk_aligned, kq_scale, T, best_sp, total_sp,
+                            ld_q_attn, ld_sink_attn);
                         if (fuse_fa2_256_tail) {
                             // Single full-chunk fused-rel tail launch (384 CTAs @ T=2048, 768 @ T=4096):
                             // zero k_rel_table_t32, zero 48-CTA sub-tiling, and clipped R sits in disjoint Region 2 (rel_tab)!
                             const int q_tiles_128 = (T + 127) / 128;
                             k_attn_q8_gqa3_pp_fa2_256_tail<<<dim3((unsigned) (3 * q_tiles_128), (unsigned) hp.n_head_kv), 256, (size_t) fa2_256_tail_smem, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, nullptr, sink, pp_sp_buf,
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, nullptr, pSink, pp_sp_buf,
                                 (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp,
-                                rel_tab, L.attn_rel_bias);
+                                rel_tab, L.attn_rel_bias, ld_q_attn, ld_sink_attn);
                         } else if (sub_tile_fa2_256) {
                             const int sub_step = (rel_tab_cap_t / 256) * 256;
                             for (int t_off = 0; t_off < T; t_off += sub_step) {
@@ -8500,7 +8501,8 @@ struct Engine {
                                 (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, bulk_aligned, pos0_d, kq_scale, T, best_sp, total_sp);
                         }
                         k_attn_pp_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            pp_sp_buf, pGate, att, (int) hp.n_head, total_sp, want_att_f16 ? act_bf16 : nullptr);
+                            pp_sp_buf, pGate, att, (int) hp.n_head, total_sp, want_att_f16 ? act_bf16 : nullptr,
+                            pGate_f16, ld_gate_attn);
                         if (want_att_f16) att_f16_ready = act_bf16;
                     } else if (can_fa2_192 && T >= 128) {
                         const int q_tiles = (T + 63) / 64;
@@ -8849,7 +8851,7 @@ struct Engine {
                                                    vmsg_down_pre != nullptr && T > 64 && cc_maj >= 7);
                     if (use_l2_chunk_ffn) {
                         const bool use_l2_router = can_l2_router_ffn;
-                        const bool use_fuse_ctrl_rms_1 = (use_l2_router && use_presplit_router &&
+                        const bool use_fuse_ctrl_rms_1 = (cc_maj >= 8 && use_l2_router && use_presplit_router &&
                                                           can_ctrl_rms_1 && fuse_ctrl_rms_ffn_eff);
                         const int local_m3 = (l_idx_ffn - vmsg_hoist_base_l) * 4 + 3;
                         const float* w_m3 = vmsg_w + (size_t) (l_idx_ffn * 4 + 3) * (size_t) T * 2;
