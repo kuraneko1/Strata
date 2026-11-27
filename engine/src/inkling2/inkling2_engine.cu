@@ -886,7 +886,7 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
         L.ffn_norm = m.upload_f32(tn("ffn_norm.weight"), (size_t) hp.n_embd);
         const size_t router_elems = (size_t) hp.n_embd * (size_t) hp.n_expert;
         L.ffn_gate_inp = m.upload_f32(tn("ffn_gate_inp.weight"), router_elems);
-        if (lm_cc_maj >= 8) {
+        if (lm_cc_maj >= 7) {
             L.ffn_gate_inp_hi = m.gpu_alloc<__half>(router_elems);
             L.ffn_gate_inp_lo = m.gpu_alloc<__half>(router_elems);
             k_split_ozaki_f32_to_f16_pair<<<(unsigned) ((router_elems + 255) / 256), 256>>>(
@@ -2787,19 +2787,23 @@ struct Engine {
         cudaFuncSetAttribute((const void*) k_control_down_phaseA_pp_wmma_splitk<3, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute((const void*) k_control_down_phaseA_pp_wmma_splitk<1, true>,  cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute((const void*) k_control_down_phaseA_pp_wmma_splitk<1, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute((const void*) k_control_up_combine_pp_wmma_vmsg<3>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+        cudaFuncSetAttribute((const void*) k_control_up_combine_pp_wmma_vmsg<3>, cudaFuncAttributePreferredSharedMemoryCarveout, (cc_maj == 7) ? cudaSharedmemCarveoutMaxShared : 50);
         cudaFuncSetAttribute((const void*) k_control_up_combine_pp_wmma_vmsg<1>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute((const void*) k_router_sgemm_f32_pp_splitk, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        if (cc_maj >= 8) {
-            cudaFuncSetAttribute((const void*) k_router_ozaki2_tc_presplit_pp,
+        if (cc_maj >= 7) {
+            cudaFuncSetAttribute((const void*) k_router_ozaki2_tc_presplit_pp<64>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute((const void*) k_router_ozaki2_tc_presplit_pp<32>,
                                  cudaFuncAttributePreferredSharedMemoryCarveout,
                                  cudaSharedmemCarveoutMaxShared);
         }
         (void) cudaGetLastError();
-        can_ctrl_rms_3 = (cc_maj >= 8) &&
-            try_set_smem((const void*) k_control_up_combine_rms_f16_vmsg<3>, 29696);
-        can_ctrl_rms_1 = (cc_maj >= 8) &&
-            try_set_smem((const void*) k_control_up_combine_rms_f16_vmsg<1>, 29696);
+        const int ctrl_rms_smem = (cc_maj == 7) ? 96256 : 29696;
+        can_ctrl_rms_3 = (cc_maj >= 7) &&
+            try_set_smem((const void*) k_control_up_combine_rms_f16_vmsg<3>, ctrl_rms_smem);
+        can_ctrl_rms_1 = (cc_maj >= 7) &&
+            try_set_smem((const void*) k_control_up_combine_rms_f16_vmsg<1>, ctrl_rms_smem);
         can_fused_loop_ctrl_1 = false;
         can_fused_loop_ctrl_3 = false;
         if (cc_maj >= 7 && sm_count > 0) {
@@ -3270,6 +3274,9 @@ struct Engine {
                         }
                     }
                 }
+            } else if (T >= 32 && cc_maj == 7 && N_out <= 64 && f16_ready != nullptr && (K_in & 15) == 0) {
+                k_gemm_f16x_bf16w_smallN_pp<<<dim3((unsigned) ((N_out + 63) / 64), (unsigned) ((T + 31) / 32)), 128, 0, st>>>(
+                    reinterpret_cast<const __half*>(f16_ready), wp, Y, T, (int) N_out, (int) K_in);
             } else if (T > 8 && N_out <= 64 && f16_ready != nullptr) {
                 const int64_t n_w = N_out * K_in;
                 if (ctrl_w16 && (size_t) n_w * sizeof(uint16_t) <= ctrl_w16_bytes) {
@@ -4055,7 +4062,7 @@ struct Engine {
             const char* v = std::getenv("STRATA_ROUTER_FP32_EXACT");
             return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
         }();
-        if (!no_custom_router && !router_fp32_exact && cc_maj >= 8 &&
+        if (!no_custom_router && !router_fp32_exact && cc_maj >= 7 &&
             rows >= 64 && (n_expert % 64) == 0 && (N % 32) == 0) {
             int sk = 1;
             if (rows <= 1024 && N >= 64 &&
@@ -7255,7 +7262,7 @@ struct Engine {
                         return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
                     }();
                     const bool use_fuse_ctrl_rms_3 = (attn_f16_only_ok && can_ctrl_rms_3 && fuse_ctrl_rms_attn &&
-                                                      cc_maj >= 8 && T >= 128 && N == 2304 && !save_conv_trace &&
+                                                      cc_maj >= 7 && T >= 128 && N == 2304 && !save_conv_trace &&
                                                       f16_v_buf != nullptr && L.attn_sink_proj.type != 0 &&
                                                       (bf16_x_f16 || (L.attn_q.type != 30 && L.attn_gate.type != 30 && L.attn_rel.type != 30)));
                     const int l_idx = ip - (int) hp.core_start;
@@ -7270,7 +7277,7 @@ struct Engine {
                     const float* nw2 = is_swa ? L.attn_norm : L.attn_v_inp_norm;
                     const bool has_vmsg_hoist = (vmsg_hoist_base_l >= 0 && l_idx >= vmsg_hoist_base_l &&
                                                  l_idx < vmsg_hoist_base_l + 6 && vmsg_down_pre != nullptr);
-                    const bool use_l2_chunk_attn = (!no_l2_chunk && has_vmsg_hoist && Q != nullptr && T > 64 && cc_maj >= 7 &&
+                    const bool use_l2_chunk_attn = (!no_l2_chunk && has_vmsg_hoist && Q != nullptr && T > 64 && cc_maj >= 8 &&
                                                     N == 2304 && (int) norm_blocks.size() <= 7);
                     const bool do_push_cur = (ip % hp.attn_res_block_size == 0);
                     const int pass_cur = (il - (int) hp.core_start) / (int) n_core;
@@ -7394,7 +7401,7 @@ struct Engine {
                                 ro.out_f16[2] = f16_v_buf + (size_t) tc0 * N;
                                 ro.out_lo_f16 = nullptr;
                                 ro.eps = hp.rms_eps;
-                                k_control_up_combine_rms_f16_vmsg<3><<<dim3((unsigned) ((tc_len + 15) / 16), 1, 1), 576, 29696, st>>>(
+                                k_control_up_combine_rms_f16_vmsg<3><<<dim3((unsigned) ((tc_len + 15) / 16), 1, 1), 576, (cc_maj == 7) ? 96256 : 29696, st>>>(
                                     vmsg_bank0 + (size_t) tc0 * N, vmsg_bank1 + (size_t) tc0 * N, up, ro, tc_len, N);
                             } else {
                                 k_control_up_combine_pp_wmma_vmsg<3><<<dim3((unsigned) ((N + 63) / 64), (unsigned) ((tc_len + 63) / 64)), 512, 0, st>>>(
@@ -7426,29 +7433,29 @@ struct Engine {
                             for (int i = 0; i < B; ++i) np.p[i] = norm_blocks[(size_t) (B - 1 - i)];
                             MixOuts4 mo4{{in_q, is_swa ? nullptr : in_k, is_swa ? nullptr : in_v, nullptr}};
                             NormF16Out3 nf16_empty{};
+                            auto launch_postffn_msg_full_b = [&](auto nq_tag, auto dp_tag, float* ndst_p) {
+                                constexpr int NQ_T = decltype(nq_tag)::value;
+                                constexpr bool DP_T = decltype(dp_tag)::value;
+                                switch (B) {
+                                case 0: k_postffn_shortconv_preattn_mix_pp<NQ_T, false, DP_T, 0><<<(unsigned) T, 576, 0, st>>>(moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp, cur_out_ptr, ndst_p, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4, deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false); break;
+                                case 1: k_postffn_shortconv_preattn_mix_pp<NQ_T, false, DP_T, 1><<<(unsigned) T, 576, 0, st>>>(moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp, cur_out_ptr, ndst_p, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4, deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false); break;
+                                case 2: k_postffn_shortconv_preattn_mix_pp<NQ_T, false, DP_T, 2><<<(unsigned) T, 576, 0, st>>>(moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp, cur_out_ptr, ndst_p, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4, deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false); break;
+                                case 3: k_postffn_shortconv_preattn_mix_pp<NQ_T, false, DP_T, 3><<<(unsigned) T, 576, 0, st>>>(moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp, cur_out_ptr, ndst_p, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4, deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false); break;
+                                case 4: k_postffn_shortconv_preattn_mix_pp<NQ_T, false, DP_T, 4><<<(unsigned) T, 576, 0, st>>>(moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp, cur_out_ptr, ndst_p, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4, deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false); break;
+                                default: k_postffn_shortconv_preattn_mix_pp<NQ_T, false, DP_T, -1><<<(unsigned) T, 576, 0, st>>>(moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp, cur_out_ptr, ndst_p, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4, deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false); break;
+                                }
+                            };
                             if (is_swa) {
                                 if (do_push_cur && ndst_out_ptr != nullptr) {
-                                    k_postffn_shortconv_preattn_mix_pp<1, false, true><<<(unsigned) T, 576, 0, st>>>(
-                                        moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp,
-                                        cur_out_ptr, ndst_out_ptr, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4,
-                                        deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false);
+                                    launch_postffn_msg_full_b(std::integral_constant<int, 1>{}, std::true_type{}, ndst_out_ptr);
                                 } else {
-                                    k_postffn_shortconv_preattn_mix_pp<1, false, false><<<(unsigned) T, 576, 0, st>>>(
-                                        moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp,
-                                        cur_out_ptr, nullptr, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4,
-                                        deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false);
+                                    launch_postffn_msg_full_b(std::integral_constant<int, 1>{}, std::false_type{}, nullptr);
                                 }
                             } else {
                                 if (do_push_cur && ndst_out_ptr != nullptr) {
-                                    k_postffn_shortconv_preattn_mix_pp<3, false, true><<<(unsigned) T, 576, 0, st>>>(
-                                        moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp,
-                                        cur_out_ptr, ndst_out_ptr, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4,
-                                        deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false);
+                                    launch_postffn_msg_full_b(std::integral_constant<int, 3>{}, std::true_type{}, ndst_out_ptr);
                                 } else {
-                                    k_postffn_shortconv_preattn_mix_pp<3, false, false><<<(unsigned) T, 576, 0, st>>>(
-                                        moe_raw, deferred_postffn.w_conv, deferred_postffn.hst, ffn_inp,
-                                        cur_out_ptr, nullptr, np, B, L.attn_res_query, mo4, nf16_empty, ir_c4,
-                                        deferred_postffn.hist_offset, 0, T, N, hp.rms_eps, false);
+                                    launch_postffn_msg_full_b(std::integral_constant<int, 3>{}, std::false_type{}, nullptr);
                                 }
                             }
                             k_shortconv_hist_push<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
@@ -7522,14 +7529,20 @@ struct Engine {
                             ro.out_f16[2] = f16_v_buf;
                             ro.out_lo_f16 = nullptr;
                             ro.eps = hp.rms_eps;
-                            k_control_up_combine_rms_f16_vmsg<3><<<dim3((unsigned) ((T + 15) / 16), 1, 1), 576, 29696, st>>>(
+                            k_control_up_combine_rms_f16_vmsg<3><<<dim3((unsigned) ((T + 15) / 16), 1, 1), 576, (cc_maj == 7) ? 96256 : 29696, st>>>(
                                 vmsg_bank0, vmsg_bank1, up, ro, T, N);
                         } else {
                             k_control_up_combine_pp_wmma_vmsg<3><<<dim3((unsigned) ((N + 63) / 64), (unsigned) ((T + 63) / 64)), 512, 0, st>>>(
                                 vmsg_bank0, vmsg_bank1, up, T, N);
-                            k_rms_norm_3_f16<<<dim3(3, (unsigned) T), rms_f16_blk, 0, st>>>(
-                                in_q, in_k, in_v, nullptr, nullptr, nullptr, nw0, nw1, nw2,
-                                act_bf16, act_bf16 + (size_t) T * N, f16_v_buf, N, hp.rms_eps);
+                            if (N == 2304 && T >= 64) {
+                                k_rms_norm_3_f16_x4<<<dim3(3, (unsigned) ((T + 3) / 4)), 256, 0, st>>>(
+                                    in_q, in_k, in_v, nullptr, nullptr, nullptr, nw0, nw1, nw2,
+                                    act_bf16, act_bf16 + (size_t) T * N, f16_v_buf, T, hp.rms_eps);
+                            } else {
+                                k_rms_norm_3_f16<<<dim3(3, (unsigned) T), rms_f16_blk, 0, st>>>(
+                                    in_q, in_k, in_v, nullptr, nullptr, nullptr, nw0, nw1, nw2,
+                                    act_bf16, act_bf16 + (size_t) T * N, f16_v_buf, N, hp.rms_eps);
+                            }
                         }
                         f16_v_pre_done = true;
                     }
@@ -8799,6 +8812,8 @@ struct Engine {
                     const char* v = std::getenv("STRATA_FUSE_CTRL_RMS");
                     return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
                 }();
+                static const bool fuse_ctrl_rms_ffn_set = (std::getenv("STRATA_FUSE_CTRL_RMS") != nullptr);
+                const bool fuse_ctrl_rms_ffn_eff = fuse_ctrl_rms_ffn_set ? fuse_ctrl_rms_ffn : (cc_maj == 7);
                 const bool need_cpu_ffn = (L.n_slots < hp.n_expert);
                 const bool use_pp_stream_ffn = (pp_streaming && need_cpu_ffn && L.hblobs &&
                                                 pp_stage_bytes >= L.stride && pp_layer_cnt[(size_t) il] > 0);
@@ -8808,7 +8823,7 @@ struct Engine {
                                                 (!need_cpu_ffn || use_pp_stream_ffn));
                 const bool f16_ffn_ready_pre = (T >= 16 && (N & 3) == 0);
                 const bool use_presplit_router = (!no_custom_router_ffn && !router_fp32_exact_ffn &&
-                                                  cc_maj >= 8 && T >= 128 && N == 2304 && hp.n_expert == 128 &&
+                                                  cc_maj >= 7 && T >= 128 && N == 2304 && hp.n_expert == 128 &&
                                                   L.ffn_gate_inp_hi != nullptr && L.ffn_gate_inp_lo != nullptr &&
                                                   can_l2_router_ffn && f16_ffn_ready_pre);
                 auto launch_router_pp = [&](const float* x_ptr, int t_off, int rows) {
@@ -8818,10 +8833,13 @@ struct Engine {
                 // Wave 12B + Wave 14: BM=64, BN=128, BK=32, Block=256 pre-split Ozaki-2 TC Router with Split-K
                 // (with cudaSharedmemCarveoutMaxShared -> 2 CTAs/SM = 1 wave: m_tiles <= 14 -> sk=3 e.g. 13*3=39 CTAs;
                 //  15 <= m_tiles && rows <= 1536 -> sk=4 e.g. 23*4=92 CTAs = 2.00 CTAs/SM on 46 SMs; rows > 1536 -> sk=2).
+                // Volta sm_70: BM=32, BN=128 -> 128 CTAs at T=4096 with sk=1 (0 Split-K reduce launches!).
                 auto launch_presplit_router_pp = [&](const __half* x_hi, const __half* x_lo, int t_off, int rows) {
                     float* y_ptr = router_logits + (size_t) t_off * (size_t) hp.n_expert;
-                    const int m_tiles = (rows + 63) / 64;
-                    int sk = (m_tiles <= 14) ? 3 : ((rows <= 1536) ? 4 : 2);
+                    const int m_tiles = (cc_maj == 7) ? ((rows + 31) / 32) : ((rows + 63) / 64);
+                    int sk = (cc_maj == 7)
+                           ? ((rows >= 2048) ? 1 : ((m_tiles <= 24) ? 4 : ((m_tiles <= 48) ? 2 : 1)))
+                           : ((m_tiles <= 14) ? 3 : ((rows <= 1536) ? 4 : 2));
                     while (sk > 1) {
                         const int kps = ((N / sk + 31) / 32) * 32;
                         if (kps * sk >= N && kps * (sk - 1) < N &&
@@ -8833,10 +8851,17 @@ struct Engine {
                     }
                     const int k_per_split = (sk > 1) ? (((N / sk + 31) / 32) * 32) : 0;
                     float* y_dst = (sk > 1) ? ffn_splitk_scratch : y_ptr;
-                    k_router_ozaki2_tc_presplit_pp<<<dim3(1, (unsigned) m_tiles, (unsigned) sk), 256, 0, st>>>(
-                        x_hi, x_lo,
-                        L.ffn_gate_inp_hi, L.ffn_gate_inp_lo,
-                        y_dst, rows, (int) hp.n_expert, N, k_per_split);
+                    if (cc_maj == 7) {
+                        k_router_ozaki2_tc_presplit_pp<32><<<dim3(1, (unsigned) m_tiles, (unsigned) sk), 256, 0, st>>>(
+                            x_hi, x_lo,
+                            L.ffn_gate_inp_hi, L.ffn_gate_inp_lo,
+                            y_dst, rows, (int) hp.n_expert, N, k_per_split);
+                    } else {
+                        k_router_ozaki2_tc_presplit_pp<64><<<dim3(1, (unsigned) m_tiles, (unsigned) sk), 256, 0, st>>>(
+                            x_hi, x_lo,
+                            L.ffn_gate_inp_hi, L.ffn_gate_inp_lo,
+                            y_dst, rows, (int) hp.n_expert, N, k_per_split);
+                    }
                     if (sk > 1) {
                         const int tot = rows * (int) hp.n_expert;
                         k_router_splitk_reduce<<<(unsigned) (((tot + 3) / 4 + 255) / 256), 256, 0, st>>>(y_dst, y_ptr, tot, sk);
@@ -8846,7 +8871,8 @@ struct Engine {
                     if (!no_l2_chunk && can_l2_router_ffn && (use_presplit_router || T >= 1024)) {
                         // Wave 8 Cut C+D + Wave 12B: T_CHUNK=1472 (23 M-tiles x sk=4 = 92 CTAs = 2.00 CTAs/SM on 46 SMs)
                         // with pre-split Ozaki-2 X_hi/X_lo (X_lo reuses in_ffn as __half*, 6.47 MiB <= 0.5*sz_N).
-                        const int ffn_chunk = use_presplit_router ? 1472 : 1024;
+                        // On Volta sm_70 (6 MB L2, 80 SMs), full T avoids 4x sub-chunk launches while X_lo still fits <= 0.5*sz_N!
+                        const int ffn_chunk = (cc_maj == 7) ? T : (use_presplit_router ? 1472 : 1024);
                         for (int tc0 = 0; tc0 < T; tc0 += ffn_chunk) {
                             const int tc_len = std::min(ffn_chunk, T - tc0);
                             auto launch_sconv_t_b = [&](int len, float* o32, const float* rw, uint16_t* o16, float* irp, int toff, bool loc, __half* xlo) {
@@ -8888,7 +8914,7 @@ struct Engine {
                     if (use_l2_chunk_ffn) {
                         const bool use_l2_router = can_l2_router_ffn;
                         const bool use_fuse_ctrl_rms_1 = (use_l2_router && use_presplit_router &&
-                                                          can_ctrl_rms_1 && fuse_ctrl_rms_ffn);
+                                                          can_ctrl_rms_1 && fuse_ctrl_rms_ffn_eff);
                         const int local_m3 = (l_idx_ffn - vmsg_hoist_base_l) * 4 + 3;
                         const float* w_m3 = vmsg_w + (size_t) (l_idx_ffn * 4 + 3) * (size_t) T * 2;
                         // Wave 7: When !use_l2_router, use in_k ([sz_N..2*sz_N), 100% disjoint from wo/moe_raw/in_ffn/ctrl64)
@@ -8898,7 +8924,7 @@ struct Engine {
                             return (v != nullptr && v[0] != '\0') ? std::atoi(v) : 0;
                         }();
                         const int ffn_msg_chunk = (env_ffn_msg_chunk > 0) ? env_ffn_msg_chunk
-                                                                          : ((use_l2_router && use_presplit_router) ? 1408 : 1024);
+                                                                          : ((cc_maj == 7) ? T : ((use_l2_router && use_presplit_router) ? 1408 : 1024));
                         float* ffn_tmp = use_l2_router ? in_ffn : in_k;
                         for (int tc0 = 0; tc0 < T; tc0 += ffn_msg_chunk) {
                             const int tc_len = std::min(ffn_msg_chunk, T - tc0);
@@ -8941,7 +8967,7 @@ struct Engine {
                                 ro.out_f16[0] = act_bf16 + (size_t) tc0 * N;
                                 ro.out_lo_f16 = x_lo_buf;
                                 ro.eps = hp.rms_eps;
-                                k_control_up_combine_rms_f16_vmsg<1><<<dim3((unsigned) ((tc_len + 15) / 16), 1, 1), 576, 29696, st>>>(
+                                k_control_up_combine_rms_f16_vmsg<1><<<dim3((unsigned) ((tc_len + 15) / 16), 1, 1), 576, (cc_maj == 7) ? 96256 : 29696, st>>>(
                                     vmsg_bank0 + (size_t) tc0 * N, vmsg_bank1 + (size_t) tc0 * N, up_f, ro, tc_len, N);
                                 launch_presplit_router_pp(
                                     reinterpret_cast<const __half*>(act_bf16 + (size_t) tc0 * N), x_lo_buf, tc0, tc_len);
