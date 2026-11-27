@@ -3410,7 +3410,8 @@ struct DsparkEngine {
                    (hp.n_embd % 256) == 0 && (hp.kv_dim & 3) == 0 &&
                    ((((uintptr_t) W1.d) | ((uintptr_t) W2.d)) & 3u) == 0u;
         };
-        const bool can_graph = (feat_off == 0 && T >= 1 && T <= 8 && !E.prof && !inject_graph_oom[T]);
+        const bool can_graph = (feat_off == 0 && T >= 1 && T <= 8 && !E.prof && !inject_graph_oom[T] &&
+                                h_inj_pos_pin != nullptr);
         if (can_graph) {
             auto emit_inject_small = [&](bool use_pos_d) {
                 if (use_pos_d && h_inj_pos_pin) {
@@ -3444,9 +3445,10 @@ struct DsparkEngine {
                 }
             };
             cudaGraphExec_t& ig = inject_graphs[T];
-            const int want_inj_hits = ((T == 4 && E.verify_max_t <= 5) || (T == 7 && E.verify_max_t >= 7)) ? 2 : 5;
+            const int want_inj_hits = (T == 1 || (T == 4 && E.verify_max_t >= 4) ||
+                                       T == std::min(E.verify_max_t, 7)) ? 1 : 2;
             if (!ig && ++inject_hits[T] < want_inj_hits) {
-                // Lazy capture: primary verify T on hit #2, defer rare secondary T until hit #5 (~1.5 ms Inst+Destroy break-even).
+                // Lazy capture: primary verify T (1, 4, max_t) on hit #1, secondary T on hit #2.
                 emit_inject_small(false);
                 pos = pos0 + T;
                 return;

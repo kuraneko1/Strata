@@ -7641,8 +7641,10 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
 /// Combines k_shortconv_kv_clip_norm_store_q8 (2*n_head_kv CTAs) + k_clip_and_tau_qr + k_rel_table_split (n_head*d_splits CTAs)
 /// into 1 single kernel launch (144 -> 48 launches/step across 48L, CUDA-Graph safe, STACK: 0 on sm_70+).
 /// R is read-only (no global R writeback -> zero cross-CTA race between ds==0 and ds>0).
-/// Grid = (2 * n_head_kv + n_head * d_splits), block = 128.
-__global__ void __launch_bounds__(128, 8) k_pre_attn_smallT_fused(
+/// Grid = (2 * n_head_kv + n_head * d_splits), block = SUB_T * 128 (SUB_T=2 for T=2, SUB_T=4 for T=3..8).
+/// Group A preloads conv history + cur[0..T-1] into SMEM and processes SUB_T tokens in parallel (skipping dead t==T-1 hist_trace).
+template <int SUB_T>
+__global__ void __launch_bounds__(SUB_T * 128, (SUB_T >= 4) ? 2 : 4) k_pre_attn_smallT_fused(
     const float* __restrict__ K, const float* __restrict__ V,
     const float* __restrict__ wk, const float* __restrict__ wv,
     const float* __restrict__ dyn_k, const float* __restrict__ dyn_v,
@@ -7656,77 +7658,117 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_smallT_fused(
     float rms_eps, int apply_tau, const int32_t* __restrict__ pos0, int floor_n, float alpha,
     int T, int d_splits,
     float* __restrict__ hist_trace = nullptr, size_t hist_trace_stride = 0) {
+    __shared__ union {
+        struct {
+            float s_seq[11][128];
+            float s_red_sq[SUB_T][4];
+            float s_red_am[SUB_T][4];
+        } a;
+        struct {
+            float s_r[8][16];
+            float s_sk[8];
+        } b;
+    } smem;
+
     const int bid = (int) blockIdx.x;
-    const int tid = threadIdx.x;
-    const int warp = tid >> 5, lane = tid & 31;
+    const int tid = (int) threadIdx.x;
     const int p0 = pos0[0];
     if (bid < 2 * n_head_kv) {
-        __shared__ float s_red_sq[4];
-        __shared__ float s_red_am[4];
+        const int t_sub = tid >> 7;
+        const int c_loc = tid & 127;
+        const int sub_warp = (tid >> 5) & 3;
+        const int lane = tid & 31;
         const bool is_v = (bid >= n_head_kv);
         const int hkv = is_v ? (bid - n_head_kv) : bid;
         const int kv_dim = n_head_kv * 128;
-        const int c = hkv * 128 + tid;
+        const int c = hkv * 128 + c_loc;
         const int c_all = is_v ? (kv_dim + c) : c;
         const float* cur = is_v ? V : K;
         const float* dyn = is_v ? dyn_v : dyn_k;
         float* hc = hist + (size_t) c_all * 3;
-        float h0 = hc[0], h1 = hc[1], h2 = hc[2];
-        const float4 w4 = *reinterpret_cast<const float4*>((is_v ? wv : wk) + (size_t) c * 4);
+        if (t_sub == 0) {
+            smem.a.s_seq[0][c_loc] = hc[0];
+            smem.a.s_seq[1][c_loc] = hc[1];
+            smem.a.s_seq[2][c_loc] = hc[2];
+        }
+        for (int t = t_sub; t < T; t += SUB_T) {
+            smem.a.s_seq[3 + t][c_loc] = __ldg(cur + (size_t) t * kv_dim + c);
+        }
+        __syncthreads();
+
+        const float4 w4 = __ldg(reinterpret_cast<const float4*>((is_v ? wv : wk) + (size_t) c * 4));
         const float conv_scale = rsqrtf(dyn ? 9.0f : 5.0f);
         const bool pow2_cap = (cap & (cap - 1)) == 0;
         const int cap_mask = cap - 1;
         int8_t* q_dst_base = is_v ? vq : kq;
         __half* s_dst_base = is_v ? vs : ks;
-        for (int t = 0; t < T; ++t) {
-            const size_t idx = (size_t) t * kv_dim + c;
-            const float x = cur[idx];
-            float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
-            if (dyn) {
-                const float* dt = dyn + ((size_t) t * n_head_kv + hkv) * 4;
-                s += x * dt[0] + h2 * dt[1] + h1 * dt[2] + h0 * dt[3];
+
+        for (int t_base = 0; t_base < T; t_base += SUB_T) {
+            const int t = t_base + t_sub;
+            const bool active = (t < T);
+            float h0 = 0.0f, h1 = 0.0f, h2 = 0.0f, x = 0.0f, val = 0.0f;
+            if (active) {
+                h0 = smem.a.s_seq[t + 0][c_loc];
+                h1 = smem.a.s_seq[t + 1][c_loc];
+                h2 = smem.a.s_seq[t + 2][c_loc];
+                x  = smem.a.s_seq[t + 3][c_loc];
+                float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+                if (dyn) {
+                    const float4 dt = __ldg(reinterpret_cast<const float4*>(dyn + ((size_t) t * n_head_kv + hkv) * 4));
+                    s += x * dt.x + h2 * dt.y + h1 * dt.z + h0 * dt.w;
+                }
+                val = (x + s) * conv_scale;
             }
-            float val = (x + s) * conv_scale;
-            h0 = h1; h1 = h2; h2 = x;
-            if (hist_trace) {
-                float* ht = hist_trace + (size_t) t * hist_trace_stride + (size_t) c_all * 3;
-                ht[0] = h0; ht[1] = h1; ht[2] = h2;
-            }
-            float sq = val * val;
+            float sq = active ? (val * val) : 0.0f;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
-            if (lane == 0) s_red_sq[warp] = sq;
+            if (lane == 0) smem.a.s_red_sq[t_sub][sub_warp] = sq;
             __syncthreads();
-            const float tot_sq = s_red_sq[0] + s_red_sq[1] + s_red_sq[2] + s_red_sq[3];
-            const float fac = is_v ? rsqrtf(tot_sq / 128.0f + rms_eps) : fminf(1.0f, qk_clip / (sqrtf(tot_sq) + 1e-6f));
-            val *= fac;
-            float am = fabsf(val);
+            if (active) {
+                const float tot_sq = smem.a.s_red_sq[t_sub][0] + smem.a.s_red_sq[t_sub][1]
+                                   + smem.a.s_red_sq[t_sub][2] + smem.a.s_red_sq[t_sub][3];
+                const float fac = is_v ? rsqrtf(tot_sq / 128.0f + rms_eps)
+                                       : fminf(1.0f, qk_clip / (sqrtf(tot_sq) + 1e-6f));
+                val *= fac;
+            }
+            float am = active ? fabsf(val) : 0.0f;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
-            if (lane == 0) s_red_am[warp] = am;
+            if (lane == 0) smem.a.s_red_am[t_sub][sub_warp] = am;
             __syncthreads();
-            const float amax = fmaxf(fmaxf(s_red_am[0], s_red_am[1]), fmaxf(s_red_am[2], s_red_am[3]));
-            const float dk = amax / 127.0f;
-            const float ik = dk > 0.0f ? (127.0f / amax) : 0.0f;
-            const int pos = p0 + t;
-            const int slot = is_swa ? (pow2_cap ? (pos & cap_mask) : (pos % cap)) : pos;
-            const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
-            q_dst_base[q_off + tid] = (int8_t) __float2int_rn(val * ik);
-            if (tid == 0) {
-                const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
-                s_dst_base[s_off] = __float2half(dk);
+            if (active) {
+                const float amax = fmaxf(fmaxf(smem.a.s_red_am[t_sub][0], smem.a.s_red_am[t_sub][1]),
+                                         fmaxf(smem.a.s_red_am[t_sub][2], smem.a.s_red_am[t_sub][3]));
+                const float dk = amax / 127.0f;
+                const float ik = dk > 0.0f ? (127.0f / amax) : 0.0f;
+                const int pos = p0 + t;
+                const int slot = is_swa ? (pow2_cap ? (pos & cap_mask) : (pos % cap)) : pos;
+                const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
+                q_dst_base[q_off + c_loc] = (int8_t) __float2int_rn(val * ik);
+                if (c_loc == 0) {
+                    const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
+                    s_dst_base[s_off] = __float2half(dk);
+                }
+                if (hist_trace && t + 1 < T) {
+                    float* ht = hist_trace + (size_t) t * hist_trace_stride + (size_t) c_all * 3;
+                    ht[0] = h1; ht[1] = h2; ht[2] = x;
+                }
             }
         }
-        hc[0] = h0; hc[1] = h1; hc[2] = h2;
+        if (t_sub == 0) {
+            hc[0] = smem.a.s_seq[T + 0][c_loc];
+            hc[1] = smem.a.s_seq[T + 1][c_loc];
+            hc[2] = smem.a.s_seq[T + 2][c_loc];
+        }
         return;
     }
 
-    __shared__ float s_r[8][16];
-    __shared__ float s_sk[8];
+    const int warp = tid >> 5, lane = tid & 31;
+    constexpr int kWarps = SUB_T * 4;
     const int b = bid - 2 * n_head_kv;
     const int h = b / d_splits;
     const int ds = b % d_splits;
-    for (int t = warp; t < T; t += 4) {
+    for (int t = warp; t < T; t += kWarps) {
         float tau = 1.0f;
         if (apply_tau) {
             const float ratio = fmaxf(1.0f, (float) (p0 + t + 1) / (float) floor_n);
@@ -7742,8 +7784,8 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_smallT_fused(
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) rsq += __shfl_xor_sync(0xffffffffu, rsq, o);
         const float rfac = fminf(1.0f, rel_clip / (sqrtf(rsq) + 1e-6f)) * tau;
-        if (lane < 16) s_r[t][lane] = rval * rfac;
-        if (lane == 0) s_sk[t] = __ldg(&sink[(size_t) t * n_head + h]);
+        if (lane < 16) smem.b.s_r[t][lane] = rval * rfac;
+        if (lane == 0) smem.b.s_sk[t] = __ldg(&sink[(size_t) t * n_head + h]);
         if (ds == 0) {
             float4* q4 = reinterpret_cast<float4*>(Q + ((size_t) t * n_head + h) * 128);
             float4 v = q4[lane];
@@ -7763,19 +7805,19 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_smallT_fused(
     const int chunk = (max_d + d_splits - 1) / d_splits;
     const int d0 = ds * chunk;
     const int d1 = min(max_d, d0 + chunk);
-    for (int d = d0 + tid; d < d1; d += 128) {
+    for (int d = d0 + tid; d < d1; d += SUB_T * 128) {
         const float4* rb4 = reinterpret_cast<const float4*>(rel_bias + (size_t) d * 16);
         const float4 b0 = __ldg(rb4 + 0), b1 = __ldg(rb4 + 1), b2 = __ldg(rb4 + 2), b3 = __ldg(rb4 + 3);
 #pragma unroll 1
         for (int r = 0; r < T; ++r) {
             if (d <= p0 + r) {
-                const float4* sr4 = reinterpret_cast<const float4*>(s_r[r]);
+                const float4* sr4 = reinterpret_cast<const float4*>(smem.b.s_r[r]);
                 const float4 q0 = sr4[0], q1 = sr4[1], q2 = sr4[2], q3 = sr4[3];
                 const float dot = (q0.x * b0.x + q0.y * b0.y + q0.z * b0.z + q0.w * b0.w)
                                 + (q1.x * b1.x + q1.y * b1.y + q1.z * b1.z + q1.w * b1.w)
                                 + (q2.x * b2.x + q2.y * b2.y + q2.z * b2.z + q2.w * b2.w)
                                 + (q3.x * b3.x + q3.y * b3.y + q3.z * b3.z + q3.w * b3.w);
-                rel_tab[(((size_t) r * n_head + h) * n_ext) + d] = dot - s_sk[r];
+                rel_tab[(((size_t) r * n_head + h) * n_ext) + d] = dot - smem.b.s_sk[r];
             }
         }
     }

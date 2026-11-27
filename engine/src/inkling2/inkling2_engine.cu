@@ -3221,26 +3221,40 @@ struct Engine {
             if (T == 1) {
                 K::bf16_gemv_fp32_mmvf(X, wp, Y, K_in, N_out, st);
             } else if (T >= 2 && T <= 8 && (K_in % 4) == 0 && ((((uintptr_t) wp) & 7u) == 0u) && ((((uintptr_t) X) & 15u) == 0u)) {
+                auto launch_bf16_cta = [&](auto mt_tag) {
+                    constexpr int MT = decltype(mt_tag)::value;
+                    k_gemm_bf16_smallT_cta<MT, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, MT);
+                };
+                auto launch_bf16_warp = [&](auto mt_tag) {
+                    constexpr int MT = decltype(mt_tag)::value;
+                    const unsigned nb = (unsigned) ((N_out + 7) / 8);
+                    k_gemm_bf16_smallT_warp<MT, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, MT);
+                };
                 if (N_out <= 128) {
-                    if (T == 4) {
-                        k_gemm_bf16_smallT_cta<4, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 4);
-                    } else if (T == 2) {
-                        k_gemm_bf16_smallT_cta<2, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 2);
-                    } else if (T == 3) {
-                        k_gemm_bf16_smallT_cta<3, true><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 3);
-                    } else {
-                        k_gemm_bf16_smallT_cta<8, false><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    switch (T) {
+                        case 2: launch_bf16_cta(std::integral_constant<int, 2>{}); break;
+                        case 3: launch_bf16_cta(std::integral_constant<int, 3>{}); break;
+                        case 4: launch_bf16_cta(std::integral_constant<int, 4>{}); break;
+                        case 5: launch_bf16_cta(std::integral_constant<int, 5>{}); break;
+                        case 6: launch_bf16_cta(std::integral_constant<int, 6>{}); break;
+                        case 7: launch_bf16_cta(std::integral_constant<int, 7>{}); break;
+                        case 8: launch_bf16_cta(std::integral_constant<int, 8>{}); break;
+                        default: k_gemm_bf16_smallT_cta<8, false><<<(unsigned) N_out, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T); break;
                     }
                 } else {
-                    const unsigned nb = (unsigned) ((N_out + 7) / 8);
-                    if (T == 4) {
-                        k_gemm_bf16_smallT_warp<4, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 4);
-                    } else if (T == 2) {
-                        k_gemm_bf16_smallT_warp<2, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 2);
-                    } else if (T == 3) {
-                        k_gemm_bf16_smallT_warp<3, true><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, 3);
-                    } else {
-                        k_gemm_bf16_smallT_warp<8, false><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    switch (T) {
+                        case 2: launch_bf16_warp(std::integral_constant<int, 2>{}); break;
+                        case 3: launch_bf16_warp(std::integral_constant<int, 3>{}); break;
+                        case 4: launch_bf16_warp(std::integral_constant<int, 4>{}); break;
+                        case 5: launch_bf16_warp(std::integral_constant<int, 5>{}); break;
+                        case 6: launch_bf16_warp(std::integral_constant<int, 6>{}); break;
+                        case 7: launch_bf16_warp(std::integral_constant<int, 7>{}); break;
+                        case 8: launch_bf16_warp(std::integral_constant<int, 8>{}); break;
+                        default: {
+                            const unsigned nb = (unsigned) ((N_out + 7) / 8);
+                            k_gemm_bf16_smallT_warp<8, false><<<nb, 256, 0, st>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                            break;
+                        }
                     }
                 }
             } else if (T > 8 && N_out <= 64 && f16_ready != nullptr) {
@@ -6621,12 +6635,13 @@ struct Engine {
             }
             uint16_t& fg_hits = full_decode_graph_hits[T][capture_dspark ? 1 : 0][want_softcap ? 1 : 0][want_argmax ? 1 : 0][fg_sp_b];
             if (fg_hits < 65535u) ++fg_hits;
-            // Break-even 700-node cudaGraphInstantiate policy (~4.0 ms Inst+Destroy vs ~0.83 ms HostGap saved/replay -> break-even = 5 replays):
-            // capture primary hot sizes on hit #1 (T=1 OFF, T=4 when dm<=5, T=7 when dm>=6), and defer rare T or T=1 dspark until hit #6.
+            // Capture primary verify sizes (T=1 OFF, T=4 base, T=max verify) on hit #1, secondary verify T (2..9) on hit #2,
+            // and rare T=1 DSpark fallback on hit #3 to eliminate mid-generation cudaGraphInstantiate / uncaptured HostGaps.
             const bool want_capture_fg = (T == 1 && !capture_dspark) ||
-                                         (T == 4 && verify_max_t <= 5) ||
-                                         (T == 7 && verify_max_t >= 7) ||
-                                         (fg_hits >= 6);
+                                         (T == 4 && verify_max_t >= 4) ||
+                                         (T == std::min(verify_max_t, 9) && verify_max_t >= 2) ||
+                                         (T >= 2 && fg_hits >= 2) ||
+                                         (fg_hits >= 3);
             if (want_capture_fg) {
                 if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
                     capturing_full_graph = true;
@@ -8128,17 +8143,31 @@ struct Engine {
                     fuse_sink_pre_attn ? in_q : nullptr, fuse_sink_pre_attn ? N : 0,
                     kv_paired, q_split_ctas);
             } else if (fused_pre_attn_smallT) {
-                const int d_splits = (max_rel > 512) ? 4 : 2;
-                const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
-                k_pre_attn_smallT_fused<<<n_ctas, 128, 0, st>>>(
-                    pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
-                    hst, cur_kq, cur_ks, cur_vq, cur_vs,
-                    pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
-                    L.attn_rel_bias, sink, rel_tab,
-                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, max_rel,
-                    cur_kv_cap, is_swa ? 1 : 0, hp.rms_eps, apply_tau, pos0_d,
-                    (int) hp.log_scale_floor, hp.log_scale_alpha, T, d_splits,
-                    h_tr, total_conv_floats);
+                if (T <= 2) {
+                    const int d_splits = (max_rel > 1024) ? 4 : ((max_rel > 512) ? 2 : 1);
+                    const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
+                    k_pre_attn_smallT_fused<2><<<n_ctas, 256, 0, st>>>(
+                        pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                        hst, cur_kq, cur_ks, cur_vq, cur_vs,
+                        pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
+                        L.attn_rel_bias, sink, rel_tab,
+                        (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, max_rel,
+                        cur_kv_cap, is_swa ? 1 : 0, hp.rms_eps, apply_tau, pos0_d,
+                        (int) hp.log_scale_floor, hp.log_scale_alpha, T, d_splits,
+                        h_tr, total_conv_floats);
+                } else {
+                    const int d_splits = (max_rel > 1024) ? 2 : 1;
+                    const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
+                    k_pre_attn_smallT_fused<4><<<n_ctas, 512, 0, st>>>(
+                        pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                        hst, cur_kq, cur_ks, cur_vq, cur_vs,
+                        pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
+                        L.attn_rel_bias, sink, rel_tab,
+                        (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, max_rel,
+                        cur_kv_cap, is_swa ? 1 : 0, hp.rms_eps, apply_tau, pos0_d,
+                        (int) hp.log_scale_floor, hp.log_scale_alpha, T, d_splits,
+                        h_tr, total_conv_floats);
+                }
             } else {
             const bool fused_kv_q8 = (T < 32 && kv_q8 && hp.head_dim == 128);
             if (fused_kv_q8) {
@@ -9048,9 +9077,9 @@ struct Engine {
                 if (!use_t1_core && !cg) {
                     uint16_t& vc_hits = verify_core_graph_hits[T][fg_sp_b];
                     if (vc_hits < 65535u) ++vc_hits;
-                    want_capture_cg = (T == 4 && verify_max_t <= 5) ||
-                                      (T == 7 && verify_max_t >= 7) ||
-                                      (vc_hits >= 6);
+                    want_capture_cg = (T == 4 && verify_max_t >= 4) ||
+                                      (T == std::min(verify_max_t, 9) && verify_max_t >= 2) ||
+                                      (vc_hits >= 2);
                 }
                 if (!cg && want_capture_cg && !graph_oom) {
                     const auto saved_nb = norm_blocks;
@@ -9120,9 +9149,9 @@ struct Engine {
             if (use_vf_pre_graph && !pre_vec[(size_t) il]) {
                 uint16_t& vp_hits = verify_pre_graph_hits[T][(size_t) il];
                 if (vp_hits < 65535u) ++vp_hits;
-                want_capture_pre = (T == 4 && verify_max_t <= 5) ||
-                                   (T == 7 && verify_max_t >= 7) ||
-                                   (vp_hits >= 6);
+                want_capture_pre = (T == 4 && verify_max_t >= 4) ||
+                                   (T == std::min(verify_max_t, 9) && verify_max_t >= 2) ||
+                                   (vp_hits >= 2);
             }
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (pre_vec[(size_t) il] || (want_capture_pre && !graph_oom))) {
@@ -11275,6 +11304,20 @@ int run(int argc, char** argv) {
                     E.forward(wv.data(), 1 + wk, false, nullptr, false, true, wk, &wp, true, false);
                     E.commit_verify(0, wk, wp0);
                     dspark->inject(E, wp0, 1);
+                }
+                if (!E.hybrid && E.core_all_gpu && E.full_kv_cap == E.ctx && !E.prof && !E.prof_detail && !E.graph_oom) {
+                    const int t_cap = std::min(std::min(E.verify_max_t, 9), 1 + w_max_k);
+                    std::vector<int32_t> wv_warm((size_t) t_cap, w);
+                    std::vector<int32_t> wp_warm;
+                    for (int t_w = 2; t_w <= t_cap; ++t_w) {
+                        const int n_warm = (t_w == 4 || t_w == std::min(E.verify_max_t, 9)) ? 1 : 2;
+                        for (int pass_w = 0; pass_w < n_warm && E.pos + t_w <= E.ctx; ++pass_w) {
+                            const int wp_w = (int) E.pos;
+                            E.forward(wv_warm.data(), t_w, false, nullptr, false, true, t_w - 1, &wp_warm, true, false);
+                            E.commit_verify(t_w - 1, t_w - 1, wp_w);
+                            dspark->inject(E, wp_w, t_w);
+                        }
+                    }
                 }
                 if (E.in_decode_phase) E.set_phase_prefill();
             } else {
