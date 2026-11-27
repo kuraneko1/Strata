@@ -8099,18 +8099,34 @@ struct Engine {
                 moe_raw_zero_pending = true;
             };
             if (fused_pre_attn_t1) {
-                const int d_splits = (max_rel > 512) ? 4 : 2;
-                const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
+                const int n_kv_h = (int) hp.n_head_kv;
+                const int n_h = (int) hp.n_head;
+                int kv_paired = 0;
+                int q_split_ctas = 0;
+                int d_splits = (max_rel > 512) ? 4 : 2;
+                if (n_kv_h > 0 && n_h > 0) {
+                    if (sm_count >= n_kv_h + n_h && ((sm_count - n_kv_h) % n_h) == 0) {
+                        kv_paired = 1;
+                        d_splits = (sm_count - n_kv_h) / n_h;
+                    } else if ((n_h % 3) == 0 && sm_count >= 2 * n_kv_h + (n_h / 3) + n_h &&
+                               ((sm_count - 2 * n_kv_h - (n_h / 3)) % n_h) == 0) {
+                        q_split_ctas = n_h / 3;
+                        d_splits = (sm_count - 2 * n_kv_h - q_split_ctas) / n_h;
+                    }
+                }
+                const int n_kv_ctas = kv_paired ? n_kv_h : (2 * n_kv_h);
+                const unsigned n_ctas = (unsigned) (n_kv_ctas + q_split_ctas + n_h * d_splits);
                 k_pre_attn_t1_fused<<<n_ctas, 128, 0, st>>>(
                     pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
                     hst, cur_kq, cur_ks, cur_vq, cur_vs,
                     pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
                     L.attn_rel_bias, sink, rel_tab,
-                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, max_rel,
+                    n_h, n_kv_h, (int) hp.n_rel_ext, max_rel,
                     cur_kv_cap, is_swa ? 1 : 0, hp.rms_eps, apply_tau, pos0_d,
                     (int) hp.log_scale_floor, hp.log_scale_alpha, d_splits,
                     fuse_sink_pre_attn ? (const uint16_t*) L.attn_sink_proj.d : nullptr,
-                    fuse_sink_pre_attn ? in_q : nullptr, fuse_sink_pre_attn ? N : 0);
+                    fuse_sink_pre_attn ? in_q : nullptr, fuse_sink_pre_attn ? N : 0,
+                    kv_paired, q_split_ctas);
             } else if (fused_pre_attn_smallT) {
                 const int d_splits = (max_rel > 512) ? 4 : 2;
                 const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
@@ -8881,7 +8897,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(h_h, in_ffn, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
                 if (T == 1 && hp.n_expert <= 128 && Kp <= 16 && (N & 3) == 0 && d_router_done != nullptr) {
                     const bool has_g = L.n_slots > 0;
-                    k_router_gemv_and_group_t1<<<(unsigned) ((hp.n_expert + 1) / 2), 192, 0, st>>>(
+                    k_router_gemv_and_group_t1<1><<<(unsigned) hp.n_expert, 128, 0, st>>>(
                         L.ffn_gate_inp, in_ffn, router_logits, L.exp_probs_b, ids, ewts,
                         has_g ? L.d_slot_of : nullptr, has_g ? L.d_blobs : nullptr, L.stride,
                         N, (int) hp.n_expert, Kp, hp.expert_weights_scale,

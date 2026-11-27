@@ -7356,9 +7356,11 @@ __global__ void k_shortconv_kv_clip_norm_store_q8(
 }
 
 /// Fused T=1 pre-attention super-kernel (kv_q8, head_dim=128, n_rel=16, !save_conv_trace):
-/// Combines k_shortconv_kv_clip_norm_store_q8 (16 CTAs) + k_clip_and_tau_qr (24 heads) + k_rel_table_split (24*d_splits CTAs)
+/// Combines k_shortconv_kv_clip_norm_store_q8 + k_clip_and_tau_qr + k_rel_table_split (+ optional bf16 sink GEMV)
 /// into 1 single kernel launch (-2 launches & -2 serial GPU pipeline drains on all 48 layers!).
-/// Grid = (2 * n_head_kv + n_head * d_splits), block = 128.
+/// Supports kv_paired (8 paired K+V CTAs vs 16 unpaired) and optional q_split_ctas (dedicated Q-clip CTAs)
+/// to cleanly fill 80 SMs (V100: 8+72=80), 72 SMs (PG500: 16+8+48=72), and 128 SMs (4090: 8+120=128).
+/// Rel CTAs overlap Q-clip (warp 1, float4) with R-clip/sink (warp 0) and use 4-threads/row coalesced rel_bias loads.
 __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
     const float* __restrict__ K, const float* __restrict__ V,
     const float* __restrict__ wk, const float* __restrict__ wv,
@@ -7371,65 +7373,161 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
     const float* __restrict__ rel_bias, float* __restrict__ sink, float* __restrict__ rel_tab,
     int n_head, int n_head_kv, int n_ext, int max_rel, int cap, int is_swa,
     float rms_eps, int apply_tau, const int32_t* __restrict__ pos0, int floor_n, float alpha, int d_splits,
-    const uint16_t* __restrict__ w_sink_bf16 = nullptr, const float* __restrict__ in_q_sink = nullptr, int n_embd_sink = 0) {
+    const uint16_t* __restrict__ w_sink_bf16 = nullptr, const float* __restrict__ in_q_sink = nullptr, int n_embd_sink = 0,
+    int kv_paired = 0, int q_split_ctas = 0) {
     const int bid = (int) blockIdx.x;
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
-    const int p0 = pos0[0];
-    if (bid < 2 * n_head_kv) {
-        __shared__ float s_red[4];
-        const bool is_v = (bid >= n_head_kv);
-        const int hkv = is_v ? (bid - n_head_kv) : bid;
+    const int p0 = __ldg(pos0);
+    const int n_kv_ctas = kv_paired ? n_head_kv : (2 * n_head_kv);
+    if (bid < n_kv_ctas) {
         const int kv_dim = n_head_kv * 128;
-        const int c = hkv * 128 + tid;
-        const int c_all = is_v ? (kv_dim + c) : c;
-        const float* cur = is_v ? V : K;
-        const float* dyn = is_v ? dyn_v : dyn_k;
-        float* hc = hist + (size_t) c_all * 3;
-        const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
-        const float4 w4 = *reinterpret_cast<const float4*>((is_v ? wv : wk) + (size_t) c * 4);
-        const float conv_scale = rsqrtf(dyn ? 9.0f : 5.0f);
-        const float x = cur[c];
-        float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
-        if (dyn) {
-            const float* dt = dyn + (size_t) hkv * 4;
-            s += x * dt[0] + h2 * dt[1] + h1 * dt[2] + h0 * dt[3];
-        }
-        float val = (x + s) * conv_scale;
-        hc[0] = h1; hc[1] = h2; hc[2] = x;
-        float sq = val * val;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
-        if (lane == 0) s_red[warp] = sq;
-        __syncthreads();
-        const float tot_sq = s_red[0] + s_red[1] + s_red[2] + s_red[3];
-        const float fac = is_v ? rsqrtf(tot_sq / 128.0f + rms_eps) : fminf(1.0f, qk_clip / (sqrtf(tot_sq) + 1e-6f));
-        val *= fac;
-        float am = fabsf(val);
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
-        __syncthreads();
-        if (lane == 0) s_red[warp] = am;
-        __syncthreads();
-        const float amax = fmaxf(fmaxf(s_red[0], s_red[1]), fmaxf(s_red[2], s_red[3]));
-        const float dk = amax / 127.0f;
-        const float ik = dk > 0.0f ? (127.0f / amax) : 0.0f;
         const bool pow2_cap = (cap & (cap - 1)) == 0;
         const int slot = is_swa ? (pow2_cap ? (p0 & (cap - 1)) : (p0 % cap)) : p0;
-        const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
-        (is_v ? vq : kq)[q_off + tid] = (int8_t) __float2int_rn(val * ik);
-        if (tid == 0) {
-            const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
-            (is_v ? vs : ks)[s_off] = __float2half(dk);
+        if (kv_paired) {
+            __shared__ float s_sq_k[4], s_sq_v[4], s_am_k[4], s_am_v[4];
+            const int hkv = bid;
+            const int c = hkv * 128 + tid;
+            float* hck = hist + (size_t) c * 3;
+            float* hcv = hist + (size_t) (kv_dim + c) * 3;
+            const float kh0 = hck[0], kh1 = hck[1], kh2 = hck[2];
+            const float vh0 = hcv[0], vh1 = hcv[1], vh2 = hcv[2];
+            const float4 wk4 = __ldg(reinterpret_cast<const float4*>(wk + (size_t) c * 4));
+            const float4 wv4 = __ldg(reinterpret_cast<const float4*>(wv + (size_t) c * 4));
+            const float kx = __ldg(K + c);
+            const float vx = __ldg(V + c);
+            float sk = kh0 * wk4.x + kh1 * wk4.y + kh2 * wk4.z + kx * wk4.w;
+            float sv = vh0 * wv4.x + vh1 * wv4.y + vh2 * wv4.z + vx * wv4.w;
+            if (dyn_k) {
+                const float4 dtk = __ldg(reinterpret_cast<const float4*>(dyn_k + (size_t) hkv * 4));
+                sk += kx * dtk.x + kh2 * dtk.y + kh1 * dtk.z + kh0 * dtk.w;
+            }
+            if (dyn_v) {
+                const float4 dtv = __ldg(reinterpret_cast<const float4*>(dyn_v + (size_t) hkv * 4));
+                sv += vx * dtv.x + vh2 * dtv.y + vh1 * dtv.z + vh0 * dtv.w;
+            }
+            float kval = (kx + sk) * rsqrtf(dyn_k ? 9.0f : 5.0f);
+            float vval = (vx + sv) * rsqrtf(dyn_v ? 9.0f : 5.0f);
+            hck[0] = kh1; hck[1] = kh2; hck[2] = kx;
+            hcv[0] = vh1; hcv[1] = vh2; hcv[2] = vx;
+            float ksq = kval * kval, vsq = vval * vval;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                ksq += __shfl_xor_sync(0xffffffffu, ksq, o);
+                vsq += __shfl_xor_sync(0xffffffffu, vsq, o);
+            }
+            if (lane == 0) {
+                s_sq_k[warp] = ksq;
+                s_sq_v[warp] = vsq;
+            }
+            __syncthreads();
+            const float ktot_sq = s_sq_k[0] + s_sq_k[1] + s_sq_k[2] + s_sq_k[3];
+            const float vtot_sq = s_sq_v[0] + s_sq_v[1] + s_sq_v[2] + s_sq_v[3];
+            kval *= fminf(1.0f, qk_clip / (sqrtf(ktot_sq) + 1e-6f));
+            vval *= rsqrtf(vtot_sq / 128.0f + rms_eps);
+            float kam = fabsf(kval), vam = fabsf(vval);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                kam = fmaxf(kam, __shfl_xor_sync(0xffffffffu, kam, o));
+                vam = fmaxf(vam, __shfl_xor_sync(0xffffffffu, vam, o));
+            }
+            if (lane == 0) {
+                s_am_k[warp] = kam;
+                s_am_v[warp] = vam;
+            }
+            __syncthreads();
+            const float kamax = fmaxf(fmaxf(s_am_k[0], s_am_k[1]), fmaxf(s_am_k[2], s_am_k[3]));
+            const float vamax = fmaxf(fmaxf(s_am_v[0], s_am_v[1]), fmaxf(s_am_v[2], s_am_v[3]));
+            const float kdk = kamax / 127.0f;
+            const float vdk = vamax / 127.0f;
+            const float kik = kdk > 0.0f ? (127.0f / kamax) : 0.0f;
+            const float vik = vdk > 0.0f ? (127.0f / vamax) : 0.0f;
+            const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
+            kq[q_off + tid] = (int8_t) __float2int_rn(kval * kik);
+            vq[q_off + tid] = (int8_t) __float2int_rn(vval * vik);
+            if (tid == 0) {
+                const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
+                ks[s_off] = __float2half(kdk);
+                vs[s_off] = __float2half(vdk);
+            }
+        } else {
+            __shared__ float s_sq[4], s_am[4];
+            const bool is_v = (bid >= n_head_kv);
+            const int hkv = is_v ? (bid - n_head_kv) : bid;
+            const int c = hkv * 128 + tid;
+            const int c_all = is_v ? (kv_dim + c) : c;
+            const float* cur = is_v ? V : K;
+            const float* dyn = is_v ? dyn_v : dyn_k;
+            float* hc = hist + (size_t) c_all * 3;
+            const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+            const float4 w4 = __ldg(reinterpret_cast<const float4*>((is_v ? wv : wk) + (size_t) c * 4));
+            const float conv_scale = rsqrtf(dyn ? 9.0f : 5.0f);
+            const float x = __ldg(cur + c);
+            float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+            if (dyn) {
+                const float4 dt = __ldg(reinterpret_cast<const float4*>(dyn + (size_t) hkv * 4));
+                s += x * dt.x + h2 * dt.y + h1 * dt.z + h0 * dt.w;
+            }
+            float val = (x + s) * conv_scale;
+            hc[0] = h1; hc[1] = h2; hc[2] = x;
+            float sq = val * val;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+            if (lane == 0) s_sq[warp] = sq;
+            __syncthreads();
+            const float tot_sq = s_sq[0] + s_sq[1] + s_sq[2] + s_sq[3];
+            const float fac = is_v ? rsqrtf(tot_sq / 128.0f + rms_eps) : fminf(1.0f, qk_clip / (sqrtf(tot_sq) + 1e-6f));
+            val *= fac;
+            float am = fabsf(val);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            if (lane == 0) s_am[warp] = am;
+            __syncthreads();
+            const float amax = fmaxf(fmaxf(s_am[0], s_am[1]), fmaxf(s_am[2], s_am[3]));
+            const float dk = amax / 127.0f;
+            const float ik = dk > 0.0f ? (127.0f / amax) : 0.0f;
+            const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
+            (is_v ? vq : kq)[q_off + tid] = (int8_t) __float2int_rn(val * ik);
+            if (tid == 0) {
+                const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
+                (is_v ? vs : ks)[s_off] = __float2half(dk);
+            }
         }
         return;
     }
 
-    __shared__ float s_r[16];
+    if (bid < n_kv_ctas + q_split_ctas) {
+        const int hpb = n_head / q_split_ctas;
+        if (warp < hpb) {
+            const int h = (bid - n_kv_ctas) * hpb + warp;
+            if (h < n_head) {
+                float tau = 1.0f;
+                if (apply_tau) {
+                    const float ratio = fmaxf(1.0f, (float) (p0 + 1) / (float) floor_n);
+                    tau = 1.0f + alpha * logf(ratio);
+                }
+                float4* q4 = reinterpret_cast<float4*>(Q + (size_t) h * 128);
+                float4 v = q4[lane];
+                if (q_scale) {
+                    const float4 sc = __ldg(reinterpret_cast<const float4*>(q_scale + (size_t) h * 128) + lane);
+                    v.x *= sc.x; v.y *= sc.y; v.z *= sc.z; v.w *= sc.w;
+                }
+                float sq = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+                const float fac = fminf(1.0f, qk_clip / (sqrtf(sq) + 1e-6f)) * tau;
+                q4[lane] = make_float4(v.x * fac, v.y * fac, v.z * fac, v.w * fac);
+            }
+        }
+        return;
+    }
+
+    __shared__ __align__(16) float s_r[16];
     __shared__ float s_sk;
     __shared__ float s_sp[8];
-    const int b = bid - 2 * n_head_kv;
+    const int b = bid - (n_kv_ctas + q_split_ctas);
     const int h = b / d_splits;
+    if (h >= n_head) return;
     const int ds = b % d_splits;
     if (w_sink_bf16 && in_q_sink && n_embd_sink > 0) {
         // Bit-exact match to bf16_f32_mmvf_kernel<256> using 128 threads x 2 virtual halves (t, t+128)!
@@ -7459,17 +7557,19 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
             s_sp[4 + warp] = acc_hi;
         }
         __syncthreads();
-        if (warp == 0) {
+    }
+    if (warp == 0) {
+        if (w_sink_bf16 && in_q_sink && n_embd_sink > 0) {
             float v = (lane < 8) ? s_sp[lane] : 0.0f;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
             if (lane == 0) {
                 s_sk = v;
                 if (ds == 0) sink[h] = v;
             }
+        } else if (lane == 0) {
+            s_sk = __ldg(&sink[h]);
         }
-    }
-    if (warp == 0) {
         float tau = 1.0f;
         if (apply_tau) {
             const float ratio = fmaxf(1.0f, (float) (p0 + 1) / (float) floor_n);
@@ -7480,7 +7580,7 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
         float rval = 0.0f;
         if (lane < 16) {
             rval = rv[lane];
-            if (r_scale) rval *= r_scale[(size_t) h * 16 + lane];
+            if (r_scale) rval *= __ldg(r_scale + (size_t) h * 16 + lane);
         }
         float rsq = rval * rval;
 #pragma unroll
@@ -7491,45 +7591,49 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
             s_r[lane] = rc;
             if (ds == 0) rv[lane] = rc;
         }
-        if (!w_sink_bf16 && lane == 0) s_sk = sink[h];
-        // ds == 0 also clips Q[h][0..127] in-place (exact match to k_clip_and_tau_qr)
-        if (ds == 0) {
-            float* qv = Q + (size_t) h * 128;
-            float qvals[4], qsq = 0.0f;
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const int i = k * 32 + lane;
-                float val = qv[i];
-                if (q_scale) val *= q_scale[(size_t) h * 128 + i];
-                qvals[k] = val;
-                qsq += val * val;
-            }
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) qsq += __shfl_xor_sync(0xffffffffu, qsq, o);
-            const float qfac = fminf(1.0f, qk_clip / (sqrtf(qsq) + 1e-6f)) * tau;
-#pragma unroll
-            for (int k = 0; k < 4; ++k) qv[k * 32 + lane] = qvals[k] * qfac;
+    } else if (q_split_ctas == 0 && ds == 0 && warp == 1) {
+        // Overlap Q[h][0..127] float4 clip with warp 0's R-clip & sink reduction!
+        float tau = 1.0f;
+        if (apply_tau) {
+            const float ratio = fmaxf(1.0f, (float) (p0 + 1) / (float) floor_n);
+            tau = 1.0f + alpha * logf(ratio);
         }
+        float4* q4 = reinterpret_cast<float4*>(Q + (size_t) h * 128);
+        float4 v = q4[lane];
+        if (q_scale) {
+            const float4 sc = __ldg(reinterpret_cast<const float4*>(q_scale + (size_t) h * 128) + lane);
+            v.x *= sc.x; v.y *= sc.y; v.z *= sc.z; v.w *= sc.w;
+        }
+        float qsq = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) qsq += __shfl_xor_sync(0xffffffffu, qsq, o);
+        const float qfac = fminf(1.0f, qk_clip / (sqrtf(qsq) + 1e-6f)) * tau;
+        q4[lane] = make_float4(v.x * qfac, v.y * qfac, v.z * qfac, v.w * qfac);
     }
     __syncthreads();
-    const float4 q0 = reinterpret_cast<const float4*>(s_r)[0];
-    const float4 q1 = reinterpret_cast<const float4*>(s_r)[1];
-    const float4 q2 = reinterpret_cast<const float4*>(s_r)[2];
-    const float4 q3 = reinterpret_cast<const float4*>(s_r)[3];
+    const int g_cta = tid >> 2;
+    const int c = tid & 3;
+    const float4 qc = reinterpret_cast<const float4*>(s_r)[c];
     const float sk = s_sk;
     const int max_d = min(min(n_ext, max_rel), p0 + 1);
     const int chunk = (max_d + d_splits - 1) / d_splits;
     const int d0 = ds * chunk;
     const int d1 = min(max_d, d0 + chunk);
+    const float4* rb4_base = reinterpret_cast<const float4*>(rel_bias);
     float* dst = rel_tab + (size_t) h * n_ext;
-    for (int d = d0 + tid; d < d1; d += blockDim.x) {
-        const float4* rb4 = reinterpret_cast<const float4*>(rel_bias + (size_t) d * 16);
-        const float4 b0 = rb4[0], b1 = rb4[1], b2 = rb4[2], b3 = rb4[3];
-        const float dot = (q0.x * b0.x + q0.y * b0.y + q0.z * b0.z + q0.w * b0.w)
-                        + (q1.x * b1.x + q1.y * b1.y + q1.z * b1.z + q1.w * b1.w)
-                        + (q2.x * b2.x + q2.y * b2.y + q2.z * b2.z + q2.w * b2.w)
-                        + (q3.x * b3.x + q3.y * b3.y + q3.z * b3.z + q3.w * b3.w);
-        dst[d] = dot - sk;
+    for (int d_off = d0; d_off < d1; d_off += 32) {
+        const int d = d_off + g_cta;
+        float part = 0.0f;
+        if (d < d1) {
+            const float4 bc = __ldg(rb4_base + (size_t) d * 4 + c);
+            part = qc.x * bc.x + qc.y * bc.y + qc.z * bc.z + qc.w * bc.w;
+        }
+        const float p1 = __shfl_xor_sync(0xffffffffu, part, 1);
+        const float p2 = __shfl_xor_sync(0xffffffffu, part, 2);
+        const float p3 = __shfl_xor_sync(0xffffffffu, part, 3);
+        if (c == 0 && d < d1) {
+            dst[d] = (((part + p1) + p2) + p3) - sk;
+        }
     }
 }
 
@@ -17058,13 +17162,14 @@ __global__ void k_route_inkling2(const float* __restrict__ logits, const float* 
     }
 }
 
-/// Fused T=1 Router GEMV (64 CTAs x 192 thr, 2 rows/CTA) + Warp Top-K Route + Group (1 single launch, STACK:0, CUDA-Graph safe!).
-/// Exact 576/192=3 float4 iters for N==2304 (0 tail divergence), 6 warps/SM latency hiding, REG<=56 (down from 128),
-/// eliminates 2nd __syncthreads() (warps 1..5 exit immediately), uses v2.f32 relaxed store + v4.f32 relaxed load!
+/// Fused T=1 Router GEMV (ROWS_PER_CTA=1: 128 CTAs x 128 thr for full SM fill; ROWS_PER_CTA=2: 64 CTAs x 192 thr)
+/// + Warp Top-K Route + Group (1 single launch, STACK:0, CUDA-Graph safe!).
+/// Uses PTX relaxed global stores + atom.acq_rel.gpu completion barrier + SMEM s_all_p (2 shuffles/iter) + coalesced ids/ewts stores.
+template <int ROWS_PER_CTA = 2>
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
-__global__ void __launch_bounds__(192, 6) k_router_gemv_and_group_t1(
+__global__ void __launch_bounds__((ROWS_PER_CTA == 1) ? 128 : 192, (ROWS_PER_CTA == 1) ? 8 : 6) k_router_gemv_and_group_t1(
 #else
-__global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
+__global__ void __launch_bounds__((ROWS_PER_CTA == 1) ? 128 : 192, (ROWS_PER_CTA == 1) ? 7 : 5) k_router_gemv_and_group_t1(
 #endif
     const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ logits,
     const float* __restrict__ bias, int32_t* __restrict__ ids, float* __restrict__ ewts,
@@ -17073,43 +17178,73 @@ __global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
     unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
     int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
     int32_t* __restrict__ ent_tok, uint32_t* __restrict__ d_hits, uint32_t* __restrict__ d_done) {
-    __shared__ float sh0[6], sh1[6];
-    const int o0 = (int) blockIdx.x * 2;
+    constexpr int BLK = (ROWS_PER_CTA == 1) ? 128 : 192;
+    constexpr int NWARPS = BLK >> 5;
+    __shared__ float sh0[NWARPS];
+    __shared__ float sh1[(ROWS_PER_CTA == 1) ? 1 : NWARPS];
+    const int o0 = (ROWS_PER_CTA == 1) ? (int) blockIdx.x : ((int) blockIdx.x * 2);
     if (o0 >= n_exp) return;
     const int o1 = o0 + 1;
-    const bool has1 = (o1 < n_exp);
+    const bool has1 = (ROWS_PER_CTA == 2) && (o1 < n_exp);
     const float4* wr0 = reinterpret_cast<const float4*>(W + (size_t) o0 * n_in);
     const float4* wr1 = has1 ? reinterpret_cast<const float4*>(W + (size_t) o1 * n_in) : wr0;
     const float4* xr = reinterpret_cast<const float4*>(x);
     const int tid = threadIdx.x;
     float acc0 = 0.0f, acc1 = 0.0f;
     const int n4 = n_in >> 2;
-    if (n4 == 576) {
-        const float4 b0 = __ldg(xr + tid);
-        const float4 a00 = __ldg(wr0 + tid);
-        const float4 b1 = __ldg(xr + tid + 192);
-        const float4 a01 = __ldg(wr0 + tid + 192);
-        const float4 b2 = __ldg(xr + tid + 384);
-        const float4 a02 = __ldg(wr0 + tid + 384);
-        acc0 = (a00.x * b0.x + a00.y * b0.y + a00.z * b0.z + a00.w * b0.w)
-             + (a01.x * b1.x + a01.y * b1.y + a01.z * b1.z + a01.w * b1.w)
-             + (a02.x * b2.x + a02.y * b2.y + a02.z * b2.z + a02.w * b2.w);
-        if (has1) {
-            const float4 a10 = __ldg(wr1 + tid);
-            const float4 a11 = __ldg(wr1 + tid + 192);
-            const float4 a12 = __ldg(wr1 + tid + 384);
-            acc1 = (a10.x * b0.x + a10.y * b0.y + a10.z * b0.z + a10.w * b0.w)
-                 + (a11.x * b1.x + a11.y * b1.y + a11.z * b1.z + a11.w * b1.w)
-                 + (a12.x * b2.x + a12.y * b2.y + a12.z * b2.z + a12.w * b2.w);
+    if (ROWS_PER_CTA == 1) {
+        if (n4 == 576) {
+#pragma unroll 1
+            for (int k = 0; k < 4; k += 2) {
+                const int idx0 = tid + k * 128;
+                const int idx1 = idx0 + 128;
+                const float4 b0 = __ldg(xr + idx0);
+                const float4 a0 = __ldg(wr0 + idx0);
+                const float4 b1 = __ldg(xr + idx1);
+                const float4 a1 = __ldg(wr0 + idx1);
+                acc0 += (a0.x * b0.x + a0.y * b0.y + a0.z * b0.z + a0.w * b0.w)
+                      + (a1.x * b1.x + a1.y * b1.y + a1.z * b1.z + a1.w * b1.w);
+            }
+            if (tid < 64) {
+                const float4 b4 = __ldg(xr + tid + 512);
+                const float4 a4 = __ldg(wr0 + tid + 512);
+                acc0 += a4.x * b4.x + a4.y * b4.y + a4.z * b4.z + a4.w * b4.w;
+            }
+        } else {
+            for (int i = tid; i < n4; i += BLK) {
+                const float4 b = __ldg(xr + i);
+                const float4 a0 = __ldg(wr0 + i);
+                acc0 += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+            }
         }
     } else {
-        for (int i = tid; i < n4; i += 192) {
-            const float4 b = __ldg(xr + i);
-            const float4 a0 = __ldg(wr0 + i);
-            acc0 += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+        if (n4 == 576) {
+            const float4 b0 = __ldg(xr + tid);
+            const float4 a00 = __ldg(wr0 + tid);
+            const float4 a10 = has1 ? __ldg(wr1 + tid) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float4 b1 = __ldg(xr + tid + 192);
+            const float4 a01 = __ldg(wr0 + tid + 192);
+            const float4 a11 = has1 ? __ldg(wr1 + tid + 192) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float4 b2 = __ldg(xr + tid + 384);
+            const float4 a02 = __ldg(wr0 + tid + 384);
+            const float4 a12 = has1 ? __ldg(wr1 + tid + 384) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            acc0 = (a00.x * b0.x + a00.y * b0.y + a00.z * b0.z + a00.w * b0.w)
+                 + (a01.x * b1.x + a01.y * b1.y + a01.z * b1.z + a01.w * b1.w)
+                 + (a02.x * b2.x + a02.y * b2.y + a02.z * b2.z + a02.w * b2.w);
             if (has1) {
-                const float4 a1 = __ldg(wr1 + i);
-                acc1 += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
+                acc1 = (a10.x * b0.x + a10.y * b0.y + a10.z * b0.z + a10.w * b0.w)
+                     + (a11.x * b1.x + a11.y * b1.y + a11.z * b1.z + a11.w * b1.w)
+                     + (a12.x * b2.x + a12.y * b2.y + a12.z * b2.z + a12.w * b2.w);
+            }
+        } else {
+            for (int i = tid; i < n4; i += BLK) {
+                const float4 b = __ldg(xr + i);
+                const float4 a0 = __ldg(wr0 + i);
+                acc0 += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+                if (has1) {
+                    const float4 a1 = __ldg(wr1 + i);
+                    acc1 += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
+                }
             }
         }
     }
@@ -17117,22 +17252,25 @@ __global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
-        acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
+        if (ROWS_PER_CTA == 2) acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
     }
-    if (lane == 0) { sh0[warp] = acc0; sh1[warp] = acc1; }
+    if (lane == 0) {
+        sh0[warp] = acc0;
+        if (ROWS_PER_CTA == 2) sh1[warp] = acc1;
+    }
     __syncthreads();
     if (warp != 0) return;
 
-    acc0 = (lane < 6) ? sh0[lane] : 0.0f;
-    acc1 = (lane < 6) ? sh1[lane] : 0.0f;
+    acc0 = (lane < NWARPS) ? sh0[lane] : 0.0f;
+    if (ROWS_PER_CTA == 2) acc1 = (lane < NWARPS) ? sh1[lane] : 0.0f;
 #pragma unroll
-    for (int o = 4; o > 0; o >>= 1) {
+    for (int o = (ROWS_PER_CTA == 1) ? 2 : 4; o > 0; o >>= 1) {
         acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
-        acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
+        if (ROWS_PER_CTA == 2) acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
     }
     int is_last = 0;
     if (lane == 0) {
-        const uint32_t expected_ctas = (uint32_t) ((n_exp + 1) >> 1);
+        const uint32_t expected_ctas = (ROWS_PER_CTA == 1) ? (uint32_t) n_exp : (uint32_t) ((n_exp + 1) >> 1);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         if (has1) {
             asm volatile("st.relaxed.gpu.global.v2.f32 [%0], {%1, %2};" :: "l"(logits + o0), "f"(acc0), "f"(acc1) : "memory");
@@ -17161,8 +17299,8 @@ __global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
     if (!is_last) return;
 
     __shared__ int32_t s_e[16];
-    __shared__ float s_p[16];
-    float p[4], s[4];
+    __shared__ __align__(16) float s_all_p[128];
+    float s[4];
     const bool vec4_exp = ((n_exp & 3) == 0);
     const int e0 = lane << 2;
     if (vec4_exp) {
@@ -17177,12 +17315,13 @@ __global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
                               __ldcg(logits + e0 + 2), __ldcg(logits + e0 + 3));
 #endif
             const float4 b4 = bias ? __ldg(reinterpret_cast<const float4*>(bias + e0)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            p[0] = sigmf(lg4.x); s[0] = p[0] + b4.x;
-            p[1] = sigmf(lg4.y); s[1] = p[1] + b4.y;
-            p[2] = sigmf(lg4.z); s[2] = p[2] + b4.z;
-            p[3] = sigmf(lg4.w); s[3] = p[3] + b4.w;
+            const float4 pv = make_float4(sigmf(lg4.x), sigmf(lg4.y), sigmf(lg4.z), sigmf(lg4.w));
+            reinterpret_cast<float4*>(s_all_p)[lane] = pv;
+            s[0] = pv.x + b4.x;
+            s[1] = pv.y + b4.y;
+            s[2] = pv.z + b4.z;
+            s[3] = pv.w + b4.w;
         } else {
-            p[0] = p[1] = p[2] = p[3] = 0.0f;
             s[0] = s[1] = s[2] = s[3] = -1e30f;
         }
     } else {
@@ -17197,10 +17336,9 @@ __global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
                 lg_val = __ldcg(logits + e);
 #endif
                 const float pr = sigmf(lg_val);
-                p[j] = pr;
+                s_all_p[e] = pr;
                 s[j] = pr + (bias ? __ldg(bias + e) : 0.0f);
             } else {
-                p[j] = 0.0f;
                 s[j] = -1e30f;
             }
         }
@@ -17209,23 +17347,19 @@ __global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
     for (int k = 0; k < top_k; ++k) {
         float bv = s[0];
         int be = vec4_exp ? e0 : lane;
-        float bp = p[0];
 #pragma unroll
         for (int j = 1; j < 4; ++j) {
-            if (s[j] > bv) { bv = s[j]; be = vec4_exp ? (e0 + j) : (j * 32 + lane); bp = p[j]; }
+            if (s[j] > bv) { bv = s[j]; be = vec4_exp ? (e0 + j) : (j * 32 + lane); }
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
             const int oe = __shfl_xor_sync(0xffffffffu, be, off);
-            const float op = __shfl_xor_sync(0xffffffffu, bp, off);
-            if (ov > bv || (ov == bv && oe < be)) { bv = ov; be = oe; bp = op; }
+            if (ov > bv || (ov == bv && oe < be)) { bv = ov; be = oe; }
         }
         if (lane == 0) {
             s_e[k] = be;
-            s_p[k] = bp;
-            ids[k] = be;
-            wsum += bp;
+            wsum += s_all_p[be];
         }
         if (vec4_exp) {
             if ((be >> 2) == lane) {
@@ -17247,7 +17381,8 @@ __global__ void __launch_bounds__(192, 5) k_router_gemv_and_group_t1(
     int sl = -1;
     if (lane < top_k) {
         const int be = s_e[lane];
-        ewts[lane] = s_p[lane] * fac;
+        ids[lane] = be;
+        ewts[lane] = s_all_p[be] * fac;
         if (d_hits) d_hits[be] += 1u;
         sl = slot_of ? __ldg(slot_of + be) : -1;
     }
