@@ -5448,9 +5448,31 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
     }
 }
 
+// Decode 8 interleaved NVFP4 K-tile weights from 1 uint32_t using fused lop3.b32 for sign selection (2 LOP3 vs 3).
+__device__ __forceinline__ int2 iq_nvfp4_ktile_decode_pair_t1(uint32_t p) {
+    const uint32_t mag  = ((p >> 1) & 0x07070707u) | (p & 0x70707070u);
+    uint32_t sel;
+#if defined(__CUDA_ARCH__) && !defined(__HIPCC__)
+    uint32_t t_sel;
+    asm("lop3.b32 %0, %1, 0x40404040, 0x32103210, 0xEA;" : "=r"(t_sel) : "r"(p << 6));
+    asm("lop3.b32 %0, %1, 0x04040404, %2, 0xEA;" : "=r"(sel) : "r"(p >> 5), "r"(t_sel));
+#else
+    sel = 0x32103210u | ((p >> 5) & 0x04040404u) | ((p << 6) & 0x40404040u);
+#endif
+    const uint32_t lo0  = iq_prmt_raw(0x03020100u, 0x0C080604u, mag);
+    const uint32_t hi0  = iq_prmt_raw(0xFDFEFF00u, 0xF4F8FAFCu, mag);
+    const uint32_t t0   = iq_prmt_raw(lo0, hi0, sel);
+    const uint32_t mag1 = mag >> 16;
+    const uint32_t sel1 = sel >> 16;
+    const uint32_t lo1  = iq_prmt_raw(0x03020100u, 0x0C080604u, mag1);
+    const uint32_t hi1  = iq_prmt_raw(0xFDFEFF00u, 0xF4F8FAFCu, mag1);
+    const uint32_t t1   = iq_prmt_raw(lo1, hi1, sel1);
+    return make_int2((int) t0, (int) t1);
+}
+
 // Standalone T=1 (single-entry-per-group) fused NVFP4 Gate+Up+SiTU+Q8_1 kernel:
 // KTILE=true: 8 warps (256 thr, 4 blk/SM, 5,408 B SMEM), 32 consecutive rows/warp (100% coalesced 512B LDG.E.128),
-// Split-K=8 (9 exact steps/warp), staggered Gate/Up software-pipelined prefetch, direct zero-unperm prmt.b32 decode,
+// Split-K=8 (9 exact steps/warp), staggered Gate/Up software-pipelined prefetch, direct zero-unperm lop3+prmt.b32 decode,
 // pre-interleaved SMEM xq (2x LDS.128 broadcast), register-direct Warp-0 SiTU + q8_1_store, STACK: 0!
 template <bool KTILE = false>
 __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel(
@@ -5458,7 +5480,8 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
     const block_q8_1* __restrict__ xq, NativeExpertLayout L, float beta, float lb,
     block_q8_1* __restrict__ hq) {
-    if ((int) blockIdx.y >= *n_groups) return;
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
     __shared__ float s_ue4m3[256];
     if constexpr (KTILE) s_ue4m3[threadIdx.x] = ue4m3_to_f32_half_branchless((uint8_t) threadIdx.x);
     else                 s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
@@ -5478,10 +5501,11 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
         const uint32_t gd_off = (uint32_t) r_g * 4u + (uint32_t) half * 2u;
         const uint32_t ud_off = gd_off + 256u;
         bool need_sync = false;
-        for (int g = blockIdx.y; ; g += gridDim.y) {
-            if (g >= *(const volatile int32_t*) n_groups) break;
+        for (int g = blockIdx.y; g < ng; g += gridDim.y) {
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
             const uint8_t* kt_base = blob + w_off;
+            const float sc_g = (warp == 0 && L.tail_off) ? __ldg((const float*) (blob + L.tail_off) + 0) : 1.0f;
+            const float sc_u = (warp == 0 && L.tail_off) ? __ldg((const float*) (blob + L.tail_off) + 1) : 1.0f;
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int e = e0; e < e1; ++e) {
                 if (need_sync) iq_sync_lds();
@@ -5489,112 +5513,70 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
                 if (threadIdx.x < 72) {
                     iq_stage_q8_1_interleaved_f32(xq + (size_t) ent_tok[e] * 72 + threadIdx.x, s_dx[threadIdx.x], s_xq[threadIdx.x]);
                 }
-                iq_sync_lds();
                 const uint8_t* kt = kt_base;
                 int4 gq = __ldg(reinterpret_cast<const int4*>(kt + gq_off));
                 uint16_t gd = __ldg(reinterpret_cast<const uint16_t*>(kt + gd_off));
+                iq_sync_lds();
                 float sg = 0.0f, su = 0.0f;
                 int k = warp;
 #pragma unroll 1
                 for (int iter = 0; iter < 9; ++iter) {
                     const int4 uq = __ldg(reinterpret_cast<const int4*>(kt + uq_off));
                     const uint16_t ud = __ldg(reinterpret_cast<const uint16_t*>(kt + ud_off));
-                    const float dx = s_dx[k];
-                    const int4 xv0 = s_xq[k][0];
-                    const int4 xv1 = s_xq[k][1];
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
                     const float g_sc0 = s_ue4m3[gd & 0xFFu];
                     const float g_sc1 = s_ue4m3[gd >> 8];
+                    const float dx = s_dx[k];
+                    const int4 xv0 = s_xq[k][0];
+                    int s0g;
                     {
-                        int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.x);
+                        int2 v0 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) gq.x);
                         asm volatile("" : "+r"(v0.x), "+r"(v0.y));
-                        const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.y);
-                        int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
-                        s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
-                        s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
-                        s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
-                        int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.z);
-                        asm volatile("" : "+r"(v2.x), "+r"(v2.y));
-                        const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.w);
-                        int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
-                        s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
-                        s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
-                        s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
-                        float p = g_sc0 * dx * (float) s0;
-                        p += g_sc1 * dx * (float) s1;
-                        sg += p;
+                        const int2 v1 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) gq.y);
+                        s0g = ggml_cuda_dp4a(v0.x, xv0.x, 0);
+                        s0g = ggml_cuda_dp4a(v0.y, xv0.y, s0g);
+                        s0g = ggml_cuda_dp4a(v1.x, xv0.z, s0g);
+                        s0g = ggml_cuda_dp4a(v1.y, xv0.w, s0g);
                     }
+                    const int4 xv1 = s_xq[k][1];
+                    int s1g;
+                    {
+                        int2 v2 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) gq.z);
+                        asm volatile("" : "+r"(v2.x), "+r"(v2.y));
+                        const int2 v3 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) gq.w);
+                        s1g = ggml_cuda_dp4a(v2.x, xv1.x, 0);
+                        s1g = ggml_cuda_dp4a(v2.y, xv1.y, s1g);
+                        s1g = ggml_cuda_dp4a(v3.x, xv1.z, s1g);
+                        s1g = ggml_cuda_dp4a(v3.y, xv1.w, s1g);
+                    }
+                    sg = __fmaf_rn(g_sc0 * (float) s0g + g_sc1 * (float) s1g, dx, sg);
                     if (iter < 8) {
                         const uint8_t* kt_n = kt + 18432u;
                         gq = __ldg(reinterpret_cast<const int4*>(kt_n + gq_off));
                         gd = __ldg(reinterpret_cast<const uint16_t*>(kt_n + gd_off));
                     }
+                    const float u_sc0 = s_ue4m3[ud & 0xFFu];
+                    const float u_sc1 = s_ue4m3[ud >> 8];
+                    int s0u;
                     {
-                        const float u_sc0 = s_ue4m3[ud & 0xFFu];
-                        const float u_sc1 = s_ue4m3[ud >> 8];
-                        int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.x);
+                        int2 v0 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) uq.x);
                         asm volatile("" : "+r"(v0.x), "+r"(v0.y));
-                        const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.y);
-                        int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
-                        s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
-                        s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
-                        s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
-                        int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.z);
-                        asm volatile("" : "+r"(v2.x), "+r"(v2.y));
-                        const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.w);
-                        int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
-                        s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
-                        s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
-                        s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
-                        float p = u_sc0 * dx * (float) s0;
-                        p += u_sc1 * dx * (float) s1;
-                        su += p;
+                        const int2 v1 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) uq.y);
+                        s0u = ggml_cuda_dp4a(v0.x, xv0.x, 0);
+                        s0u = ggml_cuda_dp4a(v0.y, xv0.y, s0u);
+                        s0u = ggml_cuda_dp4a(v1.x, xv0.z, s0u);
+                        s0u = ggml_cuda_dp4a(v1.y, xv0.w, s0u);
                     }
-#else
+                    int s1u;
                     {
-                        int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.x);
-                        asm volatile("" : "+r"(v0.x), "+r"(v0.y));
-                        const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.y);
-                        int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
-                        s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
-                        s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
-                        s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
-                        int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.z);
+                        int2 v2 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) uq.z);
                         asm volatile("" : "+r"(v2.x), "+r"(v2.y));
-                        const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) gq.w);
-                        int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
-                        s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
-                        s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
-                        s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
-                        float p = s_ue4m3[gd & 0xFFu] * dx * (float) s0;
-                        p += s_ue4m3[gd >> 8] * dx * (float) s1;
-                        sg += p;
+                        const int2 v3 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) uq.w);
+                        s1u = ggml_cuda_dp4a(v2.x, xv1.x, 0);
+                        s1u = ggml_cuda_dp4a(v2.y, xv1.y, s1u);
+                        s1u = ggml_cuda_dp4a(v3.x, xv1.z, s1u);
+                        s1u = ggml_cuda_dp4a(v3.y, xv1.w, s1u);
                     }
-                    if (iter < 8) {
-                        const uint8_t* kt_n = kt + 18432u;
-                        gq = __ldg(reinterpret_cast<const int4*>(kt_n + gq_off));
-                        gd = __ldg(reinterpret_cast<const uint16_t*>(kt_n + gd_off));
-                    }
-                    {
-                        int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.x);
-                        asm volatile("" : "+r"(v0.x), "+r"(v0.y));
-                        const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.y);
-                        int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
-                        s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
-                        s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
-                        s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
-                        int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.z);
-                        asm volatile("" : "+r"(v2.x), "+r"(v2.y));
-                        const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) uq.w);
-                        int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
-                        s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
-                        s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
-                        s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
-                        float p = s_ue4m3[ud & 0xFFu] * dx * (float) s0;
-                        p += s_ue4m3[ud >> 8] * dx * (float) s1;
-                        su += p;
-                    }
-#endif
+                    su = __fmaf_rn(u_sc0 * (float) s0u + u_sc1 * (float) s1u, dx, su);
                     kt += 18432u;
                     k += 8;
                 }
@@ -5604,8 +5586,6 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
                 }
                 iq_sync_lds();
                 if (warp == 0) {
-                    const float sc_g = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
-                    const float sc_u = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
                     float sum_g = sg, sum_u = su;
 #pragma unroll
                     for (int w = 0; w < 7; ++w) {
@@ -5621,7 +5601,6 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
             }
         }
     } else {
-        const int ng = *n_groups;
         __shared__ float sh[32];
         iq_sync_lds();
         const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
@@ -5657,8 +5636,8 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
 
 // Standalone T=1 NVFP4 down (n_ff == 1152, 36 half-blocks, 32 rows/CTA -> 72x8 = 576 CTAs = 0.90 wave on V100!).
 // KTILE=true: 4 warps (128 thr) x 32 consecutive rows/warp (100% coalesced 512B LDG.E.128 & 128B STG.E.32),
-// Split-K=4 (exact 9 half-blocks/warp, 0 tail idle), software-pipelined prefetch, direct zero-unperm decode,
-// pre-interleaved SMEM hq (2x LDS.128 broadcast), STACK: 0!
+// Split-K=4 (exact 9 half-blocks/warp, 0 tail idle), 2-step ping-pong prefetch (0 q_cur=q_nxt MOVs, 0 loop branch),
+// direct zero-unperm lop3+prmt.b32 decode, pre-interleaved SMEM hq (2x LDS.128 broadcast), STACK: 0!
 template <bool KTILE = false>
 __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
@@ -5688,13 +5667,43 @@ __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
         const int kb0 = warp >> 1;
         const size_t w_off = L.down_off + (size_t) (r_c >> 7) * 18u * 4608u + (size_t) kb0 * 4608u;
         const size_t q_off = 512u + (size_t) half * 2048u + (size_t) rl * 16u;
-        const int d_rel = (int) ((size_t) rl * 4u + (size_t) half * 2u) - (int) q_off;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+        const size_t d_off = (size_t) rl * 4u + (size_t) half * 2u;
+        auto eval_step = [&](const int4 q, uint16_t d16, int k_idx, float& acc) {
+            const float sc0 = s_ue4m3[d16 & 0xFFu];
+            const float sc1 = s_ue4m3[d16 >> 8];
+            const float dx = s_dx[k_idx];
+            int s0;
+            {
+                const int4 xv0 = s_xq[k_idx][0];
+                const int2 v0 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) q.x);
+                const int2 v1 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) q.y);
+                s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
+                s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
+                s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
+                s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
+            }
+            int s1;
+            {
+                const int4 xv1 = s_xq[k_idx][1];
+                const int2 v2 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) q.z);
+                const int2 v3 = iq_nvfp4_ktile_decode_pair_t1((uint32_t) q.w);
+                s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
+                s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
+                s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
+                s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
+            }
+            acc = __fmaf_rn(sc0 * (float) s0 + sc1 * (float) s1, dx, acc);
+        };
         bool need_sync = false;
         for (int g = blockIdx.y; g < ng; g += gridDim.y) {
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
             const uint8_t* qp_base = blob + w_off + q_off;
-            const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+            const int d_rel = (int) d_off - (int) q_off;
+#else
+            const uint8_t* dp_base = blob + w_off + d_off;
+#endif
+            const float sd = L.tail_off ? __ldg((const float*) (blob + L.tail_off) + 2) : 1.0f;
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int e = e0; e < e1; ++e) {
                 if (need_sync) iq_sync_lds();
@@ -5702,114 +5711,47 @@ __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
                 if (threadIdx.x < 36) {
                     iq_stage_q8_1_interleaved_f32(hq + (size_t) e * 36 + threadIdx.x, s_dx[threadIdx.x], s_xq[threadIdx.x]);
                 }
-                iq_sync_lds();
+                const int dst_row = (warp == 0) ? __ldg(ent_dst + e) : 0;
                 const uint8_t* qp = qp_base;
-                int4 q_cur = __ldg(reinterpret_cast<const int4*>(qp));
-                uint16_t d_cur = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel));
-                float acc = 0.0f;
-                int k = warp;
-#pragma unroll 1
-                for (int iter = 0; iter < 9; ++iter) {
-                    int4 q_nxt;
-                    uint16_t d_nxt;
-                    if (iter < 8) {
-                        q_nxt = __ldg(reinterpret_cast<const int4*>(qp + 9216u));
-                        d_nxt = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel + 9216u));
-                    }
-                    const float sc0 = s_ue4m3[d_cur & 0xFFu];
-                    const float sc1 = s_ue4m3[d_cur >> 8];
-                    const float dx = s_dx[k];
-                    const int4 xv0 = s_xq[k][0];
-                    const int4 xv1 = s_xq[k][1];
-                    const int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.x);
-                    const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.y);
-                    int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
-                    s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
-                    s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
-                    s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
-                    const int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.z);
-                    const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.w);
-                    int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
-                    s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
-                    s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
-                    s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
-                    float p = sc0 * dx * (float) s0;
-                    p += sc1 * dx * (float) s1;
-                    acc += p;
-                    qp += 9216u;
-                    k += 4;
-                    q_cur = q_nxt;
-                    d_cur = d_nxt;
-                }
-                if (warp > 0) s_red[warp - 1][lane] = acc;
-                iq_sync_lds();
-                if (warp == 0 && valid_r) {
-                    const float sum = acc + s_red[0][lane] + s_red[1][lane] + s_red[2][lane];
-                    out[(size_t) ent_dst[e] * L.n_embd + r] = sum * sd;
-                }
-            }
-        }
+                int4 q0 = __ldg(reinterpret_cast<const int4*>(qp));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+                uint16_t d0 = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel));
 #else
-        const size_t d_off = (size_t) rl * 4u + (size_t) half * 2u;
-        for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-            const uint8_t* qp_base = blob + w_off + q_off;
-            const uint8_t* dp_base = blob + w_off + d_off;
-            const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
-            const int e0 = grp_start[g], e1 = grp_start[g + 1];
-            for (int e = e0; e < e1; ++e) {
-                if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
-                if (threadIdx.x < 36) {
-                    iq_stage_q8_1_interleaved_f32(hq + (size_t) e * 36 + threadIdx.x, s_dx[threadIdx.x], s_xq[threadIdx.x]);
-                }
-                iq_sync_lds();
-                const uint8_t* qp = qp_base;
                 const uint8_t* dp = dp_base;
-                int4 q_cur = __ldg(reinterpret_cast<const int4*>(qp));
-                uint16_t d_cur = __ldg(reinterpret_cast<const uint16_t*>(dp));
+                uint16_t d0 = __ldg(reinterpret_cast<const uint16_t*>(dp));
+#endif
+                iq_sync_lds();
                 float acc = 0.0f;
                 int k = warp;
 #pragma unroll 1
-                for (int iter = 0; iter < 9; ++iter) {
-                    int4 q_nxt;
-                    uint16_t d_nxt;
-                    if (iter < 8) {
-                        q_nxt = __ldg(reinterpret_cast<const int4*>(qp + 9216u));
-                        d_nxt = __ldg(reinterpret_cast<const uint16_t*>(dp + 9216u));
-                    }
-                    const float dx = s_dx[k];
-                    const int4 xv0 = s_xq[k][0];
-                    const int2 v0 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.x);
-                    const int2 v1 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.y);
-                    int s0 = ggml_cuda_dp4a(v0.x, xv0.x, 0);
-                    s0 = ggml_cuda_dp4a(v0.y, xv0.y, s0);
-                    s0 = ggml_cuda_dp4a(v1.x, xv0.z, s0);
-                    s0 = ggml_cuda_dp4a(v1.y, xv0.w, s0);
-                    const int4 xv1 = s_xq[k][1];
-                    const int2 v2 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.z);
-                    const int2 v3 = iq_nvfp4_ktile_decode_pair_interleaved((uint32_t) q_cur.w);
-                    int s1 = ggml_cuda_dp4a(v2.x, xv1.x, 0);
-                    s1 = ggml_cuda_dp4a(v2.y, xv1.y, s1);
-                    s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
-                    s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
-                    float p = s_ue4m3[d_cur & 0xFFu] * dx * (float) s0;
-                    p += s_ue4m3[d_cur >> 8] * dx * (float) s1;
-                    acc += p;
-                    qp += 9216u;
-                    dp += 9216u;
-                    k += 4;
-                    q_cur = q_nxt;
-                    d_cur = d_nxt;
+                for (int step = 0; step < 4; ++step) {
+                    const int4 q1 = __ldg(reinterpret_cast<const int4*>(qp + 9216u));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+                    const uint16_t d1 = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel + 9216u));
+#else
+                    const uint16_t d1 = __ldg(reinterpret_cast<const uint16_t*>(dp + 9216u));
+#endif
+                    eval_step(q0, d0, k, acc);
+                    q0 = __ldg(reinterpret_cast<const int4*>(qp + 18432u));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750 && !defined(__HIPCC__)
+                    d0 = __ldg(reinterpret_cast<const uint16_t*>(qp + d_rel + 18432u));
+#else
+                    d0 = __ldg(reinterpret_cast<const uint16_t*>(dp + 18432u));
+                    dp += 18432u;
+#endif
+                    eval_step(q1, d1, k + 4, acc);
+                    qp += 18432u;
+                    k += 8;
                 }
+                eval_step(q0, d0, k, acc);
                 if (warp > 0) s_red[warp - 1][lane] = acc;
                 iq_sync_lds();
                 if (warp == 0 && valid_r) {
                     const float sum = acc + s_red[0][lane] + s_red[1][lane] + s_red[2][lane];
-                    out[(size_t) ent_dst[e] * L.n_embd + r] = sum * sd;
+                    out[(size_t) dst_row * L.n_embd + r] = sum * sd;
                 }
             }
         }
-#endif
     } else {
         iq_sync_lds();
         const int r0 = (int) blockIdx.x * 32 + (threadIdx.x >> 3) * 2;
