@@ -106,6 +106,32 @@ class EndTokenIds(Fixture):
                 return list(text.encode())
         self.assertEqual(end_token_ids(Bare()), set())
 
+    def test_gguf_special_id_keys_are_included(self):
+        class GgufPadAndEot:
+            special_ids = {
+                "tokenizer.ggml.bos_token_id": 0,
+                "tokenizer.ggml.pad_token_id": 199999,
+                "tokenizer.ggml.eos_token_id": 200006,
+                "tokenizer.ggml.eot_token_id": 200007,
+            }
+
+            def encode(self, text, parse_special=False):
+                if text == "<|endoftext|>":
+                    return [199999]
+                return list(text.encode())
+
+        class GgufSameEosEot:
+            special_ids = {
+                "tokenizer.ggml.eos_token_id": 200006,
+                "tokenizer.ggml.eot_token_id": 200006,
+            }
+
+            def encode(self, text, parse_special=False):
+                return list(text.encode())
+
+        self.assertEqual(end_token_ids(GgufPadAndEot()), {199999, 200006, 200007})
+        self.assertEqual(end_token_ids(GgufSameEosEot()), {200006})
+
     def test_a_service_without_a_family_does_not_stop_on_im(self):
         svc = Service(DsEngine(self.tok, "x"), self.tok, ChatTemplate(TEMPLATE))
         im = self.tok.encode("im")[0]
