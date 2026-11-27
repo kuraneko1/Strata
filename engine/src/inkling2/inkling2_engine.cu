@@ -1256,6 +1256,8 @@ struct Engine {
     bool can_ctrl_wmma = false;
     bool can_ctrl_rms_3 = false;
     bool can_ctrl_rms_1 = false;
+    bool can_fused_loop_ctrl_1 = false;
+    bool can_fused_loop_ctrl_3 = false;
     bool can_fa2_256 = false;
     size_t l2_persist_bytes = 0;
     size_t l2_max_window_bytes = 0;
@@ -1299,8 +1301,8 @@ struct Engine {
     int32_t* d_grp_part_cnt = nullptr; // Wave 5: [2 * 16 * 128] multi-CTA expert grouping scratch (hist + off)
     int32_t* d_grp_part_off = nullptr;
     uint32_t* d_hits_pool = nullptr;   // Wave 5: contiguous [n_phys * n_expert] GPU hit counters (12 KiB)
-    uint32_t* d_router_done = nullptr; // [16] self-resetting completion counters: [0]=router, [1..8]=mix_q8
-    float* d_mix_scratch = nullptr;    // [8 * 880] multi-CTA mix_normed_q8 partial/weight scratch (27.5 KiB)
+    uint32_t* d_router_done = nullptr; // [16] self-resetting completion counters: [0]=router, [1..9]=loop_ctrl3, [12..14]=loop_ctrl1
+    float* d_mix_scratch = nullptr;    // [8 * 880] multi-CTA scratch (27.5 KiB)
     unsigned long long* grp_ptr = nullptr;
     int32_t *pos0_d = nullptr, *pick_d = nullptr;
     int pos0_sub_cap = 1;
@@ -2798,6 +2800,17 @@ struct Engine {
             try_set_smem((const void*) k_control_up_combine_rms_f16_vmsg<3>, 29696);
         can_ctrl_rms_1 = (cc_maj >= 8) &&
             try_set_smem((const void*) k_control_up_combine_rms_f16_vmsg<1>, 29696);
+        can_fused_loop_ctrl_1 = false;
+        can_fused_loop_ctrl_3 = false;
+        if (cc_maj >= 7 && sm_count > 0) {
+            int bpsm1 = 0, bpsm3 = 0;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsm1, k_loop_ctrl_fused_rms_q8_t1<1, 64>, 256, 0) == cudaSuccess) {
+                can_fused_loop_ctrl_1 = (bpsm1 * sm_count >= 64);
+            }
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsm3, k_loop_ctrl_fused_rms_q8_t1<3, 32>, 256, 0) == cudaSuccess) {
+                can_fused_loop_ctrl_3 = (bpsm3 * sm_count >= 96);
+            }
+        }
         (void) cudaGetLastError();
         can_fa2_192 =
             try_set_smem((const void*) k_attn_q8_gqa3_pp_fa2_192<false, false, false>, 98304) &&
@@ -6842,6 +6855,16 @@ struct Engine {
             int hist_offset = 0;
         };
         DeferredPostFfn deferred_postffn{};
+        struct DeferredPostFfnT1 {
+            bool active = false;
+            const float* eparts_p = nullptr;
+            const float* ewts_p = nullptr;
+            const float* w_conv = nullptr;
+            float* hst = nullptr;
+            const float* res_add = nullptr;
+            int hist_offset = 0;
+        };
+        DeferredPostFfnT1 deferred_postffn_t1{};
         int pre_push_done_il = -1;
         float* pre_push_ndst = nullptr;
         bool pre_routed_pp_cur = false;
@@ -6895,6 +6918,15 @@ struct Engine {
                     moe_raw, deferred_postffn.hst, N, deferred_postffn.hist_offset, T);
                 deferred_postffn.active = false;
             };
+            auto flush_deferred_postffn_t1_to_cur = [&]() {
+                if (!deferred_postffn_t1.active) return;
+                const unsigned nb = (unsigned) ((N + 31) / 32);
+                k_combine_experts_shortconv_k8<false, true><<<nb, 32, 0, st>>>(
+                    deferred_postffn_t1.eparts_p, deferred_postffn_t1.ewts_p, deferred_postffn_t1.w_conv,
+                    deferred_postffn_t1.hst, deferred_postffn_t1.res_add, cur,
+                    N, deferred_postffn_t1.hist_offset, 1, nullptr, 0);
+                deferred_postffn_t1.active = false;
+            };
             bool has_msg = false;
             float* ir_m0 = ctrl_inv_rms ? (ctrl_inv_rms + (size_t) 0 * T) : nullptr;
             float* ir_m1 = ctrl_inv_rms ? (ctrl_inv_rms + (size_t) 1 * T) : nullptr;
@@ -6935,6 +6967,7 @@ struct Engine {
                 float* B0_pre       = reinterpret_cast<float*>(reg1_u8 + 2 * sz_bank_f16);
                 float* B1_pre       = reinterpret_cast<float*>(reg1_u8 + 2 * sz_bank_f16 + sz_bpre_f32);
                 if (ip == hp.core_start) {
+                    flush_deferred_postffn_t1_to_cur();
                     if (pass == 0) {
                         prelude_norm_blocks = norm_blocks;
                         if (!deferred_postffn.active) {
@@ -7073,7 +7106,7 @@ struct Engine {
 
             const float* ink_src = in_k;
             const float* inv_src = in_v;
-            if (!deferred_postffn.active) {
+            if (!deferred_postffn.active && !deferred_postffn_t1.active) {
                 emit_dspark_capture();
             }
             const bool fuse_q8_norm = (T <= 8 && (N & 31) == 0);
@@ -7150,19 +7183,51 @@ struct Engine {
                     emit_dspark_capture();
                     fused_mix_norm = true;
                 } else if (!has_msg && fuse_q8_norm) {
-                    if (is_swa) {
-                        NormQ8Out3 nq8{L.attn_norm, nullptr, nullptr, xq, nullptr, nullptr};
-                        if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 1, T)) {
-                            fused_mix_norm = true;
-                            q8_pre_done = true;
+                    if (deferred_postffn_t1.active && T == 1 && N == 2304 && (int) norm_blocks.size() <= 7) {
+                        const int B = (int) norm_blocks.size();
+                        NormMixPtrs np{};
+                        for (int i = 0; i < B; ++i) np.p[i] = norm_blocks[(size_t) (B - 1 - i)];
+                        const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
+                        if (is_swa) {
+                            MixOuts4 mo4{{in_q, nullptr, nullptr, nullptr}};
+                            NormQ8Out3 nq8{L.attn_norm, nullptr, nullptr, xq, nullptr, nullptr};
+                            k_combine_experts_shortconv_k8_mix_q8_t1<1><<<1, 576, 0, st>>>(
+                                deferred_postffn_t1.eparts_p, deferred_postffn_t1.ewts_p, deferred_postffn_t1.w_conv,
+                                deferred_postffn_t1.hst, deferred_postffn_t1.res_add, cur, deferred_postffn_t1.hist_offset,
+                                np, B + 1, L.attn_res_query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
                             ink_src = in_q;
                             inv_src = in_q;
+                        } else {
+                            MixOuts4 mo4{{in_q, in_k, in_v, nullptr}};
+                            NormQ8Out3 nq8{L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm, xq, xq_k, xq_v};
+                            k_combine_experts_shortconv_k8_mix_q8_t1<3><<<1, 576, 0, st>>>(
+                                deferred_postffn_t1.eparts_p, deferred_postffn_t1.ewts_p, deferred_postffn_t1.w_conv,
+                                deferred_postffn_t1.hst, deferred_postffn_t1.res_add, cur, deferred_postffn_t1.hist_offset,
+                                np, B + 1, L.attn_res_query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
                         }
+                        deferred_postffn_t1.active = false;
+                        emit_dspark_capture();
+                        fused_mix_norm = true;
+                        q8_pre_done = true;
                     } else {
-                        NormQ8Out3 nq8{L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm, xq, xq_k, xq_v};
-                        if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 3, T)) {
-                            fused_mix_norm = true;
-                            q8_pre_done = true;
+                        if (deferred_postffn_t1.active) {
+                            flush_deferred_postffn_t1_to_cur();
+                            emit_dspark_capture();
+                        }
+                        if (is_swa) {
+                            NormQ8Out3 nq8{L.attn_norm, nullptr, nullptr, xq, nullptr, nullptr};
+                            if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 1, T)) {
+                                fused_mix_norm = true;
+                                q8_pre_done = true;
+                                ink_src = in_q;
+                                inv_src = in_q;
+                            }
+                        } else {
+                            NormQ8Out3 nq8{L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm, xq, xq_k, xq_v};
+                            if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 3, T)) {
+                                fused_mix_norm = true;
+                                q8_pre_done = true;
+                            }
                         }
                     }
                 } else if (!has_msg && T > 8 && N == 2304) {
@@ -7473,6 +7538,10 @@ struct Engine {
                     flush_deferred_postffn_to_cur();
                     emit_dspark_capture();
                 }
+                if (deferred_postffn_t1.active && !defer_msg_mix_dual) {
+                    flush_deferred_postffn_t1_to_cur();
+                    emit_dspark_capture();
+                }
                 const bool use_fused_ctrl_down = (has_msg && has_msg_ir && T >= 32 && N == 2304 &&
                                                   hp.loop_gate_rank == 64 && can_ctrl_wmma && can_ctrl_down_wmma &&
                                                   L.loop_down[0].type == 0 && L.loop_down[1].type == 0 && L.loop_down[2].type == 0 &&
@@ -7498,7 +7567,23 @@ struct Engine {
                     np_c.p[Bc] = cur_in;
                     MixOuts4 mo4_c{{in_q, in_k, in_v, nullptr}};
                     const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
-                    if (is_swa) {
+                    if (deferred_postffn_t1.active && T == 1 && N == 2304 && Bc <= 7) {
+                        if (is_swa) {
+                            k_combine_experts_shortconv_k8_mix_dual_t1<1><<<dim3(1u, 2u), 576, 0, st>>>(
+                                dual_np_msg, dual_D_msg, dual_qm0, dual_qm1, dual_mo4_msg,
+                                deferred_postffn_t1.eparts_p, deferred_postffn_t1.ewts_p, deferred_postffn_t1.w_conv,
+                                deferred_postffn_t1.hst, deferred_postffn_t1.res_add, cur, deferred_postffn_t1.hist_offset,
+                                np_c, Bc + 1, L.attn_res_query, mo4_c, 1, N, inv_sqrt_n, hp.rms_eps);
+                        } else {
+                            k_combine_experts_shortconv_k8_mix_dual_t1<3><<<dim3(1u, 2u), 576, 0, st>>>(
+                                dual_np_msg, dual_D_msg, dual_qm0, dual_qm1, dual_mo4_msg,
+                                deferred_postffn_t1.eparts_p, deferred_postffn_t1.ewts_p, deferred_postffn_t1.w_conv,
+                                deferred_postffn_t1.hst, deferred_postffn_t1.res_add, cur, deferred_postffn_t1.hist_offset,
+                                np_c, Bc + 1, L.attn_res_query, mo4_c, 0, N, inv_sqrt_n, hp.rms_eps);
+                        }
+                        deferred_postffn_t1.active = false;
+                        emit_dspark_capture();
+                    } else if (is_swa) {
                         k_mix_normed_fused_1pass_dual<1><<<dim3((unsigned) T, 2), 576, 0, st>>>(
                             dual_np_msg, dual_D_msg, dual_qm0, dual_qm1, dual_mo4_msg,
                             np_c, Bc + 1, L.attn_res_query, mo4_c, 1, N, inv_sqrt_n, hp.rms_eps);
@@ -7509,6 +7594,10 @@ struct Engine {
                     }
                     defer_msg_mix_dual = false;
                 } else {
+                    if (deferred_postffn_t1.active) {
+                        flush_deferred_postffn_t1_to_cur();
+                        emit_dspark_capture();
+                    }
                     run_mix_normed(norm_blocks, cur_in, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
                 }
                 if (has_msg) {
@@ -7525,9 +7614,9 @@ struct Engine {
                         const unsigned nb = (unsigned) ((N + 15) / 16);
                         // Reuse ctrl2N (size T*2*N floats >> 3*T*64 floats) for batched 3-module ctrl64 (0 extra VRAM).
                         if (T == 1) {
-                            k_loop_down_fused_smallT_3<1, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 1, hp.rms_eps);
-                            if (N == 2304 && d_router_done != nullptr && d_mix_scratch != nullptr) {
-                                CtrlUpRmsQ8Ptrs3 upr{
+                            if (N == 2304 && d_router_done != nullptr && d_mix_scratch != nullptr && can_fused_loop_ctrl_3) {
+                                LoopCtrlRmsQ8Ptrs3 lcp{
+                                    {(const float*) L.loop_down[0].d, (const float*) L.loop_down[1].d, (const float*) L.loop_down[2].d},
                                     {(const float*) L.loop_gain[0].d, (const float*) L.loop_gain[1].d, (const float*) L.loop_gain[2].d},
                                     {(const float*) L.loop_forget[0].d, (const float*) L.loop_forget[1].d, (const float*) L.loop_forget[2].d},
                                     {in_q, in_k, in_v},
@@ -7538,11 +7627,29 @@ struct Engine {
                                      is_swa ? L.attn_norm : L.attn_v_inp_norm},
                                     {xq, xq_k, xq_v}
                                 };
-                                k_control_up_combine_rms_q8_t1<3><<<dim3(144u, 3u), 256, 0, st>>>(
-                                    upr, ctrl2N, d_mix_scratch, d_router_done + 12, hp.rms_eps, N);
+                                k_loop_ctrl_fused_rms_q8_t1<3, 32><<<dim3(32u, 3u), 256, 0, st>>>(
+                                    lcp, d_mix_scratch, d_router_done + 1, hp.rms_eps);
                                 q8_pre_done = true;
                             } else {
-                                k_control_up_combine_smallT_3<1, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 1, N);
+                                k_loop_down_fused_smallT_3<1, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 1, hp.rms_eps);
+                                if (N == 2304 && d_router_done != nullptr && d_mix_scratch != nullptr) {
+                                    CtrlUpRmsQ8Ptrs3 upr{
+                                        {(const float*) L.loop_gain[0].d, (const float*) L.loop_gain[1].d, (const float*) L.loop_gain[2].d},
+                                        {(const float*) L.loop_forget[0].d, (const float*) L.loop_forget[1].d, (const float*) L.loop_forget[2].d},
+                                        {in_q, in_k, in_v},
+                                        {msg0, msg1, msg2},
+                                        {in_q, in_k, in_v},
+                                        {is_swa ? L.attn_norm : L.attn_q_inp_norm,
+                                         is_swa ? L.attn_norm : L.attn_k_inp_norm,
+                                         is_swa ? L.attn_norm : L.attn_v_inp_norm},
+                                        {xq, xq_k, xq_v}
+                                    };
+                                    k_control_up_combine_rms_q8_t1<3><<<dim3(144u, 3u), 256, 0, st>>>(
+                                        upr, ctrl2N, d_mix_scratch, d_router_done + 12, hp.rms_eps, N);
+                                    q8_pre_done = true;
+                                } else {
+                                    k_control_up_combine_smallT_3<1, true><<<dim3(nb, 3), 256, 0, st>>>(up, ctrl2N, 1, N);
+                                }
                             }
                         } else if (T == 4) {
                             k_loop_down_fused_smallT_3<4, true><<<dim3(64, 3), 192, 0, st>>>(cp, ctrl2N, N, 64, 4, hp.rms_eps);
@@ -7625,6 +7732,10 @@ struct Engine {
             } else {
                 if (deferred_postffn.active) {
                     flush_deferred_postffn_to_cur();
+                    emit_dspark_capture();
+                }
+                if (deferred_postffn_t1.active && !defer_msg_mix_dual) {
+                    flush_deferred_postffn_t1_to_cur();
                     emit_dspark_capture();
                 }
                 if (has_msg) {
@@ -8550,8 +8661,9 @@ struct Engine {
             }
             if (moe_raw_disjoint_wo) kick_async_moe_zero();
             const bool do_push = (ip % hp.attn_res_block_size == 0);
-            const bool fuse_post_attn_ffn_t1 = (T == 1 && !do_push && !has_msg && !save_conv_trace &&
-                                                N == 2304 && (int) norm_blocks.size() + 1 <= 8);
+            const bool fuse_post_attn_ffn_t1 = (T == 1 && !save_conv_trace && N == 2304 &&
+                                                L.ffn_res_query != nullptr && !use_vmsg_layer &&
+                                                (int) norm_blocks.size() + (do_push ? 1 : 0) + 1 <= 8);
             static const bool no_sconv_mix = (std::getenv("STRATA_NO_SCONV_MIX") != nullptr);
             const int B_after_push = (int) norm_blocks.size() + (do_push ? 1 : 0);
             const bool fuse_post_attn_ffn_pp = (!no_sconv_mix && T >= 32 && N == 2304 && !save_conv_trace &&
@@ -8598,21 +8710,64 @@ struct Engine {
                 k_rms_norm_f16<<<(unsigned) T, rms_f16_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
             };
             if (fuse_post_attn_ffn_t1) {
+                if (do_push) {
+                    if (pre_push_done_il == il) {
+                        norm_blocks.push_back(pre_push_ndst);
+                        pre_push_done_il = -1;
+                    } else {
+                        const int pass_cur = (n_core > 0 && ip >= hp.core_start && ip < hp.core_end)
+                                           ? ((il - (int) hp.core_start) / (int) n_core) : 0;
+                        push_block(cur_in, il, ip, pass_cur);
+                    }
+                }
                 const int B = (int) norm_blocks.size();
                 NormMixPtrs np{};
                 for (int i = 0; i < B; ++i) np.p[i] = norm_blocks[(size_t) (B - 1 - i)];
                 np.p[B] = ffn_inp;
                 const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
-                if (d_mix_scratch != nullptr && d_router_done != nullptr) {
-                    k_mix_normed_q8_phase1<true><<<dim3(18u, 1u), 128, 0, st>>>(
-                        wo, L.attn_post_conv, hst, cur_in, ffn_inp, 2 * (int) kv_dim,
-                        np, B + 1, L.ffn_res_query, d_mix_scratch, d_router_done + 1, N, inv_sqrt_n, hp.rms_eps);
-                    k_mix_normed_q8_phase2<<<dim3(18u, 1u), 32, 0, st>>>(
-                        np, B + 1, d_mix_scratch, in_ffn, L.ffn_norm, xq, N);
-                } else {
-                    k_shortconv_mix_normed_fused_1pass_q8_t1<<<1, 576, 0, st>>>(
-                        wo, L.attn_post_conv, hst, cur_in, ffn_inp, 2 * (int) kv_dim,
+                if (!has_msg) {
+                    k_shortconv_mix_normed_fused_1pass_q8_t1<true><<<1, 576, 0, st>>>(
+                        wo, L.attn_post_conv, hst, do_push ? nullptr : cur_in, ffn_inp, 2 * (int) kv_dim,
                         np, B + 1, L.ffn_res_query, in_ffn, L.ffn_norm, xq, N, inv_sqrt_n, hp.rms_eps);
+                } else {
+                    k_shortconv_mix_normed_fused_1pass_q8_t1<false><<<1, 576, 0, st>>>(
+                        wo, L.attn_post_conv, hst, do_push ? nullptr : cur_in, ffn_inp, 2 * (int) kv_dim,
+                        np, B + 1, L.ffn_res_query, in_ffn, nullptr, nullptr, N, inv_sqrt_n, hp.rms_eps);
+                    if (hp.loop_gate_rank == 64 && L.loop_down[3].type == 0 &&
+                        L.loop_gain[3].type == 0 && L.loop_forget[3].type == 0 &&
+                        d_router_done != nullptr && d_mix_scratch != nullptr) {
+                        if (can_fused_loop_ctrl_1) {
+                            LoopCtrlRmsQ8Ptrs3 lcp{
+                                {(const float*) L.loop_down[3].d, nullptr, nullptr},
+                                {(const float*) L.loop_gain[3].d, nullptr, nullptr},
+                                {(const float*) L.loop_forget[3].d, nullptr, nullptr},
+                                {in_ffn, nullptr, nullptr},
+                                {msg3, nullptr, nullptr},
+                                {in_ffn, nullptr, nullptr},
+                                {L.ffn_norm, nullptr, nullptr},
+                                {xq, nullptr, nullptr}
+                            };
+                            k_loop_ctrl_fused_rms_q8_t1<1, 64><<<dim3(64u, 1u), 256, 0, st>>>(
+                                lcp, d_mix_scratch, d_router_done + 12, hp.rms_eps);
+                        } else {
+                            k_loop_down_fused_smallT<1, true><<<64u, 256, 0, st>>>(
+                                (const float*) L.loop_down[3].d, in_ffn, msg3, ctrl64, N, 64, 1, hp.rms_eps);
+                            CtrlUpRmsQ8Ptrs3 upr{
+                                {(const float*) L.loop_gain[3].d, nullptr, nullptr},
+                                {(const float*) L.loop_forget[3].d, nullptr, nullptr},
+                                {in_ffn, nullptr, nullptr},
+                                {msg3, nullptr, nullptr},
+                                {in_ffn, nullptr, nullptr},
+                                {L.ffn_norm, nullptr, nullptr},
+                                {xq, nullptr, nullptr}
+                            };
+                            k_control_up_combine_rms_q8_t1<1><<<dim3(144u, 1u), 256, 0, st>>>(
+                                upr, ctrl64, d_mix_scratch, d_router_done + 15, hp.rms_eps, N);
+                        }
+                    } else {
+                        run_control(in_ffn, msg3, L, 3, in_ffn, 1);
+                        k_rms_norm_q8_1<<<1u, 576, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
+                    }
                 }
             } else if (fuse_post_attn_ffn_pp) {
                 // Note: push_block(cur_in) pushes rms_norm(cur_in) (independent of wo->ffn_inp!), so run it first and
@@ -8893,19 +9048,34 @@ struct Engine {
                         if (has_msg && T == 1 && ffn_want_q8 && N == 2304 && hp.loop_gate_rank == 64 &&
                             L.loop_down[3].type == 0 && L.loop_gain[3].type == 0 && L.loop_forget[3].type == 0 &&
                             d_router_done != nullptr && d_mix_scratch != nullptr) {
-                            k_loop_down_fused_smallT<1, true><<<64u, 256, 0, st>>>(
-                                (const float*) L.loop_down[3].d, in_ffn, msg3, ctrl64, N, 64, 1, hp.rms_eps);
-                            CtrlUpRmsQ8Ptrs3 upr{
-                                {(const float*) L.loop_gain[3].d, nullptr, nullptr},
-                                {(const float*) L.loop_forget[3].d, nullptr, nullptr},
-                                {in_ffn, nullptr, nullptr},
-                                {msg3, nullptr, nullptr},
-                                {in_ffn, nullptr, nullptr},
-                                {L.ffn_norm, nullptr, nullptr},
-                                {xq, nullptr, nullptr}
-                            };
-                            k_control_up_combine_rms_q8_t1<1><<<dim3(144u, 1u), 256, 0, st>>>(
-                                upr, ctrl64, d_mix_scratch, d_router_done + 15, hp.rms_eps, N);
+                            if (can_fused_loop_ctrl_1) {
+                                LoopCtrlRmsQ8Ptrs3 lcp{
+                                    {(const float*) L.loop_down[3].d, nullptr, nullptr},
+                                    {(const float*) L.loop_gain[3].d, nullptr, nullptr},
+                                    {(const float*) L.loop_forget[3].d, nullptr, nullptr},
+                                    {in_ffn, nullptr, nullptr},
+                                    {msg3, nullptr, nullptr},
+                                    {in_ffn, nullptr, nullptr},
+                                    {L.ffn_norm, nullptr, nullptr},
+                                    {xq, nullptr, nullptr}
+                                };
+                                k_loop_ctrl_fused_rms_q8_t1<1, 64><<<dim3(64u, 1u), 256, 0, st>>>(
+                                    lcp, d_mix_scratch, d_router_done + 12, hp.rms_eps);
+                            } else {
+                                k_loop_down_fused_smallT<1, true><<<64u, 256, 0, st>>>(
+                                    (const float*) L.loop_down[3].d, in_ffn, msg3, ctrl64, N, 64, 1, hp.rms_eps);
+                                CtrlUpRmsQ8Ptrs3 upr{
+                                    {(const float*) L.loop_gain[3].d, nullptr, nullptr},
+                                    {(const float*) L.loop_forget[3].d, nullptr, nullptr},
+                                    {in_ffn, nullptr, nullptr},
+                                    {msg3, nullptr, nullptr},
+                                    {in_ffn, nullptr, nullptr},
+                                    {L.ffn_norm, nullptr, nullptr},
+                                    {xq, nullptr, nullptr}
+                                };
+                                k_control_up_combine_rms_q8_t1<1><<<dim3(144u, 1u), 256, 0, st>>>(
+                                    upr, ctrl64, d_mix_scratch, d_router_done + 15, hp.rms_eps, N);
+                            }
                         } else {
                             if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T, ffn_ctrl_ir ? ir_c0 : nullptr, ffn_ctrl_ir ? ir_m3 : nullptr);
                             if (ffn_want_q8) {
@@ -9010,6 +9180,21 @@ struct Engine {
                     }
                 }
             }
+            const bool use_t1_core_post = (!can_full_graph && !capturing_full_graph && !prof && T == 1 && !capture_dspark &&
+                                           core_all_gpu && !prof_detail);
+            const int core_end_virt_post = (int) (hp.core_start + hp.num_loops * n_core);
+            bool can_defer_postffn_t1 = false;
+            if (!no_vert_fuse && !hybrid && T == 1 && !save_conv_trace && N == 2304 && fuse_comb_conv &&
+                (int) hp.n_expert_used == 8 && ((((uintptr_t) ewts) & 15u) == 0u) &&
+                il + 1 < hp.n_layer && (int) norm_blocks.size() <= 7) {
+                const int ip_next = hp.loop_layer(il + 1);
+                const PhysLayer& L_next = m->layers[(size_t) ip_next];
+                if (ip_next != hp.core_start &&
+                    !(use_t1_core_post && il + 1 == core_end_virt_post) &&
+                    L_next.attn_res_query != nullptr) {
+                    can_defer_postffn_t1 = true;
+                }
+            }
             const bool post_conv_done = run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv,
                                                 f16_ffn_ready,
                                                 can_defer_postffn ? nullptr : (((is_hy && T <= std::max(verify_max_t, 8) && !pp_streaming) || want_pp_comb_conv) ? &hy_conv : nullptr),
@@ -9020,6 +9205,8 @@ struct Engine {
                 // Already fused k_combine_experts[_hybrid]_shortconv directly into cur!
             } else if (can_defer_postffn) {
                 deferred_postffn = DeferredPostFfn{true, il, L.ffn_post_conv, hst, 2 * (int) kv_dim + N};
+            } else if (can_defer_postffn_t1) {
+                deferred_postffn_t1 = DeferredPostFfnT1{true, eparts, ewts, L.ffn_post_conv, hst, ffn_inp, 2 * (int) kv_dim + N};
             } else if (fuse_comb_conv) {
                 const unsigned nb = (unsigned) ((N + 31) / 32);
                 const int ho = 2 * (int) kv_dim + N;

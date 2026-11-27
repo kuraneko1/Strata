@@ -1759,8 +1759,9 @@ __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass_f16(
     if constexpr (NQ >= 3) store_q(2, nf16.w2, out.p[2], nf16.y16_2);
 }
 
-/// 4-in-1 fused T=1 k_shortconv(wo -> ffn_inp, res=cur) + k_mix_normed_fused_1pass_q8<1>(..., last=ffn_inp -> in_ffn, xq):
-/// Eliminates k_shortconv launch AND ffn_inp global read on !do_push && !has_msg && !save_conv_trace layers (24/48 layers)!
+/// 4-in-1 fused T=1 k_shortconv(wo -> ffn_inp, res=cur) + k_mix_normed_fused_1pass[_q8]<1>(..., last=ffn_inp -> in_ffn[, xq]):
+/// Eliminates k_shortconv launch AND ffn_inp global read on all T=1 layers (WRITE_Q8=true for !has_msg, WRITE_Q8=false for has_msg)!
+template <bool WRITE_Q8 = true>
 __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_t1(
     const float* __restrict__ wo, const float* __restrict__ w_conv, float* __restrict__ hist,
     const float* __restrict__ res_cur, float* __restrict__ ffn_inp_out, int hist_offset,
@@ -1774,17 +1775,17 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int blk_idx = tid >> 3;
     const int sub_lane = tid & 7;
-    const float4 qv = reinterpret_cast<const float4*>(q0)[tid];
+    const float4 qv = __ldg(reinterpret_cast<const float4*>(q0) + tid);
 
-    // 1. Compute 4 channels of post-attn shortconv + residual add in registers, update hist, write ffn_inp_out
-    const float4 wov = reinterpret_cast<const float4*>(wo)[tid];
-    const float4 rcv = reinterpret_cast<const float4*>(res_cur)[tid];
+    // 1. Compute 4 channels of post-attn shortconv + optional residual add in registers, update hist, write ffn_inp_out
+    const float4 wov = __ldg(reinterpret_cast<const float4*>(wo) + tid);
+    const float4 rcv = res_cur ? __ldg(reinterpret_cast<const float4*>(res_cur) + tid) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     const float scale = rsqrtf(5.0f);
     const int c0 = tid * 4;
     auto do_conv1 = [&](int ci, float x, float res) -> float {
         float* hc = hist + (size_t) (hist_offset + ci) * 3;
         const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
-        const float4 w4 = *reinterpret_cast<const float4*>(w_conv + (size_t) ci * 4);
+        const float4 w4 = __ldg(reinterpret_cast<const float4*>(w_conv + (size_t) ci * 4));
         const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
         hc[0] = h1; hc[1] = h2; hc[2] = x;
         return (x + s) * scale + res;
@@ -1796,7 +1797,7 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_
         do_conv1(c0 + 3, wov.w, rcv.w));
     reinterpret_cast<float4*>(ffn_inp_out)[tid] = v_last;
 
-    // 2. Mix over [norm_blocks..., v_last] (exact same arithmetic as k_mix_normed_fused_1pass_q8<1>)
+    // 2. Mix over [norm_blocks..., v_last] (exact same arithmetic as k_mix_normed_fused_1pass[_q8]<1>)
     float4 cv[8];
 #pragma unroll
     for (int d = 0; d < 8; ++d) {
@@ -1817,6 +1818,8 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_
     }
     __syncthreads();
     if (warp == 0) {
+        float v_w = -1e30f;
+        float inv_rms_local = 1.0f;
         if (lane < D) {
             float s = 0.0f;
 #pragma unroll
@@ -1825,182 +1828,9 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_
                 float ss = 0.0f;
 #pragma unroll
                 for (int w = 0; w < 18; ++w) ss += s_ss[w];
-                const float ir = rsqrtf(ss / (float) N + rms_eps);
-                s_inv_rms = ir;
-                s *= ir;
+                inv_rms_local = rsqrtf(ss / (float) N + rms_eps);
+                s *= inv_rms_local;
             }
-            s_w[lane] = s * inv_sqrt_n;
-        }
-        __syncwarp();
-        if (lane == 0) {
-            float m = -1e30f;
-            for (int d = 0; d < D; ++d) m = fmaxf(m, s_w[d]);
-            float sum = 0.0f;
-            for (int d = 0; d < D; ++d) {
-                s_w[d] = __expf(s_w[d] - m);
-                sum += s_w[d];
-            }
-            const float inv = __fdividef(1.0f, sum);
-            for (int d = 0; d < D; ++d) s_w[d] *= inv;
-            s_w[D - 1] *= s_inv_rms;
-        }
-    }
-    __syncthreads();
-    float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
-#pragma unroll
-    for (int d = 0; d < 8; ++d) {
-        if (d < D) {
-            const float wd = s_w[d];
-            ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
-        }
-    }
-    const float4 r = make_float4(ax, ay, az, aw);
-    float ss = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-    if (lane == 0) s_ss[warp] = ss;
-    __syncthreads();
-    if (tid == 0) {
-        float tot = 0.0f;
-#pragma unroll
-        for (int w = 0; w < 18; ++w) tot += s_ss[w];
-        s_inv_rms = rsqrtf(tot / (float) N + rms_eps);
-    }
-    __syncthreads();
-    const float ir = s_inv_rms;
-    float4 o;
-    if (nw0) {
-        const float4 ww = reinterpret_cast<const float4*>(nw0)[tid];
-        o = make_float4(r.x * ir * ww.x, r.y * ir * ww.y, r.z * ir * ww.z, r.w * ir * ww.w);
-    } else {
-        o = make_float4(r.x * ir, r.y * ir, r.z * ir, r.w * ir);
-    }
-    reinterpret_cast<float4*>(out0)[tid] = o;
-    if (xq0) q8_1_sub8_store(o, xq0, blk_idx, sub_lane);
-}
-
-/// Multi-CTA (18 CTAs/token x 128 thr = 2304 ch, 1 ch/thread) parallel Phase 1 for N == 2304 decode mix_normed + RMSNorm + Q8_1
-/// (optionally fusing post-attn T=1 shortconv + residual add with 100% coalesced hist & w_conv accesses across 18 SMs!).
-/// Computes exact query dots + symmetric Gram matrix G[a][b] = v_a . v_b across 18 SMs; last CTA via atom.acq_rel.gpu
-/// produces exact effective weights w_eff[d] = softmax_w[d] * inv_rms_out so Phase 2 runs barrier-free across 18 SMs!
-/// CUDA-Graph safe (d_done[t] self-resets to 0), STACK: 0, LOCAL: 0.
-template <bool DO_SHORTCONV>
-__global__ void __launch_bounds__(128, 8) k_mix_normed_q8_phase1(
-    const float* __restrict__ wo, const float* __restrict__ w_conv, float* __restrict__ hist,
-    const float* __restrict__ res_cur, float* __restrict__ ffn_inp_out, int hist_offset,
-    NormMixPtrs ptrs, int D, const float* __restrict__ q0,
-    float* __restrict__ scratch, uint32_t* __restrict__ d_done,
-    int N, float inv_sqrt_n, float rms_eps) {
-    __shared__ float s_v[8][128];     // 4 KiB, zero bank conflicts (thread tid accesses col tid)
-    __shared__ float s_part[4][48];   // 4 warps x up to (8 dots + 36 Gram entries)
-    __shared__ float s_tot[48];
-    __shared__ float s_w[8];
-    __shared__ int s_is_last;
-
-    const int cta = (int) blockIdx.x;
-    const int t = (int) blockIdx.y;
-    const int tid = (int) threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int c = cta * 128 + tid;
-
-    float v_last = 0.0f;
-    if constexpr (DO_SHORTCONV) {
-        float* hc = hist + (size_t) (hist_offset + c) * 3;
-        const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
-        const float4 w4 = __ldg(reinterpret_cast<const float4*>(w_conv + (size_t) c * 4));
-        const float x = __ldg(wo + c);
-        const float res = __ldg(res_cur + c);
-        const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
-        hc[0] = h1; hc[1] = h2; hc[2] = x;
-        v_last = (x + s) * rsqrtf(5.0f) + res;
-        ffn_inp_out[c] = v_last;
-    }
-
-    const float q = __ldg(q0 + c);
-#pragma unroll
-    for (int d = 0; d < 8; ++d) {
-        if (d < D) {
-            const float vd = (DO_SHORTCONV && d == D - 1)
-                ? v_last
-                : __ldg(ptrs.p[d] + (size_t) t * N + c);
-            s_v[d][tid] = vd;
-            float dot = vd * q;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
-            if (lane == 0) s_part[warp][d] = dot;
-        }
-    }
-
-    int p = 0;
-    for (int a = 0; a < D; ++a) {
-        const float va = s_v[a][tid];
-        for (int b = a; b < D; ++b) {
-            float prod = va * s_v[b][tid];
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) prod += __shfl_xor_sync(0xffffffffu, prod, o);
-            if (lane == 0) s_part[warp][D + p] = prod;
-            ++p;
-        }
-    }
-    __syncthreads();
-
-    const int n_tot = D + p;
-    float* my_scratch = scratch + (size_t) t * 880u;
-    if (tid < n_tot) {
-        const float sum4 = s_part[0][tid] + s_part[1][tid] + s_part[2][tid] + s_part[3][tid];
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(my_scratch + 16 + cta * 48 + tid), "f"(sum4) : "memory");
-#else
-        *((volatile float*) (my_scratch + 16 + cta * 48 + tid)) = sum4;
-#endif
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        uint32_t prev = 0u;
-        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(d_done + t) : "memory");
-        const int last = ((prev + 1u) == 18u) ? 1 : 0;
-        if (last) {
-            asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" :: "l"(d_done + t) : "memory");
-        }
-#else
-        __threadfence();
-        const uint32_t prev = atomicAdd(d_done + t, 1u);
-        const int last = ((prev + 1u) == 18u) ? 1 : 0;
-        if (last) {
-            *((volatile uint32_t*) (d_done + t)) = 0u;
-            __threadfence();
-        }
-#endif
-        s_is_last = last;
-    }
-    __syncthreads();
-    if (!s_is_last) return;
-
-    if (tid < n_tot) {
-        float acc = 0.0f;
-#pragma unroll
-        for (int ci = 0; ci < 18; ++ci) {
-            float v_ci;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-            asm volatile("ld.relaxed.gpu.global.f32 %0, [%1];" : "=f"(v_ci) : "l"(my_scratch + 16 + ci * 48 + tid) : "memory");
-#else
-            v_ci = __ldcg(my_scratch + 16 + ci * 48 + tid);
-#endif
-            acc += v_ci;
-        }
-        s_tot[tid] = acc;
-    }
-    __syncthreads();
-
-    if (warp == 0) {
-        const float ir_last = rsqrtf(s_tot[n_tot - 1] / (float) N + rms_eps);
-        float v_w = -1e30f;
-        if (lane < D) {
-            float s = s_tot[lane];
-            if (lane == D - 1) s *= ir_last;
             v_w = s * inv_sqrt_n;
         }
         float m = v_w;
@@ -2016,58 +1846,276 @@ __global__ void __launch_bounds__(128, 8) k_mix_normed_q8_phase1(
         }
         if (lane < D) {
             float res = ev * __fdividef(1.0f, sum);
-            if (lane == D - 1) res *= ir_last;
+            if (lane == D - 1) res *= inv_rms_local;
             s_w[lane] = res;
         }
-        __syncwarp();
-        if (lane == 0) {
-            float tot_ss = 0.0f;
-            int gp = 0;
-            for (int a = 0; a < D; ++a) {
-                const float wa = s_w[a];
-                for (int b = a; b < D; ++b) {
-                    const float g = s_tot[D + gp];
-                    tot_ss += ((a == b) ? (wa * wa) : (2.0f * wa * s_w[b])) * g;
-                    ++gp;
-                }
-            }
-            const float ir_out = rsqrtf(fmaxf(0.0f, tot_ss) / (float) N + rms_eps);
-            for (int d = 0; d < D; ++d) {
-                my_scratch[d] = s_w[d] * ir_out;
-            }
-        }
     }
-}
-
-/// Multi-CTA (18 CTAs/token x 32 thr = 1 warp/CTA, 0 __syncthreads(), 0 SMEM) barrier-free Phase 2:
-/// Applies precomputed w_eff[0..D-1] to L2-hot ptrs.p[0..D-1] * nw0 and emits FP32 out0 + Q8_1 xq0 in parallel across 18 SMs!
-__global__ void __launch_bounds__(32, 16) k_mix_normed_q8_phase2(
-    NormMixPtrs ptrs, int D, const float* __restrict__ scratch,
-    float* __restrict__ out0, const float* __restrict__ nw0, void* __restrict__ xq0, int N) {
-    const int cta = (int) blockIdx.x;
-    const int t = (int) blockIdx.y;
-    const int lane = (int) threadIdx.x;
-    const int f4_idx = cta * 32 + lane;
-    const float* w_eff = scratch + (size_t) t * 880u;
-
+    __syncthreads();
     float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
 #pragma unroll
     for (int d = 0; d < 8; ++d) {
         if (d < D) {
-            const float wd = __ldg(w_eff + d);
-            const float4 v = reinterpret_cast<const float4*>(ptrs.p[d] + (size_t) t * N)[f4_idx];
-            ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
+            const float wd = s_w[d];
+            ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
         }
     }
-    float4 o;
-    if (nw0) {
-        const float4 ww = __ldg(reinterpret_cast<const float4*>(nw0) + f4_idx);
-        o = make_float4(ax * ww.x, ay * ww.y, az * ww.z, aw * ww.w);
+    const float4 r = make_float4(ax, ay, az, aw);
+    if constexpr (!WRITE_Q8) {
+        reinterpret_cast<float4*>(out0)[tid] = r;
+        return;
     } else {
-        o = make_float4(ax, ay, az, aw);
+        float ss = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        if (lane == 0) s_ss[warp] = ss;
+        __syncthreads();
+        if (warp == 0) {
+            float tot = (lane < 18) ? s_ss[lane] : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, o);
+            if (lane == 0) s_inv_rms = rsqrtf(tot / (float) N + rms_eps);
+        }
+        __syncthreads();
+        const float ir = s_inv_rms;
+        float4 o;
+        if (nw0) {
+            const float4 ww = __ldg(reinterpret_cast<const float4*>(nw0) + tid);
+            o = make_float4(r.x * ir * ww.x, r.y * ir * ww.y, r.z * ir * ww.z, r.w * ir * ww.w);
+        } else {
+            o = make_float4(r.x * ir, r.y * ir, r.z * ir, r.w * ir);
+        }
+        reinterpret_cast<float4*>(out0)[tid] = o;
+        if (xq0) q8_1_sub8_store(o, xq0, blk_idx, sub_lane);
     }
-    reinterpret_cast<float4*>(out0 + (size_t) t * N)[f4_idx] = o;
-    if (xq0) q8_1_sub8_store(o, xq0, t * 72 + cta * 4 + (lane >> 3), lane & 7);
+}
+
+/// Shared T=1 helper: combine_experts(top_k=8) + post-FFN shortconv + residual add for 4 contiguous channels (tid*4..+3).
+__device__ __forceinline__ float4 combine_experts_shortconv_k8_ch4(
+    const float* __restrict__ eparts, const float* __restrict__ ewts,
+    const float* __restrict__ w_conv, float* __restrict__ hist,
+    const float* __restrict__ res_add, int hist_offset, int tid, int N) {
+    const float4 e0 = __ldg(reinterpret_cast<const float4*>(ewts));
+    const float4 e1 = __ldg(reinterpret_cast<const float4*>(ewts + 4));
+    const float4 p0 = __ldg(reinterpret_cast<const float4*>(eparts) + tid);
+    float4 acc = make_float4(e0.x * p0.x, e0.x * p0.y, e0.x * p0.z, e0.x * p0.w);
+    auto add_ep = [&](int k, float w) {
+        const float4 p = __ldg(reinterpret_cast<const float4*>(eparts + (size_t) k * (size_t) N) + tid);
+        acc.x = fmaf(w, p.x, acc.x);
+        acc.y = fmaf(w, p.y, acc.y);
+        acc.z = fmaf(w, p.z, acc.z);
+        acc.w = fmaf(w, p.w, acc.w);
+    };
+    add_ep(1, e0.y); add_ep(2, e0.z); add_ep(3, e0.w);
+    add_ep(4, e1.x); add_ep(5, e1.y); add_ep(6, e1.z); add_ep(7, e1.w);
+
+    const float scale = rsqrtf(5.0f);
+    const float4 rcv = res_add ? __ldg(reinterpret_cast<const float4*>(res_add) + tid) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const int c0 = tid << 2;
+    auto conv_ch = [&](int ci, float x, float res) -> float {
+        float* hc = hist + (size_t) (hist_offset + ci) * 3u;
+        const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+        const float4 w4 = __ldg(reinterpret_cast<const float4*>(w_conv + (size_t) ci * 4u));
+        const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+        hc[0] = h1; hc[1] = h2; hc[2] = x;
+        return (x + s) * scale + res;
+    };
+    return make_float4(
+        conv_ch(c0 + 0, acc.x, rcv.x),
+        conv_ch(c0 + 1, acc.y, rcv.y),
+        conv_ch(c0 + 2, acc.z, rcv.z),
+        conv_ch(c0 + 3, acc.w, rcv.w));
+}
+
+/// Fused T=1 Post-FFN combine_experts_shortconv_k8 -> cur + Pre-Attn mix_normed + RMSNorm + Q8_1 (!has_msg, N == 2304):
+/// Eliminates k_combine_experts_shortconv_k8 launch + cur HBM/L2 read on T=1 Full-VRAM non-has_msg layers!
+template <int NQ>
+__global__ void __launch_bounds__(576, (NQ >= 3) ? 1 : 2) k_combine_experts_shortconv_k8_mix_q8_t1(
+    const float* __restrict__ eparts, const float* __restrict__ ewts,
+    const float* __restrict__ w_conv, float* __restrict__ hist,
+    const float* __restrict__ res_add, float* __restrict__ cur_out, int hist_offset,
+    NormMixPtrs ptrs, int D, const float* __restrict__ q0,
+    MixOuts4 out, NormQ8Out3 nq8, int N, float inv_sqrt_n, float rms_eps) {
+    __shared__ float s_dot[NQ][8][18];
+    __shared__ float s_w[NQ][8];
+    __shared__ float s_ss[18];
+    __shared__ float s_inv_rms;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int blk_idx = tid >> 3;
+    const int sub_lane = tid & 7;
+
+    const float4 v_cur = combine_experts_shortconv_k8_ch4(eparts, ewts, w_conv, hist, res_add, hist_offset, tid, N);
+    reinterpret_cast<float4*>(cur_out)[tid] = v_cur;
+
+    float4 qv[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) qv[q] = __ldg(reinterpret_cast<const float4*>(q0 + (size_t) q * N) + tid);
+
+    float4 cv[8];
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+            const float4 v = (d == D - 1) ? v_cur : reinterpret_cast<const float4*>(ptrs.p[d])[tid];
+            cv[d] = v;
+            if (d == D - 1) {
+                float ss = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+                if (lane == 0) s_ss[warp] = ss;
+            }
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                float dot = v.x * qv[q].x + v.y * qv[q].y + v.z * qv[q].z + v.w * qv[q].w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+                if (lane == 0) s_dot[q][d][warp] = dot;
+            }
+        }
+    }
+    __syncthreads();
+    if constexpr (NQ == 1) {
+        if (warp == 0) {
+            float v_w = -1e30f;
+            float inv_rms_local = 1.0f;
+            if (lane < D) {
+                float s = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) s += s_dot[0][lane][w];
+                if (lane == D - 1) {
+                    float ss = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < 18; ++w) ss += s_ss[w];
+                    inv_rms_local = rsqrtf(ss / (float) N + rms_eps);
+                    s *= inv_rms_local;
+                }
+                v_w = s * inv_sqrt_n;
+            }
+            float m = v_w;
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+            const float ev = (lane < D) ? __expf(v_w - m) : 0.0f;
+            float sum = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float ed = __shfl_sync(0xffffffffu, ev, d);
+                if (d < D) sum += ed;
+            }
+            if (lane < D) {
+                float res = ev * __fdividef(1.0f, sum);
+                if (lane == D - 1) res *= inv_rms_local;
+                s_w[0][lane] = res;
+            }
+        }
+        __syncthreads();
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            if (d < D) {
+                const float wd = s_w[0][d];
+                ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+            }
+        }
+        const float4 r = make_float4(ax, ay, az, aw);
+        float ss = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        if (lane == 0) s_ss[warp] = ss;
+        __syncthreads();
+        if (warp == 0) {
+            float tot = (lane < 18) ? s_ss[lane] : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, o);
+            if (lane == 0) s_inv_rms = rsqrtf(tot / (float) N + rms_eps);
+        }
+        __syncthreads();
+        const float ir = s_inv_rms;
+        float4 o;
+        if (nq8.w0) {
+            const float4 ww = __ldg(reinterpret_cast<const float4*>(nq8.w0) + tid);
+            o = make_float4(r.x * ir * ww.x, r.y * ir * ww.y, r.z * ir * ww.z, r.w * ir * ww.w);
+        } else {
+            o = make_float4(r.x * ir, r.y * ir, r.z * ir, r.w * ir);
+        }
+        reinterpret_cast<float4*>(out.p[0])[tid] = o;
+        if (nq8.xq0) q8_1_sub8_store(o, nq8.xq0, blk_idx, sub_lane);
+        return;
+    }
+
+    if (warp == 0) {
+        if (lane < NQ * D) {
+            const int q = lane / D, d = lane % D;
+            float s = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 18; ++w) s += s_dot[q][d][w];
+            if (d == D - 1) {
+                float ss = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) ss += s_ss[w];
+                const float ir = rsqrtf(ss / (float) N + rms_eps);
+                if (q == 0) s_inv_rms = ir;
+                s *= ir;
+            }
+            s_w[q][d] = s * inv_sqrt_n;
+        }
+        __syncwarp();
+        if (lane < NQ) {
+            const int q = lane;
+            float m = -1e30f;
+            for (int d = 0; d < D; ++d) m = fmaxf(m, s_w[q][d]);
+            float sum = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                s_w[q][d] = __expf(s_w[q][d] - m);
+                sum += s_w[q][d];
+            }
+            const float inv = __fdividef(1.0f, sum);
+            for (int d = 0; d < D; ++d) s_w[q][d] *= inv;
+            s_w[q][D - 1] *= s_inv_rms;
+        }
+    }
+    __syncthreads();
+    float ax[NQ] = {}, ay[NQ] = {}, az[NQ] = {}, aw[NQ] = {};
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+#pragma unroll
+            for (int q = 0; q < NQ; ++q) {
+                const float wd = s_w[q][d];
+                ax[q] += wd * cv[d].x; ay[q] += wd * cv[d].y; az[q] += wd * cv[d].z; aw[q] += wd * cv[d].w;
+            }
+        }
+    }
+    __shared__ float s_ss3[NQ][18];
+    __shared__ float s_ir3[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) {
+        float ss = ax[q] * ax[q] + ay[q] * ay[q] + az[q] * az[q] + aw[q] * aw[q];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        if (lane == 0) s_ss3[q][warp] = ss;
+    }
+    __syncthreads();
+    if (tid < NQ) {
+        float tot = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 18; ++w) tot += s_ss3[tid][w];
+        s_ir3[tid] = rsqrtf(tot / (float) N + rms_eps);
+    }
+    __syncthreads();
+    auto store_q = [&](int q, const float* nw, float* y_dst, void* xq_dst) {
+        const float ir = s_ir3[q];
+        float4 o;
+        if (nw) {
+            const float4 ww = __ldg(reinterpret_cast<const float4*>(nw) + tid);
+            o = make_float4(ax[q] * ir * ww.x, ay[q] * ir * ww.y, az[q] * ir * ww.z, aw[q] * ir * ww.w);
+        } else {
+            o = make_float4(ax[q] * ir, ay[q] * ir, az[q] * ir, aw[q] * ir);
+        }
+        reinterpret_cast<float4*>(y_dst)[tid] = o;
+        if (xq_dst) q8_1_sub8_store(o, xq_dst, blk_idx, sub_lane);
+    };
+    store_q(0, nq8.w0, out.p[0], nq8.xq0);
+    if constexpr (NQ >= 2) store_q(1, nq8.w1, out.p[1], nq8.xq1);
+    if constexpr (NQ >= 3) store_q(2, nq8.w2, out.p[2], nq8.xq2);
 }
 
 /// Dual-CTA batched pre-attn mix_normed for decode has_msg layers (T=1..8, N==2304):
@@ -2229,7 +2277,173 @@ __global__ void __launch_bounds__(576, 1) k_mix_normed_fused_1pass_dual(
                     ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
                 }
             }
-            reinterpret_cast<float4*>(out_c.p[q] + (size_t) t * N)[tid] = make_float4(ax, ay, az, aw);
+        }
+    }
+}
+
+/// Fused T=1 Post-FFN combine_experts_shortconv_k8 -> cur + Dual-CTA Pre-Attn mix_normed (has_msg layers, N == 2304):
+/// blockIdx.y == 0: msg0, msg3, msg1, msg2 from norm_bank
+/// blockIdx.y == 1: combine_experts_shortconv_k8 -> cur_out, then in_q[, in_k, in_v] from norm_blocks + cur_v!
+template <int NQ_CUR>
+__global__ void __launch_bounds__(576, 1) k_combine_experts_shortconv_k8_mix_dual_t1(
+    NormMixPtrs ptrs_m, int D_m, const float* __restrict__ qm0, const float* __restrict__ qm1, MixOuts4 out_m,
+    const float* __restrict__ eparts, const float* __restrict__ ewts,
+    const float* __restrict__ w_conv, float* __restrict__ hist,
+    const float* __restrict__ res_add, float* __restrict__ cur_out, int hist_offset,
+    NormMixPtrs ptrs_c, int D_c, const float* __restrict__ qc0, MixOuts4 out_c, int swa_broadcast,
+    int N, float inv_sqrt_n, float rms_eps) {
+    __shared__ float s_dot[4][8][18];
+    __shared__ float s_w[4][8];
+    __shared__ float s_ss[18];
+    const int which = blockIdx.y;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+
+    if (which == 0) {
+        float4 cv[8];
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            if (d < D_m) {
+                const float4 v = reinterpret_cast<const float4*>(ptrs_m.p[d])[tid];
+                cv[d] = v;
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float4* q_ptr = reinterpret_cast<const float4*>(
+                        (q >= 2) ? (qm1 + (size_t) (q - 2) * N) : (qm0 + (size_t) q * N));
+                    const float4 qv = __ldg(q_ptr + tid);
+                    float dot = v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+                    if (lane == 0) s_dot[q][d][warp] = dot;
+                }
+            }
+        }
+        __syncthreads();
+        if (warp < 4) {
+            const int q = warp;
+            float wv = -1e30f;
+            if (lane < D_m) {
+                float s = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) s += s_dot[q][lane][w];
+                wv = s * inv_sqrt_n;
+            }
+            float m = wv;
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+            const float ev = (lane < D_m) ? __expf(wv - m) : 0.0f;
+            float sum = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float ed = __shfl_sync(0xffffffffu, ev, d);
+                if (d < D_m) sum += ed;
+            }
+            if (lane < D_m) s_w[q][lane] = ev * __fdividef(1.0f, sum);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                if (d < D_m) {
+                    const float wd = s_w[q][d];
+                    ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+                }
+            }
+            reinterpret_cast<float4*>(out_m.p[q])[tid] = make_float4(ax, ay, az, aw);
+        }
+        return;
+    }
+
+    const float4 v_cur = combine_experts_shortconv_k8_ch4(eparts, ewts, w_conv, hist, res_add, hist_offset, tid, N);
+    reinterpret_cast<float4*>(cur_out)[tid] = v_cur;
+
+    float4 cv[8];
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D_c) {
+            const float4 v = (d == D_c - 1) ? v_cur : reinterpret_cast<const float4*>(ptrs_c.p[d])[tid];
+            cv[d] = v;
+            if (d == D_c - 1) {
+                float ss = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+                if (lane == 0) s_ss[warp] = ss;
+            }
+#pragma unroll
+            for (int q = 0; q < NQ_CUR; ++q) {
+                const float4 qv = __ldg(reinterpret_cast<const float4*>(qc0 + (size_t) q * N) + tid);
+                float dot = v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+                if (lane == 0) s_dot[q][d][warp] = dot;
+            }
+        }
+    }
+    __syncthreads();
+    if (warp < NQ_CUR) {
+        const int q = warp;
+        float wv = -1e30f;
+        float inv_rms_local = 1.0f;
+        if (lane < D_c) {
+            float s = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 18; ++w) s += s_dot[q][lane][w];
+            if (lane == D_c - 1) {
+                float ss = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) ss += s_ss[w];
+                inv_rms_local = rsqrtf(ss / (float) N + rms_eps);
+                s *= inv_rms_local;
+            }
+            wv = s * inv_sqrt_n;
+        }
+        float m = wv;
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        const float ev = (lane < D_c) ? __expf(wv - m) : 0.0f;
+        float sum = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            const float ed = __shfl_sync(0xffffffffu, ev, d);
+            if (d < D_c) sum += ed;
+        }
+        if (lane < D_c) {
+            float res = ev * __fdividef(1.0f, sum);
+            if (lane == D_c - 1) res *= inv_rms_local;
+            s_w[q][lane] = res;
+        }
+    }
+    __syncthreads();
+    if constexpr (NQ_CUR == 1) {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            if (d < D_c) {
+                const float wd = s_w[0][d];
+                ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+            }
+        }
+        const float4 r = make_float4(ax, ay, az, aw);
+        reinterpret_cast<float4*>(out_c.p[0])[tid] = r;
+        if (swa_broadcast) {
+            reinterpret_cast<float4*>(out_c.p[1])[tid] = r;
+            reinterpret_cast<float4*>(out_c.p[2])[tid] = r;
+        }
+    } else {
+#pragma unroll
+        for (int q = 0; q < NQ_CUR; ++q) {
+            float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                if (d < D_c) {
+                    const float wd = s_w[q][d];
+                    ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+                }
+            }
+            reinterpret_cast<float4*>(out_c.p[q])[tid] = make_float4(ax, ay, az, aw);
         }
     }
 }
@@ -5848,6 +6062,336 @@ __global__ void __launch_bounds__(256, 4) k_control_up_combine_rms_q8_t1(
         }
         reinterpret_cast<float4*>(out)[i4] = o;
         if (xqr) q8_1_sub8_store(o, xqr, i4 >> 3, sub_lane);
+    }
+}
+
+struct LoopCtrlRmsQ8Ptrs3 {
+    const float *wd[3];
+    const float *wg[3];
+    const float *wf[3];
+    const float *c[3];
+    const float *m[3];
+    float *o[3];
+    const float *nw[3];
+    void *xq[3];
+};
+
+/// Vertically fused T=1 (N=2304, R=64) loop_down + control_up_combine + RMSNorm + Q8_1 quantization:
+/// Eliminates ctrl64 GMEM round-trip, inter-kernel launch gap, intermediate out HBM/L2 round-trip, and 1-CTA epilogue tail!
+/// Uses self-reversing sense barriers on d_done[mod*3 + 0..2] (CUDA-Graph safe, 0 extra memset).
+/// Grid: dim3(G, N_MOD), Block: 256. Requires scratch >= N_MOD*128 floats, d_done >= N_MOD*3 uint32 (init 0),
+/// and resident CTAs >= G*N_MOD (verified at Engine init via cudaOccupancyMaxActiveBlocksPerMultiprocessor).
+template <int N_MOD, int G>
+__global__ void __launch_bounds__(256, 4) k_loop_ctrl_fused_rms_q8_t1(
+        LoopCtrlRmsQ8Ptrs3 cp, float* __restrict__ scratch, uint32_t* __restrict__ d_done, float rms_eps) {
+    const int mod = (N_MOD == 1) ? 0 : (int) blockIdx.y;
+    const int cta = (int) blockIdx.x;
+    if (mod >= N_MOD || cta >= G) return;
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    constexpr int N = 2304;
+    constexpr int N4 = 576;
+    constexpr int R = 64;
+    constexpr int N_BLK = 72;
+    constexpr int MAX_ITERS = (N_BLK + G - 1) / G;
+    constexpr int ROWS_PER_CTA = R / G;
+
+    __shared__ uint32_t s_sense;
+    __shared__ float s_x[64];
+    __shared__ float s_blk[MAX_ITERS][32];
+    __shared__ float s_red[6][8];
+    __shared__ float s_ir;
+
+    float* mod_scr = scratch + (size_t) mod * 128u;
+    uint32_t* b1 = d_done + (size_t) mod * 3u + 0u;
+    uint32_t* b2 = d_done + (size_t) mod * 3u + 1u;
+    uint32_t* d_sense = d_done + (size_t) mod * 3u + 2u;
+
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        uint32_t s = 0u;
+        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(s) : "l"(d_sense) : "memory");
+        s_sense = s;
+#else
+        s_sense = *((volatile uint32_t*) d_sense);
+#endif
+    }
+
+    // Phase 1: Fused loop_down ([2*N -> R=64])
+    {
+        const float4* c4 = reinterpret_cast<const float4*>(cp.c[mod]);
+        const float4* m4 = reinterpret_cast<const float4*>(cp.m[mod]);
+        if constexpr (ROWS_PER_CTA == 1) {
+            const float4* wc4 = reinterpret_cast<const float4*>(cp.wd[mod] + (size_t) cta * (2 * N));
+            const float4* wm4 = reinterpret_cast<const float4*>(cp.wd[mod] + (size_t) cta * (2 * N) + N);
+            float dc = 0.0f, sc = 0.0f, dm = 0.0f, sm = 0.0f;
+            for (int i = tid; i < N4; i += 256) {
+                const float4 awc = __ldg(wc4 + i);
+                const float4 awm = __ldg(wm4 + i);
+                const float4 vc = __ldg(c4 + i);
+                const float4 vm = __ldg(m4 + i);
+                dc += awc.x * vc.x + awc.y * vc.y + awc.z * vc.z + awc.w * vc.w;
+                sc += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
+                dm += awm.x * vm.x + awm.y * vm.y + awm.z * vm.z + awm.w * vm.w;
+                sm += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
+            }
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                dc += __shfl_xor_sync(0xffffffffu, dc, m);
+                sc += __shfl_xor_sync(0xffffffffu, sc, m);
+                dm += __shfl_xor_sync(0xffffffffu, dm, m);
+                sm += __shfl_xor_sync(0xffffffffu, sm, m);
+            }
+            if (lane == 0) {
+                s_red[0][warp] = dc; s_red[1][warp] = sc;
+                s_red[2][warp] = dm; s_red[3][warp] = sm;
+            }
+            __syncthreads();
+            if (warp == 0) {
+                float tot = 0.0f;
+                if (lane < 4) {
+#pragma unroll
+                    for (int w = 0; w < 8; ++w) tot += s_red[lane][w];
+                }
+                const float tdc = __shfl_sync(0xffffffffu, tot, 0);
+                const float tsc = __shfl_sync(0xffffffffu, tot, 1);
+                const float tdm = __shfl_sync(0xffffffffu, tot, 2);
+                const float tsm = __shfl_sync(0xffffffffu, tot, 3);
+                if (lane == 0) {
+                    const float rc = rsqrtf(tsc / (float) N + rms_eps);
+                    const float rm = rsqrtf(tsm / (float) N + rms_eps);
+                    const float val = tdc * rc + tdm * rm;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                    asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(mod_scr + cta), "f"(val) : "memory");
+#else
+                    *((volatile float*) (mod_scr + cta)) = val;
+#endif
+                }
+            }
+        } else {
+            const int r0 = cta;
+            const int r1 = cta + G;
+            const float4* wc4_0 = reinterpret_cast<const float4*>(cp.wd[mod] + (size_t) r0 * (2 * N));
+            const float4* wm4_0 = reinterpret_cast<const float4*>(cp.wd[mod] + (size_t) r0 * (2 * N) + N);
+            const float4* wc4_1 = reinterpret_cast<const float4*>(cp.wd[mod] + (size_t) r1 * (2 * N));
+            const float4* wm4_1 = reinterpret_cast<const float4*>(cp.wd[mod] + (size_t) r1 * (2 * N) + N);
+            float dc0 = 0.0f, dm0 = 0.0f, dc1 = 0.0f, dm1 = 0.0f, sc = 0.0f, sm = 0.0f;
+            for (int i = tid; i < N4; i += 256) {
+                const float4 vc = __ldg(c4 + i);
+                const float4 vm = __ldg(m4 + i);
+                sc += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
+                sm += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
+                const float4 awc0 = __ldg(wc4_0 + i);
+                const float4 awm0 = __ldg(wm4_0 + i);
+                dc0 += awc0.x * vc.x + awc0.y * vc.y + awc0.z * vc.z + awc0.w * vc.w;
+                dm0 += awm0.x * vm.x + awm0.y * vm.y + awm0.z * vm.z + awm0.w * vm.w;
+                const float4 awc1 = __ldg(wc4_1 + i);
+                const float4 awm1 = __ldg(wm4_1 + i);
+                dc1 += awc1.x * vc.x + awc1.y * vc.y + awc1.z * vc.z + awc1.w * vc.w;
+                dm1 += awm1.x * vm.x + awm1.y * vm.y + awm1.z * vm.z + awm1.w * vm.w;
+            }
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                dc0 += __shfl_xor_sync(0xffffffffu, dc0, m);
+                dm0 += __shfl_xor_sync(0xffffffffu, dm0, m);
+                dc1 += __shfl_xor_sync(0xffffffffu, dc1, m);
+                dm1 += __shfl_xor_sync(0xffffffffu, dm1, m);
+                sc += __shfl_xor_sync(0xffffffffu, sc, m);
+                sm += __shfl_xor_sync(0xffffffffu, sm, m);
+            }
+            if (lane == 0) {
+                s_red[0][warp] = dc0; s_red[1][warp] = dm0;
+                s_red[2][warp] = dc1; s_red[3][warp] = dm1;
+                s_red[4][warp] = sc;  s_red[5][warp] = sm;
+            }
+            __syncthreads();
+            if (warp == 0) {
+                float tot = 0.0f;
+                if (lane < 6) {
+#pragma unroll
+                    for (int w = 0; w < 8; ++w) tot += s_red[lane][w];
+                }
+                const float tdc0 = __shfl_sync(0xffffffffu, tot, 0);
+                const float tdm0 = __shfl_sync(0xffffffffu, tot, 1);
+                const float tdc1 = __shfl_sync(0xffffffffu, tot, 2);
+                const float tdm1 = __shfl_sync(0xffffffffu, tot, 3);
+                const float tsc  = __shfl_sync(0xffffffffu, tot, 4);
+                const float tsm  = __shfl_sync(0xffffffffu, tot, 5);
+                if (lane == 0) {
+                    const float rc = rsqrtf(tsc / (float) N + rms_eps);
+                    const float rm = rsqrtf(tsm / (float) N + rms_eps);
+                    const float v0 = tdc0 * rc + tdm0 * rm;
+                    const float v1 = tdc1 * rc + tdm1 * rm;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                    asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(mod_scr + r0), "f"(v0) : "memory");
+                    asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(mod_scr + r1), "f"(v1) : "memory");
+#else
+                    *((volatile float*) (mod_scr + r0)) = v0;
+                    *((volatile float*) (mod_scr + r1)) = v1;
+#endif
+                }
+            }
+        }
+    }
+
+    // Barrier 1: All G CTAs of this module synchronize after publishing ctrl64[0..63]
+    __syncthreads();
+    if (tid == 0) {
+        const uint32_t s = s_sense;
+        const uint32_t delta = (s == 0u) ? 1u : 0xffffffffu;
+        const uint32_t target = (s == 0u) ? (uint32_t) G : 0u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        uint32_t prev = 0u;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                     : "=r"(prev) : "l"(b1), "r"(delta) : "memory");
+        if (prev + delta != target) {
+            uint32_t cur_v = 0u;
+            do {
+                __nanosleep(32);
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(cur_v) : "l"(b1) : "memory");
+            } while (cur_v != target);
+        }
+#else
+        __threadfence();
+        const uint32_t prev = atomicAdd(b1, delta);
+        if (prev + delta != target) {
+            while (*((volatile uint32_t*) b1) != target) {}
+        }
+        __threadfence();
+#endif
+    }
+    __syncthreads();
+
+    // Phase 2: control_up_combine into SMEM s_blk[iter][0..31] + CTA sum-of-squares
+    if (tid < 16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        float4 v4;
+        asm volatile("ld.relaxed.gpu.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(v4.x), "=f"(v4.y), "=f"(v4.z), "=f"(v4.w)
+                     : "l"(mod_scr + (size_t) tid * 4u) : "memory");
+        reinterpret_cast<float4*>(s_x)[tid] = v4;
+#else
+        reinterpret_cast<float4*>(s_x)[tid] = *reinterpret_cast<const float4*>(mod_scr + (size_t) tid * 4u);
+#endif
+    }
+    __syncthreads();
+
+    float cta_ss = 0.0f;
+    {
+        const int half = lane >> 4;
+        const int i = lane & 15;
+        const float* wg = half ? cp.wf[mod] : cp.wg[mod];
+        const float* cur_p = cp.c[mod];
+        const float* msg_p = cp.m[mod];
+        const float4 x0 = reinterpret_cast<const float4*>(s_x)[i];
+        for (int iter = 0; iter < MAX_ITERS; ++iter) {
+            const int blk = cta + iter * G;
+            if (blk < N_BLK) {
+                const int base_o = blk * 32 + warp * 4;
+                const float4 w0 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 0) * 64u) + i);
+                const float4 w1 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 1) * 64u) + i);
+                const float4 w2 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 2) * 64u) + i);
+                const float4 w3 = __ldg(reinterpret_cast<const float4*>(wg + (size_t) (base_o + 3) * 64u) + i);
+                float a0 = w0.x * x0.x + w0.y * x0.y + w0.z * x0.z + w0.w * x0.w;
+                float a1 = w1.x * x0.x + w1.y * x0.y + w1.z * x0.z + w1.w * x0.w;
+                float a2 = w2.x * x0.x + w2.y * x0.y + w2.z * x0.z + w2.w * x0.w;
+                float a3 = w3.x * x0.x + w3.y * x0.y + w3.z * x0.z + w3.w * x0.w;
+#pragma unroll
+                for (int m = 8; m > 0; m >>= 1) {
+                    a0 += __shfl_xor_sync(0xffffffffu, a0, m);
+                    a1 += __shfl_xor_sync(0xffffffffu, a1, m);
+                    a2 += __shfl_xor_sync(0xffffffffu, a2, m);
+                    a3 += __shfl_xor_sync(0xffffffffu, a3, m);
+                }
+                const float f0 = __shfl_sync(0xffffffffu, a0, 16);
+                const float f1 = __shfl_sync(0xffffffffu, a1, 16);
+                const float f2 = __shfl_sync(0xffffffffu, a2, 16);
+                const float f3 = __shfl_sync(0xffffffffu, a3, 16);
+                if (lane == 0) {
+                    const float4 cv = __ldg(reinterpret_cast<const float4*>(cur_p + base_o));
+                    const float4 mv = __ldg(reinterpret_cast<const float4*>(msg_p + base_o));
+                    const float v0 = (1.0f - fast_tanh(f0)) * cv.x + fast_tanh(a0) * mv.x;
+                    const float v1 = (1.0f - fast_tanh(f1)) * cv.y + fast_tanh(a1) * mv.y;
+                    const float v2 = (1.0f - fast_tanh(f2)) * cv.z + fast_tanh(a2) * mv.z;
+                    const float v3 = (1.0f - fast_tanh(f3)) * cv.w + fast_tanh(a3) * mv.w;
+                    reinterpret_cast<float4*>(s_blk[iter])[warp] = make_float4(v0, v1, v2, v3);
+                    cta_ss += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) cta_ss += __shfl_xor_sync(0xffffffffu, cta_ss, m);
+    if (lane == 0) s_red[0][warp] = cta_ss;
+    __syncthreads();
+    if (tid == 0) {
+        float csum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) csum += s_red[0][w];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(mod_scr + 64u + cta), "f"(csum) : "memory");
+#else
+        *((volatile float*) (mod_scr + 64u + cta)) = csum;
+#endif
+        const uint32_t s = s_sense;
+        const uint32_t delta = (s == 0u) ? 1u : 0xffffffffu;
+        const uint32_t target = (s == 0u) ? (uint32_t) G : 0u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        uint32_t prev = 0u;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                     : "=r"(prev) : "l"(b2), "r"(delta) : "memory");
+        if (prev + delta == target) {
+            asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(d_sense), "r"(s ^ 1u) : "memory");
+        } else {
+            uint32_t cur_v = 0u;
+            do {
+                __nanosleep(32);
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(cur_v) : "l"(b2) : "memory");
+            } while (cur_v != target);
+        }
+#else
+        __threadfence();
+        const uint32_t prev = atomicAdd(b2, delta);
+        if (prev + delta == target) {
+            *((volatile uint32_t*) d_sense) = s ^ 1u;
+            __threadfence();
+        } else {
+            while (*((volatile uint32_t*) b2) != target) {}
+        }
+        __threadfence();
+#endif
+    }
+    __syncthreads();
+
+    // Phase 3: Parallel RMSNorm + Q8_1 store across all G CTAs (1 Q8_1 block per warp in s_blk[warp])
+    float ps = 0.0f;
+    if (tid < G) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("ld.relaxed.gpu.global.f32 %0, [%1];" : "=f"(ps) : "l"(mod_scr + 64u + tid) : "memory");
+#else
+        ps = *((volatile float*) (mod_scr + 64u + tid));
+#endif
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+    if (lane == 0) s_red[0][warp] = ps;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = (lane < 8) ? s_red[0][lane] : 0.0f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, o);
+        if (lane == 0) s_ir = rsqrtf(tot / 2304.0f + rms_eps);
+    }
+    __syncthreads();
+
+    if (warp < MAX_ITERS) {
+        const int blk = cta + warp * G;
+        if (blk < N_BLK) {
+            const int idx = blk * 32 + lane;
+            float xi = s_blk[warp][lane] * s_ir;
+            if (cp.nw[mod]) xi *= __ldg(cp.nw[mod] + idx);
+            cp.o[mod][idx] = xi;
+            if (cp.xq[mod]) q8_1_warp_store(xi, cp.xq[mod], blk, lane);
+        }
     }
 }
 
