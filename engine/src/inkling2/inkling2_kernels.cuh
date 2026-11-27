@@ -1889,6 +1889,197 @@ __global__ void __launch_bounds__(576, 2) k_shortconv_mix_normed_fused_1pass_q8_
     }
 }
 
+/// Multi-CTA (18 CTAs/token x 128 thr = 2304 ch, 1 ch/thread) parallel Phase 1 for N == 2304 decode mix_normed + RMSNorm + Q8_1
+/// (optionally fusing post-attn T=1 shortconv + residual add with 100% coalesced hist & w_conv accesses across 18 SMs!).
+/// Computes exact query dots + symmetric Gram matrix G[a][b] = v_a . v_b across 18 SMs; last CTA via atom.acq_rel.gpu
+/// produces exact effective weights w_eff[d] = softmax_w[d] * inv_rms_out so Phase 2 runs barrier-free across 18 SMs!
+/// CUDA-Graph safe (d_done[t] self-resets to 0), STACK: 0, LOCAL: 0.
+template <bool DO_SHORTCONV>
+__global__ void __launch_bounds__(128, 8) k_mix_normed_q8_phase1(
+    const float* __restrict__ wo, const float* __restrict__ w_conv, float* __restrict__ hist,
+    const float* __restrict__ res_cur, float* __restrict__ ffn_inp_out, int hist_offset,
+    NormMixPtrs ptrs, int D, const float* __restrict__ q0,
+    float* __restrict__ scratch, uint32_t* __restrict__ d_done,
+    int N, float inv_sqrt_n, float rms_eps) {
+    __shared__ float s_v[8][128];     // 4 KiB, zero bank conflicts (thread tid accesses col tid)
+    __shared__ float s_part[4][48];   // 4 warps x up to (8 dots + 36 Gram entries)
+    __shared__ float s_tot[48];
+    __shared__ float s_w[8];
+    __shared__ int s_is_last;
+
+    const int cta = (int) blockIdx.x;
+    const int t = (int) blockIdx.y;
+    const int tid = (int) threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int c = cta * 128 + tid;
+
+    float v_last = 0.0f;
+    if constexpr (DO_SHORTCONV) {
+        float* hc = hist + (size_t) (hist_offset + c) * 3;
+        const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+        const float4 w4 = __ldg(reinterpret_cast<const float4*>(w_conv + (size_t) c * 4));
+        const float x = __ldg(wo + c);
+        const float res = __ldg(res_cur + c);
+        const float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+        hc[0] = h1; hc[1] = h2; hc[2] = x;
+        v_last = (x + s) * rsqrtf(5.0f) + res;
+        ffn_inp_out[c] = v_last;
+    }
+
+    const float q = __ldg(q0 + c);
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+            const float vd = (DO_SHORTCONV && d == D - 1)
+                ? v_last
+                : __ldg(ptrs.p[d] + (size_t) t * N + c);
+            s_v[d][tid] = vd;
+            float dot = vd * q;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) s_part[warp][d] = dot;
+        }
+    }
+
+    int p = 0;
+    for (int a = 0; a < D; ++a) {
+        const float va = s_v[a][tid];
+        for (int b = a; b < D; ++b) {
+            float prod = va * s_v[b][tid];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) prod += __shfl_xor_sync(0xffffffffu, prod, o);
+            if (lane == 0) s_part[warp][D + p] = prod;
+            ++p;
+        }
+    }
+    __syncthreads();
+
+    const int n_tot = D + p;
+    float* my_scratch = scratch + (size_t) t * 880u;
+    if (tid < n_tot) {
+        const float sum4 = s_part[0][tid] + s_part[1][tid] + s_part[2][tid] + s_part[3][tid];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.relaxed.gpu.global.f32 [%0], %1;" :: "l"(my_scratch + 16 + cta * 48 + tid), "f"(sum4) : "memory");
+#else
+        *((volatile float*) (my_scratch + 16 + cta * 48 + tid)) = sum4;
+#endif
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        uint32_t prev = 0u;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(prev) : "l"(d_done + t) : "memory");
+        const int last = ((prev + 1u) == 18u) ? 1 : 0;
+        if (last) {
+            asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" :: "l"(d_done + t) : "memory");
+        }
+#else
+        __threadfence();
+        const uint32_t prev = atomicAdd(d_done + t, 1u);
+        const int last = ((prev + 1u) == 18u) ? 1 : 0;
+        if (last) {
+            *((volatile uint32_t*) (d_done + t)) = 0u;
+            __threadfence();
+        }
+#endif
+        s_is_last = last;
+    }
+    __syncthreads();
+    if (!s_is_last) return;
+
+    if (tid < n_tot) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int ci = 0; ci < 18; ++ci) {
+            float v_ci;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("ld.relaxed.gpu.global.f32 %0, [%1];" : "=f"(v_ci) : "l"(my_scratch + 16 + ci * 48 + tid) : "memory");
+#else
+            v_ci = __ldcg(my_scratch + 16 + ci * 48 + tid);
+#endif
+            acc += v_ci;
+        }
+        s_tot[tid] = acc;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        const float ir_last = rsqrtf(s_tot[n_tot - 1] / (float) N + rms_eps);
+        float v_w = -1e30f;
+        if (lane < D) {
+            float s = s_tot[lane];
+            if (lane == D - 1) s *= ir_last;
+            v_w = s * inv_sqrt_n;
+        }
+        float m = v_w;
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+        const float ev = (lane < D) ? __expf(v_w - m) : 0.0f;
+        float sum = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            const float ed = __shfl_sync(0xffffffffu, ev, d);
+            if (d < D) sum += ed;
+        }
+        if (lane < D) {
+            float res = ev * __fdividef(1.0f, sum);
+            if (lane == D - 1) res *= ir_last;
+            s_w[lane] = res;
+        }
+        __syncwarp();
+        if (lane == 0) {
+            float tot_ss = 0.0f;
+            int gp = 0;
+            for (int a = 0; a < D; ++a) {
+                const float wa = s_w[a];
+                for (int b = a; b < D; ++b) {
+                    const float g = s_tot[D + gp];
+                    tot_ss += ((a == b) ? (wa * wa) : (2.0f * wa * s_w[b])) * g;
+                    ++gp;
+                }
+            }
+            const float ir_out = rsqrtf(fmaxf(0.0f, tot_ss) / (float) N + rms_eps);
+            for (int d = 0; d < D; ++d) {
+                my_scratch[d] = s_w[d] * ir_out;
+            }
+        }
+    }
+}
+
+/// Multi-CTA (18 CTAs/token x 32 thr = 1 warp/CTA, 0 __syncthreads(), 0 SMEM) barrier-free Phase 2:
+/// Applies precomputed w_eff[0..D-1] to L2-hot ptrs.p[0..D-1] * nw0 and emits FP32 out0 + Q8_1 xq0 in parallel across 18 SMs!
+__global__ void __launch_bounds__(32, 16) k_mix_normed_q8_phase2(
+    NormMixPtrs ptrs, int D, const float* __restrict__ scratch,
+    float* __restrict__ out0, const float* __restrict__ nw0, void* __restrict__ xq0, int N) {
+    const int cta = (int) blockIdx.x;
+    const int t = (int) blockIdx.y;
+    const int lane = (int) threadIdx.x;
+    const int f4_idx = cta * 32 + lane;
+    const float* w_eff = scratch + (size_t) t * 880u;
+
+    float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+            const float wd = __ldg(w_eff + d);
+            const float4 v = reinterpret_cast<const float4*>(ptrs.p[d] + (size_t) t * N)[f4_idx];
+            ax += wd * v.x; ay += wd * v.y; az += wd * v.z; aw += wd * v.w;
+        }
+    }
+    float4 o;
+    if (nw0) {
+        const float4 ww = __ldg(reinterpret_cast<const float4*>(nw0) + f4_idx);
+        o = make_float4(ax * ww.x, ay * ww.y, az * ww.z, aw * ww.w);
+    } else {
+        o = make_float4(ax, ay, az, aw);
+    }
+    reinterpret_cast<float4*>(out0 + (size_t) t * N)[f4_idx] = o;
+    if (xq0) q8_1_sub8_store(o, xq0, t * 72 + cta * 4 + (lane >> 3), lane & 7);
+}
+
 /// Shared T=1 helper: combine_experts(top_k=8) + post-FFN shortconv + residual add for 4 contiguous channels (tid*4..+3).
 __device__ __forceinline__ float4 combine_experts_shortconv_k8_ch4(
     const float* __restrict__ eparts, const float* __restrict__ ewts,
@@ -8219,11 +8410,9 @@ __global__ void k_shortconv_kv_clip_norm_store_q8(
 }
 
 /// Fused T=1 pre-attention super-kernel (kv_q8, head_dim=128, n_rel=16, !save_conv_trace):
-/// Combines k_shortconv_kv_clip_norm_store_q8 + k_clip_and_tau_qr + k_rel_table_split (+ optional bf16 sink GEMV)
+/// Combines k_shortconv_kv_clip_norm_store_q8 (16 CTAs) + k_clip_and_tau_qr (24 heads) + k_rel_table_split (24*d_splits CTAs)
 /// into 1 single kernel launch (-2 launches & -2 serial GPU pipeline drains on all 48 layers!).
-/// Supports kv_paired (8 paired K+V CTAs vs 16 unpaired) and optional q_split_ctas (dedicated Q-clip CTAs)
-/// to cleanly fill 80 SMs (V100: 8+72=80), 72 SMs (PG500: 16+8+48=72), and 128 SMs (4090: 8+120=128).
-/// Rel CTAs overlap Q-clip (warp 1, float4) with R-clip/sink (warp 0) and use 4-threads/row coalesced rel_bias loads.
+/// Grid = (2 * n_head_kv + n_head * d_splits), block = 128.
 __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
     const float* __restrict__ K, const float* __restrict__ V,
     const float* __restrict__ wk, const float* __restrict__ wv,
@@ -8236,161 +8425,65 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
     const float* __restrict__ rel_bias, float* __restrict__ sink, float* __restrict__ rel_tab,
     int n_head, int n_head_kv, int n_ext, int max_rel, int cap, int is_swa,
     float rms_eps, int apply_tau, const int32_t* __restrict__ pos0, int floor_n, float alpha, int d_splits,
-    const uint16_t* __restrict__ w_sink_bf16 = nullptr, const float* __restrict__ in_q_sink = nullptr, int n_embd_sink = 0,
-    int kv_paired = 0, int q_split_ctas = 0) {
+    const uint16_t* __restrict__ w_sink_bf16 = nullptr, const float* __restrict__ in_q_sink = nullptr, int n_embd_sink = 0) {
     const int bid = (int) blockIdx.x;
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
-    const int p0 = __ldg(pos0);
-    const int n_kv_ctas = kv_paired ? n_head_kv : (2 * n_head_kv);
-    if (bid < n_kv_ctas) {
+    const int p0 = pos0[0];
+    if (bid < 2 * n_head_kv) {
+        __shared__ float s_red[4];
+        const bool is_v = (bid >= n_head_kv);
+        const int hkv = is_v ? (bid - n_head_kv) : bid;
         const int kv_dim = n_head_kv * 128;
+        const int c = hkv * 128 + tid;
+        const int c_all = is_v ? (kv_dim + c) : c;
+        const float* cur = is_v ? V : K;
+        const float* dyn = is_v ? dyn_v : dyn_k;
+        float* hc = hist + (size_t) c_all * 3;
+        const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
+        const float4 w4 = *reinterpret_cast<const float4*>((is_v ? wv : wk) + (size_t) c * 4);
+        const float conv_scale = rsqrtf(dyn ? 9.0f : 5.0f);
+        const float x = cur[c];
+        float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
+        if (dyn) {
+            const float* dt = dyn + (size_t) hkv * 4;
+            s += x * dt[0] + h2 * dt[1] + h1 * dt[2] + h0 * dt[3];
+        }
+        float val = (x + s) * conv_scale;
+        hc[0] = h1; hc[1] = h2; hc[2] = x;
+        float sq = val * val;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        if (lane == 0) s_red[warp] = sq;
+        __syncthreads();
+        const float tot_sq = s_red[0] + s_red[1] + s_red[2] + s_red[3];
+        const float fac = is_v ? rsqrtf(tot_sq / 128.0f + rms_eps) : fminf(1.0f, qk_clip / (sqrtf(tot_sq) + 1e-6f));
+        val *= fac;
+        float am = fabsf(val);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        __syncthreads();
+        if (lane == 0) s_red[warp] = am;
+        __syncthreads();
+        const float amax = fmaxf(fmaxf(s_red[0], s_red[1]), fmaxf(s_red[2], s_red[3]));
+        const float dk = amax / 127.0f;
+        const float ik = dk > 0.0f ? (127.0f / amax) : 0.0f;
         const bool pow2_cap = (cap & (cap - 1)) == 0;
         const int slot = is_swa ? (pow2_cap ? (p0 & (cap - 1)) : (p0 % cap)) : p0;
-        if (kv_paired) {
-            __shared__ float s_sq_k[4], s_sq_v[4], s_am_k[4], s_am_v[4];
-            const int hkv = bid;
-            const int c = hkv * 128 + tid;
-            float* hck = hist + (size_t) c * 3;
-            float* hcv = hist + (size_t) (kv_dim + c) * 3;
-            const float kh0 = hck[0], kh1 = hck[1], kh2 = hck[2];
-            const float vh0 = hcv[0], vh1 = hcv[1], vh2 = hcv[2];
-            const float4 wk4 = __ldg(reinterpret_cast<const float4*>(wk + (size_t) c * 4));
-            const float4 wv4 = __ldg(reinterpret_cast<const float4*>(wv + (size_t) c * 4));
-            const float kx = __ldg(K + c);
-            const float vx = __ldg(V + c);
-            float sk = kh0 * wk4.x + kh1 * wk4.y + kh2 * wk4.z + kx * wk4.w;
-            float sv = vh0 * wv4.x + vh1 * wv4.y + vh2 * wv4.z + vx * wv4.w;
-            if (dyn_k) {
-                const float4 dtk = __ldg(reinterpret_cast<const float4*>(dyn_k + (size_t) hkv * 4));
-                sk += kx * dtk.x + kh2 * dtk.y + kh1 * dtk.z + kh0 * dtk.w;
-            }
-            if (dyn_v) {
-                const float4 dtv = __ldg(reinterpret_cast<const float4*>(dyn_v + (size_t) hkv * 4));
-                sv += vx * dtv.x + vh2 * dtv.y + vh1 * dtv.z + vh0 * dtv.w;
-            }
-            float kval = (kx + sk) * rsqrtf(dyn_k ? 9.0f : 5.0f);
-            float vval = (vx + sv) * rsqrtf(dyn_v ? 9.0f : 5.0f);
-            hck[0] = kh1; hck[1] = kh2; hck[2] = kx;
-            hcv[0] = vh1; hcv[1] = vh2; hcv[2] = vx;
-            float ksq = kval * kval, vsq = vval * vval;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) {
-                ksq += __shfl_xor_sync(0xffffffffu, ksq, o);
-                vsq += __shfl_xor_sync(0xffffffffu, vsq, o);
-            }
-            if (lane == 0) {
-                s_sq_k[warp] = ksq;
-                s_sq_v[warp] = vsq;
-            }
-            __syncthreads();
-            const float ktot_sq = s_sq_k[0] + s_sq_k[1] + s_sq_k[2] + s_sq_k[3];
-            const float vtot_sq = s_sq_v[0] + s_sq_v[1] + s_sq_v[2] + s_sq_v[3];
-            kval *= fminf(1.0f, qk_clip / (sqrtf(ktot_sq) + 1e-6f));
-            vval *= rsqrtf(vtot_sq / 128.0f + rms_eps);
-            float kam = fabsf(kval), vam = fabsf(vval);
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) {
-                kam = fmaxf(kam, __shfl_xor_sync(0xffffffffu, kam, o));
-                vam = fmaxf(vam, __shfl_xor_sync(0xffffffffu, vam, o));
-            }
-            if (lane == 0) {
-                s_am_k[warp] = kam;
-                s_am_v[warp] = vam;
-            }
-            __syncthreads();
-            const float kamax = fmaxf(fmaxf(s_am_k[0], s_am_k[1]), fmaxf(s_am_k[2], s_am_k[3]));
-            const float vamax = fmaxf(fmaxf(s_am_v[0], s_am_v[1]), fmaxf(s_am_v[2], s_am_v[3]));
-            const float kdk = kamax / 127.0f;
-            const float vdk = vamax / 127.0f;
-            const float kik = kdk > 0.0f ? (127.0f / kamax) : 0.0f;
-            const float vik = vdk > 0.0f ? (127.0f / vamax) : 0.0f;
-            const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
-            kq[q_off + tid] = (int8_t) __float2int_rn(kval * kik);
-            vq[q_off + tid] = (int8_t) __float2int_rn(vval * vik);
-            if (tid == 0) {
-                const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
-                ks[s_off] = __float2half(kdk);
-                vs[s_off] = __float2half(vdk);
-            }
-        } else {
-            __shared__ float s_sq[4], s_am[4];
-            const bool is_v = (bid >= n_head_kv);
-            const int hkv = is_v ? (bid - n_head_kv) : bid;
-            const int c = hkv * 128 + tid;
-            const int c_all = is_v ? (kv_dim + c) : c;
-            const float* cur = is_v ? V : K;
-            const float* dyn = is_v ? dyn_v : dyn_k;
-            float* hc = hist + (size_t) c_all * 3;
-            const float h0 = hc[0], h1 = hc[1], h2 = hc[2];
-            const float4 w4 = __ldg(reinterpret_cast<const float4*>((is_v ? wv : wk) + (size_t) c * 4));
-            const float conv_scale = rsqrtf(dyn ? 9.0f : 5.0f);
-            const float x = __ldg(cur + c);
-            float s = h0 * w4.x + h1 * w4.y + h2 * w4.z + x * w4.w;
-            if (dyn) {
-                const float4 dt = __ldg(reinterpret_cast<const float4*>(dyn + (size_t) hkv * 4));
-                s += x * dt.x + h2 * dt.y + h1 * dt.z + h0 * dt.w;
-            }
-            float val = (x + s) * conv_scale;
-            hc[0] = h1; hc[1] = h2; hc[2] = x;
-            float sq = val * val;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
-            if (lane == 0) s_sq[warp] = sq;
-            __syncthreads();
-            const float tot_sq = s_sq[0] + s_sq[1] + s_sq[2] + s_sq[3];
-            const float fac = is_v ? rsqrtf(tot_sq / 128.0f + rms_eps) : fminf(1.0f, qk_clip / (sqrtf(tot_sq) + 1e-6f));
-            val *= fac;
-            float am = fabsf(val);
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
-            if (lane == 0) s_am[warp] = am;
-            __syncthreads();
-            const float amax = fmaxf(fmaxf(s_am[0], s_am[1]), fmaxf(s_am[2], s_am[3]));
-            const float dk = amax / 127.0f;
-            const float ik = dk > 0.0f ? (127.0f / amax) : 0.0f;
-            const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
-            (is_v ? vq : kq)[q_off + tid] = (int8_t) __float2int_rn(val * ik);
-            if (tid == 0) {
-                const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
-                (is_v ? vs : ks)[s_off] = __float2half(dk);
-            }
+        const size_t q_off = is_swa ? ((size_t) slot * kv_dim + hkv * 128) : (((size_t) hkv * cap + slot) * 128);
+        (is_v ? vq : kq)[q_off + tid] = (int8_t) __float2int_rn(val * ik);
+        if (tid == 0) {
+            const size_t s_off = is_swa ? ((size_t) slot * n_head_kv + hkv) : ((size_t) hkv * cap + slot);
+            (is_v ? vs : ks)[s_off] = __float2half(dk);
         }
         return;
     }
 
-    if (bid < n_kv_ctas + q_split_ctas) {
-        const int hpb = n_head / q_split_ctas;
-        if (warp < hpb) {
-            const int h = (bid - n_kv_ctas) * hpb + warp;
-            if (h < n_head) {
-                float tau = 1.0f;
-                if (apply_tau) {
-                    const float ratio = fmaxf(1.0f, (float) (p0 + 1) / (float) floor_n);
-                    tau = 1.0f + alpha * logf(ratio);
-                }
-                float4* q4 = reinterpret_cast<float4*>(Q + (size_t) h * 128);
-                float4 v = q4[lane];
-                if (q_scale) {
-                    const float4 sc = __ldg(reinterpret_cast<const float4*>(q_scale + (size_t) h * 128) + lane);
-                    v.x *= sc.x; v.y *= sc.y; v.z *= sc.z; v.w *= sc.w;
-                }
-                float sq = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
-                const float fac = fminf(1.0f, qk_clip / (sqrtf(sq) + 1e-6f)) * tau;
-                q4[lane] = make_float4(v.x * fac, v.y * fac, v.z * fac, v.w * fac);
-            }
-        }
-        return;
-    }
-
-    __shared__ __align__(16) float s_r[16];
+    __shared__ float s_r[16];
     __shared__ float s_sk;
     __shared__ float s_sp[8];
-    const int b = bid - (n_kv_ctas + q_split_ctas);
+    const int b = bid - 2 * n_head_kv;
     const int h = b / d_splits;
-    if (h >= n_head) return;
     const int ds = b % d_splits;
     if (w_sink_bf16 && in_q_sink && n_embd_sink > 0) {
         // Bit-exact match to bf16_f32_mmvf_kernel<256> using 128 threads x 2 virtual halves (t, t+128)!
@@ -8420,19 +8513,17 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
             s_sp[4 + warp] = acc_hi;
         }
         __syncthreads();
-    }
-    if (warp == 0) {
-        if (w_sink_bf16 && in_q_sink && n_embd_sink > 0) {
+        if (warp == 0) {
             float v = (lane < 8) ? s_sp[lane] : 0.0f;
 #pragma unroll
-            for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
             if (lane == 0) {
                 s_sk = v;
                 if (ds == 0) sink[h] = v;
             }
-        } else if (lane == 0) {
-            s_sk = __ldg(&sink[h]);
         }
+    }
+    if (warp == 0) {
         float tau = 1.0f;
         if (apply_tau) {
             const float ratio = fmaxf(1.0f, (float) (p0 + 1) / (float) floor_n);
@@ -8443,7 +8534,7 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
         float rval = 0.0f;
         if (lane < 16) {
             rval = rv[lane];
-            if (r_scale) rval *= __ldg(r_scale + (size_t) h * 16 + lane);
+            if (r_scale) rval *= r_scale[(size_t) h * 16 + lane];
         }
         float rsq = rval * rval;
 #pragma unroll
@@ -8454,49 +8545,45 @@ __global__ void __launch_bounds__(128, 8) k_pre_attn_t1_fused(
             s_r[lane] = rc;
             if (ds == 0) rv[lane] = rc;
         }
-    } else if (q_split_ctas == 0 && ds == 0 && warp == 1) {
-        // Overlap Q[h][0..127] float4 clip with warp 0's R-clip & sink reduction!
-        float tau = 1.0f;
-        if (apply_tau) {
-            const float ratio = fmaxf(1.0f, (float) (p0 + 1) / (float) floor_n);
-            tau = 1.0f + alpha * logf(ratio);
-        }
-        float4* q4 = reinterpret_cast<float4*>(Q + (size_t) h * 128);
-        float4 v = q4[lane];
-        if (q_scale) {
-            const float4 sc = __ldg(reinterpret_cast<const float4*>(q_scale + (size_t) h * 128) + lane);
-            v.x *= sc.x; v.y *= sc.y; v.z *= sc.z; v.w *= sc.w;
-        }
-        float qsq = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        if (!w_sink_bf16 && lane == 0) s_sk = sink[h];
+        // ds == 0 also clips Q[h][0..127] in-place (exact match to k_clip_and_tau_qr)
+        if (ds == 0) {
+            float* qv = Q + (size_t) h * 128;
+            float qvals[4], qsq = 0.0f;
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) qsq += __shfl_xor_sync(0xffffffffu, qsq, o);
-        const float qfac = fminf(1.0f, qk_clip / (sqrtf(qsq) + 1e-6f)) * tau;
-        q4[lane] = make_float4(v.x * qfac, v.y * qfac, v.z * qfac, v.w * qfac);
+            for (int k = 0; k < 4; ++k) {
+                const int i = k * 32 + lane;
+                float val = qv[i];
+                if (q_scale) val *= q_scale[(size_t) h * 128 + i];
+                qvals[k] = val;
+                qsq += val * val;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) qsq += __shfl_xor_sync(0xffffffffu, qsq, o);
+            const float qfac = fminf(1.0f, qk_clip / (sqrtf(qsq) + 1e-6f)) * tau;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) qv[k * 32 + lane] = qvals[k] * qfac;
+        }
     }
     __syncthreads();
-    const int g_cta = tid >> 2;
-    const int c = tid & 3;
-    const float4 qc = reinterpret_cast<const float4*>(s_r)[c];
+    const float4 q0 = reinterpret_cast<const float4*>(s_r)[0];
+    const float4 q1 = reinterpret_cast<const float4*>(s_r)[1];
+    const float4 q2 = reinterpret_cast<const float4*>(s_r)[2];
+    const float4 q3 = reinterpret_cast<const float4*>(s_r)[3];
     const float sk = s_sk;
     const int max_d = min(min(n_ext, max_rel), p0 + 1);
     const int chunk = (max_d + d_splits - 1) / d_splits;
     const int d0 = ds * chunk;
     const int d1 = min(max_d, d0 + chunk);
-    const float4* rb4_base = reinterpret_cast<const float4*>(rel_bias);
     float* dst = rel_tab + (size_t) h * n_ext;
-    for (int d_off = d0; d_off < d1; d_off += 32) {
-        const int d = d_off + g_cta;
-        float part = 0.0f;
-        if (d < d1) {
-            const float4 bc = __ldg(rb4_base + (size_t) d * 4 + c);
-            part = qc.x * bc.x + qc.y * bc.y + qc.z * bc.z + qc.w * bc.w;
-        }
-        const float p1 = __shfl_xor_sync(0xffffffffu, part, 1);
-        const float p2 = __shfl_xor_sync(0xffffffffu, part, 2);
-        const float p3 = __shfl_xor_sync(0xffffffffu, part, 3);
-        if (c == 0 && d < d1) {
-            dst[d] = (((part + p1) + p2) + p3) - sk;
-        }
+    for (int d = d0 + tid; d < d1; d += blockDim.x) {
+        const float4* rb4 = reinterpret_cast<const float4*>(rel_bias + (size_t) d * 16);
+        const float4 b0 = rb4[0], b1 = rb4[1], b2 = rb4[2], b3 = rb4[3];
+        const float dot = (q0.x * b0.x + q0.y * b0.y + q0.z * b0.z + q0.w * b0.w)
+                        + (q1.x * b1.x + q1.y * b1.y + q1.z * b1.z + q1.w * b1.w)
+                        + (q2.x * b2.x + q2.y * b2.y + q2.z * b2.z + q2.w * b2.w)
+                        + (q3.x * b3.x + q3.y * b3.y + q3.z * b3.z + q3.w * b3.w);
+        dst[d] = dot - sk;
     }
 }
 
@@ -14090,9 +14177,12 @@ __global__ void k_attn_pp_split_combine(const float* __restrict__ split_out, con
 /// GQA-3 Split-KV Q8 decode / verify attention (1 <= T < 16):
 /// grid (n_head_kv, split_n, T), block 128 (8 half-warps of 16 threads).
 /// Each half-warp handles 1 key token via uint2 KV loads, SIMD i8x4_to_h2x2 decode, __half2 V acc, and log2 exp2f.
-/// Volta sm_70 & sm_75+ both achieve 8 blk/SM (64 reg budget, STACK:0, software-pipelined prefetch).
-template <bool ALLOW_SWA = false>
+/// Volta sm_70 uses 6 blk/SM (80 reg budget -> STACK:0 + software-pipelined prefetch); sm_75+ uses 8 blk/SM.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+__global__ void __launch_bounds__(128, 6) k_attn_q8_gqa3_split(
+#else
 __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
+#endif
         const float* __restrict__ Q,
         const int8_t* __restrict__ kq, const __half* __restrict__ ks,
         const int8_t* __restrict__ vq, const __half* __restrict__ vs,
@@ -14100,8 +14190,7 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
         float* __restrict__ split_out,
         int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
         const int32_t* __restrict__ pos0, float kq_scale, int split_n) {
-    alignas(16) __shared__ __half2 sq2[3][64];
-    __shared__ float s_nsink[3];
+    __shared__ __half2 sq2[3][64];
     __shared__ float s_m[3][8];
     __shared__ float s_l[3][8];
     __shared__ float s_acc[8][128];
@@ -14109,15 +14198,16 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
     const int tid = threadIdx.x;
     const int hw = tid >> 4;
     const int hlane = tid & 15;
+    const int kv_dim = n_head_kv * 128;
     const int h0 = 3 * hkv;
     constexpr float kLog2e = 1.4426950408889634f;
     const float kq_l2 = kq_scale * kLog2e;
 
     const int pos_q = pos0[0] + t;
-    const int j0 = (ALLOW_SWA && is_swa) ? max(0, pos_q - n_swa + 1) : 0;
+    const int j0 = is_swa ? max(0, pos_q - n_swa + 1) : 0;
     const int j1 = pos_q + 1;
     const int n_tok = j1 - j0;
-    const int chunk_sz = (ALLOW_SWA && is_swa) ? max(32, (n_tok + split_n - 1) / split_n) : max(64, (n_tok + split_n - 1) / split_n);
+    const int chunk_sz = is_swa ? max(32, (n_tok + split_n - 1) / split_n) : max(64, (n_tok + split_n - 1) / split_n);
     const int c_beg = j0 + sp * chunk_sz;
     if (c_beg >= j1) {
         if (tid < 3) {
@@ -14136,36 +14226,26 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
             sq2[g][tid] = __float22half2_rn(qf);
         }
     }
-    if (tid < 3) {
-        s_nsink[tid] = -sink[(size_t) t * n_head + (h0 + tid)] * kLog2e;
-    }
     __syncthreads();
 
     const int base8 = hlane * 8;
-    __half2 q2[2][4];
+    __half2 q2[3][4];
 #pragma unroll
-    for (int g = 0; g < 2; ++g) {
+    for (int g = 0; g < 3; ++g) {
         q2[g][0] = sq2[g][hlane * 4 + 0];
         q2[g][1] = sq2[g][hlane * 4 + 1];
         q2[g][2] = sq2[g][hlane * 4 + 2];
         q2[g][3] = sq2[g][hlane * 4 + 3];
     }
-    auto dot_q_kh = [&](int g, const __half2 kh[4]) -> __half2 {
-        if (g < 2) {
-            __half2 d2 = __hmul2(q2[g][0], kh[0]);
-            d2 = __hfma2(q2[g][1], kh[1], d2);
-            d2 = __hfma2(q2[g][2], kh[2], d2);
-            d2 = __hfma2(q2[g][3], kh[3], d2);
-            return d2;
-        }
-        const uint4 qv = *reinterpret_cast<const uint4*>(&sq2[2][hlane * 4]);
-        const __half2* q2g = reinterpret_cast<const __half2*>(&qv);
-        __half2 d2 = __hmul2(q2g[0], kh[0]);
-        d2 = __hfma2(q2g[1], kh[1], d2);
-        d2 = __hfma2(q2g[2], kh[2], d2);
-        d2 = __hfma2(q2g[3], kh[3], d2);
-        return d2;
-    };
+
+    float neg_sink2[3];
+    const float* rt[3];
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        const int h = h0 + g;
+        rt[g] = rel_tab + ((size_t) t * n_head + h) * n_ext;
+        neg_sink2[g] = -sink[(size_t) t * n_head + h] * kLog2e;
+    }
 
     const bool has_sink = (sp == 0 && hw == 0);
     const __half2 z2 = __half2half2(__float2half(0.0f));
@@ -14181,14 +14261,15 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
 
     // Bulk loop for !is_swa tokens with dist >= n_ext: linear slot == j, Head-Major [n_head_kv][cap][128].
     // Uses shifted-nsink (0 bulk adds), fast_exp2f_hw, lazy rescale (only when sc > m[g]), and 0xffffffffu warp shuffles.
-    const size_t hkv_cap = (size_t) hkv * cap;
-    const int bulk_end = (ALLOW_SWA && is_swa) ? c_beg : min(c_end, max(c_beg, pos_q - n_ext + 1));
+    const int8_t* kq_h = kq + (size_t) hkv * cap * 128 + base8;
+    const int8_t* vq_h = vq + (size_t) hkv * cap * 128 + base8;
+    const __half* ks_h = ks + (size_t) hkv * cap;
+    const __half* vs_h = vs + (size_t) hkv * cap;
+    const int bulk_end = is_swa ? c_beg : min(c_end, max(c_beg, pos_q - n_ext + 1));
     if (c_beg < bulk_end) {
-        const int8_t* kq_h = kq + hkv_cap * 128 + base8;
-        const __half* ks_h = ks + hkv_cap;
 #pragma unroll
         for (int g = 0; g < 3; ++g) {
-            if (m[g] > -1e20f) m[g] -= s_nsink[g];
+            if (m[g] > -1e20f) m[g] -= neg_sink2[g];
         }
         const int bulk_vec_end = c_beg + ((bulk_end - c_beg) & ~7);
         const unsigned hw_mask = (hw & 1) ? 0xffff0000u : 0x0000ffffu;
@@ -14210,7 +14291,10 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 float sc[3];
 #pragma unroll
                 for (int g = 0; g < 3; ++g) {
-                    const __half2 d2 = dot_q_kh(g, kh);
+                    __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                    d2 = __hfma2(q2[g][1], kh[1], d2);
+                    d2 = __hfma2(q2[g][2], kh[2], d2);
+                    d2 = __hfma2(q2[g][3], kh[3], d2);
                     float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
                     for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(hw_mask, dt, o, 16);
@@ -14218,9 +14302,8 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 }
                 // Exact FP16-zero V-skip: 2^-28 = 3.7e-9 -> __float2half(p * d_v) == 0.0 bit-identically!
                 if (sc[0] - m[0] >= -28.0f || sc[1] - m[1] >= -28.0f || sc[2] - m[2] >= -28.0f) {
-                    const size_t hj = hkv_cap + j;
-                    const float d_v = __half2float(__ldg(&vs[hj]));
-                    const uint2 v8 = *reinterpret_cast<const uint2*>(vq + hj * 128 + base8);
+                    const float d_v = __half2float(__ldg(&vs_h[j]));
+                    const uint2 v8 = *reinterpret_cast<const uint2*>(vq_h + (size_t) j * 128);
                     __half2 vh[4];
                     i8x4_to_h2x2(v8.x, vh[0], vh[1]);
                     i8x4_to_h2x2(v8.y, vh[2], vh[3]);
@@ -14251,11 +14334,10 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
             }
         }
         if (j < bulk_end) {
-            const size_t hj = hkv_cap + j;
-            const float dkkq2 = __half2float(__ldg(&ks[hj])) * kq_l2;
-            const float d_v = __half2float(__ldg(&vs[hj]));
-            const uint2 k8 = *reinterpret_cast<const uint2*>(kq + hj * 128 + base8);
-            const uint2 v8 = *reinterpret_cast<const uint2*>(vq + hj * 128 + base8);
+            const float dkkq2 = __half2float(__ldg(&ks_h[j])) * kq_l2;
+            const float d_v = __half2float(__ldg(&vs_h[j]));
+            const uint2 k8 = *reinterpret_cast<const uint2*>(kq_h + (size_t) j * 128);
+            const uint2 v8 = *reinterpret_cast<const uint2*>(vq_h + (size_t) j * 128);
             __half2 kh[4], vh[4];
             i8x4_to_h2x2(k8.x, kh[0], kh[1]);
             i8x4_to_h2x2(k8.y, kh[2], kh[3]);
@@ -14264,7 +14346,10 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
             const unsigned am = __activemask();
 #pragma unroll
             for (int g = 0; g < 3; ++g) {
-                const __half2 d2 = dot_q_kh(g, kh);
+                __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                d2 = __hfma2(q2[g][1], kh[1], d2);
+                d2 = __hfma2(q2[g][2], kh[2], d2);
+                d2 = __hfma2(q2[g][3], kh[3], d2);
                 float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
                 for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(am, dt, o, 16);
@@ -14289,18 +14374,16 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
         }
 #pragma unroll
         for (int g = 0; g < 3; ++g) {
-            if (m[g] > -1e20f) m[g] += s_nsink[g];
+            if (m[g] > -1e20f) m[g] += neg_sink2[g];
         }
     }
 
+    const bool pow2_cap = (cap & (cap - 1)) == 0;
+    const int cap_mask = cap - 1;
     const int j_rem_beg = max(c_beg, bulk_end);
     const unsigned hw_mask_rem = (hw & 1) ? 0xffff0000u : 0x0000ffffu;
-    if constexpr (ALLOW_SWA) {
-      if (is_swa && j_rem_beg < c_end) {
-        const int kv_dim = n_head_kv * 128;
-        const bool pow2_cap = (cap & (cap - 1)) == 0;
-        const int cap_mask = cap - 1;
-        const float* rt0 = rel_tab + ((size_t) t * n_head + h0) * n_ext;
+    if (is_swa && j_rem_beg < c_end) {
+        // Software-pipelined SWA main loop (multiple-of-8 tokens: zero branch divergence, hw_mask shuffles, overlapped next_k8 prefetch!).
         const int8_t* swa_kq_base = kq + (size_t) hkv * 128 + base8;
         const int8_t* swa_vq_base = vq + (size_t) hkv * 128 + base8;
         const __half* swa_ks_base = ks + hkv;
@@ -14329,11 +14412,14 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 float sc[3];
 #pragma unroll
                 for (int g = 0; g < 3; ++g) {
-                    const __half2 d2 = dot_q_kh(g, kh);
+                    __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                    d2 = __hfma2(q2[g][1], kh[1], d2);
+                    d2 = __hfma2(q2[g][2], kh[2], d2);
+                    d2 = __hfma2(q2[g][3], kh[3], d2);
                     float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
                     for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(hw_mask_rem, dt, o, 16);
-                    const float bias = in_rel ? (__ldg(&rt0[g * n_ext + dist]) * kLog2e) : s_nsink[g];
+                    const float bias = in_rel ? (__ldg(&rt[g][dist]) * kLog2e) : neg_sink2[g];
                     sc[g] = dt * dkkq2 + bias;
                 }
                 if (sc[0] - m[0] >= -28.0f || sc[1] - m[1] >= -28.0f || sc[2] - m[2] >= -28.0f) {
@@ -14388,7 +14474,7 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
                 for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(am, dt, o, 16);
-                const float bias = in_rel ? (__ldg(&rt0[g * n_ext + dist]) * kLog2e) : s_nsink[g];
+                const float bias = in_rel ? (__ldg(&rt[g][dist]) * kLog2e) : neg_sink2[g];
                 sc[g] = dt * dkkq2 + bias;
             }
             if (sc[0] - m[0] >= -28.0f || sc[1] - m[1] >= -28.0f || sc[2] - m[2] >= -28.0f) {
@@ -14420,13 +14506,8 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 }
             }
         }
-      }
-    }
-    if (j_rem_beg < c_end && (!ALLOW_SWA || !is_swa)) {
+    } else if (j_rem_beg < c_end) {
         // Software-pipelined Full-Attn rel_tab tail loop (multiple-of-8 tokens: 0 divergence, static hw_mask_rem, overlapped next_k8 prefetch!).
-        const float* rt0 = rel_tab + ((size_t) t * n_head + h0) * n_ext;
-        const int8_t* kq_h = kq + hkv_cap * 128 + base8;
-        const __half* ks_h = ks + hkv_cap;
         const int rem_vec_end = j_rem_beg + ((c_end - j_rem_beg) & ~7);
         int j = j_rem_beg + hw;
         if (j < rem_vec_end) {
@@ -14448,17 +14529,19 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
                 float sc[3];
 #pragma unroll
                 for (int g = 0; g < 3; ++g) {
-                    const __half2 d2 = dot_q_kh(g, kh);
+                    __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                    d2 = __hfma2(q2[g][1], kh[1], d2);
+                    d2 = __hfma2(q2[g][2], kh[2], d2);
+                    d2 = __hfma2(q2[g][3], kh[3], d2);
                     float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
                     for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(hw_mask_rem, dt, o, 16);
-                    const float bias = in_rel ? (__ldg(&rt0[g * n_ext + dist]) * kLog2e) : s_nsink[g];
+                    const float bias = in_rel ? (__ldg(&rt[g][dist]) * kLog2e) : neg_sink2[g];
                     sc[g] = dt * dkkq2 + bias;
                 }
                 if (sc[0] - m[0] >= -28.0f || sc[1] - m[1] >= -28.0f || sc[2] - m[2] >= -28.0f) {
-                    const size_t hj = hkv_cap + j;
-                    const float d_v = __half2float(__ldg(&vs[hj]));
-                    const uint2 v8 = *reinterpret_cast<const uint2*>(vq + hj * 128 + base8);
+                    const float d_v = __half2float(__ldg(&vs_h[j]));
+                    const uint2 v8 = *reinterpret_cast<const uint2*>(vq_h + (size_t) j * 128);
                     __half2 vh[4];
                     i8x4_to_h2x2(v8.x, vh[0], vh[1]);
                     i8x4_to_h2x2(v8.y, vh[2], vh[3]);
@@ -14489,9 +14572,8 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
             }
         }
         if (j < c_end) {
-            const size_t hj = hkv_cap + j;
-            const float dkkq2 = __half2float(__ldg(&ks[hj])) * kq_l2;
-            const uint2 k8 = *reinterpret_cast<const uint2*>(kq + hj * 128 + base8);
+            const float dkkq2 = __half2float(__ldg(&ks_h[j])) * kq_l2;
+            const uint2 k8 = *reinterpret_cast<const uint2*>(kq_h + (size_t) j * 128);
             __half2 kh[4];
             i8x4_to_h2x2(k8.x, kh[0], kh[1]);
             i8x4_to_h2x2(k8.y, kh[2], kh[3]);
@@ -14500,16 +14582,19 @@ __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_split(
             float sc[3];
 #pragma unroll
             for (int g = 0; g < 3; ++g) {
-                const __half2 d2 = dot_q_kh(g, kh);
+                __half2 d2 = __hmul2(q2[g][0], kh[0]);
+                d2 = __hfma2(q2[g][1], kh[1], d2);
+                d2 = __hfma2(q2[g][2], kh[2], d2);
+                d2 = __hfma2(q2[g][3], kh[3], d2);
                 float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
 #pragma unroll
                 for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(am, dt, o, 16);
-                const float bias = dist < n_ext ? (__ldg(&rt0[g * n_ext + dist]) * kLog2e) : s_nsink[g];
+                const float bias = dist < n_ext ? (__ldg(&rt[g][dist]) * kLog2e) : neg_sink2[g];
                 sc[g] = dt * dkkq2 + bias;
             }
             if (sc[0] - m[0] >= -28.0f || sc[1] - m[1] >= -28.0f || sc[2] - m[2] >= -28.0f) {
-                const float d_v = __half2float(__ldg(&vs[hj]));
-                const uint2 v8 = *reinterpret_cast<const uint2*>(vq + hj * 128 + base8);
+                const float d_v = __half2float(__ldg(&vs_h[j]));
+                const uint2 v8 = *reinterpret_cast<const uint2*>(vq_h + (size_t) j * 128);
                 __half2 vh[4];
                 i8x4_to_h2x2(v8.x, vh[0], vh[1]);
                 i8x4_to_h2x2(v8.y, vh[2], vh[3]);

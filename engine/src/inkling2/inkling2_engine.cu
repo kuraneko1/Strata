@@ -2739,7 +2739,7 @@ struct Engine {
             const int n_hkv = std::max(1, (int) hp.n_head_kv);
             const int max_t_split = std::min(std::max(verify_max_t, 1), 15);
             const int sm70_t1_hi = (cc_maj == 7 && cc_min < 5)
-                ? std::clamp((sm_count * 16) / n_hkv, 40, kAttnSplitMax) : attn_split_t1_full;
+                ? std::clamp((sm_count * 12) / n_hkv, 40, kAttnSplitMax) : attn_split_t1_full;
             int max_slots = std::max({attn_split_t1_full, sm70_t1_hi, attn_split_t1_swa});
             for (int t = 2; t <= max_t_split; ++t) {
                 int sp_t = 1;
@@ -7190,51 +7190,19 @@ struct Engine {
                     emit_dspark_capture();
                     fused_mix_norm = true;
                 } else if (!has_msg && fuse_q8_norm) {
-                    if (deferred_postffn_t1.active && T == 1 && N == 2304 && (int) norm_blocks.size() <= 7) {
-                        const int B = (int) norm_blocks.size();
-                        NormMixPtrs np{};
-                        for (int i = 0; i < B; ++i) np.p[i] = norm_blocks[(size_t) (B - 1 - i)];
-                        const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
-                        if (is_swa) {
-                            MixOuts4 mo4{{in_q, nullptr, nullptr, nullptr}};
-                            NormQ8Out3 nq8{L.attn_norm, nullptr, nullptr, xq, nullptr, nullptr};
-                            k_combine_experts_shortconv_k8_mix_q8_t1<1><<<1, 576, 0, st>>>(
-                                deferred_postffn_t1.eparts_p, deferred_postffn_t1.ewts_p, deferred_postffn_t1.w_conv,
-                                deferred_postffn_t1.hst, deferred_postffn_t1.res_add, cur, deferred_postffn_t1.hist_offset,
-                                np, B + 1, L.attn_res_query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
+                    if (is_swa) {
+                        NormQ8Out3 nq8{L.attn_norm, nullptr, nullptr, xq, nullptr, nullptr};
+                        if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 1, T)) {
+                            fused_mix_norm = true;
+                            q8_pre_done = true;
                             ink_src = in_q;
                             inv_src = in_q;
-                        } else {
-                            MixOuts4 mo4{{in_q, in_k, in_v, nullptr}};
-                            NormQ8Out3 nq8{L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm, xq, xq_k, xq_v};
-                            k_combine_experts_shortconv_k8_mix_q8_t1<3><<<1, 576, 0, st>>>(
-                                deferred_postffn_t1.eparts_p, deferred_postffn_t1.ewts_p, deferred_postffn_t1.w_conv,
-                                deferred_postffn_t1.hst, deferred_postffn_t1.res_add, cur, deferred_postffn_t1.hist_offset,
-                                np, B + 1, L.attn_res_query, mo4, nq8, N, inv_sqrt_n, hp.rms_eps);
                         }
-                        deferred_postffn_t1.active = false;
-                        emit_dspark_capture();
-                        fused_mix_norm = true;
-                        q8_pre_done = true;
                     } else {
-                        if (deferred_postffn_t1.active) {
-                            flush_deferred_postffn_t1_to_cur();
-                            emit_dspark_capture();
-                        }
-                        if (is_swa) {
-                            NormQ8Out3 nq8{L.attn_norm, nullptr, nullptr, xq, nullptr, nullptr};
-                            if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 1, T)) {
-                                fused_mix_norm = true;
-                                q8_pre_done = true;
-                                ink_src = in_q;
-                                inv_src = in_q;
-                            }
-                        } else {
-                            NormQ8Out3 nq8{L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm, xq, xq_k, xq_v};
-                            if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 3, T)) {
-                                fused_mix_norm = true;
-                                q8_pre_done = true;
-                            }
+                        NormQ8Out3 nq8{L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm, xq, xq_k, xq_v};
+                        if (try_run_mix_normed_q8(norm_blocks, cur_in, L.attn_res_query, outs, nq8, 3, T)) {
+                            fused_mix_norm = true;
+                            q8_pre_done = true;
                         }
                     }
                 } else if (!has_msg && T > 8 && N == 2304) {
@@ -8238,34 +8206,18 @@ struct Engine {
                 moe_raw_zero_pending = true;
             };
             if (fused_pre_attn_t1) {
-                const int n_kv_h = (int) hp.n_head_kv;
-                const int n_h = (int) hp.n_head;
-                int kv_paired = 0;
-                int q_split_ctas = 0;
-                int d_splits = (max_rel > 512) ? 4 : 2;
-                if (n_kv_h > 0 && n_h > 0) {
-                    if (sm_count >= n_kv_h + n_h && ((sm_count - n_kv_h) % n_h) == 0) {
-                        kv_paired = 1;
-                        d_splits = (sm_count - n_kv_h) / n_h;
-                    } else if ((n_h % 3) == 0 && sm_count >= 2 * n_kv_h + (n_h / 3) + n_h &&
-                               ((sm_count - 2 * n_kv_h - (n_h / 3)) % n_h) == 0) {
-                        q_split_ctas = n_h / 3;
-                        d_splits = (sm_count - 2 * n_kv_h - q_split_ctas) / n_h;
-                    }
-                }
-                const int n_kv_ctas = kv_paired ? n_kv_h : (2 * n_kv_h);
-                const unsigned n_ctas = (unsigned) (n_kv_ctas + q_split_ctas + n_h * d_splits);
+                const int d_splits = (max_rel > 512) ? 4 : 2;
+                const unsigned n_ctas = (unsigned) (2 * (int) hp.n_head_kv + (int) hp.n_head * d_splits);
                 k_pre_attn_t1_fused<<<n_ctas, 128, 0, st>>>(
                     pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
                     hst, cur_kq, cur_ks, cur_vq, cur_vs,
                     pQ, L.attn_q_clip, hp.qk_clip, pR, L.attn_rel_clip, hp.rel_clip,
                     L.attn_rel_bias, sink, rel_tab,
-                    n_h, n_kv_h, (int) hp.n_rel_ext, max_rel,
+                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, max_rel,
                     cur_kv_cap, is_swa ? 1 : 0, hp.rms_eps, apply_tau, pos0_d,
                     (int) hp.log_scale_floor, hp.log_scale_alpha, d_splits,
                     fuse_sink_pre_attn ? (const uint16_t*) L.attn_sink_proj.d : nullptr,
-                    fuse_sink_pre_attn ? in_q : nullptr, fuse_sink_pre_attn ? N : 0,
-                    kv_paired, q_split_ctas);
+                    fuse_sink_pre_attn ? in_q : nullptr, fuse_sink_pre_attn ? N : 0);
             } else if (fused_pre_attn_smallT) {
                 if (T <= 2) {
                     const int d_splits = (max_rel > 1024) ? 4 : ((max_rel > 512) ? 2 : 1);
@@ -8392,13 +8344,7 @@ struct Engine {
                                               L.attn_output.type != 30 && (q_dim % wo_blck) == 0);
                     float* const att_f32_out = att_need_xq ? nullptr : att;
                     void* const att_xq_out = att_need_xq ? xq : nullptr;
-                    if (is_swa && T == 1) {
-                        k_attn_q8_gqa3_swa_1pass<512><<<(unsigned) hp.n_head, 512, 0, st>>>(
-                            pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
-                            att_f32_out, att_xq_out,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
-                        if (att_xq_out) att_xq_ready = xq;
-                    } else if (is_swa && T >= 2 && T <= 5) {
+                    if (is_swa && T >= 2 && T <= 5) {
                         const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
                         if (T == 5) {
                             k_attn_q8_gqa3_verify4_swa_wmma_split<5><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
@@ -8438,13 +8384,7 @@ struct Engine {
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, att_xq_out);
                         if (att_xq_out) att_xq_ready = xq;
-                    } else if (is_swa && T < 16) {
-                        k_attn_q8_gqa3_swa_1pass<128><<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
-                            att_f32_out, att_xq_out,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
-                        if (att_xq_out) att_xq_ready = xq;
-                    } else if (T >= 2 && T <= 5) {
+                    } else if (T >= 2 && T <= 5 && !is_swa) {
                         const int vf_mult = (cc_maj == 7 && cc_min < 5 && pos <= 98304) ? 12 : 24;
                         const int sp = std::min(sp_cap, std::clamp((sm_count * vf_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
                         if (T == 5) {
@@ -8467,7 +8407,7 @@ struct Engine {
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, att_xq_out);
                         if (att_xq_out) att_xq_ready = xq;
-                    } else if (T >= 6 && T <= 8) {
+                    } else if (T >= 6 && T <= 8 && !is_swa) {
                         const int vf_mult = (cc_maj == 7 && cc_min < 5 && pos <= 98304) ? 12 : 24;
                         const int sp = std::min(sp_cap, std::clamp((sm_count * vf_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
                         if (T == 8) {
@@ -8489,17 +8429,18 @@ struct Engine {
                     } else if (T < 16) {
                         const int t1_full_sp = (cc_maj == 7 && cc_min < 5)
                             ? ((pos >= 32768 && pos < 131072)
-                                ? std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax)
-                                : std::clamp((sm_count * 8) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax))
+                                ? std::clamp((sm_count * 12) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax)
+                                : std::clamp((sm_count * 6) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax))
                             : attn_split_t1_full;
                         const int sp = std::min(sp_cap, (T == 1)
-                            ? t1_full_sp
-                            : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax));
+                            ? (is_swa ? attn_split_t1_swa : t1_full_sp)
+                            : (is_swa ? std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv * T), 4, 24)
+                                      : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax)));
                         k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp, (unsigned) T), 128, 0, st>>>(
                             pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, att_xq_out);
+                            attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa, att_xq_out);
                         if (att_xq_out) att_xq_ready = xq;
                     } else if (use_fa2_256_path) {
                         // Zero-sP, Zero-Spill 256-row FA2: pure bulk Split-KV [0, bulk_aligned) + 1 tail split [bulk_aligned, pos+T).
@@ -8713,9 +8654,8 @@ struct Engine {
             }
             if (moe_raw_disjoint_wo) kick_async_moe_zero();
             const bool do_push = (ip % hp.attn_res_block_size == 0);
-            const bool fuse_post_attn_ffn_t1 = (T == 1 && !save_conv_trace && N == 2304 &&
-                                                L.ffn_res_query != nullptr && !use_vmsg_layer &&
-                                                (int) norm_blocks.size() + (do_push ? 1 : 0) + 1 <= 8);
+            const bool fuse_post_attn_ffn_t1 = (T == 1 && !do_push && !has_msg && !save_conv_trace &&
+                                                N == 2304 && (int) norm_blocks.size() + 1 <= 8);
             static const bool no_sconv_mix = (std::getenv("STRATA_NO_SCONV_MIX") != nullptr);
             const int B_after_push = (int) norm_blocks.size() + (do_push ? 1 : 0);
             const bool fuse_post_attn_ffn_pp = (!no_sconv_mix && T >= 32 && N == 2304 && !save_conv_trace &&
@@ -8762,64 +8702,21 @@ struct Engine {
                 k_rms_norm_f16<<<(unsigned) T, rms_f16_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
             };
             if (fuse_post_attn_ffn_t1) {
-                if (do_push) {
-                    if (pre_push_done_il == il) {
-                        norm_blocks.push_back(pre_push_ndst);
-                        pre_push_done_il = -1;
-                    } else {
-                        const int pass_cur = (n_core > 0 && ip >= hp.core_start && ip < hp.core_end)
-                                           ? ((il - (int) hp.core_start) / (int) n_core) : 0;
-                        push_block(cur_in, il, ip, pass_cur);
-                    }
-                }
                 const int B = (int) norm_blocks.size();
                 NormMixPtrs np{};
                 for (int i = 0; i < B; ++i) np.p[i] = norm_blocks[(size_t) (B - 1 - i)];
                 np.p[B] = ffn_inp;
                 const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
-                if (!has_msg) {
-                    k_shortconv_mix_normed_fused_1pass_q8_t1<true><<<1, 576, 0, st>>>(
-                        wo, L.attn_post_conv, hst, do_push ? nullptr : cur_in, ffn_inp, 2 * (int) kv_dim,
-                        np, B + 1, L.ffn_res_query, in_ffn, L.ffn_norm, xq, N, inv_sqrt_n, hp.rms_eps);
+                if (d_mix_scratch != nullptr && d_router_done != nullptr) {
+                    k_mix_normed_q8_phase1<true><<<dim3(18u, 1u), 128, 0, st>>>(
+                        wo, L.attn_post_conv, hst, cur_in, ffn_inp, 2 * (int) kv_dim,
+                        np, B + 1, L.ffn_res_query, d_mix_scratch, d_router_done + 1, N, inv_sqrt_n, hp.rms_eps);
+                    k_mix_normed_q8_phase2<<<dim3(18u, 1u), 32, 0, st>>>(
+                        np, B + 1, d_mix_scratch, in_ffn, L.ffn_norm, xq, N);
                 } else {
-                    k_shortconv_mix_normed_fused_1pass_q8_t1<false><<<1, 576, 0, st>>>(
-                        wo, L.attn_post_conv, hst, do_push ? nullptr : cur_in, ffn_inp, 2 * (int) kv_dim,
-                        np, B + 1, L.ffn_res_query, in_ffn, nullptr, nullptr, N, inv_sqrt_n, hp.rms_eps);
-                    if (hp.loop_gate_rank == 64 && L.loop_down[3].type == 0 &&
-                        L.loop_gain[3].type == 0 && L.loop_forget[3].type == 0 &&
-                        d_router_done != nullptr && d_mix_scratch != nullptr) {
-                        if (can_fused_loop_ctrl_1) {
-                            LoopCtrlRmsQ8Ptrs3 lcp{
-                                {(const float*) L.loop_down[3].d, nullptr, nullptr},
-                                {(const float*) L.loop_gain[3].d, nullptr, nullptr},
-                                {(const float*) L.loop_forget[3].d, nullptr, nullptr},
-                                {in_ffn, nullptr, nullptr},
-                                {msg3, nullptr, nullptr},
-                                {in_ffn, nullptr, nullptr},
-                                {L.ffn_norm, nullptr, nullptr},
-                                {xq, nullptr, nullptr}
-                            };
-                            k_loop_ctrl_fused_rms_q8_t1<1, 64><<<dim3(64u, 1u), 256, 0, st>>>(
-                                lcp, d_mix_scratch, d_router_done + 12, hp.rms_eps);
-                        } else {
-                            k_loop_down_fused_smallT<1, true><<<64u, 256, 0, st>>>(
-                                (const float*) L.loop_down[3].d, in_ffn, msg3, ctrl64, N, 64, 1, hp.rms_eps);
-                            CtrlUpRmsQ8Ptrs3 upr{
-                                {(const float*) L.loop_gain[3].d, nullptr, nullptr},
-                                {(const float*) L.loop_forget[3].d, nullptr, nullptr},
-                                {in_ffn, nullptr, nullptr},
-                                {msg3, nullptr, nullptr},
-                                {in_ffn, nullptr, nullptr},
-                                {L.ffn_norm, nullptr, nullptr},
-                                {xq, nullptr, nullptr}
-                            };
-                            k_control_up_combine_rms_q8_t1<1><<<dim3(144u, 1u), 256, 0, st>>>(
-                                upr, ctrl64, d_mix_scratch, d_router_done + 15, hp.rms_eps, N);
-                        }
-                    } else {
-                        run_control(in_ffn, msg3, L, 3, in_ffn, 1);
-                        k_rms_norm_q8_1<<<1u, 576, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
-                    }
+                    k_shortconv_mix_normed_fused_1pass_q8_t1<true><<<1, 576, 0, st>>>(
+                        wo, L.attn_post_conv, hst, cur_in, ffn_inp, 2 * (int) kv_dim,
+                        np, B + 1, L.ffn_res_query, in_ffn, L.ffn_norm, xq, N, inv_sqrt_n, hp.rms_eps);
                 }
             } else if (fuse_post_attn_ffn_pp) {
                 // Note: push_block(cur_in) pushes rms_norm(cur_in) (independent of wo->ffn_inp!), so run it first and
@@ -9245,21 +9142,7 @@ struct Engine {
                     }
                 }
             }
-            const bool use_t1_core_post = (!can_full_graph && !capturing_full_graph && !prof && T == 1 && !capture_dspark &&
-                                           core_all_gpu && !prof_detail);
-            const int core_end_virt_post = (int) (hp.core_start + hp.num_loops * n_core);
-            bool can_defer_postffn_t1 = false;
-            if (!no_vert_fuse && !hybrid && T == 1 && !save_conv_trace && N == 2304 && fuse_comb_conv &&
-                (int) hp.n_expert_used == 8 && ((((uintptr_t) ewts) & 15u) == 0u) &&
-                il + 1 < hp.n_layer && (int) norm_blocks.size() <= 7) {
-                const int ip_next = hp.loop_layer(il + 1);
-                const PhysLayer& L_next = m->layers[(size_t) ip_next];
-                if (ip_next != hp.core_start &&
-                    !(use_t1_core_post && il + 1 == core_end_virt_post) &&
-                    L_next.attn_res_query != nullptr) {
-                    can_defer_postffn_t1 = true;
-                }
-            }
+            const bool can_defer_postffn_t1 = false;
             const bool post_conv_done = run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv,
                                                 f16_ffn_ready,
                                                 can_defer_postffn ? nullptr : (((is_hy && T <= std::max(verify_max_t, 8) && !pp_streaming) || want_pp_comb_conv) ? &hy_conv : nullptr),
