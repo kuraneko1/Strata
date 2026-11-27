@@ -2737,7 +2737,7 @@ struct Engine {
             const int n_hkv = std::max(1, (int) hp.n_head_kv);
             const int max_t_split = std::min(std::max(verify_max_t, 1), 15);
             const int sm70_t1_hi = (cc_maj == 7 && cc_min < 5)
-                ? std::clamp((sm_count * 12) / n_hkv, 40, kAttnSplitMax) : attn_split_t1_full;
+                ? std::clamp((sm_count * 16) / n_hkv, 40, kAttnSplitMax) : attn_split_t1_full;
             int max_slots = std::max({attn_split_t1_full, sm70_t1_hi, attn_split_t1_swa});
             for (int t = 2; t <= max_t_split; ++t) {
                 int sp_t = 1;
@@ -8217,47 +8217,26 @@ struct Engine {
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
                     const int sp_cap = std::max(1, attn_split_slots / std::max(1, T));
-                    if (is_swa && T >= 2 && T <= 5) {
-                        const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
-                        if (T == 5) {
-                            k_attn_q8_gqa3_verify4_swa_wmma_split<5><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
-                        } else if (T == 4) {
-                            k_attn_q8_gqa3_verify4_swa_wmma_split<4><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
-                        } else if (T == 3) {
-                            k_attn_q8_gqa3_verify4_swa_wmma_split<3><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                    const auto* wo_ti = strata::quant::type_info(L.attn_output.type);
+                    const int wo_blck = wo_ti ? wo_ti->blck : 256;
+                    const bool att_need_xq = (T <= 8 && L.attn_output.type != 0 && L.attn_output.type != 1 &&
+                                              L.attn_output.type != 30 && (q_dim % wo_blck) == 0);
+                    float* const att_f32_out = att_need_xq ? nullptr : att;
+                    void* const att_xq_out = att_need_xq ? xq : nullptr;
+                    if (is_swa && T < 16) {
+                        if (T == 1) {
+                            k_attn_q8_gqa3_swa_1pass<512><<<(unsigned) hp.n_head, 512, 0, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
+                                att_f32_out, att_xq_out,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
                         } else {
-                            k_attn_q8_gqa3_verify4_swa_wmma_split<2><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                            k_attn_q8_gqa3_swa_1pass<128><<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
+                                att_f32_out, att_xq_out,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
                         }
-                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
-                        att_xq_ready = xq;
-                    } else if (is_swa && T >= 6 && T <= 8) {
-                        const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
-                        if (T == 8) {
-                            k_attn_q8_gqa3_verify8_swa_wmma_split<8><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
-                        } else if (T == 7) {
-                            k_attn_q8_gqa3_verify8_swa_wmma_split<7><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
-                        } else {
-                            k_attn_q8_gqa3_verify8_swa_wmma_split<6><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
-                        }
-                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
-                        att_xq_ready = xq;
-                    } else if (T >= 2 && T <= 5 && !is_swa) {
+                        if (att_xq_out) att_xq_ready = xq;
+                    } else if (T >= 2 && T <= 5) {
                         const int vf_mult = (cc_maj == 7 && cc_min < 5 && pos <= 98304) ? 12 : 24;
                         const int sp = std::min(sp_cap, std::clamp((sm_count * vf_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
                         if (T == 5) {
@@ -8278,9 +8257,9 @@ struct Engine {
                                 (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         }
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
-                        att_xq_ready = xq;
-                    } else if (T >= 6 && T <= 8 && !is_swa) {
+                            attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, att_xq_out);
+                        if (att_xq_out) att_xq_ready = xq;
+                    } else if (T >= 6 && T <= 8) {
                         const int vf_mult = (cc_maj == 7 && cc_min < 5 && pos <= 98304) ? 12 : 24;
                         const int sp = std::min(sp_cap, std::clamp((sm_count * vf_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
                         if (T == 8) {
@@ -8297,24 +8276,23 @@ struct Engine {
                                 (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         }
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
-                        att_xq_ready = xq;
+                            attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, att_xq_out);
+                        if (att_xq_out) att_xq_ready = xq;
                     } else if (T < 16) {
                         const int t1_full_sp = (cc_maj == 7 && cc_min < 5)
                             ? ((pos >= 32768 && pos < 131072)
-                                ? std::clamp((sm_count * 12) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax)
-                                : std::clamp((sm_count * 6) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax))
+                                ? std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax)
+                                : std::clamp((sm_count * 8) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax))
                             : attn_split_t1_full;
                         const int sp = std::min(sp_cap, (T == 1)
-                            ? (is_swa ? attn_split_t1_swa : t1_full_sp)
-                            : (is_swa ? std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv * T), 4, 24)
-                                      : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax)));
+                            ? t1_full_sp
+                            : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax));
                         k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp, (unsigned) T), 128, 0, st>>>(
                             pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                            attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa, (T <= 8) ? xq : nullptr);
-                        if (T <= 8) att_xq_ready = xq;
+                            attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, att_xq_out);
+                        if (att_xq_out) att_xq_ready = xq;
                     } else if (use_fa2_256_path) {
                         // Zero-sP, Zero-Spill 256-row FA2: pure bulk Split-KV [0, bulk_aligned) + 1 tail split [bulk_aligned, pos+T).
                         // Uses Region 0 pp_sp_buf inside layer_arena (zero extra VRAM; disjoint from Q/att_gate/att & Region 2 rel_tab).
