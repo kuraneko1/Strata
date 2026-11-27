@@ -33,6 +33,17 @@ bool image_load_file(const std::string& path, ImageU8& out, std::string& err) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open " + path; return false; }
     std::vector<uint8_t> buf;
+    if (std::fseek(f, 0, SEEK_END) == 0) {
+        const long fsz = std::ftell(f);
+        if (fsz > 0 && std::fseek(f, 0, SEEK_SET) == 0) {
+            buf.resize((size_t) fsz);
+            const size_t got = std::fread(buf.data(), 1, buf.size(), f);
+            std::fclose(f);
+            buf.resize(got);
+            return image_decode(buf.data(), buf.size(), out, err);
+        }
+        (void) std::fseek(f, 0, SEEK_SET);
+    }
     uint8_t tmp[1 << 16];
     size_t k;
     while ((k = std::fread(tmp, 1, sizeof tmp, f)) > 0) buf.insert(buf.end(), tmp, tmp + k);
@@ -313,7 +324,10 @@ bool prepare_image(const ImageU8& src, const VitGeometry& g, int min_tokens, int
     return true;
 }
 
-bool prepare_image_u8(const ImageU8& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err) {
+namespace {
+
+bool prepare_image_u8_impl(const ImageU8& src, std::vector<uint8_t>* move_rgb, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out,
+                           std::string& err) {
     if (src.w <= 0 || src.h <= 0 || src.rgb.size() != (size_t) src.w * src.h * 3) { err = "the picture is empty"; return false; }
     out.chw.clear();
     if (g.is_inkling2v()) {
@@ -336,18 +350,35 @@ bool prepare_image_u8(const ImageU8& src, const VitGeometry& g, int min_tokens, 
             out.raw_h = src.h;
             out.w = aw0;
             out.h = ah0;
-            out.rgb = src.rgb;
+            if (move_rgb) out.rgb = std::move(*move_rgb);
+            else out.rgb = src.rgb;
         }
         return true;
     }
     const Size2 t = prepared_size(src.w, src.h, g, min_tokens, max_tokens);
     if (t.w <= 0 || t.h <= 0) { err = "the picture has no usable size"; return false; }
+    if (move_rgb && src.w == t.w && src.h == t.h) {
+        out.w = out.raw_w = t.w;
+        out.h = out.raw_h = t.h;
+        out.rgb = std::move(*move_rgb);
+        return true;
+    }
     ImageU8 r;
     resize_pad_ceil(src, r, t);
     out.w = out.raw_w = t.w;
     out.h = out.raw_h = t.h;
     out.rgb = std::move(r.rgb);
     return true;
+}
+
+}  // namespace
+
+bool prepare_image_u8(const ImageU8& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err) {
+    return prepare_image_u8_impl(src, nullptr, g, min_tokens, max_tokens, out, err);
+}
+
+bool prepare_image_u8(ImageU8&& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err) {
+    return prepare_image_u8_impl(src, &src.rgb, g, min_tokens, max_tokens, out, err);
 }
 
 }  // namespace strata_vit

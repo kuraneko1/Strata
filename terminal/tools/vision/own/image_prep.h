@@ -57,6 +57,7 @@ bool prepare_image(const ImageU8& src, const VitGeometry& g, int min_tokens, int
 
 // GPU fast path: resizes only if needed and fills out.rgb / out.raw_w / out.raw_h (skips CPU float chw & normalise/pad).
 bool prepare_image_u8(const ImageU8& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err);
+bool prepare_image_u8(ImageU8&& src, const VitGeometry& g, int min_tokens, int max_tokens, PreparedImage& out, std::string& err);
 
 // the size prepare_image would give (no pixels touched)
 Size2 prepared_size(int w, int h, const VitGeometry& g, int min_tokens, int max_tokens);

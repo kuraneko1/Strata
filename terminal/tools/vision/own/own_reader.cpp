@@ -121,6 +121,7 @@ int own_reader_run(const OwnReaderOptions& o) {
     std::printf("READY %d own\n", geo.out_dim);   // the third word names the reader (a server reads only the start: "READY")
     std::fflush(stdout);
 
+    std::vector<float> rows;
     std::string line;
     while (std::getline(std::cin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
@@ -132,7 +133,7 @@ int own_reader_run(const OwnReaderOptions& o) {
         PreparedImage prep;
         if (!image_load_file(img, src, err)) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
 #ifdef STRATA_VIT_GPU
-        const bool prep_ok = gpu ? prepare_image_u8(src, geo, o.min_tokens, o.max_tokens, prep, err)
+        const bool prep_ok = gpu ? prepare_image_u8(std::move(src), geo, o.min_tokens, o.max_tokens, prep, err)
                                  : prepare_image(src, geo, o.min_tokens, o.max_tokens, prep, err);
 #else
         const bool prep_ok = prepare_image(src, geo, o.min_tokens, o.max_tokens, prep, err);
@@ -146,7 +147,6 @@ int own_reader_run(const OwnReaderOptions& o) {
             std::fflush(stdout);
             continue;
         }
-        std::vector<float> rows;
         int nx = 0, ny = 0;
         if (std::getenv("STRATA_VIT_PROF"))
             std::fprintf(stderr, "vit-prof: read + decode + prepare %.2f ms\n", std::chrono::duration<double, std::milli>(clock::now() - t0).count());
