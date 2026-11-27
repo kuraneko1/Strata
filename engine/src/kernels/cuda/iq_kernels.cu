@@ -5548,7 +5548,11 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
                         s1g = ggml_cuda_dp4a(v3.x, xv1.z, s1g);
                         s1g = ggml_cuda_dp4a(v3.y, xv1.w, s1g);
                     }
-                    sg = __fmaf_rn(g_sc0 * (float) s0g + g_sc1 * (float) s1g, dx, sg);
+                    {
+                        float p = g_sc0 * dx * (float) s0g;
+                        p += g_sc1 * dx * (float) s1g;
+                        sg += p;
+                    }
                     if (iter < 8) {
                         const uint8_t* kt_n = kt + 18432u;
                         gq = __ldg(reinterpret_cast<const int4*>(kt_n + gq_off));
@@ -5576,7 +5580,11 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel
                         s1u = ggml_cuda_dp4a(v3.x, xv1.z, s1u);
                         s1u = ggml_cuda_dp4a(v3.y, xv1.w, s1u);
                     }
-                    su = __fmaf_rn(u_sc0 * (float) s0u + u_sc1 * (float) s1u, dx, su);
+                    {
+                        float p = u_sc0 * dx * (float) s0u;
+                        p += u_sc1 * dx * (float) s1u;
+                        su += p;
+                    }
                     kt += 18432u;
                     k += 8;
                 }
@@ -5692,7 +5700,9 @@ __global__ void __launch_bounds__(128, 8) native_down_nvfp4_36_t1_kernel(
                 s1 = ggml_cuda_dp4a(v3.x, xv1.z, s1);
                 s1 = ggml_cuda_dp4a(v3.y, xv1.w, s1);
             }
-            acc = __fmaf_rn(sc0 * (float) s0 + sc1 * (float) s1, dx, acc);
+            float p = sc0 * dx * (float) s0;
+            p += sc1 * dx * (float) s1;
+            acc += p;
         };
         bool need_sync = false;
         for (int g = blockIdx.y; g < ng; g += gridDim.y) {
@@ -13185,7 +13195,7 @@ __global__ void __launch_bounds__(256, (BM_SM == 32) ? 4 : 3) wmma_grouped_gu_si
             mma_step(a_base, b_base);
             if (do_store) {
                 const uint4 nx = x_ok ? __ldg(reinterpret_cast<const uint4*>(cxp + 32)) : make_uint4(0, 0, 0, 0);
-                iq_sts128_u32_sm70(dst_x0_lo + st_wr, nx);
+                if ((int) threadIdx.x < 128) iq_sts128_u32_sm70(dst_x0_lo + st_wr, nx);
             }
             mma_step(a_base ^ 0x10u, b_base ^ 0x10u);
             mma_step(a_base ^ 0x20u, b_base ^ 0x20u);
@@ -17684,7 +17694,7 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
                 };
                 if (L.situ_linear_beta > 0.0f) launch_gu_situ_128(std::true_type{});
                 else                           launch_gu_situ_128(std::false_type{});
-                zeroed_in_gu = true;
+                zeroed_in_gu = !volta_split_gu;
             }
         } else {
             k_build_wmma_tiles<64><<<1, 256, 0, s>>>(grp_start, n_groups, tile_g, tile_c0, n_tiles);

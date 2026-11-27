@@ -2277,6 +2277,7 @@ __global__ void __launch_bounds__(576, 1) k_mix_normed_fused_1pass_dual(
                     ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
                 }
             }
+            reinterpret_cast<float4*>(out_c.p[q] + (size_t) t * N)[tid] = make_float4(ax, ay, az, aw);
         }
     }
 }

@@ -8392,18 +8392,57 @@ struct Engine {
                                               L.attn_output.type != 30 && (q_dim % wo_blck) == 0);
                     float* const att_f32_out = att_need_xq ? nullptr : att;
                     void* const att_xq_out = att_need_xq ? xq : nullptr;
-                    if (is_swa && T < 16) {
-                        if (T == 1) {
-                            k_attn_q8_gqa3_swa_1pass<512><<<(unsigned) hp.n_head, 512, 0, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
-                                att_f32_out, att_xq_out,
-                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
+                    if (is_swa && T == 1) {
+                        k_attn_q8_gqa3_swa_1pass<512><<<(unsigned) hp.n_head, 512, 0, st>>>(
+                            pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
+                            att_f32_out, att_xq_out,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
+                        if (att_xq_out) att_xq_ready = xq;
+                    } else if (is_swa && T >= 2 && T <= 5) {
+                        const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
+                        if (T == 5) {
+                            k_attn_q8_gqa3_verify4_swa_wmma_split<5><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else if (T == 4) {
+                            k_attn_q8_gqa3_verify4_swa_wmma_split<4><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else if (T == 3) {
+                            k_attn_q8_gqa3_verify4_swa_wmma_split<3><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         } else {
-                            k_attn_q8_gqa3_swa_1pass<128><<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
-                                att_f32_out, att_xq_out,
-                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
+                            k_attn_q8_gqa3_verify4_swa_wmma_split<2><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
                         }
+                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, att_xq_out);
+                        if (att_xq_out) att_xq_ready = xq;
+                    } else if (is_swa && T >= 6 && T <= 8) {
+                        const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
+                        if (T == 8) {
+                            k_attn_q8_gqa3_verify8_swa_wmma_split<8><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else if (T == 7) {
+                            k_attn_q8_gqa3_verify8_swa_wmma_split<7><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        } else {
+                            k_attn_q8_gqa3_verify8_swa_wmma_split<6><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 18448, st>>>(
+                                pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, cur_kv_cap, (int) hp.n_swa, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+                        }
+                        k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            attn_split, pGate, att_f32_out, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, att_xq_out);
+                        if (att_xq_out) att_xq_ready = xq;
+                    } else if (is_swa && T < 16) {
+                        k_attn_q8_gqa3_swa_1pass<128><<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                            pQ, cur_kq, cur_ks, cur_vq, cur_vs, rel_tab, sink, pGate,
+                            att_f32_out, att_xq_out,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, cur_kv_cap, (int) hp.n_swa, pos0_d, kq_scale);
                         if (att_xq_out) att_xq_ready = xq;
                     } else if (T >= 2 && T <= 5) {
                         const int vf_mult = (cc_maj == 7 && cc_min < 5 && pos <= 98304) ? 12 : 24;
